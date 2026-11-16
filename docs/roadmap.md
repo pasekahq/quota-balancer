@@ -6,7 +6,8 @@
 - `/v1/pick`, `/v1/report`, `/v1/state`, `/v1/health` with typed requests/responses, fixtures and
   contract tests over a real unix socket.
 - HTTP/1.1 framing with hard limits, `SO_PEERCRED` peer identity, systemd socket activation.
-- Multicall binary: `qbd` / `qb daemon`, `qb agent` (connectivity only), CLI.
+- Multicall binary: `qbd` / `qb daemon`, `qb agent` (the credential owner that answers the
+  daemon's probe jobs), CLI.
 - systemd templates with hardening (`qbd.service` exposure 0.2).
 - CI: fmt, clippy `-D warnings`, tests, MSRV, cargo-deny, gitleaks, size/RSS budgets, unit exposure.
 

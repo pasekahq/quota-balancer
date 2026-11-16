@@ -11,7 +11,8 @@ holds a short lease so that parallel workers do not all pile onto the same last 
 own credentials. `qb` never sees model traffic and never stores or refreshes anyone's tokens.
 
 > **Status: pre-alpha skeleton (0.0.x).** The API contract, transport, CLI and service templates
-> are in place; the scheduling policy, vendor adapters and the agent's probe are being built.
+> are in place, and the agent probes the vendors' usage endpoints; the scheduling policy and
+> vendor adapters are being built.
 > See [docs/roadmap.md](docs/roadmap.md). Not ready for use.
 
 ## Why

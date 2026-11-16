@@ -47,7 +47,8 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   zeroizes it. It never writes or refreshes credentials. Before its first connection to `qbd`
   it makes itself non-dumpable and restricts itself with landlock to reading the credential
   directories, `/etc/resolv.conf` and `/etc/hosts`, and to TCP connections to port 443; a
-  kernel that cannot enforce part of this gets one warning in the log. On 401 it reports
+  kernel that cannot enforce part of this gets one warning in the log. DNS over TCP (port 53)
+  is not allowed, so a truncated UDP answer fails the probe as `error`. On 401 it reports
   `auth_stale`; the vendor CLI refreshes its own token on next use.
 - **Clients** send no secrets: only outcome classes and window numbers.
 
