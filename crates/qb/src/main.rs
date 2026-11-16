@@ -1,15 +1,18 @@
 //! `qb` multicall entry point. Invoked as `qbd` it runs the daemon.
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use qb::auth::Gate;
+use qb::config::Config;
 use qb::journal::{self, Journal};
-use qb::{DEFAULT_CONFIG, DEFAULT_SOCKET, agent, client, config, listen, log, server};
+use qb::{DEFAULT_CONFIG, DEFAULT_SOCKET, agent, api, client, config, listen, log, server, stream};
 use qb_core::Core;
 use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, paths};
+use qb_vendors::claude::Event;
 
 const HELP: &str = "\
 qb - pre-flight quota balancer for coding-agent subscriptions
@@ -24,17 +27,31 @@ COMMANDS:
     agent                               run the credential-owner agent
     health                              GET /v1/health
     state                               GET /v1/state
+    why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
     pick --role R (--difficulty N | --vendor V --model M [--effort E] [--login L])
          [--resume-of RUN] [--avoid-vendor V] [--minutes N] [--run-id ID]
                                         POST /v1/pick
     report (--lease ID | --login L) --outcome O [--model M] [--release]
                                         POST /v1/report
+    report (--lease ID | --login L) --from-stream-json FILE [--model M] [--release]
+                                        POST /v1/report with the windows of the last
+                                        rate_limit_event of a stream-json log (- = stdin);
+                                        outcome `rejected` if that event was rejected, else
+                                        `ok`; exit 1 without an event; lines over 1 MiB
+                                        are skipped
+    simulate [--config PATH] <JOURNAL> [--at T] [--pick JSON]
+                                        replay JOURNAL.1 and JOURNAL against a config
+                                        without a daemon and print the /v1/state JSON at T
+                                        (default: the last record's time), then the
+                                        PickResponse to the PickRequest JSON; writes nothing
     version                             print the version
 
 OPTIONS:
-    -s, --socket PATH   unix socket (default: $QB_SOCKET, else /run/qb/qb.sock)
-    -h, --help          print this help
-    -V, --version       print the version
+    -s, --socket PATH       unix socket (default: $QB_SOCKET, else /run/qb/qb.sock)
+    --bearer-file PATH      send the token in PATH (trailing whitespace trimmed) as
+                            `Authorization: Bearer` (default: $QB_BEARER_FILE)
+    -h, --help              print this help
+    -V, --version           print the version
 
 Client commands print the JSON response and exit 0 on HTTP 2xx, 1 otherwise, 2 on usage or
 connection errors. qb sends no telemetry.
@@ -43,12 +60,37 @@ connection errors. qb sends no telemetry.
 enum Cmd {
     Daemon(PathBuf),
     Agent,
-    Health,
-    State,
-    Pick(PickRequest),
-    Report(ReportRequest),
+    Simulate(Simulate),
+    Call(Call),
     Version,
     Help,
+}
+
+/// A request to the daemon.
+enum Call {
+    Health,
+    State,
+    Why(String),
+    Pick(PickRequest),
+    Report(ReportRequest),
+    /// A report whose outcome and windows come from a stream-json log; `-` is stdin.
+    ReportStream(ReportRequest, PathBuf),
+}
+
+struct Simulate {
+    config: PathBuf,
+    journal: PathBuf,
+    at: Option<u64>,
+    pick: Option<PickRequest>,
+}
+
+/// The client name a simulated pick runs as.
+const SIMULATE_CLIENT: &str = "simulate";
+
+struct Args {
+    socket: PathBuf,
+    bearer_file: Option<PathBuf>,
+    cmd: Cmd,
 }
 
 fn main() -> ExitCode {
@@ -76,11 +118,15 @@ fn string(v: OsString) -> Result<String, lexopt::Error> {
 }
 
 #[allow(clippy::too_many_lines)] // one flat table of options reads best
-fn parse(as_qbd: bool) -> Result<(PathBuf, Cmd), lexopt::Error> {
+fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
     use lexopt::prelude::*;
     let mut p = lexopt::Parser::from_env();
     let mut socket = None;
+    let mut bearer_file = None;
     let mut config = None;
+    let mut operand: Option<OsString> = None;
+    let (mut at, mut sim_pick) = (None, None);
+    let mut from_stream = None;
     let mut name: Option<String> = if as_qbd {
         Some("daemon".to_owned())
     } else {
@@ -107,14 +153,35 @@ fn parse(as_qbd: bool) -> Result<(PathBuf, Cmd), lexopt::Error> {
     };
     let mut outcome_set = false;
 
+    let early = |cmd| Args {
+        socket: default_socket(),
+        bearer_file: None,
+        cmd,
+    };
     while let Some(arg) = p.next()? {
         let sub = name.as_deref();
         match arg {
             Short('s') | Long("socket") => socket = Some(PathBuf::from(p.value()?)),
-            Short('h') | Long("help") => return Ok((default_socket(), Cmd::Help)),
-            Short('V') | Long("version") => return Ok((default_socket(), Cmd::Version)),
+            Long("bearer-file") => bearer_file = Some(PathBuf::from(p.value()?)),
+            Short('h') | Long("help") => return Ok(early(Cmd::Help)),
+            Short('V') | Long("version") => return Ok(early(Cmd::Version)),
             Value(v) if name.is_none() => name = Some(string(v)?),
-            Long("config") if sub == Some("daemon") => config = Some(PathBuf::from(p.value()?)),
+            Value(v) if matches!(sub, Some("why" | "simulate")) && operand.is_none() => {
+                operand = Some(v);
+            }
+            Long("config") if matches!(sub, Some("daemon" | "simulate")) => {
+                config = Some(PathBuf::from(p.value()?));
+            }
+            Long("at") if sub == Some("simulate") => at = Some(p.value()?.parse()?),
+            Long("pick") if sub == Some("simulate") => {
+                let raw = string(p.value()?)?;
+                let req: PickRequest = serde_json::from_str(&raw)
+                    .map_err(|e| lexopt::Error::from(format!("--pick: {e}")))?;
+                sim_pick = Some(req);
+            }
+            Long("from-stream-json") if sub == Some("report") => {
+                from_stream = Some(PathBuf::from(p.value()?));
+            }
             Long("role") if sub == Some("pick") => pick.role = string(p.value()?)?,
             Long("difficulty") if sub == Some("pick") => {
                 pick.difficulty = Some(p.value()?.parse()?);
@@ -152,9 +219,26 @@ fn parse(as_qbd: bool) -> Result<(PathBuf, Cmd), lexopt::Error> {
         None => Cmd::Help,
         Some("daemon") => Cmd::Daemon(config.unwrap_or_else(default_config)),
         Some("agent") => Cmd::Agent,
-        Some("health") => Cmd::Health,
-        Some("state") => Cmd::State,
+        Some("health") => Cmd::Call(Call::Health),
+        Some("state") => Cmd::Call(Call::State),
         Some("version") => Cmd::Version,
+        Some("why") => {
+            let lease = operand.ok_or("a lease id is required")?;
+            Cmd::Call(Call::Why(string(lease)?))
+        }
+        Some("simulate") => {
+            let journal = operand.ok_or("a journal path is required")?;
+            if let Some(req) = &sim_pick {
+                req.validate()
+                    .map_err(|e| lexopt::Error::from(format!("--pick: {}", e.message())))?;
+            }
+            Cmd::Simulate(Simulate {
+                config: config.unwrap_or_else(default_config),
+                journal: PathBuf::from(journal),
+                at,
+                pick: sim_pick,
+            })
+        }
         Some("pick") => {
             if vendor.is_some() || model.is_some() {
                 let (Some(vendor), Some(model)) = (vendor, model) else {
@@ -169,25 +253,33 @@ fn parse(as_qbd: bool) -> Result<(PathBuf, Cmd), lexopt::Error> {
             }
             pick.validate()
                 .map_err(|e| lexopt::Error::from(e.message()))?;
-            Cmd::Pick(pick)
+            Cmd::Call(Call::Pick(pick))
         }
         Some("report") => {
-            if !outcome_set {
-                return Err("--outcome is required".into());
-            }
             if report.lease_id.is_none() && report.login.is_none() {
                 return Err("--lease or --login is required".into());
             }
-            Cmd::Report(report)
+            match (from_stream, outcome_set) {
+                (Some(_), true) => {
+                    return Err("--outcome and --from-stream-json are exclusive".into());
+                }
+                (Some(file), false) => Cmd::Call(Call::ReportStream(report, file)),
+                (None, true) => Cmd::Call(Call::Report(report)),
+                (None, false) => return Err("--outcome is required".into()),
+            }
         }
         Some(other) => return Err(format!("unknown command `{other}`").into()),
     };
-    Ok((socket, cmd))
+    Ok(Args {
+        socket,
+        bearer_file,
+        cmd,
+    })
 }
 
-fn run((socket, cmd): (PathBuf, Cmd)) -> Result<ExitCode, String> {
+fn run(args: Args) -> Result<ExitCode, String> {
     let mut out = std::io::stdout().lock();
-    match cmd {
+    match args.cmd {
         Cmd::Help => {
             let _ = out.write_all(HELP.as_bytes());
             Ok(ExitCode::SUCCESS)
@@ -196,28 +288,79 @@ fn run((socket, cmd): (PathBuf, Cmd)) -> Result<ExitCode, String> {
             let _ = writeln!(out, "qb {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Daemon(config) => daemon(&socket, &config),
-        Cmd::Agent => agent::run(&socket).map(|()| ExitCode::SUCCESS),
-        Cmd::Health => request(&socket, "GET", paths::HEALTH, None),
-        Cmd::State => request(&socket, "GET", paths::STATE, None),
-        Cmd::Pick(req) => {
-            let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
-            request(&socket, "POST", paths::PICK, Some(&body))
-        }
-        Cmd::Report(req) => {
-            let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
-            request(&socket, "POST", paths::REPORT, Some(&body))
+        Cmd::Daemon(config) => daemon(&args.socket, &config),
+        Cmd::Agent => agent::run(&args.socket).map(|()| ExitCode::SUCCESS),
+        Cmd::Simulate(sim) => simulate(sim),
+        Cmd::Call(call) => {
+            let bearer = bearer(args.bearer_file)?;
+            let send = |method, path: &str, body: Option<&[u8]>| {
+                request(&args.socket, bearer.as_deref(), method, path, body)
+            };
+            match call {
+                Call::Health => send("GET", paths::HEALTH, None),
+                Call::State => send("GET", paths::STATE, None),
+                Call::Why(lease) => send("GET", &format!("{}{lease}", paths::WHY), None),
+                Call::Pick(req) => send("POST", paths::PICK, Some(&encode(&req)?)),
+                Call::Report(req) => send("POST", paths::REPORT, Some(&encode(&req)?)),
+                Call::ReportStream(mut req, file) => {
+                    let Some(event) = last_event(&file)? else {
+                        log::error(&format!(
+                            "qb: {}: no rate_limit_event, nothing reported",
+                            file.display()
+                        ));
+                        return Ok(ExitCode::from(1));
+                    };
+                    req.outcome = if event.status == "rejected" {
+                        Outcome::Rejected
+                    } else {
+                        Outcome::Ok
+                    };
+                    req.windows = event.windows;
+                    send("POST", paths::REPORT, Some(&encode(&req)?))
+                }
+            }
         }
     }
 }
 
+fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(value).map_err(|e| e.to_string())
+}
+
+/// The token of `--bearer-file`, else of `$QB_BEARER_FILE`, without trailing whitespace;
+/// `None` without either.
+fn bearer(file: Option<PathBuf>) -> Result<Option<String>, String> {
+    let Some(file) = file.or_else(|| std::env::var_os("QB_BEARER_FILE").map(PathBuf::from)) else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let token = text.trim_end();
+    if token.is_empty() {
+        return Err(format!("{}: the bearer file is empty", file.display()));
+    }
+    Ok(Some(token.to_owned()))
+}
+
+/// The last `rate_limit_event` of the stream-json log `file`, `-` for stdin.
+fn last_event(file: &Path) -> Result<Option<Event>, String> {
+    let name = file.display().to_string();
+    let found = if file == Path::new("-") {
+        stream::last_rate_limit_event(&mut std::io::stdin().lock(), "stdin")
+    } else {
+        let f = File::open(file).map_err(|e| format!("{name}: {e}"))?;
+        stream::last_rate_limit_event(&mut BufReader::new(f), &name)
+    };
+    found.map_err(|e| format!("{name}: {e}"))
+}
+
 fn request(
     socket: &Path,
+    bearer: Option<&str>,
     method: &str,
     path: &str,
     body: Option<&[u8]>,
 ) -> Result<ExitCode, String> {
-    let (status, resp) = client::call(socket, method, path, body)
+    let (status, resp) = client::call(socket, method, path, body, bearer)
         .map_err(|e| format!("{}: {e}", socket.display()))?;
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(&resp);
@@ -229,14 +372,42 @@ fn request(
     })
 }
 
-fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
+/// The config in `file` and a core built from it, validated as the daemon does.
+fn load(file: &Path) -> Result<(Config, Core), String> {
     let config = config::load(file).map_err(|e| e.to_string())?;
-    let mut core = Core::new(config.core_spec()).map_err(|e| format!("{}: {e}", file.display()))?;
+    let core = Core::new(config.core_spec()).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok((config, core))
+}
+
+fn simulate(sim: Simulate) -> Result<ExitCode, String> {
+    let (_, mut core) = load(&sim.config)?;
+    let replayed = journal::replay(&mut core, &sim.journal).map_err(|e| e.to_string())?;
+    let at = sim.at.or(replayed.last_at).ok_or_else(|| {
+        format!(
+            "{}: no record to take the time from; pass --at",
+            sim.journal.display()
+        )
+    })?;
+    let mut out = std::io::stdout().lock();
+    let state = encode(&api::state(&mut core, at))?;
+    let _ = out.write_all(&state);
+    let _ = out.write_all(b"\n");
+    if let Some(req) = sim.pick {
+        let (resp, _) = api::decide(&mut core, req, SIMULATE_CLIENT, at)
+            .map_err(|e| format!("--pick: {}", e.message()))?;
+        let _ = out.write_all(&encode(&resp)?);
+        let _ = out.write_all(b"\n");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
+    let (config, mut core) = load(file)?;
     let mut journal = match &config.journal {
         config::Journal::Off {} => Journal::off(),
         config::Journal::Path { path, rotate_bytes } => {
-            let valid = journal::replay(&mut core, path).map_err(|e| e.to_string())?;
-            Journal::open(path, *rotate_bytes, valid)
+            let replayed = journal::replay(&mut core, path).map_err(|e| e.to_string())?;
+            Journal::open(path, *rotate_bytes, replayed.valid_len)
                 .map_err(|e| format!("{}: {e}", path.display()))?
         }
     };

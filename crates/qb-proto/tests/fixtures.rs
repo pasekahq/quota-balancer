@@ -2,7 +2,7 @@
 
 use qb_proto::{
     Decision, ErrorBody, HealthResponse, Outcome, PickRequest, PickResponse, ReportRequest,
-    ReportResponse, StateResponse,
+    ReportResponse, StateResponse, WhyResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -56,6 +56,13 @@ fn state_health_error() {
     assert_eq!(s.logins.len(), 1);
     let _: HealthResponse = roundtrip("health_response.json");
     let _: ErrorBody = roundtrip("error_body.json");
+}
+
+#[test]
+fn why() {
+    let w: WhyResponse = roundtrip("why_response.json");
+    assert_eq!(w.reason.as_deref(), Some("spend_before_reset"));
+    assert_eq!(w.cost.len(), w.login_state.windows.len());
 }
 
 #[test]

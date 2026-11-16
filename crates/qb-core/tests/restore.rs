@@ -3,7 +3,9 @@
 mod common;
 
 use common::{DAY, HOUR, NOW, cand, core, on, outcome, pick_for, release, role, spec, step};
-use qb_core::{Auth, Core, LeaseRecord, Marks, OutcomeClass, Record, RestoreError, Verdict};
+use qb_core::{
+    Auth, Core, LeaseRecord, Marks, OutcomeClass, Reason, Record, RestoreError, Verdict,
+};
 
 fn worker() -> Core {
     core(spec(vec![role(
@@ -32,6 +34,7 @@ fn lease(id: u64, login: &str, cost: Vec<f64>, expires_at: u64) -> Record {
         run_id: None,
         cost,
         expires_at,
+        reason: None,
     })
 }
 
@@ -61,6 +64,10 @@ fn records_rebuild_leases_marks_and_the_lease_counter() {
     }
     assert_eq!(restored.marks("login-3").map(|m| m.auth), Some(Auth::Dead));
     assert_eq!(restored.lease(kept), live.lease(kept));
+    assert_eq!(
+        restored.lease(kept).and_then(|l| l.reason),
+        Some(Reason::SpendBeforeReset)
+    );
 
     assert_eq!(restored.records(), live.records());
     assert_eq!(live.records()[0], Record::Issued(2));

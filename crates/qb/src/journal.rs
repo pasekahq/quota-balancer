@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use qb_core::{Auth, Core, LeaseRecord, Marks, Record};
+use qb_core::{Auth, Core, LeaseRecord, Marks, Reason, Record};
 use serde::{Deserialize, Serialize};
 
 use crate::log;
@@ -39,6 +39,8 @@ struct LeaseLine {
     run_id: Option<String>,
     cost: Vec<f64>,
     expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -92,6 +94,7 @@ pub fn encode(record: &Record, at: u64) -> Result<Vec<u8>, serde_json::Error> {
                 run_id: l.run_id.clone(),
                 cost: l.cost.clone(),
                 expires_at: l.expires_at,
+                reason: l.reason.map(|r| r.as_str().to_owned()),
             });
         }
         Record::Release(id) => line.release = Some(*id),
@@ -124,6 +127,12 @@ pub fn decode(line: &[u8]) -> Result<(Record, u64), String> {
     let record = match (line.issued, line.lease, line.release, line.marks) {
         (Some(n), None, None, None) => Record::Issued(n),
         (None, Some(l), None, None) => Record::Lease(LeaseRecord {
+            reason: match l.reason {
+                None => None,
+                Some(name) => Some(
+                    Reason::from_name(&name).ok_or_else(|| format!("unknown reason `{name}`"))?,
+                ),
+            },
             id: l.id,
             login: l.login,
             model: l.model,
@@ -183,14 +192,22 @@ impl fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
-/// Restores every record of `file` into `core` in order and returns the length of its complete
-/// lines, `None` when the file does not exist. A final line without its newline was torn by a
-/// crash and is skipped with a warning; a record that does not fit the config is skipped with a
-/// warning.
+/// What a replay read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Replayed {
+    /// Length of the complete lines of the file.
+    pub valid_len: u64,
+    /// Time of the last decoded record; `None` without one.
+    pub last_at: Option<u64>,
+}
+
+/// Restores every record of `file` into `core` in order; `None` when the file does not exist.
+/// A final line without its newline was torn by a crash and is skipped with a warning; a record
+/// that does not fit the config is skipped with a warning. The file is only read.
 ///
 /// # Errors
 /// The file cannot be read, or a complete line does not decode.
-pub fn replay_file(core: &mut Core, file: &Path) -> Result<Option<u64>, ReplayError> {
+pub fn replay_file(core: &mut Core, file: &Path) -> Result<Option<Replayed>, ReplayError> {
     let fail = |line, reason: String| ReplayError {
         file: file.to_owned(),
         line,
@@ -206,10 +223,12 @@ pub fn replay_file(core: &mut Core, file: &Path) -> Result<Option<u64>, ReplayEr
     };
     let complete = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let mut n = 0;
+    let mut last_at = None;
     for line in text[..complete].split_inclusive(|&b| b == b'\n') {
         n += 1;
         let line = &line[..line.len() - 1];
         let (record, at) = decode(line).map_err(|reason| fail(Some(n), reason))?;
+        last_at = Some(at);
         if let Err(e) = core.restore(&record, at) {
             log::warn(&format!("{}: line {n}: skipped: {e}", file.display()));
         }
@@ -221,16 +240,26 @@ pub fn replay_file(core: &mut Core, file: &Path) -> Result<Option<u64>, ReplayEr
             n + 1
         ));
     }
-    Ok(Some(complete as u64))
+    Ok(Some(Replayed {
+        valid_len: complete as u64,
+        last_at,
+    }))
 }
 
-/// Replays `<path>.1`, then `path`, and returns the length of the complete lines of `path`.
+/// Replays `<path>.1`, then `path`: the length of the complete lines of `path` and the time of
+/// the last record of either file.
 ///
 /// # Errors
 /// See [`replay_file`].
-pub fn replay(core: &mut Core, path: &Path) -> Result<u64, ReplayError> {
-    replay_file(core, &rotated(path))?;
-    Ok(replay_file(core, path)?.unwrap_or(0))
+pub fn replay(core: &mut Core, path: &Path) -> Result<Replayed, ReplayError> {
+    let old = replay_file(core, &rotated(path))?;
+    let current = replay_file(core, path)?;
+    Ok(Replayed {
+        valid_len: current.map_or(0, |r| r.valid_len),
+        last_at: current
+            .and_then(|r| r.last_at)
+            .or(old.and_then(|r| r.last_at)),
+    })
 }
 
 /// Where the daemon's state changes go: nowhere, or an appended file.
@@ -242,7 +271,7 @@ pub struct Journal {
 #[derive(Debug)]
 struct Appender {
     path: PathBuf,
-    /// `None` after a rotation could not reopen `path`; the next record retries.
+    /// `None` after a failed append; the next record starts a fresh file.
     file: Option<File>,
     len: u64,
     rotate_bytes: u64,
@@ -287,8 +316,9 @@ impl Journal {
 
     /// Appends `record` as of `at`. Once the file reaches the rotation size it becomes
     /// `<path>.1` and the new file starts with `core`'s live state, so either file pair
-    /// replays to the same leases and marks. While the new file cannot be opened nothing is
-    /// written; the first record that opens it writes the live state, which includes `record`.
+    /// replays to the same leases and marks. After a failed write nothing more goes into that
+    /// file: the next record moves it to `<path>.1` and starts a new file with the live state,
+    /// which includes that record.
     ///
     /// # Errors
     /// Encoding, writing, rotation or reopening failed.
@@ -300,28 +330,35 @@ impl Journal {
             return a.start(core, at);
         };
         let line = encode(record, at)?;
-        file.write_all(&line)?;
+        if let Err(e) = file.write_all(&line) {
+            a.file = None;
+            return Err(e);
+        }
         a.len += line.len() as u64;
         if a.len < a.rotate_bytes {
             return Ok(());
         }
-        std::fs::rename(&a.path, rotated(&a.path))?;
-        a.file = None;
         a.start(core, at)
     }
 }
 
 impl Appender {
-    /// Opens a fresh `path` and writes `core`'s live state as of `at` as its header.
+    /// Moves `path` to `<path>.1` if it exists, then opens a fresh `path` and writes `core`'s
+    /// live state as of `at` as its header. Leaves no handle unless the header was written.
     fn start(&mut self, core: &Core, at: u64) -> io::Result<()> {
         let mut header = Vec::new();
         for r in core.records() {
             header.extend(encode(&r, at)?);
         }
-        let file = self.file.insert((self.open)(&self.path)?);
-        self.len = 0;
+        self.file = None;
+        match std::fs::rename(&self.path, rotated(&self.path)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut file = (self.open)(&self.path)?;
         file.write_all(&header)?;
         self.len = header.len() as u64;
+        self.file = Some(file);
         Ok(())
     }
 }
@@ -348,8 +385,8 @@ mod tests {
         }
     }
 
-    fn rate_limited_core() -> Core {
-        let mut core = Core::new(Spec {
+    fn fresh_core() -> Core {
+        Core::new(Spec {
             vendors: vec![VendorSpec {
                 name: "vendor-a".into(),
                 windows: Vec::new(),
@@ -361,7 +398,11 @@ mod tests {
             rate_limit_backoff_s: 60,
             ..Spec::default()
         })
-        .expect("valid spec");
+        .expect("valid spec")
+    }
+
+    fn rate_limited_core() -> Core {
+        let mut core = fresh_core();
         let input = ReportInput {
             subject: ReportSubject::Login("login-1".into()),
             outcome: OutcomeClass::Http429,
@@ -411,6 +452,36 @@ mod tests {
             .expect("reopened");
         assert_eq!(records(&rotated(&path)), [Record::Release(1)]);
         assert_eq!(records(&path), core.records());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_failed_write_restarts_the_file_with_the_live_state() {
+        const TORN: &[u8] = b"{\"at\":";
+        let dir = std::env::temp_dir().join(format!("qb-journal-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("journal");
+        let core = rate_limited_core();
+        let mut journal = Journal::open(&path, 1 << 20, 0).expect("open");
+        journal
+            .record(&core, &Record::Release(1), NOW)
+            .expect("append");
+        open_append(&path)
+            .and_then(|mut f| f.write_all(TORN))
+            .expect("torn line");
+        if let Some(a) = &mut journal.file {
+            a.file = Some(File::open(&path).expect("read-only handle"));
+        }
+
+        assert!(journal.record(&core, &Record::Release(2), NOW).is_err());
+        journal
+            .record(&core, &Record::Release(3), NOW + 1)
+            .expect("restarted");
+        assert!(std::fs::read(rotated(&path)).expect(".1").ends_with(TORN));
+        assert_eq!(records(&path), core.records());
+        let mut replayed = fresh_core();
+        replay(&mut replayed, &path).expect("replays");
+        assert_eq!(replayed.records(), core.records());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

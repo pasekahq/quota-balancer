@@ -27,6 +27,8 @@ pub mod paths {
     pub const STATE: &str = "/v1/state";
     /// `GET`: liveness and version.
     pub const HEALTH: &str = "/v1/health";
+    /// `GET`, followed by a lease id: why a live lease was granted.
+    pub const WHY: &str = "/v1/why/";
 }
 
 /// `POST /v1/pick` request.
@@ -315,6 +317,40 @@ pub struct LeaseState {
     pub run_id: Option<String>,
     /// When the lease expires unless released first.
     pub expires_at: u64,
+}
+
+/// The fraction a lease reserves in one window of its login.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowCost {
+    /// Window name.
+    pub name: String,
+    /// Reserved fraction.
+    pub cost: f64,
+}
+
+/// `GET /v1/why/{lease_id}` response: a live lease, why it was granted and its login now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WhyResponse {
+    /// Lease id.
+    pub lease_id: String,
+    /// Login the lease holds.
+    pub login: String,
+    /// Model of the lease.
+    pub model: String,
+    /// Client that took the lease.
+    pub client: String,
+    /// Caller's run id from the pick request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// When the lease expires unless released first.
+    pub expires_at: u64,
+    /// Reservation per window of the login's vendor, in declaration order.
+    pub cost: Vec<WindowCost>,
+    /// The pick `reason` the lease was granted with; absent when the journal did not keep it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The lease's login as `GET /v1/state` shows it.
+    pub login_state: LoginState,
 }
 
 /// `GET /v1/state` response.

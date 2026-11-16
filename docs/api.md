@@ -10,6 +10,7 @@ Types are defined in `crates/qb-proto`; example payloads are in `crates/qb-proto
 | `POST /v1/pick` | `PickRequest` | 200 `PickResponse` |
 | `POST /v1/report` | `ReportRequest` | 200 `ReportResponse`, 403 another client's lease, 404 unknown lease/login/model |
 | `GET /v1/state` | — | 200 `StateResponse` |
+| `GET /v1/why/{lease_id}` | — | 200 `WhyResponse`, 404 unknown or ended lease |
 | `GET /v1/health` | — | 200 `HealthResponse` |
 
 Errors: `{"error": <code>, "message": "..."}` with codes `bad_request` (400), `unauthorized`
@@ -124,6 +125,25 @@ of the two) and windows (`used`, `reserved`, `resets_at`, `observed_at`, `source
 costs in that window. A window never reported shows `used = 0`, `observed_at = 0`,
 `source = assumed`, `stale = true`; once its `resets_at` has passed it shows `used = 0`,
 `source = assumed` and no `resets_at`.
+
+## `GET /v1/why/{lease_id}`
+
+Why a live lease was granted, and its login now. See `why_response.json`.
+
+```json
+{"lease_id": "l-257", "login": "login-1", "model": "model-small", "client": "client-a",
+ "run_id": "run-0001", "expires_at": 1800005400,
+ "cost": [{"name": "five_hour", "cost": 0.06}, {"name": "seven_day", "cost": 0.0018}],
+ "reason": "spend_before_reset", "login_state": {"login": "login-1", "...": "..."}}
+```
+
+The lease fields are those of `GET /v1/state`; `cost` is the fraction the lease reserves in
+each window of the login's vendor, in declaration order. `reason` is the `reason` the pick
+answered (`spend_before_reset`, `neighbour_step` or `pinned`); it survives a restart and is
+absent for a lease replayed from a journal line that does not keep it. `login_state` is the
+login's entry of `GET /v1/state` at the same time. A lease id that names no live lease, because
+it never existed, was released or expired, is 404 `not_found`. Every caller may ask about every
+lease; the request takes a token like any other.
 
 ## `GET /v1/health`
 

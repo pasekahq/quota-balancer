@@ -93,6 +93,7 @@ dependencies = [
  "lexopt",
  "qb-core",
  "qb-proto",
+ "qb-vendors",
  "rustix",
  "serde",
  "serde_json",

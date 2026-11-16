@@ -376,6 +376,8 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
 fn redact(message: &str) -> String {
     const QUOTED: &str = "string \"";
     const VARIANT: &str = "unknown variant `";
+    // The value may contain "`, " itself; serde's own list follows the last marker.
+    const VARIANT_END: &str = "`, expected";
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
     loop {
@@ -393,7 +395,7 @@ fn redact(message: &str) -> String {
         rest = if prefix == QUOTED {
             after_debug_string(value)
         } else {
-            value.find("`, ").map_or("", |end| &value[end + 1..])
+            value.rfind(VARIANT_END).map_or("", |end| &value[end + 1..])
         };
     }
 }

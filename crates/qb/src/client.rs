@@ -9,20 +9,31 @@ use std::time::Duration;
 /// Upper bound on a response we are willing to buffer.
 const MAX_RESPONSE: u64 = 1024 * 1024;
 
-/// Sends one request and returns `(status, body)`.
+/// Sends one request, with `Authorization: Bearer` when `bearer` is given, and returns
+/// `(status, body)`.
 ///
 /// # Errors
-/// Connection, timeout or framing errors.
+/// A bearer with a control character, connection, timeout or framing errors.
 pub fn call(
     socket: &Path,
     method: &str,
     path: &str,
     body: Option<&[u8]>,
+    bearer: Option<&str>,
 ) -> io::Result<(u16, Vec<u8>)> {
+    if bearer.is_some_and(|b| b.chars().any(char::is_control)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bearer token contains a control character",
+        ));
+    }
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: qb\r\nConnection: close\r\n");
+    if let Some(token) = bearer {
+        let _ = write!(req, "Authorization: Bearer {token}\r\n");
+    }
     if let Some(b) = body {
         let _ = write!(
             req,

@@ -265,6 +265,12 @@ fn rejections_name_the_field() {
             "unknown variant, expected",
         ),
         (
+            "token with a backtick and comma pasted into the journal mode",
+            BASE.replace("mode = \"off\"", "mode = \"x`, s3cret-token\""),
+            "journal.mode",
+            "unknown variant, expected",
+        ),
+        (
             "hex of the wrong length",
             with(&client(&format!("bearer_sha256 = \"{}\"", &hex64[..62]))),
             "clients[0].bearer_sha256",

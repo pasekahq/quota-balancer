@@ -4,7 +4,8 @@
 //!   HTTP/1.1 on a unix socket, identifies callers by bearer token or `SO_PEERCRED`. Holds no
 //!   vendor secrets and needs no network.
 //! - `qb agent`: runs as the owner of vendor CLI credentials and answers the daemon's probes.
-//! - `qb <command>`: CLI client (`health`, `state`, `pick`, `report`).
+//! - `qb <command>`: CLI client (`health`, `state`, `why`, `pick`, `report`) and the offline
+//!   `simulate`.
 
 #![deny(unsafe_code)]
 
@@ -19,6 +20,7 @@ pub mod listen;
 pub mod log;
 pub mod server;
 mod sha256;
+pub mod stream;
 
 /// Socket path used when neither `--socket` nor `QB_SOCKET` is given.
 pub const DEFAULT_SOCKET: &str = "/run/qb/qb.sock";
