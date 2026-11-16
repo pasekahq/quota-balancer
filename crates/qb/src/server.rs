@@ -1,5 +1,5 @@
 //! The daemon loop: sleep in `poll()` until a connection or the policy's next deadline, then
-//! accept, identify the peer, read one request, answer, close.
+//! accept, read one request, identify and rate-limit the caller, answer, close.
 //!
 //! Single thread, one connection at a time with short timeouts. The policy core is owned by
 //! this loop, so leases are consistent without locks.
@@ -10,11 +10,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qb_core::Core;
-use qb_proto::ErrorCode;
+use qb_proto::{ErrorCode, paths};
 use rustix::event::{PollFd, PollFlags, Timespec};
 
-use crate::api::{self, Caller, Env};
-use crate::http::{self, MAX_HEAD, ReadError};
+use crate::api::{self, Env};
+use crate::auth::{Denied, Gate};
+use crate::http::{self, MAX_HEAD, Method, ReadError};
 use crate::journal::Journal;
 use crate::log;
 
@@ -28,16 +29,11 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Identity of the peer from `SO_PEERCRED`.
-pub fn caller_of(stream: &UnixStream) -> Caller {
-    match rustix::net::sockopt::socket_peercred(stream) {
-        Ok(cred) => Caller {
-            client: format!("uid:{}", cred.uid.as_raw()),
-        },
-        Err(_) => Caller {
-            client: "unknown".to_owned(),
-        },
-    }
+/// The peer's uid from `SO_PEERCRED`, `None` when the kernel does not report one.
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    rustix::net::sockopt::socket_peercred(stream)
+        .ok()
+        .map(|cred| cred.uid.as_raw())
 }
 
 /// How long the loop may sleep at `now`: until the core's next deadline, after applying the
@@ -52,7 +48,8 @@ pub fn poll_timeout(core: &mut Core, now: u64) -> Option<Duration> {
     }
 }
 
-/// Serves connections until the listener fails; state changes go to `journal`.
+/// Serves connections until the listener fails; `gate` admits callers, state changes go to
+/// `journal`.
 ///
 /// # Errors
 /// The listener cannot be made non-blocking or polled.
@@ -60,6 +57,7 @@ pub fn serve(
     listener: &UnixListener,
     core: &mut Core,
     journal: &mut Journal,
+    gate: &mut Gate,
 ) -> io::Result<Infallible> {
     listener.set_nonblocking(true)?;
     let started = Instant::now();
@@ -76,7 +74,7 @@ pub fn serve(
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     if stream.set_nonblocking(false).is_ok() {
-                        handle(&mut stream, core, journal, &mut buf, started);
+                        handle(&mut stream, core, journal, gate, &mut buf, started);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -95,6 +93,7 @@ fn handle(
     stream: &mut UnixStream,
     core: &mut Core,
     journal: &mut Journal,
+    gate: &mut Gate,
     buf: &mut Vec<u8>,
     started: Instant,
 ) {
@@ -103,14 +102,25 @@ fn handle(
     {
         return;
     }
-    let caller = caller_of(stream);
+    let uid = peer_uid(stream);
     let reply = match http::read_request(stream, buf) {
         Ok(req) => {
             let env = Env {
                 now: unix_now(),
                 uptime_s: started.elapsed().as_secs(),
             };
-            api::handle(core, journal, &req, &caller, env)
+            match gate.admit(uid, req.bearer.as_deref(), Instant::now()) {
+                Ok(caller) => api::handle(core, journal, &req, &caller, env),
+                Err(Denied::Unauthorized)
+                    if req.method == Method::Get && req.path == paths::HEALTH =>
+                {
+                    api::health(env)
+                }
+                Err(Denied::Unauthorized) => api::error(ErrorCode::Unauthorized, "unknown client"),
+                Err(Denied::TooManyRequests) => {
+                    api::error(ErrorCode::TooManyRequests, "rate limit exceeded")
+                }
+            }
         }
         Err(ReadError::Closed | ReadError::Io(_)) => return,
         Err(ReadError::Malformed) => api::error(ErrorCode::BadRequest, "malformed HTTP request"),
@@ -127,7 +137,7 @@ fn handle(
         drain_pending(stream);
     }
     if let Err(e) = http::write_response(stream, reply.status, &reply.body) {
-        log::warn(&format!("write to {} failed: {e}", caller.client));
+        log::warn(&format!("write of a {} reply failed: {e}", reply.status));
     }
 }
 

@@ -312,7 +312,7 @@ impl<'de> Deserialize<'de> for BearerHash {
         let hex = String::deserialize(d)?;
         // The value is never echoed: a misplaced plaintext token must not reach the logs.
         let invalid = || de::Error::custom("expected the token's SHA-256 as 64 hex characters");
-        if hex.len() != 64 {
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(invalid());
         }
         let mut out = [0; 32];
@@ -354,9 +354,9 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
                 .get(..span.start)
                 .map_or(0, |s| s.matches('\n').count())
                 + 1;
-            format!("{} (line {line})", e.message().trim_end())
+            format!("{} (line {line})", redact(e.message().trim_end()))
         }
-        None => e.message().trim_end().to_owned(),
+        None => redact(e.message().trim_end()),
     };
     let document =
         toml::Deserializer::parse(text).map_err(|e| error(String::new(), describe(&e)))?;
@@ -369,6 +369,47 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
         .validate()
         .map_err(|(field, reason)| error(field, reason))?;
     Ok(config)
+}
+
+/// `message` without the string values serde quotes in type and variant errors, so a token
+/// pasted into the wrong field does not reach the logs.
+fn redact(message: &str) -> String {
+    const QUOTED: &str = "string \"";
+    const VARIANT: &str = "unknown variant `";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    loop {
+        let next = [QUOTED, VARIANT]
+            .into_iter()
+            .filter_map(|p| Some((rest.find(p)?, p)))
+            .min();
+        let Some((at, prefix)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(&prefix[..prefix.len() - 2]);
+        let value = &rest[at + prefix.len()..];
+        rest = if prefix == QUOTED {
+            after_debug_string(value)
+        } else {
+            value.find("`, ").map_or("", |end| &value[end + 1..])
+        };
+    }
+}
+
+/// What follows the closing quote of a `{:?}`-formatted string whose opening quote is gone.
+fn after_debug_string(s: &str) -> &str {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        match (escaped, c) {
+            (true, _) => escaped = false,
+            (false, '\\') => escaped = true,
+            (false, '"') => return &s[i + 1..],
+            _ => {}
+        }
+    }
+    ""
 }
 
 /// A validation failure: field path and reason.

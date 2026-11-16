@@ -241,6 +241,30 @@ fn rejections_name_the_field() {
             "64 hex characters",
         ),
         (
+            "64 characters with a sign",
+            with(&client(&format!("bearer_sha256 = \"+f{}\"", &hex64[..62]))),
+            "clients[0].bearer_sha256",
+            "64 hex characters",
+        ),
+        (
+            "token pasted into the uid",
+            with(&client("uid = \"s3cret-token\"")),
+            "clients[0].uid",
+            "invalid type: string, expected u32",
+        ),
+        (
+            "token with a quote pasted into a number",
+            with("[limits]\nburst = 's3cret\"token'"),
+            "limits.burst",
+            "invalid type: string, expected u32",
+        ),
+        (
+            "token pasted into the journal mode",
+            BASE.replace("mode = \"off\"", "mode = \"s3cret-token\""),
+            "journal.mode",
+            "unknown variant, expected",
+        ),
+        (
             "hex of the wrong length",
             with(&client(&format!("bearer_sha256 = \"{}\"", &hex64[..62]))),
             "clients[0].bearer_sha256",

@@ -25,9 +25,17 @@ dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 sock="$dir/qb.sock"
 # The example journals under StateDirectory, which a CI runner cannot create; the copy keeps
-# the journal enabled so its writes count towards the RSS figure.
-sed 's|^path = "/var/lib/qb/journal"$|path = "'"$dir"'/journal"|' "$config" >"$dir/qbd.toml"
-grep -qF "path = \"$dir/journal\"" "$dir/qbd.toml" || { echo "::error::journal path not found in $config"; exit 1; }
+# the journal enabled so its writes count towards the RSS figure. It also declares the runner's
+# uid as the client and lets that client send all requests within one burst.
+uid=$(id -u)
+sed -e 's|^path = "/var/lib/qb/journal"$|path = "'"$dir"'/journal"|' \
+    -e 's|^uid = 1001$|uid = '"$uid"'|' \
+    -e 's|^rate_per_s = 5.0$|rate_per_s = '"$requests"'.0|' \
+    -e 's|^burst = 20$|burst = '"$requests"'|' \
+    "$config" >"$dir/qbd.toml"
+for line in "path = \"$dir/journal\"" "uid = $uid" "rate_per_s = $requests.0" "burst = $requests"; do
+  grep -qxF "$line" "$dir/qbd.toml" || { echo "::error::cannot set '$line' in a copy of $config"; exit 1; }
+done
 "$bin" --socket "$sock" daemon --config "$dir/qbd.toml" 2>"$dir/qbd.log" &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; rm -rf "$dir"' EXIT

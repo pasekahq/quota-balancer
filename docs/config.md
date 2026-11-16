@@ -98,7 +98,8 @@ Optional. Each client needs `uid`, `bearer_sha256` or both.
 | `bearer_sha256` | string | SHA-256 of the bearer token as 64 hex characters; unique. Plaintext tokens are rejected. |
 | `role` | string | Declared role. |
 
-Compute the hash with `printf %s "$TOKEN" | sha256sum`.
+Compute the hash with `printf %s "$TOKEN" | sha256sum`. How a request is matched to a client is
+described in [api.md](api.md#callers).
 
 ## `[journal]`
 
@@ -149,7 +150,7 @@ Optional. Back-off of the agent's vendor probes.
 
 ## `[limits]`
 
-Optional. A token bucket per client.
+Optional. A token bucket per client; see [api.md](api.md#callers).
 
 | Key | Type | Meaning |
 |---|---|---|
