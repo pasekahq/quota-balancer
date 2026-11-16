@@ -1,0 +1,16 @@
+# quota-balancer daemon socket (template). systemd owns the listening socket, so qbd can run
+# with PrivateNetwork=yes and clients queue instead of failing while qbd restarts.
+# Install: copy to /etc/systemd/system/, create group `qb-clients`, add client users to it.
+[Unit]
+Description=quota-balancer socket
+Documentation=https://github.com/vladmesh/quota-balancer
+
+[Socket]
+ListenStream=/run/qb/qb.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=qb-clients
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

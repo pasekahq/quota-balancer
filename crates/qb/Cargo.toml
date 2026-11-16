@@ -1,0 +1,25 @@
+[package]
+name = "qb"
+description = "quota-balancer multicall binary: qbd daemon, qb agent and the qb CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "qb"
+path = "src/main.rs"
+
+[dependencies]
+qb-core.workspace = true
+qb-proto.workspace = true
+httparse.workspace = true
+lexopt.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

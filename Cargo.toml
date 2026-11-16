@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/qb-core", "crates/qb-proto", "crates/qb"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/vladmesh/quota-balancer"
+publish = false
+
+[workspace.dependencies]
+qb-core = { path = "crates/qb-core" }
+qb-proto = { path = "crates/qb-proto" }
+httparse = { version = "1", default-features = false, features = ["std"] }
+lexopt = "0.3"
+rustix = { version = "1", default-features = false, features = ["std", "net"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+dbg_macro = "warn"
+print_stdout = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+# Size-first release profile. The binary-size budget in ci/budgets.sh depends on it.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

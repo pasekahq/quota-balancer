@@ -1,0 +1,61 @@
+# quota-balancer daemon (template). Holds no vendor secrets and opens no outbound connections:
+# it only serves the socket passed by qbd.socket. Target: `systemd-analyze security` <= 1.5.
+[Unit]
+Description=quota-balancer daemon
+Documentation=https://github.com/vladmesh/quota-balancer
+Requires=qbd.socket
+After=qbd.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/qb daemon
+Restart=on-failure
+RestartSec=1s
+
+# Identity and privileges
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Network: none at all; the listening socket comes from systemd.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+StateDirectory=qb
+StateDirectoryMode=0700
+
+# Kernel and process surface
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+SystemCallErrorNumber=EPERM
+
+# Resource ceilings (the daemon idles at ~1 MB RSS)
+MemoryMax=16M
+TasksMax=4
+CPUQuota=20%

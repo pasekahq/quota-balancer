@@ -1,0 +1,1 @@
+{"decision": "run", "reason": "spend_before_reset", "lease_id": "l-17", "vendor": "vendor-a", "model": "model-large", "effort": "high", "login": "login-1", "tier": 1, "stale": false, "quota_snapshot_at": 1800000000}

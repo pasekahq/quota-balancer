@@ -1,0 +1,34 @@
+# quota-balancer agent (template, user unit). Runs as the owner of the vendor CLI credentials,
+# connects to qbd itself and answers lazy probes with window numbers only. Install into
+# ~/.config/systemd/user/ of that user. Landlock and seccomp are applied from inside the process.
+[Unit]
+Description=quota-balancer agent
+Documentation=https://github.com/vladmesh/quota-balancer
+
+[Service]
+Type=simple
+Environment=QB_SOCKET=/run/qb/qb.sock
+ExecStart=%h/.local/bin/qb agent
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+# Namespace-based sandboxing in user units needs unprivileged user namespaces, which some
+# distributions restrict. Enable where available:
+#ProtectSystem=strict
+#ProtectHome=read-only
+#PrivateTmp=yes
+UMask=0077
+MemoryMax=32M
+TasksMax=4
+
+[Install]
+WantedBy=default.target
