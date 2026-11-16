@@ -4,12 +4,13 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use qb::client::call;
+use qb::config;
 use qb_core::Core;
 use qb_proto::{
     Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, PickResponse, StateResponse,
@@ -163,12 +164,18 @@ impl Drop for Daemon {
     }
 }
 
-fn wait_for(path: &std::path::Path) {
+fn wait_for(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while UnixStream::connect(path).is_err() {
         assert!(Instant::now() < deadline, "daemon did not come up");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn example(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/examples")
+        .join(name)
 }
 
 #[test]
@@ -179,7 +186,8 @@ fn binary_roles_end_to_end() {
         Command::new(exe)
             .args(["--socket"])
             .arg(&sock)
-            .arg("daemon")
+            .args(["daemon", "--config"])
+            .arg(example("minimal.toml"))
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
@@ -222,6 +230,7 @@ fn binary_roles_end_to_end() {
 
     let second = Command::new(exe)
         .env("QB_SOCKET", &sock)
+        .env("QB_CONFIG", example("minimal.toml"))
         .arg("daemon")
         .stderr(Stdio::null())
         .status()
@@ -231,6 +240,77 @@ fn binary_roles_end_to_end() {
         Some(2),
         "a second daemon on a live socket refuses"
     );
+}
+
+#[test]
+fn daemon_serves_configured_logins() {
+    let exe = env!("CARGO_BIN_EXE_qb");
+    let file = example("qbd.toml");
+    let sock = temp_socket("cfg");
+    let _d = Daemon(
+        Command::new(exe)
+            .arg("--socket")
+            .arg(&sock)
+            .args(["daemon", "--config"])
+            .arg(&file)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&sock);
+    let (status, body) = call(&sock, "GET", paths::STATE, None).unwrap();
+    assert_eq!(status, 200);
+    let state: StateResponse = serde_json::from_slice(&body).unwrap();
+    let served: Vec<(String, String)> = state
+        .logins
+        .into_iter()
+        .map(|l| (l.login, l.vendor))
+        .collect();
+    let configured: Vec<(String, String)> = config::load(&file)
+        .unwrap()
+        .logins
+        .into_iter()
+        .map(|l| (l.name, l.vendor))
+        .collect();
+    assert_ne!(configured, []);
+    assert_eq!(served, configured);
+}
+
+#[test]
+fn daemon_refuses_a_missing_or_invalid_config() {
+    let exe = env!("CARGO_BIN_EXE_qb");
+    let sock = temp_socket("badcfg");
+    let invalid = sock.with_file_name("invalid.toml");
+    let text = std::fs::read_to_string(example("minimal.toml"))
+        .unwrap()
+        .replace("vendor = \"vendor-a\"", "vendor = \"vendor-z\"");
+    std::fs::write(&invalid, text).unwrap();
+    let missing = sock.with_file_name("missing.toml");
+    for (config, expected) in [
+        (&missing, format!("{}: cannot read", missing.display())),
+        (
+            &invalid,
+            format!(
+                "{}: logins[0].vendor: undeclared vendor `vendor-z`",
+                invalid.display()
+            ),
+        ),
+    ] {
+        let out = Command::new(exe)
+            .arg("--socket")
+            .arg(&sock)
+            .args(["daemon", "--config"])
+            .arg(config)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains(&expected), "{stderr}");
+        assert!(
+            !sock.exists(),
+            "the socket is bound only after the config loads"
+        );
+    }
 }
 
 #[test]

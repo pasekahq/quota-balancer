@@ -6,6 +6,7 @@
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/qb}"
+config="$(dirname "$0")/../deploy/examples/qbd.toml"
 max_bytes="${QB_MAX_BINARY_BYTES:-2621440}"
 max_rss_kb="${QB_MAX_RSS_KB:-4096}"
 requests="${QB_REQUESTS:-10000}"
@@ -22,7 +23,7 @@ fi
 
 dir=$(mktemp -d)
 sock="$dir/qb.sock"
-"$bin" --socket "$sock" daemon 2>"$dir/qbd.log" &
+"$bin" --socket "$sock" daemon --config "$config" 2>"$dir/qbd.log" &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; rm -rf "$dir"' EXIT
 for _ in $(seq 100); do [ -S "$sock" ] && break; sleep 0.05; done

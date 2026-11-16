@@ -22,6 +22,8 @@ pub struct LoginIdx(pub u8);
 pub const MAX_LOGINS: usize = 32;
 /// Upper bound on quota windows per login.
 pub const MAX_WINDOWS: usize = 4;
+/// Upper bound on candidates per ladder step.
+pub const MAX_CANDIDATES: usize = 8;
 /// Upper bound on live leases.
 pub const MAX_LEASES: usize = 256;
 
