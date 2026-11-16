@@ -49,13 +49,17 @@ daemon's config file in [docs/config.md](docs/config.md).
 
 ## Budgets
 
-These are enforced in CI on every change (`ci/budgets.sh`):
+These are enforced in CI on every change (`ci/budgets.sh` and the acceptance lane, see
+[docs/design.md](docs/design.md#budgets)):
 
-| Budget | Limit | Current skeleton |
-|---|---|---|
-| static musl binary | ≤ 2.5 MiB | ~0.5 MiB |
-| daemon peak RSS after 10 000 requests | ≤ 4 MiB | ~0.6 MiB |
-| `qbd.service` exposure (`systemd-analyze security`) | ≤ 1.5 | 0.2 |
+| Budget | Limit |
+|---|---|
+| static musl binary | ≤ 2.5 MiB |
+| daemon peak RSS after 10 000 picks | ≤ 4 MiB |
+| pick latency over the unix socket, p99 | ≤ 1 ms |
+| idle daemon wake-ups | 0 |
+| disk writes with `journal = off` | 0 bytes |
+| `qbd.service` exposure (`systemd-analyze security`) | ≤ 1.5 |
 
 ## Build
 
