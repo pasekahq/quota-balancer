@@ -113,6 +113,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qb-vendors"
+version = "0.0.1"
+dependencies = [
+ "qb-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

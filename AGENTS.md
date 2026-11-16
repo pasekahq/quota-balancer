@@ -14,6 +14,7 @@ socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan: `docs/roadmap.m
 |---|---|
 | `crates/qb-core` | Pure policy: state, `pick`, `report`, leases. **No I/O, no clock, no `unsafe`.** The caller passes `now`. |
 | `crates/qb-proto` | Wire types of `/v1`. Every message is declared here exactly once. Fixtures in `tests/fixtures/`. |
+| `crates/qb-vendors` | Pure, total parsers of vendor quota data (stream-json, statusline, rollouts, usage endpoints) into `qb-proto` window reports. Rules in `docs/vendors.md`; fixtures in `tests/fixtures/`. |
 | `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs`, `main.rs` (CLI). |
 | `deploy/systemd/` | Unit templates with hardening. |
 | `ci/budgets.sh` | Binary size and RSS budgets. |
