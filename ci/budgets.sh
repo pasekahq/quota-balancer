@@ -22,8 +22,13 @@ if file "$bin" | grep -q 'dynamically linked'; then
 fi
 
 dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
 sock="$dir/qb.sock"
-"$bin" --socket "$sock" daemon --config "$config" 2>"$dir/qbd.log" &
+# The example journals under StateDirectory, which a CI runner cannot create; the copy keeps
+# the journal enabled so its writes count towards the RSS figure.
+sed 's|^path = "/var/lib/qb/journal"$|path = "'"$dir"'/journal"|' "$config" >"$dir/qbd.toml"
+grep -qF "path = \"$dir/journal\"" "$dir/qbd.toml" || { echo "::error::journal path not found in $config"; exit 1; }
+"$bin" --socket "$sock" daemon --config "$dir/qbd.toml" 2>"$dir/qbd.log" &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; rm -rf "$dir"' EXIT
 for _ in $(seq 100); do [ -S "$sock" ] && break; sleep 0.05; done
@@ -57,7 +62,7 @@ PY
 
 rss=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status")
 hwm=$(awk '/^VmHWM:/ {print $2}' "/proc/$pid/status")
-echo "daemon: VmRSS ${rss} kB, VmHWM ${hwm} kB (budget ${max_rss_kb} kB)"
+echo "daemon: VmRSS ${rss} kB, VmHWM ${hwm} kB (budget ${max_rss_kb} kB), journal $(cat "$dir"/journal* | wc -c) bytes"
 if [ "$hwm" -gt "$max_rss_kb" ]; then
   echo "::error::daemon peak RSS ${hwm} kB > budget ${max_rss_kb} kB"; fail=1
 fi
