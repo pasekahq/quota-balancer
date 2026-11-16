@@ -297,12 +297,23 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
         field,
         reason,
     };
-    let tree: serde_json::Value =
-        basic_toml::from_str(text).map_err(|e| error(String::new(), e.to_string()))?;
-    let config: Config = serde_path_to_error::deserialize(tree).map_err(|e| {
+    // One line per error: the toml crate's own Display adds a multi-line source snippet.
+    let describe = |e: &toml::de::Error| match e.span() {
+        Some(span) => {
+            let line = text
+                .get(..span.start)
+                .map_or(0, |s| s.matches('\n').count())
+                + 1;
+            format!("{} (line {line})", e.message().trim_end())
+        }
+        None => e.message().trim_end().to_owned(),
+    };
+    let document =
+        toml::Deserializer::parse(text).map_err(|e| error(String::new(), describe(&e)))?;
+    let config: Config = serde_path_to_error::deserialize(document).map_err(|e| {
         let field = e.path().to_string();
         let field = if field == "." { String::new() } else { field };
-        error(field, e.into_inner().to_string())
+        error(field, describe(e.inner()))
     })?;
     config
         .validate()

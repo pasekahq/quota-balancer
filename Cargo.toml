@@ -13,13 +13,13 @@ publish = false
 [workspace.dependencies]
 qb-core = { path = "crates/qb-core" }
 qb-proto = { path = "crates/qb-proto" }
-basic-toml = "0.1"
 httparse = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"
 rustix = { version = "1", default-features = false, features = ["std", "net"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 serde_path_to_error = "0.1"
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
