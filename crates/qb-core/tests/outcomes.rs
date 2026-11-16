@@ -138,7 +138,7 @@ fn report_classes_set_the_login_status_and_its_end() {
         ("seven_day", 0.6, Some(NOW + 3 * DAY)),
     ];
     let fresh: Obs = &[("five_hour", 0.1, Some(NOW + HOUR))];
-    let cases: [Case; 12] = [
+    let cases: [Case; 13] = [
         (
             "usage_limit: the full window's reset",
             &[(OutcomeClass::UsageLimit, &full_short)],
@@ -188,13 +188,23 @@ fn report_classes_set_the_login_status_and_its_end() {
             None,
         ),
         (
-            "ok with windows keeps auth_dead",
+            "ok without windows keeps auth_dead",
+            &[
+                (OutcomeClass::Http401, &[]),
+                (OutcomeClass::Http401, &[]),
+                (OutcomeClass::Ok, &[]),
+            ],
+            LoginStatus::AuthDead,
+            None,
+        ),
+        (
+            "ok with windows clears auth_dead",
             &[
                 (OutcomeClass::Http401, &[]),
                 (OutcomeClass::Http401, &[]),
                 (OutcomeClass::Ok, fresh),
             ],
-            LoginStatus::AuthDead,
+            LoginStatus::Ok,
             None,
         ),
         (

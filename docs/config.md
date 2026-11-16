@@ -160,6 +160,33 @@ Optional. A token bucket per client; see [api.md](api.md#callers).
 | `rate_per_s` | float > 0 | Refill rate in requests per second, default 5.0. |
 | `burst` | integer > 0 | Bucket size, default 20. |
 
+## `[hooks]`
+
+Optional. Commands run when a login becomes `auth_dead` and when it leaves it; when and how
+they run is in [design.md](design.md#hooks).
+
+| Key | Type | Meaning |
+|---|---|---|
+| `on_dead` | array of strings | Absolute program path, then its arguments; run when a login becomes `auth_dead`. Not empty. |
+| `on_recover` | array of strings | The same, run when a login leaves `auth_dead`. |
+
+The program is exec'd without a shell and gets the event in its environment: `QB_EVENT`
+(`dead` or `recover`), `QB_LOGIN` and `QB_VENDOR`. It must be executable by the daemon's user.
+For example, with
+
+```toml
+[hooks]
+on_dead = ["/usr/local/libexec/qb-hook"]
+on_recover = ["/usr/local/libexec/qb-hook"]
+```
+
+and `/usr/local/libexec/qb-hook`
+
+```sh
+#!/bin/sh
+logger -t qb-hook -p user.warning "login $QB_LOGIN of $QB_VENDOR: $QB_EVENT"
+```
+
 ## Agent config
 
 `qb agent` reads its own TOML file, given with `qb agent --config PATH`, under the same rules

@@ -104,12 +104,30 @@ State, all in one thread, no locks, no allocation on the hot path:
 5. Nothing admissible on the step → the nearest lower step, then the nearest higher one;
    nothing at all → `wait` with `retry_after` = the earliest time some rejected candidate gets
    all its blocks back (reset, `T_burn` start, lease expiry, end of a mark), or `dead` when
-   there is no candidate or none can recover by a known time (and the `on_dead` hook).
+   there is no candidate or none can recover by a known time. A `dead` answer runs no hook;
+   `on_dead` runs once per login, when that login becomes `auth_dead` (see [Hooks](#hooks)).
 6. Create the lease (a full table answers `wait`), append one journal line, answer.
 
 `report` is O(1): limit/rejected → exhausted until reset; 401 → `auth_stale`, repeated →
-`auth_dead`; 429 → short back-off; model unavailable → per-(login, model) dead mark; stream
+`auth_dead`, both cleared by an `ok` with an observed window; 429 → short back-off; model unavailable → per-(login, model) dead mark; stream
 windows overwrite the snapshot and reset its TTL. The exact rules are in [api.md](api.md).
+
+## Hooks
+
+`[hooks]` in the config ([config.md](config.md#hooks)) names commands `qbd` runs on a login's
+`auth_dead` edges: `on_dead` when a report or probe result makes the login `auth_dead`,
+`on_recover` when one clears it. The edge is decided where a request changes the login's marks,
+so a repeated dead state, journal replay at start and marks that end by time run nothing.
+
+A hook is exec'd without a shell, with stdin and stdout on `/dev/null` and stderr inherited, so
+its output lands in `qbd`'s log. The loop never waits for it: finished hooks are reaped on the
+next loop pass, and a non-zero exit or a failed spawn is logged and changes nothing else. At
+most 2 run at once (`TasksMax=4` counts the daemon); an event beyond that is dropped with a
+warning naming the event and login.
+
+Hooks run inside `qbd`'s sandbox: its `DynamicUser`, no network, a read-only system. An alert
+has to leave through something the sandbox allows, such as the journal via `logger` or a line
+on stderr.
 
 ## Disk
 

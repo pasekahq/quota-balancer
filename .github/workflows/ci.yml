@@ -107,5 +107,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: qbd.service exposure <= 1.5
-        run: systemd-analyze security --offline=yes --threshold=15 --no-pager deploy/systemd/qbd.service
+      - name: Exposure of every service unit within its threshold
+        run: |
+          status=0
+          for unit in deploy/systemd/*.service; do
+            case "${unit##*/}" in
+              qbd.service) threshold=15 ;;
+              # Measured 6.9: a user unit keeps namespace options off, unprivileged userns is often restricted.
+              qb-agent.service) threshold=69 ;;
+              *) echo "::error file=$unit::no exposure threshold for $unit"; status=1; continue ;;
+            esac
+            systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit" || status=1
+          done
+          exit "$status"

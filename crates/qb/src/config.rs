@@ -72,6 +72,9 @@ pub struct Config {
     /// Per-client request rate limit.
     #[serde(default)]
     pub limits: Limits,
+    /// Commands run when a login enters or leaves `auth_dead`.
+    #[serde(default)]
+    pub hooks: Hooks,
 }
 
 /// A vendor and the quota windows every login of it has.
@@ -285,6 +288,31 @@ impl Default for Limits {
             rate_per_s: 5.0,
             burst: 20,
         }
+    }
+}
+
+/// Commands `qbd` execs, without a shell, on a login's `auth_dead` edges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Hooks {
+    /// Absolute program path and arguments, run when a login becomes `auth_dead`.
+    pub on_dead: Option<Vec<String>>,
+    /// Absolute program path and arguments, run when a login leaves `auth_dead`.
+    pub on_recover: Option<Vec<String>>,
+}
+
+impl Hooks {
+    fn validate(&self) -> Result<(), Fault> {
+        for (key, command) in [("on_dead", &self.on_dead), ("on_recover", &self.on_recover)] {
+            let Some(command) = command else { continue };
+            let Some(program) = command.first() else {
+                return Err((format!("hooks.{key}"), "is empty".into()));
+            };
+            if !Path::new(program).is_absolute() {
+                return Err((format!("hooks.{key}[0]"), "must be an absolute path".into()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -696,7 +724,7 @@ impl Config {
         if self.limits.burst == 0 {
             return Err(("limits.burst".into(), "must be positive".into()));
         }
-        Ok(())
+        self.hooks.validate()
     }
 }
 
