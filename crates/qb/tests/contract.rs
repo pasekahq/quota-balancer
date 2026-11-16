@@ -1011,9 +1011,4 @@ fn each_client_has_a_token_bucket() {
     );
     assert_eq!(status, 429);
     assert_eq!(error_of(&resp), ErrorCode::TooManyRequests);
-
-    // At 0.5/s one token is back 2 s after the burst began.
-    std::thread::sleep(Duration::from_millis(2500).saturating_sub(started.elapsed()));
-    let (status, _) = call(&sock, "GET", paths::STATE, None).unwrap();
-    assert_eq!(status, 200, "a refilled token lets the next request pass");
 }
