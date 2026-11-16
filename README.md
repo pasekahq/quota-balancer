@@ -43,7 +43,8 @@ keeps a tiny model of every window, and turns them into a decision:
 - **No telemetry.** `qb` makes no network connections except, optionally, the agent's
   probe to the vendor endpoints you configure.
 
-More in [docs/design.md](docs/design.md); the wire contract is in [docs/api.md](docs/api.md).
+More in [docs/design.md](docs/design.md); the wire contract is in [docs/api.md](docs/api.md), the
+daemon's config file in [docs/config.md](docs/config.md).
 
 ## Budgets
 
@@ -71,20 +72,22 @@ cargo build --release --target x86_64-unknown-linux-musl
 ## Try it
 
 ```sh
-qb --socket /tmp/qb.sock daemon &
+qb --socket /tmp/qb.sock daemon --config deploy/examples/minimal.toml &
 qb --socket /tmp/qb.sock health
 qb --socket /tmp/qb.sock pick --role worker --difficulty 1
 curl --unix-socket /tmp/qb.sock http://qb/v1/state
 ```
 
-With no logins configured, `pick` answers `{"decision":"dead","reason":"no_candidates"}`.
+`state` lists the logins from the config. The scheduling policy is not implemented yet, so
+`pick` answers `{"decision":"dead","reason":"no_candidates"}`.
 
 ## Install as a service
 
 Templates live in [`deploy/systemd/`](deploy/systemd): `qbd.socket` + `qbd.service` (system
 units, socket activation) and `qb-agent.service` (a user unit for the credential owner). Copy
-the binary to `/usr/local/bin/qb`, create a `qb-clients` group for the users allowed to talk to
-the daemon, then `systemctl enable --now qbd.socket`.
+the binary to `/usr/local/bin/qb`, write `/etc/qb/qbd.toml` (start from
+[`deploy/examples/qbd.toml`](deploy/examples/qbd.toml)), create a `qb-clients` group for the
+users allowed to talk to the daemon, then `systemctl enable --now qbd.socket`.
 
 ## Terms of service
 

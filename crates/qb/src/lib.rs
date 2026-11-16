@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod api;
 pub mod client;
+pub mod config;
 pub mod http;
 pub mod listen;
 pub mod log;
@@ -18,3 +19,6 @@ pub mod server;
 
 /// Socket path used when neither `--socket` nor `QB_SOCKET` is given.
 pub const DEFAULT_SOCKET: &str = "/run/qb/qb.sock";
+
+/// Daemon config path used when neither `--config` nor `QB_CONFIG` is given.
+pub const DEFAULT_CONFIG: &str = "/etc/qb/qbd.toml";

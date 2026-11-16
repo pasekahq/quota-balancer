@@ -1,0 +1,85 @@
+# Example qbd config: two vendors, three logins, two roles, two clients.
+# Format: docs/config.md. Install as /etc/qb/qbd.toml.
+
+[journal]
+mode = "path"
+path = "/var/lib/qb/journal"
+rotate_bytes = 1048576
+
+[snapshot]
+ttl_s = 300
+
+[probe]
+backoff_initial_s = 30
+backoff_max_s = 3600
+
+[limits]
+rate_per_s = 5.0
+burst = 20
+
+[[vendors]]
+name = "vendor-a"
+windows = [
+  { name = "five_hour", length_s = 18000, t_burn_s = 1800 },
+  { name = "seven_day", length_s = 604800, t_burn_s = 43200 },
+]
+
+[[vendors]]
+name = "vendor-b"
+windows = [
+  { name = "five_hour", length_s = 18000, t_burn_s = 1800 },
+]
+
+[[logins]]
+name = "login-1"
+vendor = "vendor-a"
+
+[[logins]]
+name = "login-2"
+vendor = "vendor-a"
+
+[[logins]]
+name = "login-3"
+vendor = "vendor-b"
+
+[[roles]]
+name = "worker"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [
+  { vendor = "vendor-a", model = "model-small", effort = "low", tier = 1 },
+  { vendor = "vendor-b", model = "model-small", tier = 2 },
+]
+
+[[roles.ladder]]
+difficulty = 2
+candidates = [
+  { vendor = "vendor-a", model = "model-large", effort = "high", tier = 1 },
+  { vendor = "vendor-b", model = "model-large", tier = 2 },
+]
+
+[[roles.reserves]]
+difficulty = 1
+window = "seven_day"
+fraction = 0.2
+
+[[roles]]
+name = "reviewer"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [
+  { vendor = "vendor-b", model = "model-large", tier = 1 },
+  { vendor = "vendor-a", model = "model-large", effort = "high", tier = 1 },
+]
+
+[[clients]]
+name = "client-a"
+uid = 1001
+role = "worker"
+
+[[clients]]
+name = "client-b"
+bearer_sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
+role = "reviewer"

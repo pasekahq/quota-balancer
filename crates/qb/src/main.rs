@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use qb::{DEFAULT_SOCKET, agent, client, listen, log, server};
+use qb::{DEFAULT_CONFIG, DEFAULT_SOCKET, agent, client, config, listen, log, server};
 use qb_core::Core;
 use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, paths};
 
@@ -13,11 +13,12 @@ const HELP: &str = "\
 qb - pre-flight quota balancer for coding-agent subscriptions
 
 USAGE:
-    qbd [--socket PATH]                 run the policy daemon (same as `qb daemon`)
+    qbd [--socket PATH] [--config PATH] run the policy daemon (same as `qb daemon`)
     qb [--socket PATH] <COMMAND> [OPTIONS]
 
 COMMANDS:
-    daemon                              run the policy daemon
+    daemon [--config PATH]              run the policy daemon; config default: $QB_CONFIG,
+                                        else /etc/qb/qbd.toml
     agent                               run the credential-owner agent
     health                              GET /v1/health
     state                               GET /v1/state
@@ -38,7 +39,7 @@ connection errors. qb sends no telemetry.
 ";
 
 enum Cmd {
-    Daemon,
+    Daemon(PathBuf),
     Agent,
     Health,
     State,
@@ -64,6 +65,10 @@ fn default_socket() -> PathBuf {
     std::env::var_os("QB_SOCKET").map_or_else(|| PathBuf::from(DEFAULT_SOCKET), PathBuf::from)
 }
 
+fn default_config() -> PathBuf {
+    std::env::var_os("QB_CONFIG").map_or_else(|| PathBuf::from(DEFAULT_CONFIG), PathBuf::from)
+}
+
 fn string(v: OsString) -> Result<String, lexopt::Error> {
     v.into_string().map_err(lexopt::Error::NonUnicodeValue)
 }
@@ -73,6 +78,7 @@ fn parse(as_qbd: bool) -> Result<(PathBuf, Cmd), lexopt::Error> {
     use lexopt::prelude::*;
     let mut p = lexopt::Parser::from_env();
     let mut socket = None;
+    let mut config = None;
     let mut name: Option<String> = if as_qbd {
         Some("daemon".to_owned())
     } else {
@@ -106,6 +112,7 @@ fn parse(as_qbd: bool) -> Result<(PathBuf, Cmd), lexopt::Error> {
             Short('h') | Long("help") => return Ok((default_socket(), Cmd::Help)),
             Short('V') | Long("version") => return Ok((default_socket(), Cmd::Version)),
             Value(v) if name.is_none() => name = Some(string(v)?),
+            Long("config") if sub == Some("daemon") => config = Some(PathBuf::from(p.value()?)),
             Long("role") if sub == Some("pick") => pick.role = string(p.value()?)?,
             Long("difficulty") if sub == Some("pick") => {
                 pick.difficulty = Some(p.value()?.parse()?);
@@ -141,7 +148,7 @@ fn parse(as_qbd: bool) -> Result<(PathBuf, Cmd), lexopt::Error> {
     let socket = socket.unwrap_or_else(default_socket);
     let cmd = match name.as_deref() {
         None => Cmd::Help,
-        Some("daemon") => Cmd::Daemon,
+        Some("daemon") => Cmd::Daemon(config.unwrap_or_else(default_config)),
         Some("agent") => Cmd::Agent,
         Some("health") => Cmd::Health,
         Some("state") => Cmd::State,
@@ -187,7 +194,7 @@ fn run((socket, cmd): (PathBuf, Cmd)) -> Result<ExitCode, String> {
             let _ = writeln!(out, "qb {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Daemon => daemon(&socket),
+        Cmd::Daemon(config) => daemon(&socket, &config),
         Cmd::Agent => agent::run(&socket).map(|()| ExitCode::SUCCESS),
         Cmd::Health => request(&socket, "GET", paths::HEALTH, None),
         Cmd::State => request(&socket, "GET", paths::STATE, None),
@@ -220,7 +227,8 @@ fn request(
     })
 }
 
-fn daemon(socket: &Path) -> Result<ExitCode, String> {
+fn daemon(socket: &Path, config: &Path) -> Result<ExitCode, String> {
+    let config = config::load(config).map_err(|e| e.to_string())?;
     let listener = if let Some(l) = listen::from_systemd().map_err(|e| e.to_string())? {
         log::info("qbd: using the socket passed by systemd");
         l
@@ -229,7 +237,7 @@ fn daemon(socket: &Path) -> Result<ExitCode, String> {
         log::info(&format!("qbd: listening on {}", socket.display()));
         l
     };
-    let mut core = Core::new();
+    let mut core = Core::with_logins(config.login_specs());
     server::serve(&listener, &mut core);
     Ok(ExitCode::SUCCESS)
 }

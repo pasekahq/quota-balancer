@@ -1,0 +1,20 @@
+# Smallest useful qbd config: one vendor, one login, one role, no disk writes.
+# Format: docs/config.md.
+
+[journal]
+mode = "off"
+
+[[vendors]]
+name = "vendor-a"
+windows = [{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }]
+
+[[logins]]
+name = "login-1"
+vendor = "vendor-a"
+
+[[roles]]
+name = "worker"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [{ vendor = "vendor-a", model = "model-small", tier = 1 }]
