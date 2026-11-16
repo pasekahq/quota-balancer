@@ -102,9 +102,9 @@ Each entry of `windows` overwrites that window of the login's snapshot (`source 
 
 | `outcome` | Effect |
 |---|---|
-| `ok` | With at least one declared window, `unknown` and `auth_stale` become `ok`. |
+| `ok` | With at least one declared window, `unknown`, `auth_stale` and `auth_dead` become `ok`. |
 | `usage_limit`, `rejected` | `exhausted` until the earliest reset of a window at ≥ 0.99 used, else the reset of the vendor's longest window, else one longest-window length from now. |
-| `http_401` | `auth_stale`; a 401 on an `auth_stale` login makes it `auth_dead`, which no report clears (re-login and restart `qbd`). An `auth_stale` login stays pickable. |
+| `http_401` | `auth_stale`; a 401 on an `auth_stale` login makes it `auth_dead`, which only an `ok` with a declared window clears, such as a report of a session run after re-login. An `auth_stale` login stays pickable. |
 | `http_429` | `rate_limited` for `outcomes.rate_limit_backoff_s`. |
 | `model_unavailable` | The model is dead on the login for `outcomes.model_unavailable_s`; other models and logins are unaffected. |
 | `error` | Nothing. |
@@ -190,7 +190,7 @@ probe. There is at most one probe in flight per login.
 
 | `outcome` | Effect |
 |---|---|
-| `ok` | The windows apply as a report's do, with `source = probe` in `GET /v1/state`: names the login's vendor does not declare are ignored, `unknown` and `auth_stale` become `ok` when a declared window is among them. The back-off ends. |
+| `ok` | The windows apply as a report's do, with `source = probe` in `GET /v1/state`: names the login's vendor does not declare are ignored, `unknown`, `auth_stale` and `auth_dead` become `ok` when a declared window is among them. The back-off ends. |
 | `http_401` | As a report `http_401`: `auth_stale`, then `auth_dead`. It also counts as a failed probe. |
 | `http_429` | A failed probe that waits at least `retry_after_s`. |
 | `error` | A failed probe. |

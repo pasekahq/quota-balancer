@@ -355,6 +355,24 @@ fn rejections_name_the_field() {
             "roles[0].ladder[0].candidates[0].cost_per_minute",
             "2 is outside 0.0..=1.0",
         ),
+        (
+            "empty hook command",
+            with("[hooks]\non_dead = []"),
+            "hooks.on_dead",
+            "is empty",
+        ),
+        (
+            "relative hook program",
+            with("[hooks]\non_recover = [\"bin/alert\", \"/abs/arg\"]"),
+            "hooks.on_recover[0]",
+            "must be an absolute path",
+        ),
+        (
+            "unknown key in hooks",
+            with("[hooks]\non_exhausted = [\"/usr/bin/true\"]"),
+            "hooks.on_exhausted",
+            "unknown field `on_exhausted`",
+        ),
         ("not TOML", with("[[logins]\nname = 1"), "", "line"),
     ];
     for (what, text, field, reason) in cases {
@@ -366,6 +384,30 @@ fn rejections_name_the_field() {
             "{what}: echoes the token: {err}"
         );
     }
+}
+
+#[test]
+fn hooks_are_optional_and_keep_program_and_arguments() {
+    let none = config::parse(Path::new(FILE), BASE).unwrap();
+    assert_eq!((none.hooks.on_dead, none.hooks.on_recover), (None, None));
+    let text = with(
+        "[hooks]\non_dead = [\"/usr/bin/logger\", \"-t\", \"qb\"]\non_recover = [\"/usr/local/libexec/qb-hook\"]",
+    );
+    let cfg = config::parse(Path::new(FILE), &text).unwrap();
+    assert_eq!(
+        cfg.hooks.on_dead.as_deref(),
+        Some(
+            &[
+                "/usr/bin/logger".to_owned(),
+                "-t".to_owned(),
+                "qb".to_owned()
+            ][..]
+        )
+    );
+    assert_eq!(
+        cfg.hooks.on_recover.as_deref(),
+        Some(&["/usr/local/libexec/qb-hook".to_owned()][..])
+    );
 }
 
 #[test]

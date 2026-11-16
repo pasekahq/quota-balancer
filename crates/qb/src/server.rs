@@ -1,6 +1,6 @@
 //! The daemon loop: sleep in `poll()` until a connection, a parked agent hanging up or the
-//! policy's next deadline, then hand due probe jobs to parked agents, accept, read one request,
-//! identify and rate-limit the caller, answer, close.
+//! policy's next deadline, then reap finished hooks, hand due probe jobs to parked agents,
+//! accept, read one request, identify and rate-limit the caller, answer, close.
 //!
 //! Single thread, one request at a time with short timeouts; an agent's `next` request is parked
 //! in the poll set without a timeout until a probe is due. The policy core is owned by this
@@ -17,6 +17,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 use crate::api::{self, Answer, Env, Reply};
 use crate::auth::{Denied, Gate};
+use crate::hooks::Runner;
 use crate::http::{self, MAX_HEAD, Method, ReadError};
 use crate::journal::Journal;
 use crate::log;
@@ -62,7 +63,8 @@ pub fn poll_timeout(core: &mut Core, now: u64) -> Option<Duration> {
 }
 
 /// Serves connections until the listener fails; `gate` admits callers, the clients in
-/// `agents` may wait for probe jobs, state changes go to `journal`.
+/// `agents` may wait for probe jobs, state changes go to `journal`, `auth_dead` edges to
+/// `hooks`.
 ///
 /// # Errors
 /// The listener cannot be made non-blocking or polled.
@@ -70,6 +72,7 @@ pub fn serve(
     listener: &UnixListener,
     core: &mut Core,
     journal: &mut Journal,
+    hooks: &mut Runner,
     gate: &mut Gate,
     agents: &[String],
 ) -> io::Result<Infallible> {
@@ -79,6 +82,7 @@ pub fn serve(
     let mut parked: Vec<Parked> = Vec::with_capacity(MAX_PARKED);
     let mut hung = Vec::with_capacity(MAX_PARKED);
     loop {
+        hooks.reap();
         let now = unix_now();
         dispatch(core, &mut parked, now);
         // A deadline too far away for a timespec is as good as none.
@@ -106,6 +110,7 @@ pub fn serve(
                         let conn = Conn {
                             core: &mut *core,
                             journal: &mut *journal,
+                            hooks: &mut *hooks,
                             gate: &mut *gate,
                             agents,
                             parked: &mut parked,
@@ -147,6 +152,7 @@ fn dispatch(core: &mut Core, parked: &mut Vec<Parked>, now: u64) {
 struct Conn<'a> {
     core: &'a mut Core,
     journal: &'a mut Journal,
+    hooks: &'a mut Runner,
     gate: &'a mut Gate,
     agents: &'a [String],
     parked: &'a mut Vec<Parked>,
@@ -169,8 +175,15 @@ impl Conn<'_> {
                 };
                 match self.gate.admit(uid, req.bearer.as_deref(), Instant::now()) {
                     Ok(caller) => {
-                        match api::handle(self.core, self.journal, &req, &caller, self.agents, env)
-                        {
+                        match api::handle(
+                            self.core,
+                            self.journal,
+                            self.hooks,
+                            &req,
+                            &caller,
+                            self.agents,
+                            env,
+                        ) {
                             Answer::Reply(reply) => reply,
                             Answer::Park(logins) => {
                                 let waiter = Parked {

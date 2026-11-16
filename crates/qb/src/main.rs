@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use qb::auth::Gate;
 use qb::config::Config;
+use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb::{
     DEFAULT_CONFIG, DEFAULT_SOCKET, agent, api, client, config, listen, log, sandbox, server,
@@ -437,10 +438,12 @@ fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
         l
     };
     let mut gate = Gate::new(&config.clients, &config.limits);
+    let mut hooks = Runner::new(&config);
     let Err(e) = server::serve(
         &listener,
         &mut core,
         &mut journal,
+        &mut hooks,
         &mut gate,
         &config.probe.agents,
     );

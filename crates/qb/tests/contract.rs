@@ -18,6 +18,7 @@ use qb::auth::Gate;
 use qb::client::call;
 use qb::config::Kind;
 use qb::config::{self, Limits};
+use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb_core::{Core, Record, Spec};
 use qb_proto::{
@@ -60,7 +61,14 @@ fn spawn_server() -> PathBuf {
     std::thread::spawn(move || {
         let mut core = Core::new(Spec::default()).unwrap();
         let mut gate = Gate::new(&[], &Limits::default());
-        qb::server::serve(&listener, &mut core, &mut Journal::off(), &mut gate, &[])
+        qb::server::serve(
+            &listener,
+            &mut core,
+            &mut Journal::off(),
+            &mut Runner::default(),
+            &mut gate,
+            &[],
+        )
     });
     path
 }
@@ -650,13 +658,17 @@ fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
 }
 
 fn start(config: &Path, sock: &Path) -> Daemon {
+    start_with(config, sock, Stdio::null())
+}
+
+fn start_with(config: &Path, sock: &Path, stderr: Stdio) -> Daemon {
     let d = Daemon(
         Command::new(env!("CARGO_BIN_EXE_qb"))
             .arg("--socket")
             .arg(sock)
             .args(["daemon", "--config"])
             .arg(config)
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .unwrap(),
     );
@@ -1827,6 +1839,146 @@ fn an_agent_reconnects_after_a_daemon_restart() {
     );
 }
 
+/// Writes `body` to `hook.sh` next to `config` and appends a `[hooks]` section running it on both
+/// events. `/bin/sh` reads the script rather than the kernel exec'ing it, so a fork in a
+/// concurrent test that still holds the file open for writing cannot fail the exec.
+fn hook_config(config: PathBuf, body: &str) -> PathBuf {
+    let script = config.with_file_name("hook.sh");
+    std::fs::write(&script, body).unwrap();
+    let command = format!(r#"["/bin/sh", "{}"]"#, script.display());
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    write!(
+        text,
+        "\n[hooks]\non_dead = {command}\non_recover = {command}\n"
+    )
+    .unwrap();
+    std::fs::write(&config, text).unwrap();
+    config
+}
+
+/// Hook script line appending `$QB_EVENT $QB_LOGIN $QB_VENDOR` to `dir/events`.
+fn record_event(dir: &Path) -> String {
+    format!(
+        "echo \"$QB_EVENT $QB_LOGIN $QB_VENDOR\" >> '{}'\n",
+        dir.join("events").display()
+    )
+}
+
+/// The lines of `dir/events` once there are at least `n`, polled for at most 10 s.
+fn events(dir: &Path, n: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(dir.join("events")).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        if lines.len() >= n {
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "want {n} hook events, got {lines:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn report_login(sock: &Path, login: &str, outcome: &str) -> LoginStatus {
+    let body = format!(r#"{{"login":"{login}","outcome":"{outcome}","model":"model-small"}}"#);
+    let r: ReportResponse = post(sock, paths::REPORT, &body);
+    r.login_status
+}
+
+fn kill_auth(sock: &Path, login: &str) {
+    assert_eq!(
+        report_login(sock, login, "http_401"),
+        LoginStatus::AuthStale
+    );
+    assert_eq!(report_login(sock, login, "http_401"), LoginStatus::AuthDead);
+}
+
+#[test]
+fn hooks_run_once_per_auth_dead_edge_and_never_on_replay() {
+    let dir = temp_dir("hooks");
+    let sock = dir.join("qb.sock");
+    let config = hook_config(journaled_config(&dir, 1 << 20), &record_event(&dir));
+    let d = start(&config, &sock);
+    kill_auth(&sock, "login-1");
+    assert_eq!(events(&dir, 1), ["dead login-1 vendor-a"]);
+
+    assert_eq!(
+        report_login(&sock, "login-1", "http_401"),
+        LoginStatus::AuthDead
+    );
+    let changed_while_dead = report_login(&sock, "login-1", "model_unavailable");
+    assert_eq!(changed_while_dead, LoginStatus::AuthDead);
+    let resets = state(&sock).now + 3600;
+    report_windows(&sock, "login-1", &[("five_hour", 0.5, resets)]);
+    assert_eq!(status_of(&sock, "login-1"), LoginStatus::Ok);
+    assert_eq!(
+        events(&dir, 2),
+        ["dead login-1 vendor-a", "recover login-1 vendor-a"],
+        "a repeated dead state runs nothing"
+    );
+
+    kill_auth(&sock, "login-1");
+    assert_eq!(events(&dir, 3)[2], "dead login-1 vendor-a");
+    drop(d);
+    let _d = start(&config, &sock);
+    assert_eq!(status_of(&sock, "login-1"), LoginStatus::AuthDead);
+    kill_auth(&sock, "login-3");
+    assert_eq!(
+        events(&dir, 4),
+        [
+            "dead login-1 vendor-a",
+            "recover login-1 vendor-a",
+            "dead login-1 vendor-a",
+            "dead login-3 vendor-b"
+        ],
+        "replaying the journal runs nothing"
+    );
+}
+
+#[test]
+fn a_hook_beyond_two_in_flight_is_dropped_with_a_warning() {
+    let dir = temp_dir("hookcap");
+    let sock = dir.join("qb.sock");
+    let fifo = dir.join("gate");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Open for reading and writing: hooks open the FIFO at once and read until this closes.
+    let gate = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
+    let script = format!(
+        "exec 3< '{}'\n{}cat <&3 >/dev/null\n",
+        fifo.display(),
+        record_event(&dir)
+    );
+    let config = hook_config(journaled_config(&dir, 1 << 20), &script);
+    let mut d = start_with(&config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    kill_auth(&sock, "login-1");
+    kill_auth(&sock, "login-2");
+    let mut running = events(&dir, 2);
+    running.sort();
+    assert_eq!(running, ["dead login-1 vendor-a", "dead login-2 vendor-a"]);
+
+    kill_auth(&sock, "login-3");
+    let warning = line_with(&lines, "hook dead of login-3", Duration::from_secs(10));
+    let warning = warning.expect("a warning about the dropped hook");
+    assert!(warning.contains("dropped"), "{warning}");
+    let (status, _) = call(&sock, "GET", paths::HEALTH, None, None).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(events(&dir, 2).len(), 2, "the dropped hook never ran");
+    drop(gate);
+}
+
 /// Context switches of process `pid` so far.
 fn switches(pid: u32) -> u64 {
     std::fs::read_to_string(format!("/proc/{pid}/status"))
@@ -1841,8 +1993,11 @@ fn switches(pid: u32) -> u64 {
 fn an_idle_daemon_with_a_parked_agent_does_not_wake_up() {
     let dir = temp_dir("idle");
     let sock = dir.join("qb.sock");
-    let d = start(&agent_config(&dir, &[probe_on()]), &sock);
+    let config = hook_config(agent_config(&dir, &[probe_on()]), &record_event(&dir));
+    let d = start(&config, &sock);
     let mut parked = park(&sock, None, &["login-1"]);
+    kill_auth(&sock, "login-2");
+    assert_eq!(events(&dir, 1), ["dead login-2 vendor-a"]);
     assert_eq!(state(&sock).logins.len(), 3);
     std::thread::sleep(Duration::from_millis(100));
     let before = switches(d.0.id());

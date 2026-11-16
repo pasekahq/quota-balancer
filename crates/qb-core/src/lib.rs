@@ -504,7 +504,7 @@ pub enum Auth {
     Ok,
     /// One 401 seen.
     Stale,
-    /// Repeated 401.
+    /// Repeated 401; only an observed window makes it `Ok` again.
     Dead,
 }
 
@@ -1289,7 +1289,7 @@ impl Core {
         let login = &mut self.logins[li];
         match input.outcome {
             OutcomeClass::Ok => {
-                if observed && login.auth == Auth::Stale {
+                if observed {
                     login.auth = Auth::Ok;
                 }
             }
@@ -1732,7 +1732,7 @@ impl Core {
     /// Applies the result of probe `id` from `client` and returns the login and its status.
     ///
     /// `Ok` overwrites the named declared windows with `source = probe`, as a stream report
-    /// does, and ends the back-off. `Http401` steps the login's auth like a 401 report. It,
+    /// does, clears the auth state when a declared window is among them, and ends the back-off. `Http401` steps the login's auth like a 401 report. It,
     /// `Http429` and `Error` are failures: the back-off starts at the configured initial value
     /// and doubles up to the ceiling; a 429 waits at least its `retry_after_s`.
     ///
@@ -1766,7 +1766,7 @@ impl Core {
             ProbeOutcome::Ok(windows) => {
                 let observed = self.observe(li, windows, Source::Probe, now);
                 let login = &mut self.logins[li];
-                if observed && login.auth == Auth::Stale {
+                if observed {
                     login.auth = Auth::Ok;
                 }
                 login.probe.backoff_s = 0;

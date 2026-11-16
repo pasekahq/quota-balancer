@@ -27,6 +27,11 @@ backoff_max_s = 3600
 rate_per_s = 5.0
 burst = 20
 
+# Commands run without a shell when a login becomes auth_dead or leaves it (docs/config.md).
+# [hooks]
+# on_dead = ["/usr/local/libexec/qb-hook"]
+# on_recover = ["/usr/local/libexec/qb-hook"]
+
 [[vendors]]
 name = "vendor-a"
 windows = [

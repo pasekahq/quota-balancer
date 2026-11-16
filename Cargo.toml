@@ -42,7 +42,7 @@ unwrap_used = "warn"
 
 # Size-first release profile. The binary-size budget in ci/budgets.sh depends on it.
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"

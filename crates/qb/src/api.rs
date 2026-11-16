@@ -1,7 +1,7 @@
 //! `/v1` routing: HTTP request in, status and JSON body out. No sockets here.
 
 use qb_core::{
-    Core, LoginStatus as CoreStatus, LoginView, Marks, OutcomeClass, PickInput, ProbeError,
+    Auth, Core, LoginStatus as CoreStatus, LoginView, Marks, OutcomeClass, PickInput, ProbeError,
     ProbeJob, ProbeOutcome as CoreProbeOutcome, Record, ReportError, ReportInput, ReportSubject,
     Source as CoreSource, Target, Verdict, WindowObservation,
 };
@@ -13,6 +13,7 @@ use qb_proto::{
 };
 use serde::Serialize;
 
+use crate::hooks::{Event, Runner};
 use crate::http::{Method, Request};
 use crate::journal::Journal;
 use crate::log;
@@ -78,11 +79,12 @@ pub fn error(code: ErrorCode, message: impl Into<String>) -> Reply {
     )
 }
 
-/// Routes one request; granted leases, changed marks and releases go to `journal`. Only the
-/// clients in `agents` may wait for probe jobs.
+/// Routes one request; granted leases, changed marks and releases go to `journal`, a login's
+/// `auth_dead` edges to `hooks`. Only the clients in `agents` may wait for probe jobs.
 pub fn handle(
     core: &mut Core,
     journal: &mut Journal,
+    hooks: &mut Runner,
     req: &Request,
     caller: &Caller,
     agents: &[String],
@@ -103,10 +105,12 @@ pub fn handle(
         (Method::Get, paths::STATE, _) => json(200, &state(core, now)).into(),
         (Method::Get, _, Some(lease)) => why(core, lease, now).into(),
         (Method::Post, paths::PICK, _) => pick(core, journal, &req.body, caller, now).into(),
-        (Method::Post, paths::REPORT, _) => report(core, journal, &req.body, caller, now).into(),
+        (Method::Post, paths::REPORT, _) => {
+            report(core, journal, hooks, &req.body, caller, now).into()
+        }
         (Method::Post, paths::AGENT_NEXT, _) => agent_next(core, &req.body, caller, agents),
         (Method::Post, paths::AGENT_RESULT, _) => {
-            agent_result(core, journal, &req.body, caller, now).into()
+            agent_result(core, journal, hooks, &req.body, caller, now).into()
         }
         (_, p, why_of) if known.contains(&p) || why_of.is_some() => {
             error(ErrorCode::MethodNotAllowed, "method not allowed").into()
@@ -134,15 +138,23 @@ fn record(journal: &mut Journal, core: &Core, record: &Record, now: u64) {
     }
 }
 
-/// Journals the marks of `login` when they differ from `before`, its marks before the change.
+/// Journals the marks of `login` when they differ from `before`, its marks before the change,
+/// and fires the hook of an edge into or out of `auth_dead`.
 fn record_marks(
     journal: &mut Journal,
+    hooks: &mut Runner,
     core: &Core,
     login: String,
     before: Option<&Marks>,
     now: u64,
 ) {
     if let Some(marks) = core.marks(&login).filter(|m| Some(m) != before) {
+        let was_dead = before.is_some_and(|m| m.auth == Auth::Dead);
+        match (was_dead, marks.auth == Auth::Dead) {
+            (false, true) => hooks.fire(Event::Dead, &login),
+            (true, false) => hooks.fire(Event::Recover, &login),
+            _ => {}
+        }
         record(journal, core, &Record::Marks { login, marks }, now);
     }
 }
@@ -243,7 +255,14 @@ fn bare(decision: Decision, reason: &str) -> PickResponse {
     }
 }
 
-fn report(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, now: u64) -> Reply {
+fn report(
+    core: &mut Core,
+    journal: &mut Journal,
+    hooks: &mut Runner,
+    body: &[u8],
+    caller: &Caller,
+    now: u64,
+) -> Reply {
     let req: ReportRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return error(ErrorCode::BadRequest, format!("invalid report: {e}")),
@@ -277,7 +296,7 @@ fn report(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, 
     match core.report(&input, now) {
         Ok(status) => {
             if let Some(login) = login {
-                record_marks(journal, core, login, before.as_ref(), now);
+                record_marks(journal, hooks, core, login, before.as_ref(), now);
             }
             if let (true, ReportSubject::Lease(id)) = (input.release, &input.subject) {
                 record(journal, core, &Record::Release(*id), now);
@@ -335,6 +354,7 @@ pub fn job(job: &ProbeJob) -> Reply {
 fn agent_result(
     core: &mut Core,
     journal: &mut Journal,
+    hooks: &mut Runner,
     body: &[u8],
     caller: &Caller,
     now: u64,
@@ -362,7 +382,7 @@ fn agent_result(
     let before = core.probe_login(id).and_then(|l| core.marks(l));
     match core.probe_result(id, &caller.client, &outcome, now) {
         Ok((login, status)) => {
-            record_marks(journal, core, login, before.as_ref(), now);
+            record_marks(journal, hooks, core, login, before.as_ref(), now);
             json(
                 200,
                 &ReportResponse {
