@@ -78,8 +78,9 @@ qb --socket /tmp/qb.sock pick --role worker --difficulty 1
 curl --unix-socket /tmp/qb.sock http://qb/v1/state
 ```
 
-`state` lists the logins from the config. The scheduling policy is not implemented yet, so
-`pick` answers `{"decision":"dead","reason":"no_candidates"}`.
+`state` lists the logins from the config with their quota windows. Until a client reports
+windows (`POST /v1/report`, see [docs/api.md](docs/api.md)) every window counts as unused, so
+`pick` answers `run` on `login-1` with `"stale": true`.
 
 ## Install as a service
 

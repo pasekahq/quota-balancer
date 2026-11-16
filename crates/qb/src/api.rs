@@ -2,12 +2,12 @@
 
 use qb_core::{
     Core, LoginStatus as CoreStatus, OutcomeClass, PickInput, ReportError, ReportInput,
-    ReportSubject, Target, Verdict,
+    ReportSubject, Source as CoreSource, Target, Verdict, WindowObservation,
 };
 use qb_proto::{
     API_VERSION, Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginState,
-    LoginStatus, Outcome, PickRequest, PickResponse, ReportRequest, ReportResponse, StateResponse,
-    paths,
+    LoginStatus, Outcome, PickRequest, PickResponse, ReportRequest, ReportResponse, Source,
+    StateResponse, WindowState, paths,
 };
 use serde::Serialize;
 
@@ -93,6 +93,7 @@ fn pick(core: &mut Core, body: &[u8], caller: &Caller, now: u64) -> Reply {
         (None, Some(p)) => Target::Pin {
             vendor: p.vendor,
             model: p.model,
+            effort: p.effort,
             login: p.login,
         },
         (None, None) => return error(ErrorCode::BadRequest, "no target"),
@@ -108,21 +109,23 @@ fn pick(core: &mut Core, body: &[u8], caller: &Caller, now: u64) -> Reply {
         Verdict::Run(grant, reason) => PickResponse {
             decision: Decision::Run,
             reason: reason.as_str().to_owned(),
-            lease_id: Some(format!("l-{}", grant.lease_id)),
-            vendor: None,
+            lease_id: None,
+            vendor: Some(grant.vendor),
             model: Some(grant.model),
-            effort: None,
-            login: Some(grant.login.0.to_string()),
-            tier: Some(grant.tier),
+            effort: grant.effort,
+            login: Some(grant.login),
+            tier: grant.tier,
             retry_after: None,
-            stale: false,
-            quota_snapshot_at: None,
+            stale: grant.stale,
+            quota_snapshot_at: grant.snapshot_at,
         },
         Verdict::Wait {
             retry_after,
             reason,
+            stale,
         } => PickResponse {
             retry_after: Some(retry_after),
+            stale,
             ..bare(Decision::Wait, reason.as_str())
         },
         Verdict::Dead(reason) => bare(Decision::Dead, reason.as_str()),
@@ -163,6 +166,15 @@ fn report(core: &mut Core, body: &[u8], now: u64) -> Reply {
         subject,
         outcome: outcome(req.outcome),
         release: req.release,
+        windows: req
+            .windows
+            .into_iter()
+            .map(|w| WindowObservation {
+                name: w.name,
+                used: w.utilization,
+                resets_at: w.resets_at,
+            })
+            .collect(),
     };
     match core.report(&input, now) {
         Ok(status) => json(
@@ -174,6 +186,10 @@ fn report(core: &mut Core, body: &[u8], now: u64) -> Reply {
         ),
         Err(ReportError::UnknownLease) => error(ErrorCode::NotFound, "unknown lease"),
         Err(ReportError::UnknownLogin) => error(ErrorCode::NotFound, "unknown login"),
+        Err(ReportError::InvalidUtilization) => error(
+            ErrorCode::BadRequest,
+            "window utilization must be within 0.0..=1.0",
+        ),
     }
 }
 
@@ -192,7 +208,19 @@ fn state(core: &Core, now: u64) -> Reply {
                     vendor: l.vendor,
                     status: login_status(l.status),
                     dead_until: None,
-                    windows: Vec::new(),
+                    windows: l
+                        .windows
+                        .into_iter()
+                        .map(|w| WindowState {
+                            name: w.name,
+                            used: w.used,
+                            reserved: 0.0,
+                            resets_at: w.resets_at,
+                            observed_at: w.observed_at,
+                            source: source(w.source),
+                            stale: w.stale,
+                        })
+                        .collect(),
                 })
                 .collect(),
             leases: Vec::new(),
@@ -220,5 +248,12 @@ fn login_status(s: CoreStatus) -> LoginStatus {
         CoreStatus::AuthStale => LoginStatus::AuthStale,
         CoreStatus::AuthDead => LoginStatus::AuthDead,
         CoreStatus::Unknown => LoginStatus::Unknown,
+    }
+}
+
+fn source(s: CoreSource) -> Source {
+    match s {
+        CoreSource::Stream => Source::Stream,
+        CoreSource::Assumed => Source::Assumed,
     }
 }

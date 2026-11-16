@@ -7,14 +7,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qb::client::call;
 use qb::config;
-use qb_core::Core;
+use qb_core::{Core, Spec};
 use qb_proto::{
-    Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, PickResponse, StateResponse,
-    paths,
+    Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, Outcome, PickResponse,
+    ReportRequest, ReportResponse, Source, StateResponse, WindowReport, paths,
 };
 
 fn temp_socket(tag: &str) -> PathBuf {
@@ -33,7 +33,7 @@ fn spawn_server() -> PathBuf {
     let path = temp_socket("lib");
     let listener = UnixListener::bind(&path).unwrap();
     std::thread::spawn(move || {
-        let mut core = Core::new();
+        let mut core = Core::new(Spec::default()).unwrap();
         qb::server::serve(&listener, &mut core);
     });
     path
@@ -274,6 +274,138 @@ fn daemon_serves_configured_logins() {
         .collect();
     assert_ne!(configured, []);
     assert_eq!(served, configured);
+}
+
+fn report_windows(sock: &Path, login: &str, windows: &[(&str, f64, u64)]) {
+    let req = ReportRequest {
+        lease_id: None,
+        login: Some(login.into()),
+        outcome: Outcome::Ok,
+        model: None,
+        windows: windows
+            .iter()
+            .map(|&(name, utilization, resets_at)| WindowReport {
+                name: name.into(),
+                utilization,
+                resets_at: Some(resets_at),
+                length_s: None,
+            })
+            .collect(),
+        release: false,
+    };
+    let body = serde_json::to_vec(&req).unwrap();
+    let (status, resp) = call(sock, "POST", paths::REPORT, Some(&body)).unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    let r: ReportResponse = serde_json::from_slice(&resp).unwrap();
+    assert!(r.accepted);
+}
+
+fn pick_worker(sock: &Path) -> PickResponse {
+    let (status, resp) = call(
+        sock,
+        "POST",
+        paths::PICK,
+        Some(br#"{"role":"worker","difficulty":1}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    serde_json::from_slice(&resp).unwrap()
+}
+
+#[test]
+fn reported_windows_steer_pick_and_show_in_state() {
+    let exe = env!("CARGO_BIN_EXE_qb");
+    let sock = temp_socket("policy");
+    let _d = Daemon(
+        Command::new(exe)
+            .arg("--socket")
+            .arg(&sock)
+            .args(["daemon", "--config"])
+            .arg(example("qbd.toml"))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&sock);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (hour, day) = (3600, 86_400);
+    report_windows(
+        &sock,
+        "login-1",
+        &[
+            ("five_hour", 0.1, now + 2 * hour),
+            ("seven_day", 0.7, now + 6 * hour),
+        ],
+    );
+    report_windows(
+        &sock,
+        "login-2",
+        &[
+            ("five_hour", 0.1, now + 2 * hour),
+            ("seven_day", 0.1, now + 6 * day),
+        ],
+    );
+
+    let p = pick_worker(&sock);
+    assert_eq!(p.decision, Decision::Run, "{p:?}");
+    assert_eq!(p.reason, "spend_before_reset");
+    assert_eq!(
+        (p.login.as_deref(), p.vendor.as_deref(), p.model.as_deref()),
+        (Some("login-1"), Some("vendor-a"), Some("model-small"))
+    );
+    assert_eq!(
+        (p.effort.as_deref(), p.tier, p.stale),
+        (Some("low"), Some(1), false)
+    );
+    assert!(p.quota_snapshot_at.is_some_and(|t| t >= now));
+
+    report_windows(&sock, "login-1", &[("five_hour", 1.0, now + 2 * hour)]);
+    let p = pick_worker(&sock);
+    assert_eq!(p.decision, Decision::Run, "{p:?}");
+    assert_eq!(p.login.as_deref(), Some("login-2"));
+
+    let (status, body) = call(&sock, "GET", paths::STATE, None).unwrap();
+    assert_eq!(status, 200);
+    let state: StateResponse = serde_json::from_slice(&body).unwrap();
+    let login = |name: &str| {
+        state
+            .logins
+            .iter()
+            .find(|l| l.login == name)
+            .unwrap()
+            .windows
+            .iter()
+            .map(|w| (w.name.as_str(), w.used, w.resets_at, w.source, w.stale))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        login("login-1"),
+        [
+            (
+                "five_hour",
+                1.0,
+                Some(now + 2 * hour),
+                Source::Stream,
+                false
+            ),
+            (
+                "seven_day",
+                0.7,
+                Some(now + 6 * hour),
+                Source::Stream,
+                false
+            ),
+        ]
+    );
+    assert_eq!(
+        login("login-3"),
+        [("five_hour", 0.0, None, Source::Assumed, true)]
+    );
+    let l1 = &state.logins[0].windows[0];
+    assert!(l1.observed_at >= now && l1.reserved == 0.0, "{l1:?}");
 }
 
 #[test]

@@ -71,7 +71,7 @@ fn client(extra: &str) -> String {
 fn base_config_is_valid() {
     let cfg = config::parse(Path::new(FILE), BASE).unwrap();
     assert_eq!(cfg.journal, Journal::Off {});
-    assert_eq!(cfg.login_specs()[0].vendor, "vendor-a");
+    assert_eq!(cfg.core_spec().logins[0].vendor, "vendor-a");
 }
 
 #[test]

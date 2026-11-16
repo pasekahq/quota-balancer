@@ -81,7 +81,7 @@ Each reserve:
 | Key | Type | Meaning |
 |---|---|---|
 | `difficulty` | integer | A ladder step of the same role. |
-| `window` | string | A window name declared by some vendor. |
+| `window` | string | A window name declared by some vendor; it constrains only candidates whose vendor declares it. |
 | `fraction` | float `0.0..=1.0` | Part of the window this role keeps free at this difficulty. |
 
 A `(difficulty, window)` pair appears at most once per role.
@@ -115,7 +115,7 @@ Optional.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `ttl_s` | integer > 0 | Age after which a window snapshot is stale, default 300. |
+| `ttl_s` | integer > 0 | Age after which a window snapshot is stale, default 300. A stale snapshot is still used; `pick` answers with `stale: true`. |
 
 ## `[probe]`
 

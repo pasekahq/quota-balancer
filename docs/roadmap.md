@@ -4,7 +4,7 @@
 
 - Cargo workspace (`qb-core`, `qb-proto`, `qb`), size-first release profile.
 - `/v1/pick`, `/v1/report`, `/v1/state`, `/v1/health` with typed requests/responses, fixtures and
-  contract tests over a real unix socket. `pick` answers `dead/no_candidates` until the policy lands.
+  contract tests over a real unix socket.
 - HTTP/1.1 framing with hard limits, `SO_PEERCRED` peer identity, systemd socket activation.
 - Multicall binary: `qbd` / `qb daemon`, `qb agent` (connectivity only), CLI.
 - systemd templates with hardening (`qbd.service` exposure 0.2).

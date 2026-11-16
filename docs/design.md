@@ -66,6 +66,8 @@ Vendors, windows, logins, ladders, reserves and clients come from the config fil
 State, all in one thread, no locks, no allocation on the hot path:
 
 - `logins[≤32]`, each with `windows[≤4]` of `{used, resets_at, len, observed_at, source}`;
+  a window never observed, or past its `resets_at`, counts as `used = 0`, `source = assumed`,
+  and one older than the snapshot TTL is `stale` (pick still uses it and says so);
 - dead-until bitmasks per login and per (login, model);
 - `leases[≤256]` with per-login, per-window reserved sums updated in O(1);
 - precomputed ladders `difficulty × role → [candidate ≤ 8]`;
@@ -75,15 +77,21 @@ State, all in one thread, no locks, no allocation on the hot path:
 
 `pick` for k ≤ 8 candidates and W ≤ 4 windows:
 
-1. Candidates from the pin or the ladder; `resume_of` keeps the session's login.
+1. Candidates from the pin or the ladder, each expanded to the logins of its vendor;
+   `resume_of` keeps the session's login. A pin takes the logins of the pinned vendor (or the
+   one named login) and no role reserve.
 2. Drop dead logins/models, the avoided vendor, and candidates missing a required capability.
-3. Admissible if for every window `1 − used − reserved − cost ≥ reserve(role, difficulty, w)`,
-   where the reserve is dropped when the window resets within `T_burn(w)`; a task must also
-   fit into the short window.
-4. Score by spend-before-reset urgency `left / max(resets_at − now, 1h) × len`; choose
-   lexicographically by (tier, urgency, vendor preference, index).
-5. Nothing admissible on the step → neighbouring steps per the role's policy; nothing at all →
-   `wait` with `retry_after = earliest reset`, or `dead` (and the `on_dead` hook).
+3. Admissible if for every window of the login's vendor `left = 1 − used − reserved − cost`
+   is above 0 and `left ≥ reserve(role, difficulty, w)`, where the reserve is dropped when the
+   window resets within `T_burn(w)`; a reserve naming a window the vendor does not declare
+   constrains nothing. A task must also fit into the short window.
+4. Score by spend-before-reset urgency `left / max(resets_at − now, 1h) × len` on the
+   vendor's longest window (an unknown reset counts as `len` away); choose lexicographically
+   by (tier ascending, urgency descending, candidate order, login index).
+5. Nothing admissible on the step → the nearest lower step, then the nearest higher one;
+   nothing at all → `wait` with `retry_after` = the earliest time some rejected login gets
+   all its blocking windows back by reset, or `dead` when there is no candidate or none can
+   recover by a known reset (and the `on_dead` hook).
 6. Create the lease, append one journal line, answer.
 
 `report` is O(1): limit/rejected → exhausted until reset; 401 → `auth_stale`, repeated →
