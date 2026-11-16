@@ -59,6 +59,12 @@ pub struct Config {
     /// Quota snapshot freshness.
     #[serde(default)]
     pub snapshot: Snapshot,
+    /// Lease lifetime and the default cost rate.
+    #[serde(default)]
+    pub leases: Leases,
+    /// How long report outcome marks last.
+    #[serde(default)]
+    pub outcomes: Outcomes,
     /// Back-off of the agent's vendor probes.
     #[serde(default)]
     pub probe: Probe,
@@ -113,7 +119,7 @@ pub struct Role {
 }
 
 /// One ladder step: the candidates for a difficulty, in preference order.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
     /// Difficulty this step serves.
@@ -123,7 +129,7 @@ pub struct Step {
 }
 
 /// A vendor/model/effort combination a ladder step may run on.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Candidate {
     /// Declared vendor.
@@ -134,6 +140,9 @@ pub struct Candidate {
     pub effort: Option<String>,
     /// Tier; lower tiers are preferred.
     pub tier: u8,
+    /// Fraction of the vendor's shortest window one minute of work uses; defaults to
+    /// [`Leases::cost_per_minute`].
+    pub cost_per_minute: Option<Fraction>,
 }
 
 /// Fraction of a window a role keeps free at a difficulty.
@@ -193,6 +202,44 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self { ttl_s: 300 }
+    }
+}
+
+/// Lease settings.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Leases {
+    /// A lease expires this long after its pick plus the task's `expected_minutes`.
+    pub ttl_s: u64,
+    /// Cost rate of candidates without their own and of pins without a matching candidate.
+    pub cost_per_minute: Fraction,
+}
+
+impl Default for Leases {
+    fn default() -> Self {
+        Self {
+            ttl_s: 3600,
+            cost_per_minute: Fraction(0.002),
+        }
+    }
+}
+
+/// Durations of the marks report outcomes set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Outcomes {
+    /// How long a login stays `rate_limited` after `http_429`.
+    pub rate_limit_backoff_s: u64,
+    /// How long a (login, model) pair stays dead after `model_unavailable`.
+    pub model_unavailable_s: u64,
+}
+
+impl Default for Outcomes {
+    fn default() -> Self {
+        Self {
+            rate_limit_backoff_s: 60,
+            model_unavailable_s: 86_400,
+        }
     }
 }
 
@@ -373,6 +420,7 @@ impl Config {
                                     model: c.model.clone(),
                                     effort: c.effort.clone(),
                                     tier: c.tier,
+                                    cost_per_minute: c.cost_per_minute.map(Fraction::get),
                                 })
                                 .collect(),
                         })
@@ -389,6 +437,10 @@ impl Config {
                 })
                 .collect(),
             snapshot_ttl_s: self.snapshot.ttl_s,
+            lease_ttl_s: self.leases.ttl_s,
+            cost_per_minute: self.leases.cost_per_minute.get(),
+            rate_limit_backoff_s: self.outcomes.rate_limit_backoff_s,
+            model_unavailable_s: self.outcomes.model_unavailable_s,
         }
     }
 
@@ -465,6 +517,21 @@ impl Config {
         }
         if self.snapshot.ttl_s == 0 {
             return Err(("snapshot.ttl_s".into(), "must be positive".into()));
+        }
+        if self.leases.ttl_s == 0 {
+            return Err(("leases.ttl_s".into(), "must be positive".into()));
+        }
+        if self.outcomes.rate_limit_backoff_s == 0 {
+            return Err((
+                "outcomes.rate_limit_backoff_s".into(),
+                "must be positive".into(),
+            ));
+        }
+        if self.outcomes.model_unavailable_s == 0 {
+            return Err((
+                "outcomes.model_unavailable_s".into(),
+                "must be positive".into(),
+            ));
         }
         if self.probe.backoff_initial_s == 0 {
             return Err(("probe.backoff_initial_s".into(), "must be positive".into()));

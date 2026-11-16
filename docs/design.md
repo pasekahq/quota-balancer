@@ -68,11 +68,16 @@ State, all in one thread, no locks, no allocation on the hot path:
 - `logins[≤32]`, each with `windows[≤4]` of `{used, resets_at, len, observed_at, source}`;
   a window never observed, or past its `resets_at`, counts as `used = 0`, `source = assumed`,
   and one older than the snapshot TTL is `stale` (pick still uses it and says so);
-- dead-until bitmasks per login and per (login, model);
-- `leases[≤256]` with per-login, per-window reserved sums updated in O(1);
+- dead-until marks per login (`exhausted`, `rate_limited`) and per (login, model), and the
+  login's auth state (`auth_stale`, `auth_dead`);
+- `leases[≤256]` with per-login, per-window reserved sums updated in O(1); a lease id names its
+  slot, so lookup is O(1) too;
 - precomputed ladders `difficulty × role → [candidate ≤ 8]`;
-- a deadline heap (lease expiry, dead-until, resets, TTLs); the loop sleeps in `poll()` until
-  the earliest deadline, so an idle daemon wakes up zero times per second;
+- a deadline heap (lease expiry, dead-until, resets, TTLs) with lazy deletion: an entry counts
+  only while the state still holds its time, and the heap is compacted when it outgrows twice
+  the number of live deadlines. `pick` and `report` apply due deadlines first, so correctness
+  does not depend on wake-ups; the loop sleeps in `poll()` until the earliest deadline, so an
+  idle daemon wakes up zero times per second;
 - learned cost per (model, effort) as an EWMA of "% of window per minute".
 
 `pick` for k ≤ 8 candidates and W ≤ 4 windows:
@@ -80,7 +85,8 @@ State, all in one thread, no locks, no allocation on the hot path:
 1. Candidates from the pin or the ladder, each expanded to the logins of its vendor;
    `resume_of` keeps the session's login. A pin takes the logins of the pinned vendor (or the
    one named login) and no role reserve.
-2. Drop dead logins/models, the avoided vendor, and candidates missing a required capability.
+2. Drop dead logins/models, the avoided vendor, and candidates missing a required capability;
+   `auth_stale` logins stay, the vendor CLI refreshes its token on next use.
 3. Admissible if for every window of the login's vendor `left = 1 − used − reserved − cost`
    is above 0 and `left ≥ reserve(role, difficulty, w)`, where the reserve is dropped when the
    window resets within `T_burn(w)`; a reserve naming a window the vendor does not declare
@@ -89,14 +95,14 @@ State, all in one thread, no locks, no allocation on the hot path:
    vendor's longest window (an unknown reset counts as `len` away); choose lexicographically
    by (tier ascending, urgency descending, candidate order, login index).
 5. Nothing admissible on the step → the nearest lower step, then the nearest higher one;
-   nothing at all → `wait` with `retry_after` = the earliest time some rejected login gets
-   all its blocking windows back by reset, or `dead` when there is no candidate or none can
-   recover by a known reset (and the `on_dead` hook).
-6. Create the lease, append one journal line, answer.
+   nothing at all → `wait` with `retry_after` = the earliest time some rejected candidate gets
+   all its blocks back (reset, `T_burn` start, lease expiry, end of a mark), or `dead` when
+   there is no candidate or none can recover by a known time (and the `on_dead` hook).
+6. Create the lease (a full table answers `wait`), append one journal line, answer.
 
 `report` is O(1): limit/rejected → exhausted until reset; 401 → `auth_stale`, repeated →
-`auth_dead`; 429 → short back-off; model unavailable → per-model dead bit; stream windows
-overwrite the snapshot and reset its TTL.
+`auth_dead`; 429 → short back-off; model unavailable → per-(login, model) dead mark; stream
+windows overwrite the snapshot and reset its TTL. The exact rules are in [api.md](api.md).
 
 ## Disk
 

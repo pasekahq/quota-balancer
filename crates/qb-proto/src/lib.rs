@@ -310,7 +310,10 @@ pub struct LeaseState {
     pub model: String,
     /// Client that took the lease.
     pub client: String,
-    /// When the lease expires unless released or reported.
+    /// Caller's run id from the pick request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// When the lease expires unless released first.
     pub expires_at: u64,
 }
 

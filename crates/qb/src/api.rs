@@ -5,9 +5,9 @@ use qb_core::{
     ReportSubject, Source as CoreSource, Target, Verdict, WindowObservation,
 };
 use qb_proto::{
-    API_VERSION, Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginState,
-    LoginStatus, Outcome, PickRequest, PickResponse, ReportRequest, ReportResponse, Source,
-    StateResponse, WindowState, paths,
+    API_VERSION, Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LeaseState,
+    LoginState, LoginStatus, Outcome, PickRequest, PickResponse, ReportRequest, ReportResponse,
+    Source, StateResponse, WindowState, paths,
 };
 use serde::Serialize;
 
@@ -104,12 +104,14 @@ fn pick(core: &mut Core, body: &[u8], caller: &Caller, now: u64) -> Reply {
         resume_of: req.resume_of,
         avoid_vendor: req.avoid_vendor,
         client: caller.client.clone(),
+        expected_minutes: req.expected_minutes,
+        run_id: req.run_id,
     };
     let resp = match core.pick(&input, now) {
         Verdict::Run(grant, reason) => PickResponse {
             decision: Decision::Run,
             reason: reason.as_str().to_owned(),
-            lease_id: None,
+            lease_id: Some(lease_id(grant.lease)),
             vendor: Some(grant.vendor),
             model: Some(grant.model),
             effort: grant.effort,
@@ -155,7 +157,10 @@ fn report(core: &mut Core, body: &[u8], now: u64) -> Reply {
         Err(e) => return error(ErrorCode::BadRequest, format!("invalid report: {e}")),
     };
     let subject = match (req.lease_id, req.login) {
-        (Some(lease), _) => match lease.strip_prefix("l-").and_then(|n| n.parse().ok()) {
+        (Some(lease), _) => match lease
+            .strip_prefix(LEASE_PREFIX)
+            .and_then(|n| n.parse().ok())
+        {
             Some(id) => ReportSubject::Lease(id),
             None => return error(ErrorCode::NotFound, "unknown lease"),
         },
@@ -165,6 +170,7 @@ fn report(core: &mut Core, body: &[u8], now: u64) -> Reply {
     let input = ReportInput {
         subject,
         outcome: outcome(req.outcome),
+        model: req.model,
         release: req.release,
         windows: req
             .windows
@@ -190,10 +196,16 @@ fn report(core: &mut Core, body: &[u8], now: u64) -> Reply {
             ErrorCode::BadRequest,
             "window utilization must be within 0.0..=1.0",
         ),
+        Err(ReportError::MissingModel) => error(
+            ErrorCode::BadRequest,
+            "`model_unavailable` on a login needs `model`",
+        ),
+        Err(ReportError::UnknownModel) => error(ErrorCode::NotFound, "unknown model"),
     }
 }
 
-fn state(core: &Core, now: u64) -> Reply {
+fn state(core: &mut Core, now: u64) -> Reply {
+    core.tick(now);
     let snap = core.snapshot(now);
     json(
         200,
@@ -207,14 +219,14 @@ fn state(core: &Core, now: u64) -> Reply {
                     login: l.name,
                     vendor: l.vendor,
                     status: login_status(l.status),
-                    dead_until: None,
+                    dead_until: l.dead_until,
                     windows: l
                         .windows
                         .into_iter()
                         .map(|w| WindowState {
                             name: w.name,
                             used: w.used,
-                            reserved: 0.0,
+                            reserved: w.reserved,
                             resets_at: w.resets_at,
                             observed_at: w.observed_at,
                             source: source(w.source),
@@ -223,9 +235,26 @@ fn state(core: &Core, now: u64) -> Reply {
                         .collect(),
                 })
                 .collect(),
-            leases: Vec::new(),
+            leases: snap
+                .leases
+                .into_iter()
+                .map(|l| LeaseState {
+                    lease_id: lease_id(l.id),
+                    login: l.login,
+                    model: l.model,
+                    client: l.client,
+                    run_id: l.run_id,
+                    expires_at: l.expires_at,
+                })
+                .collect(),
         },
     )
+}
+
+const LEASE_PREFIX: &str = "l-";
+
+fn lease_id(id: u64) -> String {
+    format!("{LEASE_PREFIX}{id}")
 }
 
 fn outcome(o: Outcome) -> OutcomeClass {

@@ -13,8 +13,8 @@ use qb::client::call;
 use qb::config;
 use qb_core::{Core, Spec};
 use qb_proto::{
-    Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, Outcome, PickResponse,
-    ReportRequest, ReportResponse, Source, StateResponse, WindowReport, paths,
+    Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginStatus, Outcome,
+    PickResponse, ReportRequest, ReportResponse, Source, StateResponse, WindowReport, paths,
 };
 
 fn temp_socket(tag: &str) -> PathBuf {
@@ -469,4 +469,72 @@ fn cli_usage_errors_exit_2() {
         .status()
         .unwrap();
     assert_eq!(unreachable.code(), Some(2));
+}
+
+fn post<T: serde::de::DeserializeOwned>(sock: &Path, path: &str, body: &str) -> T {
+    let (status, resp) = call(sock, "POST", path, Some(body.as_bytes())).unwrap();
+    assert_eq!(status, 200, "{body}: {}", String::from_utf8_lossy(&resp));
+    serde_json::from_slice(&resp).unwrap()
+}
+
+fn state(sock: &Path) -> StateResponse {
+    let (status, body) = call(sock, "GET", paths::STATE, None).unwrap();
+    assert_eq!(status, 200);
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[test]
+fn leases_reserve_quota_and_reports_steer_the_next_pick() {
+    let exe = env!("CARGO_BIN_EXE_qb");
+    let sock = temp_socket("leases");
+    let _d = Daemon(
+        Command::new(exe)
+            .arg("--socket")
+            .arg(&sock)
+            .args(["daemon", "--config"])
+            .arg(example("qbd.toml"))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&sock);
+    let task = r#"{"role":"worker","difficulty":1,"expected_minutes":30,"run_id":"run-1"}"#;
+
+    let first: PickResponse = post(&sock, paths::PICK, task);
+    assert_eq!(first.decision, Decision::Run, "{first:?}");
+    assert_eq!(first.login.as_deref(), Some("login-1"));
+    let lease = first.lease_id.clone().unwrap();
+
+    let s = state(&sock);
+    assert_eq!(s.leases.len(), 1);
+    let l = &s.leases[0];
+    assert_eq!(
+        (l.lease_id.as_str(), l.login.as_str(), l.model.as_str()),
+        (lease.as_str(), "login-1", "model-small")
+    );
+    assert_eq!(l.run_id.as_deref(), Some("run-1"));
+    assert!(l.expires_at >= s.now + 30 * 60, "{l:?}");
+    let reserved: Vec<f64> = s.logins[0].windows.iter().map(|w| w.reserved).collect();
+    assert!(reserved.iter().all(|&r| r > 0.0), "{reserved:?}");
+
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        &format!(r#"{{"lease_id":"{lease}","outcome":"usage_limit"}}"#),
+    );
+    assert_eq!(r.login_status, LoginStatus::Exhausted);
+    let second: PickResponse = post(&sock, paths::PICK, task);
+    assert_eq!(second.decision, Decision::Run, "{second:?}");
+    assert_eq!(second.login.as_deref(), Some("login-2"));
+    assert_ne!(second.lease_id, first.lease_id);
+
+    let release = format!(r#"{{"lease_id":"{lease}","outcome":"ok","release":true}}"#);
+    let _: ReportResponse = post(&sock, paths::REPORT, &release);
+    let s = state(&sock);
+    let live: Vec<&str> = s.leases.iter().map(|l| l.lease_id.as_str()).collect();
+    assert_eq!(live, [second.lease_id.as_deref().unwrap()]);
+    assert!(s.logins[0].windows.iter().all(|w| w.reserved == 0.0));
+    assert!(s.logins[0].dead_until.is_some());
+    let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes())).unwrap();
+    assert_eq!(status, 404, "a released lease is gone");
 }
