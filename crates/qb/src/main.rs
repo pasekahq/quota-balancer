@@ -9,7 +9,10 @@ use std::process::ExitCode;
 use qb::auth::Gate;
 use qb::config::Config;
 use qb::journal::{self, Journal};
-use qb::{DEFAULT_CONFIG, DEFAULT_SOCKET, agent, api, client, config, listen, log, server, stream};
+use qb::{
+    DEFAULT_CONFIG, DEFAULT_SOCKET, agent, api, client, config, listen, log, sandbox, server,
+    stream,
+};
 use qb_core::Core;
 use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, paths};
 use qb_vendors::claude::Event;
@@ -293,12 +296,15 @@ fn run(args: Args) -> Result<ExitCode, String> {
         Cmd::Agent(file) => {
             let config = config::load_agent(&file).map_err(|e| e.to_string())?;
             let bearer = bearer(args.bearer_file)?;
-            agent::run(
-                &args.socket,
-                bearer.as_deref(),
-                &config,
-                &mut agent::NoHttps,
-            )
+            let mut fetcher = agent::Https::new();
+            let gaps = sandbox::harden(&config)?;
+            if !gaps.is_empty() {
+                log::warn(&format!(
+                    "qb agent: sandbox incomplete: {}",
+                    gaps.join("; ")
+                ));
+            }
+            agent::run(&args.socket, bearer.as_deref(), &config, &mut fetcher)
         }
         Cmd::Simulate(sim) => simulate(sim),
         Cmd::Call(call) => {

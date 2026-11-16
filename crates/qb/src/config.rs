@@ -168,8 +168,8 @@ pub struct Client {
     pub uid: Option<u32>,
     /// SHA-256 of the client's bearer token.
     pub bearer_sha256: Option<BearerHash>,
-    /// Declared role the client works as.
-    pub role: String,
+    /// Declared role the client works as; only a client listed in `[probe] agents` may omit it.
+    pub role: Option<String>,
 }
 
 /// Journal mode.
@@ -636,7 +636,16 @@ impl Config {
                     return Err((format!("{at}.bearer_sha256"), "duplicate hash".into()));
                 }
             }
-            known(&roles, format!("{at}.role"), "role", &client.role)?;
+            match &client.role {
+                Some(role) => known(&roles, format!("{at}.role"), "role", role)?,
+                None if self.probe.agents.contains(&client.name) => {}
+                None => {
+                    return Err((
+                        format!("{at}.role"),
+                        "missing; only a client in `probe.agents` may omit it".into(),
+                    ));
+                }
+            }
         }
         for (i, agent) in self.probe.agents.iter().enumerate() {
             known(&clients, format!("probe.agents[{i}]"), "client", agent)?;

@@ -15,7 +15,7 @@ socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan: `docs/roadmap.m
 | `crates/qb-core` | Pure policy: state, `pick`, `report`, leases. **No I/O, no clock, no `unsafe`.** The caller passes `now`. |
 | `crates/qb-proto` | Wire types of `/v1`. Every message is declared here exactly once. Fixtures in `tests/fixtures/`. |
 | `crates/qb-vendors` | Pure, total parsers of vendor quota data (stream-json, statusline, rollouts, usage endpoints) into `qb-proto` window reports. Rules in `docs/vendors.md`; fixtures in `tests/fixtures/`. |
-| `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs`, `main.rs` (CLI). |
+| `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs` (probe loop, HTTPS fetcher), `sandbox.rs` (agent hardening), `main.rs` (CLI). |
 | `deploy/systemd/` | Unit templates with hardening. |
 | `ci/budgets.sh` | Binary size and RSS budgets. |
 | `ci/broad_check.py` | Stdlib-only driver for fmt + clippy + test (`python3 -m ci.broad_check`); external harnesses call this. |
@@ -28,8 +28,11 @@ If `cargo` is not on `PATH`, use `$HOME/.cargo/bin/cargo`.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo build --release --locked --target x86_64-unknown-linux-musl && ci/budgets.sh
+CC_x86_64_unknown_linux_musl=gcc cargo build --release --locked --target x86_64-unknown-linux-musl && ci/budgets.sh
 ```
+
+ring's build script compiles C for the musl target; `CC_x86_64_unknown_linux_musl` names the
+compiler when `x86_64-linux-musl-gcc` is not installed.
 
 Optional locally, always in CI: `cargo deny check`, `gitleaks git .`,
 `systemd-analyze security --offline=yes --threshold=15 deploy/systemd/qbd.service`.

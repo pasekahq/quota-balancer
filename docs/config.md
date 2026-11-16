@@ -96,7 +96,7 @@ Optional. Each client needs `uid`, `bearer_sha256` or both.
 | `name` | string | Client name in leases and the journal. |
 | `uid` | integer | Local peer uid (`SO_PEERCRED`); unique. |
 | `bearer_sha256` | string | SHA-256 of the bearer token as 64 hex characters; unique. Plaintext tokens are rejected. |
-| `role` | string | Declared role. |
+| `role` | string | Declared role; a client listed in `[probe] agents` may omit it. |
 
 Compute the hash with `printf %s "$TOKEN" | sha256sum`. How a request is matched to a client is
 described in [api.md](api.md#callers).
@@ -177,7 +177,7 @@ credentials = ".claude/.credentials.json"
 |---|---|---|
 | `name` | string | Login name as declared in the daemon's config. |
 | `kind` | `"claude"` or `"codex"` | Usage endpoint and response format: Claude `oauth/usage` or Codex `wham/usage` (see [vendors.md](vendors.md)). |
-| `credentials` | string | Non-empty path of the vendor CLI's credential file; a relative path starts at the agent's working directory. |
+| `credentials` | string | Non-empty path of the vendor CLI's credential file; a relative path starts at the agent's working directory. The agent can read only the directories of these files, resolved at start (see [design.md](design.md#roles-and-privilege-separation)). |
 
 The agent connects as a client of the daemon, so it needs a `[[clients]]` entry listed in
 `[probe] agents` there, and `--bearer-file` or `$QB_BEARER_FILE` when it connects by bearer.

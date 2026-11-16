@@ -1,6 +1,7 @@
 # quota-balancer agent (template, user unit). Runs as the owner of the vendor CLI credentials,
 # connects to qbd itself and answers lazy probes with window numbers only. Install into
-# ~/.config/systemd/user/ of that user. Landlock and seccomp are applied from inside the process.
+# ~/.config/systemd/user/ of that user. The process makes itself non-dumpable and applies landlock
+# itself, so the unit's system call filter allows the landlock calls on top of @system-service.
 [Unit]
 Description=quota-balancer agent
 Documentation=https://github.com/vladmesh/quota-balancer
@@ -19,6 +20,7 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+SystemCallFilter=landlock_create_ruleset landlock_add_rule landlock_restrict_self
 SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryDenyWriteExecute=yes

@@ -18,6 +18,7 @@ pub mod http;
 pub mod journal;
 pub mod listen;
 pub mod log;
+pub mod sandbox;
 pub mod server;
 mod sha256;
 pub mod stream;

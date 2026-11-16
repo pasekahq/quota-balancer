@@ -97,4 +97,3 @@ role = "reviewer"
 [[clients]]
 name = "agent-1"
 uid = 1002
-role = "worker"

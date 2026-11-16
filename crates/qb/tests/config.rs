@@ -224,6 +224,12 @@ fn rejections_name_the_field() {
             "undeclared role `admin`",
         ),
         (
+            "client without a role that is not an agent",
+            with("[[clients]]\nname = \"client-a\"\nuid = 1"),
+            "clients[0].role",
+            "missing; only a client in `probe.agents` may omit it",
+        ),
+        (
             "undeclared client as an agent",
             with(&format!(
                 "{}\nuid = 1\n[probe]\nagents = [\"client-z\"]",
@@ -360,6 +366,16 @@ fn rejections_name_the_field() {
             "{what}: echoes the token: {err}"
         );
     }
+}
+
+#[test]
+fn a_probe_agent_client_may_omit_its_role() {
+    let cfg = config::parse(
+        Path::new(FILE),
+        &with("[[clients]]\nname = \"agent-a\"\nuid = 1\n[probe]\nagents = [\"agent-a\"]"),
+    )
+    .unwrap();
+    assert_eq!(cfg.clients[0].role, None);
 }
 
 #[test]

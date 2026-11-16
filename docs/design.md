@@ -44,8 +44,12 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   the daemon.
 - **`qb agent`** is the only component that ever touches a credential: it reads the vendor CLI's
   own credential file right before one GET, keeps the token for at most a second, then
-  zeroizes it. It never writes or refreshes credentials. On 401 it reports `auth_stale`; the
-  vendor CLI refreshes its own token on next use.
+  zeroizes it. It never writes or refreshes credentials. Before its first connection to `qbd`
+  it makes itself non-dumpable and restricts itself with landlock to reading the credential
+  directories, `/etc/resolv.conf` and `/etc/hosts`, and to TCP connections to port 443; a
+  kernel that cannot enforce part of this gets one warning in the log. DNS over TCP (port 53)
+  is not allowed, so a truncated UDP answer fails the probe as `error`. On 401 it reports
+  `auth_stale`; the vendor CLI refreshes its own token on next use.
 - **Clients** send no secrets: only outcome classes and window numbers.
 
 ## Transport
@@ -117,8 +121,9 @@ persisted. `journal = off` writes nothing. Line format, rotation and replay:
 ## Cold start
 
 systemd holds the socket while `qbd` restarts, so clients queue instead of failing. Start-up is
-exec + config parse + journal replay (milliseconds). All snapshots start stale; the first `pick`
-for a cold login may wait for one probe (≤ 1.5 s) or answer with `stale: true`.
+exec + config parse + journal replay (milliseconds). All snapshots start stale. A `pick` never
+waits for a probe: it answers from what it has with `stale: true`, and the probe it triggers
+refreshes the login for later picks.
 
 ## Budgets
 
