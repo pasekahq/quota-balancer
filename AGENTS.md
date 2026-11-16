@@ -18,6 +18,7 @@ socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan: `docs/roadmap.m
 | `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs` (probe loop, HTTPS fetcher), `sandbox.rs` (agent hardening), `main.rs` (CLI). |
 | `deploy/systemd/` | Unit templates with hardening. |
 | `ci/budgets.sh` | Binary size and RSS budgets. |
+| `clients/python/` | `qb_client.py`: single-file stdlib client (Python ≥ 3.9) to copy in; `contract.rs` drives it through `contract_driver.py`, so `cargo test` needs `python3`. |
 | `ci/broad_check.py` | Stdlib-only driver for fmt + clippy + test (`python3 -m ci.broad_check`); external harnesses call this. |
 
 ## Commands (all must pass before you push)
@@ -34,8 +35,19 @@ CC_x86_64_unknown_linux_musl=gcc cargo build --release --locked --target x86_64-
 ring's build script compiles C for the musl target; `CC_x86_64_unknown_linux_musl` names the
 compiler when `x86_64-linux-musl-gcc` is not installed.
 
-Optional locally, always in CI: `cargo deny check`, `gitleaks git .`,
-`systemd-analyze security --offline=yes --threshold=15 deploy/systemd/qbd.service`.
+Optional locally, always in CI: `cargo deny check`, `gitleaks git .`, and the exposure of every
+service unit within its own threshold (the `systemd-units` job; a new unit needs a case there):
+
+```sh
+for unit in deploy/systemd/*.service; do
+  case "${unit##*/}" in
+    qbd.service) threshold=15 ;;
+    qb-agent.service) threshold=69 ;;
+    *) echo "no exposure threshold for $unit"; continue ;;
+  esac
+  systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit"
+done
+```
 
 Release builds are CPU-heavy (fat LTO). Run one cargo build at a time on shared hosts, under
 `nice`, and do not start parallel builds of other projects.
