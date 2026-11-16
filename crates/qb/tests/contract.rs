@@ -7,8 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,28 +26,12 @@ use qb_proto::{
     paths,
 };
 
-/// Room for the directory and file names a test adds under the base.
-const NAME_ROOM: usize = 40;
-/// `sun_path` holds 108 bytes including the terminating NUL.
-const SUN_PATH: usize = 108;
+mod common;
 
-/// A fresh directory for one test under a base short enough for unix socket paths.
-fn temp_dir(tag: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let tmp = std::env::temp_dir();
-    let base = if tmp.as_os_str().len() + NAME_ROOM < SUN_PATH {
-        tmp
-    } else {
-        PathBuf::from("/tmp")
-    };
-    let dir = base.join(format!(
-        "qb-{}-{tag}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
+use common::{
+    Daemon, answer, events, hook_config, kill_auth, line_with, own_uid, park, pick_worker, post,
+    record_event, report_login, start_daemon, state, stderr_lines, temp_dir, wait_for,
+};
 
 fn temp_socket(tag: &str) -> PathBuf {
     temp_dir(tag).join("qb.sock")
@@ -198,23 +181,6 @@ fn a_silent_client_does_not_wedge_the_daemon() {
     assert!(t.elapsed() < qb::server::IO_TIMEOUT + Duration::from_secs(2));
 }
 
-struct Daemon(Child);
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while UnixStream::connect(path).is_err() {
-        assert!(Instant::now() < deadline, "daemon did not come up");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn example(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../deploy/examples")
@@ -333,19 +299,6 @@ fn report_windows(sock: &Path, login: &str, windows: &[(&str, f64, u64)]) {
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
     let r: ReportResponse = serde_json::from_slice(&resp).unwrap();
     assert!(r.accepted);
-}
-
-fn pick_worker(sock: &Path) -> PickResponse {
-    let (status, resp) = call(
-        sock,
-        "POST",
-        paths::PICK,
-        Some(br#"{"role":"worker","difficulty":1}"#),
-        None,
-    )
-    .unwrap();
-    assert_eq!(status, 200);
-    serde_json::from_slice(&resp).unwrap()
 }
 
 #[test]
@@ -521,18 +474,6 @@ fn cli_usage_errors_exit_2() {
     assert_eq!(unreachable.code(), Some(2));
 }
 
-fn post<T: serde::de::DeserializeOwned>(sock: &Path, path: &str, body: &str) -> T {
-    let (status, resp) = call(sock, "POST", path, Some(body.as_bytes()), None).unwrap();
-    assert_eq!(status, 200, "{body}: {}", String::from_utf8_lossy(&resp));
-    serde_json::from_slice(&resp).unwrap()
-}
-
-fn state(sock: &Path) -> StateResponse {
-    let (status, body) = call(sock, "GET", paths::STATE, None, None).unwrap();
-    assert_eq!(status, 200);
-    serde_json::from_slice(&body).unwrap()
-}
-
 #[test]
 fn leases_reserve_quota_and_reports_steer_the_next_pick() {
     let exe = env!("CARGO_BIN_EXE_qb");
@@ -587,11 +528,6 @@ fn leases_reserve_quota_and_reports_steer_the_next_pick() {
     assert!(s.logins[0].dead_until.is_some());
     let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes()), None).unwrap();
     assert_eq!(status, 404, "a released lease is gone");
-}
-
-/// The uid this test process runs as: the owner of a directory it created.
-fn own_uid() -> u32 {
-    std::fs::metadata(temp_dir("uid")).unwrap().uid()
 }
 
 /// Token of the bearer client `client-b` in the configs below; `BEARER_SHA256` is its hash.
@@ -662,18 +598,7 @@ fn start(config: &Path, sock: &Path) -> Daemon {
 }
 
 fn start_with(config: &Path, sock: &Path, stderr: Stdio) -> Daemon {
-    let d = Daemon(
-        Command::new(env!("CARGO_BIN_EXE_qb"))
-            .arg("--socket")
-            .arg(sock)
-            .args(["daemon", "--config"])
-            .arg(config)
-            .stderr(stderr)
-            .spawn()
-            .unwrap(),
-    );
-    wait_for(sock);
-    d
+    start_daemon(Path::new(env!("CARGO_BIN_EXE_qb")), config, sock, stderr)
 }
 
 const TASK: &str = r#"{"role":"worker","difficulty":1,"expected_minutes":30}"#;
@@ -1465,44 +1390,6 @@ fn probe_on() -> (&'static str, String) {
     (PROBE_ON.0, PROBE_ON.1.to_owned())
 }
 
-/// Opens `POST /v1/agent/next` for `logins` and leaves the connection waiting.
-fn park(sock: &Path, bearer: Option<&str>, logins: &[&str]) -> UnixStream {
-    let body = serde_json::json!({ "logins": logins }).to_string();
-    let auth = bearer.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
-    let mut s = UnixStream::connect(sock).unwrap();
-    write!(
-        s,
-        "POST {} HTTP/1.1\r\nHost: qb\r\n{auth}Content-Length: {}\r\n\r\n{body}",
-        paths::AGENT_NEXT,
-        body.len()
-    )
-    .unwrap();
-    s
-}
-
-/// The response on a parked connection within `wait`, `None` while it is still parked.
-fn answer(s: &mut UnixStream, wait: Duration) -> Option<(u16, Vec<u8>)> {
-    s.set_read_timeout(Some(wait)).unwrap();
-    let mut raw = Vec::new();
-    match s.read_to_end(&mut raw) {
-        Ok(_) => {}
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            assert!(raw.is_empty(), "partial answer");
-            return None;
-        }
-        Err(e) => panic!("{e}"),
-    }
-    let text = String::from_utf8(raw).unwrap();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap();
-    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-    Some((status, body.as_bytes().to_vec()))
-}
-
 fn next_now(sock: &Path, bearer: Option<&str>, logins: &[&str]) -> (u16, Vec<u8>) {
     let body = serde_json::json!({ "logins": logins }).to_string();
     call(
@@ -1760,6 +1647,29 @@ fn auth_recovered_by_a_probe_survives_a_restart() {
     );
 }
 
+/// Parks the agent behind `bearer` once the daemon has seen a closed parked connection and
+/// freed its place; each refused attempt is answered 429 and retried, for at most 10 s.
+fn park_when_free(sock: &Path, bearer: &str, logins: &[&str]) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut s = park(sock, Some(bearer), logins);
+        // Connections are accepted and answered in order, so once a later request is answered
+        // the park was decided and a refusal is already readable.
+        state(sock);
+        match answer(&mut s, Duration::from_millis(10)) {
+            None => return s,
+            Some((status, resp)) => {
+                assert_eq!(status, 429, "{}", String::from_utf8_lossy(&resp));
+                assert!(
+                    Instant::now() < deadline,
+                    "the closed connection kept its place"
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn parked_connections_are_bounded_per_agent_and_in_total() {
     let dir = temp_dir("parkcap");
@@ -1799,12 +1709,7 @@ fn parked_connections_are_bounded_per_agent_and_in_total() {
     assert_eq!(state(&sock).logins.len(), 3, "others are still served");
 
     drop(waiting.pop());
-    let mut last = park(&sock, Some(BOTS[2].0), &logins);
-    assert_eq!(
-        answer(&mut last, Duration::from_millis(300)),
-        None,
-        "a closed connection frees its place"
-    );
+    let _last = park_when_free(&sock, BOTS[2].0, &logins);
     for mut w in waiting {
         assert_eq!(answer(&mut w, Duration::from_millis(10)), None);
     }
@@ -1837,62 +1742,6 @@ fn an_agent_reconnects_after_a_daemon_restart() {
         called.recv_timeout(Duration::from_secs(15)).unwrap(),
         "login-1"
     );
-}
-
-/// Writes `body` to `hook.sh` next to `config` and appends a `[hooks]` section running it on both
-/// events. `/bin/sh` reads the script rather than the kernel exec'ing it, so a fork in a
-/// concurrent test that still holds the file open for writing cannot fail the exec.
-fn hook_config(config: PathBuf, body: &str) -> PathBuf {
-    let script = config.with_file_name("hook.sh");
-    std::fs::write(&script, body).unwrap();
-    let command = format!(r#"["/bin/sh", "{}"]"#, script.display());
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    write!(
-        text,
-        "\n[hooks]\non_dead = {command}\non_recover = {command}\n"
-    )
-    .unwrap();
-    std::fs::write(&config, text).unwrap();
-    config
-}
-
-/// Hook script line appending `$QB_EVENT $QB_LOGIN $QB_VENDOR` to `dir/events`.
-fn record_event(dir: &Path) -> String {
-    format!(
-        "echo \"$QB_EVENT $QB_LOGIN $QB_VENDOR\" >> '{}'\n",
-        dir.join("events").display()
-    )
-}
-
-/// The lines of `dir/events` once there are at least `n`, polled for at most 10 s.
-fn events(dir: &Path, n: usize) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let text = std::fs::read_to_string(dir.join("events")).unwrap_or_default();
-        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        if lines.len() >= n {
-            return lines;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "want {n} hook events, got {lines:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn report_login(sock: &Path, login: &str, outcome: &str) -> LoginStatus {
-    let body = format!(r#"{{"login":"{login}","outcome":"{outcome}","model":"model-small"}}"#);
-    let r: ReportResponse = post(sock, paths::REPORT, &body);
-    r.login_status
-}
-
-fn kill_auth(sock: &Path, login: &str) {
-    assert_eq!(
-        report_login(sock, login, "http_401"),
-        LoginStatus::AuthStale
-    );
-    assert_eq!(report_login(sock, login, "http_401"), LoginStatus::AuthDead);
 }
 
 #[test]
@@ -1979,76 +1828,14 @@ fn a_hook_beyond_two_in_flight_is_dropped_with_a_warning() {
     drop(gate);
 }
 
-/// Context switches of process `pid` so far.
-fn switches(pid: u32) -> u64 {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .unwrap()
-        .lines()
-        .filter(|l| l.contains("ctxt_switches"))
-        .map(|l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap())
-        .sum()
-}
-
-#[test]
-fn an_idle_daemon_with_a_parked_agent_does_not_wake_up() {
-    let dir = temp_dir("idle");
-    let sock = dir.join("qb.sock");
-    let config = hook_config(agent_config(&dir, &[probe_on()]), &record_event(&dir));
-    let d = start(&config, &sock);
-    let mut parked = park(&sock, None, &["login-1"]);
-    kill_auth(&sock, "login-2");
-    assert_eq!(events(&dir, 1), ["dead login-2 vendor-a"]);
-    assert_eq!(state(&sock).logins.len(), 3);
-    std::thread::sleep(Duration::from_millis(100));
-    let before = switches(d.0.id());
-    std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(switches(d.0.id()), before);
-    assert_eq!(answer(&mut parked, Duration::from_millis(10)), None);
-}
-
 /// Stands in for a token in credential files; it must never reach a log.
 const CREDENTIAL_MARK: &str = "synthetic-token-5c1e";
-
-/// Lines the child writes to stderr, as they come.
-fn stderr_lines(child: &mut Child) -> Receiver<String> {
-    let stderr = child.stderr.take().unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in std::io::BufRead::lines(std::io::BufReader::new(stderr)) {
-            let Ok(line) = line else { return };
-            if tx.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    rx
-}
-
-/// The next line of `lines` within `wait` that contains `needle`.
-fn line_with(lines: &Receiver<String>, needle: &str, wait: Duration) -> Option<String> {
-    let deadline = Instant::now() + wait;
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        match lines.recv_timeout(left) {
-            Ok(line) if line.contains(needle) => return Some(line),
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-    }
-    None
-}
 
 #[test]
 fn a_hardened_agent_binary_reports_a_malformed_credential_file_as_a_failed_probe() {
     let dir = temp_dir("agentbin");
     let sock = dir.join("qb.sock");
-    let config = agent_config(
-        &dir,
-        &[
-            probe_on(),
-            ("backoff_initial_s = 30", "backoff_initial_s = 2".to_owned()),
-        ],
-    );
-    let _d = start(&config, &sock);
+    let _d = start(&agent_config(&dir, &[probe_on()]), &sock);
     std::fs::create_dir_all(dir.join("creds")).unwrap();
     let credentials = dir.join("creds/.credentials.json");
     std::fs::write(
@@ -2087,17 +1874,6 @@ fn a_hardened_agent_binary_reports_a_malformed_credential_file_as_a_failed_probe
         "a non-dumpable process's /proc files belong to root"
     );
 
-    assert!(pick_worker(&sock).stale);
-    assert_eq!(
-        line_with(&lines, "probe of login-1", Duration::from_millis(500)),
-        None,
-        "the failed probe backs the login off"
-    );
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(pick_worker(&sock).stale);
-    let second = line_with(&lines, "probe of login-1", Duration::from_secs(5));
-    let second = second.expect("a job after the back-off, well before the probe timeout");
-    assert!(second.contains(failure), "{second}");
     let s = state(&sock);
     assert_eq!(s.logins[0].login, "login-1");
     assert_eq!(s.logins[0].status, LoginStatus::Unknown);

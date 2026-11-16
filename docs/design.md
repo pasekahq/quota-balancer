@@ -151,9 +151,30 @@ refreshes the login for later picks.
 | agent RSS idle / during probe | ≲ 2 MiB / ≲ 6 MiB |
 | binary | static musl, ≤ 2.5 MiB with TLS |
 | dependencies | ≤ 12 direct, ≲ 50 total |
-| CPU | 0 wake-ups/s idle; pick ≤ 50 µs server-side |
+| CPU | 0 wake-ups/s idle; pick ≤ 50 µs server-side, p99 ≤ 1 ms over UDS from connect to response |
 | disk | ≤ ~150 B per pick, or 0 with `journal = off` |
 | network | 0 idle; ≤ 1 small HTTPS GET per login per TTL, only on demand |
+
+CI enforces the binary, daemon RSS, latency, wake-up and `journal = off` budgets in the
+`budgets` job. `ci/budgets.sh` checks the size and static linking of the musl release binary.
+The acceptance lane, `crates/qb/tests/acceptance.rs`, runs that binary as the daemon:
+
+- the three policy scenarios of the roadmap, with reports and picks over the socket;
+- 10⁴ picks, each released by a report, one connection per request, journal on: it prints the
+  latency distribution from connect to full response and fails on p99 > 1 ms or a daemon
+  `VmHWM` above 4096 kB;
+- the same picks with `journal = off`: it fails unless the daemon's `write_bytes` is 0;
+- an idle daemon with a parked agent and hooks: it fails on any context switch over 10 s;
+- an agent's probe back-off after a failed probe.
+
+These tests are timing-bound and `#[ignore]`d, so `cargo test --workspace` skips them. The binary
+comes from `QB_ACCEPTANCE_BIN`, an absolute path, or else the cargo-built one. On a shared host
+the timings measure the neighbours, so run the lane locally only on an idle machine:
+
+```sh
+QB_ACCEPTANCE_BIN="$PWD/target/x86_64-unknown-linux-musl/release/qb" \
+  cargo test --release --locked -p qb --test acceptance -- --ignored --test-threads=1 --nocapture
+```
 
 ## Why Rust, and why synchronous
 

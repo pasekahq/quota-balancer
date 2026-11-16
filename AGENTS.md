@@ -17,7 +17,7 @@ socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan: `docs/roadmap.m
 | `crates/qb-vendors` | Pure, total parsers of vendor quota data (stream-json, statusline, rollouts, usage endpoints) into `qb-proto` window reports. Rules in `docs/vendors.md`; fixtures in `tests/fixtures/`. |
 | `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs` (probe loop, HTTPS fetcher), `sandbox.rs` (agent hardening), `main.rs` (CLI). |
 | `deploy/systemd/` | Unit templates with hardening. |
-| `ci/budgets.sh` | Binary size and RSS budgets. |
+| `ci/budgets.sh` | Binary size and static-link checks; the other budgets are the acceptance lane (`docs/design.md`, "Budgets"). |
 | `clients/python/` | `qb_client.py`: single-file stdlib client (Python ≥ 3.9) to copy in; `contract.rs` drives it through `contract_driver.py`, so `cargo test` needs `python3`. |
 | `ci/broad_check.py` | Stdlib-only driver for fmt + clippy + test (`python3 -m ci.broad_check`); external harnesses call this. |
 

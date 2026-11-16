@@ -100,8 +100,12 @@ jobs:
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: gcc
-      - name: Binary size and daemon RSS budgets
+      - name: Binary size and static linking
         run: ci/budgets.sh target/x86_64-unknown-linux-musl/release/qb
+      - name: Acceptance lane against the static binary
+        run: cargo test --release --locked -p qb --test acceptance -- --ignored --test-threads=1 --nocapture
+        env:
+          QB_ACCEPTANCE_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/qb
 
   systemd-units:
     runs-on: ubuntu-24.04
