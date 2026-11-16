@@ -107,8 +107,10 @@ Required.
 | Key | Type | Meaning |
 |---|---|---|
 | `mode` | `"path"` or `"off"` | `off` writes nothing to disk and takes no other key. |
-| `path` | string | With `mode = "path"`: absolute path of the journal file. |
+| `path` | string | With `mode = "path"`: absolute path of the journal file; the previous one is `<path>.1`. Under systemd it lives in the unit's `StateDirectory`, `/var/lib/qb`. |
 | `rotate_bytes` | integer > 0 | With `mode = "path"`: rotation size, default 1048576. |
+
+The journal's format, rotation and replay are described in [journal.md](journal.md).
 
 ## `[snapshot]`
 

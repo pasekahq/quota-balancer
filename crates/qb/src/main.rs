@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use qb::journal::{self, Journal};
 use qb::{DEFAULT_CONFIG, DEFAULT_SOCKET, agent, client, config, listen, log, server};
 use qb_core::Core;
 use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, paths};
@@ -230,6 +231,15 @@ fn request(
 fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
     let config = config::load(file).map_err(|e| e.to_string())?;
     let mut core = Core::new(config.core_spec()).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut journal = match &config.journal {
+        config::Journal::Off {} => Journal::off(),
+        config::Journal::Path { path, rotate_bytes } => {
+            let valid = journal::replay(&mut core, path).map_err(|e| e.to_string())?;
+            Journal::open(path, *rotate_bytes, valid)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+        }
+    };
+    core.tick(server::unix_now());
     let listener = if let Some(l) = listen::from_systemd().map_err(|e| e.to_string())? {
         log::info("qbd: using the socket passed by systemd");
         l
@@ -238,6 +248,6 @@ fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
         log::info(&format!("qbd: listening on {}", socket.display()));
         l
     };
-    server::serve(&listener, &mut core);
-    Ok(ExitCode::SUCCESS)
+    let Err(e) = server::serve(&listener, &mut core, &mut journal);
+    Err(format!("listener failed: {e}"))
 }

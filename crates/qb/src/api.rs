@@ -1,7 +1,7 @@
 //! `/v1` routing: HTTP request in, status and JSON body out. No sockets here.
 
 use qb_core::{
-    Core, LoginStatus as CoreStatus, OutcomeClass, PickInput, ReportError, ReportInput,
+    Core, LoginStatus as CoreStatus, OutcomeClass, PickInput, Record, ReportError, ReportInput,
     ReportSubject, Source as CoreSource, Target, Verdict, WindowObservation,
 };
 use qb_proto::{
@@ -12,6 +12,8 @@ use qb_proto::{
 use serde::Serialize;
 
 use crate::http::{Method, Request};
+use crate::journal::Journal;
+use crate::log;
 
 /// Who is calling, as established by the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +61,14 @@ pub fn error(code: ErrorCode, message: impl Into<String>) -> Reply {
     )
 }
 
-/// Routes one request.
-pub fn handle(core: &mut Core, req: &Request, caller: &Caller, env: Env) -> Reply {
+/// Routes one request; granted leases, changed marks and releases go to `journal`.
+pub fn handle(
+    core: &mut Core,
+    journal: &mut Journal,
+    req: &Request,
+    caller: &Caller,
+    env: Env,
+) -> Reply {
     let known = [paths::PICK, paths::REPORT, paths::STATE, paths::HEALTH];
     match (req.method, req.path.as_str()) {
         (Method::Get, paths::HEALTH) => json(
@@ -73,14 +81,20 @@ pub fn handle(core: &mut Core, req: &Request, caller: &Caller, env: Env) -> Repl
             },
         ),
         (Method::Get, paths::STATE) => state(core, env.now),
-        (Method::Post, paths::PICK) => pick(core, &req.body, caller, env.now),
-        (Method::Post, paths::REPORT) => report(core, &req.body, env.now),
+        (Method::Post, paths::PICK) => pick(core, journal, &req.body, caller, env.now),
+        (Method::Post, paths::REPORT) => report(core, journal, &req.body, env.now),
         (_, p) if known.contains(&p) => error(ErrorCode::MethodNotAllowed, "method not allowed"),
         _ => error(ErrorCode::NotFound, "no such endpoint"),
     }
 }
 
-fn pick(core: &mut Core, body: &[u8], caller: &Caller, now: u64) -> Reply {
+fn record(journal: &mut Journal, core: &Core, record: &Record, now: u64) {
+    if let Err(e) = journal.record(core, record, now) {
+        log::error(&format!("journal write failed: {e}"));
+    }
+}
+
+fn pick(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, now: u64) -> Reply {
     let req: PickRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return error(ErrorCode::BadRequest, format!("invalid pick request: {e}")),
@@ -108,19 +122,24 @@ fn pick(core: &mut Core, body: &[u8], caller: &Caller, now: u64) -> Reply {
         run_id: req.run_id,
     };
     let resp = match core.pick(&input, now) {
-        Verdict::Run(grant, reason) => PickResponse {
-            decision: Decision::Run,
-            reason: reason.as_str().to_owned(),
-            lease_id: Some(lease_id(grant.lease)),
-            vendor: Some(grant.vendor),
-            model: Some(grant.model),
-            effort: grant.effort,
-            login: Some(grant.login),
-            tier: grant.tier,
-            retry_after: None,
-            stale: grant.stale,
-            quota_snapshot_at: grant.snapshot_at,
-        },
+        Verdict::Run(grant, reason) => {
+            if let Some(lease) = core.lease(grant.lease) {
+                record(journal, core, &Record::Lease(lease), now);
+            }
+            PickResponse {
+                decision: Decision::Run,
+                reason: reason.as_str().to_owned(),
+                lease_id: Some(lease_id(grant.lease)),
+                vendor: Some(grant.vendor),
+                model: Some(grant.model),
+                effort: grant.effort,
+                login: Some(grant.login),
+                tier: grant.tier,
+                retry_after: None,
+                stale: grant.stale,
+                quota_snapshot_at: grant.snapshot_at,
+            }
+        }
         Verdict::Wait {
             retry_after,
             reason,
@@ -151,7 +170,7 @@ fn bare(decision: Decision, reason: &str) -> PickResponse {
     }
 }
 
-fn report(core: &mut Core, body: &[u8], now: u64) -> Reply {
+fn report(core: &mut Core, journal: &mut Journal, body: &[u8], now: u64) -> Reply {
     let req: ReportRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return error(ErrorCode::BadRequest, format!("invalid report: {e}")),
@@ -182,14 +201,31 @@ fn report(core: &mut Core, body: &[u8], now: u64) -> Reply {
             })
             .collect(),
     };
+    core.tick(now);
+    let login = match &input.subject {
+        ReportSubject::Lease(id) => core.lease(*id).map(|l| l.login),
+        ReportSubject::Login(name) => Some(name.clone()),
+    };
+    let before = login.as_deref().and_then(|l| core.marks(l));
     match core.report(&input, now) {
-        Ok(status) => json(
-            200,
-            &ReportResponse {
-                accepted: true,
-                login_status: login_status(status),
-            },
-        ),
+        Ok(status) => {
+            if let Some(login) = login {
+                let after = core.marks(&login);
+                if let Some(marks) = after.filter(|m| Some(m) != before.as_ref()) {
+                    record(journal, core, &Record::Marks { login, marks }, now);
+                }
+            }
+            if let (true, ReportSubject::Lease(id)) = (input.release, &input.subject) {
+                record(journal, core, &Record::Release(*id), now);
+            }
+            json(
+                200,
+                &ReportResponse {
+                    accepted: true,
+                    login_status: login_status(status),
+                },
+            )
+        }
         Err(ReportError::UnknownLease) => error(ErrorCode::NotFound, "unknown lease"),
         Err(ReportError::UnknownLogin) => error(ErrorCode::NotFound, "unknown login"),
         Err(ReportError::InvalidUtilization) => error(

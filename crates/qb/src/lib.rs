@@ -13,6 +13,7 @@ pub mod api;
 pub mod client;
 pub mod config;
 pub mod http;
+pub mod journal;
 pub mod listen;
 pub mod log;
 pub mod server;

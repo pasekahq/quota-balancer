@@ -47,7 +47,10 @@ pub enum ReadError {
     /// Head over [`MAX_HEAD`] or too many headers.
     HeadTooLarge,
     /// Body over [`MAX_BODY`].
-    BodyTooLarge,
+    BodyTooLarge {
+        /// Declared body bytes not read yet.
+        unread: usize,
+    },
     /// `POST` without `Content-Length`.
     LengthRequired,
 }
@@ -101,7 +104,8 @@ pub fn read_request<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<Request, Re
                 }
                 let want = content_length.unwrap_or(0);
                 if want > MAX_BODY {
-                    return Err(ReadError::BodyTooLarge);
+                    let unread = want.saturating_sub(buf.len() - head_len);
+                    return Err(ReadError::BodyTooLarge { unread });
                 }
                 let mut body = Vec::with_capacity(want);
                 let already = &buf[head_len..];
@@ -231,7 +235,7 @@ mod tests {
         );
         assert!(matches!(
             parse(big.as_bytes()),
-            Err(ReadError::BodyTooLarge)
+            Err(ReadError::BodyTooLarge { unread }) if unread == MAX_BODY + 1
         ));
         let mut head = b"GET / HTTP/1.1\r\nX: ".to_vec();
         head.extend(std::iter::repeat_n(b'a', MAX_HEAD));

@@ -108,7 +108,8 @@ windows overwrite the snapshot and reset its TTL. The exact rules are in [api.md
 
 Only the journal, written with `O_APPEND` and no fsync (~150 bytes per pick, rotated at 1 MiB ×
 2): leases and dead-until marks, replayed on start. Quota snapshots are a cache and are not
-persisted. `journal = off` writes nothing.
+persisted. `journal = off` writes nothing. Line format, rotation and replay:
+[journal.md](journal.md).
 
 ## Cold start
 
