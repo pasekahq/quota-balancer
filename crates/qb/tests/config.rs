@@ -71,7 +71,46 @@ fn client(extra: &str) -> String {
 fn base_config_is_valid() {
     let cfg = config::parse(Path::new(FILE), BASE).unwrap();
     assert_eq!(cfg.journal, Journal::Off {});
-    assert_eq!(cfg.core_spec().logins[0].vendor, "vendor-a");
+    let spec = cfg.core_spec();
+    assert_eq!(spec.logins[0].vendor, "vendor-a");
+    assert_eq!(
+        (
+            spec.lease_ttl_s,
+            spec.cost_per_minute,
+            spec.rate_limit_backoff_s,
+            spec.model_unavailable_s,
+            spec.roles[0].ladder[0].candidates[0].cost_per_minute,
+        ),
+        (3600, 0.002, 60, 86_400, None),
+        "documented defaults"
+    );
+}
+
+#[test]
+fn lease_and_outcome_settings_reach_the_core_spec() {
+    let text = with(
+        "[leases]
+ttl_s = 600
+cost_per_minute = 0.01
+         [outcomes]
+rate_limit_backoff_s = 30
+model_unavailable_s = 7200",
+    )
+    .replace(
+        "model = \"m\", tier = 1",
+        "model = \"m\", tier = 1, cost_per_minute = 0.5",
+    );
+    let spec = config::parse(Path::new(FILE), &text).unwrap().core_spec();
+    assert_eq!(
+        (
+            spec.lease_ttl_s,
+            spec.cost_per_minute,
+            spec.rate_limit_backoff_s,
+            spec.model_unavailable_s,
+            spec.roles[0].ladder[0].candidates[0].cost_per_minute,
+        ),
+        (600, 0.01, 30, 7200, Some(0.5))
+    );
 }
 
 #[test]
@@ -221,6 +260,30 @@ fn rejections_name_the_field() {
             ),
             "journal",
             "unknown field `path`",
+        ),
+        (
+            "zero lease ttl",
+            with("[leases]\nttl_s = 0"),
+            "leases.ttl_s",
+            "must be positive",
+        ),
+        (
+            "zero 429 back-off",
+            with("[outcomes]\nrate_limit_backoff_s = 0"),
+            "outcomes.rate_limit_backoff_s",
+            "must be positive",
+        ),
+        (
+            "zero model-dead time",
+            with("[outcomes]\nmodel_unavailable_s = 0"),
+            "outcomes.model_unavailable_s",
+            "must be positive",
+        ),
+        (
+            "candidate cost rate above 1",
+            BASE.replace("tier = 1 }", "tier = 1, cost_per_minute = 2.0 }"),
+            "roles[0].ladder[0].candidates[0].cost_per_minute",
+            "2 is outside 0.0..=1.0",
         ),
         ("not TOML", with("[[logins]\nname = 1"), "", "line"),
     ];

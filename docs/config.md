@@ -75,6 +75,7 @@ Each candidate:
 | `model` | string | Model name passed to the vendor CLI. |
 | `effort` | string | Optional reasoning effort. |
 | `tier` | integer 0..=255 | Lower tiers are preferred. |
+| `cost_per_minute` | float `0.0..=1.0` | Optional fraction of the vendor's shortest window one minute of work uses; default `leases.cost_per_minute`. |
 
 Each reserve:
 
@@ -116,6 +117,24 @@ Optional.
 | Key | Type | Meaning |
 |---|---|---|
 | `ttl_s` | integer > 0 | Age after which a window snapshot is stale, default 300. A stale snapshot is still used; `pick` answers with `stale: true`. |
+
+## `[leases]`
+
+Optional. Every `run` holds a lease that reserves the task's cost; see [api.md](api.md).
+
+| Key | Type | Meaning |
+|---|---|---|
+| `ttl_s` | integer > 0 | A lease expires this long after its pick plus `expected_minutes`, default 3600. |
+| `cost_per_minute` | float `0.0..=1.0` | Cost rate of candidates without their own and of pins, default 0.002. |
+
+## `[outcomes]`
+
+Optional. How long the marks of report outcomes last.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `rate_limit_backoff_s` | integer > 0 | A login stays `rate_limited` this long after `http_429`, default 60. |
+| `model_unavailable_s` | integer > 0 | A model stays dead on a login this long after `model_unavailable`, default 86400. |
 
 ## `[probe]`
 

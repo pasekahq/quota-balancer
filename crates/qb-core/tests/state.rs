@@ -21,6 +21,7 @@ fn report(core: &mut Core, subject: ReportSubject, used: f64) -> Result<LoginSta
     let input = ReportInput {
         subject,
         outcome: OutcomeClass::Ok,
+        model: None,
         release: false,
         windows: vec![WindowObservation {
             name: "five_hour".into(),
@@ -70,6 +71,7 @@ fn a_report_overwrites_the_named_windows() {
         WindowView {
             name: "five_hour".into(),
             used: 0.4,
+            reserved: 0.0,
             resets_at: Some(NOW + HOUR),
             observed_at: NOW,
             source: Source::Stream,
@@ -172,11 +174,16 @@ fn specs_beyond_the_tables_or_with_undeclared_vendors_are_refused() {
         "vendor-c",
         (0..5).map(|i| window(&format!("w{i}"), HOUR, 0)).collect(),
     ));
+    let mut empty_window = spec(vec![]);
+    empty_window
+        .vendors
+        .push(vendor("vendor-c", vec![window("w", 0, 0)]));
     let mut stray_login = spec(vec![]);
     stray_login.logins.push(login("login-9", "vendor-z"));
     let cases = [
         (many_logins, SpecError::TooManyLogins),
         (many_windows, SpecError::TooManyWindows("vendor-c".into())),
+        (empty_window, SpecError::EmptyWindow("vendor-c".into())),
         (
             spec(ladder("vendor-a", 9)),
             SpecError::TooManyCandidates("worker".into(), 1),

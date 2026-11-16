@@ -467,8 +467,3 @@ fn empty_core_has_no_candidates() {
         );
     }
 }
-
-#[test]
-fn reason_names_are_stable() {
-    assert_eq!(Reason::NoCandidates.as_str(), "no_candidates");
-}

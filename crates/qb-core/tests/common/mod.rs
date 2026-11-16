@@ -3,9 +3,9 @@
 #![allow(dead_code, unreachable_pub, clippy::missing_panics_doc)]
 
 use qb_core::{
-    CandidateSpec, Core, LoginSpec, OutcomeClass, PickInput, ReportInput, ReportSubject,
-    ReserveSpec, RoleSpec, Spec, StepSpec, Target, VendorSpec, Verdict, WindowObservation,
-    WindowSpec,
+    CandidateSpec, Core, LoginSpec, LoginStatus, LoginView, OutcomeClass, PickInput, ReportError,
+    ReportInput, ReportSubject, ReserveSpec, RoleSpec, Spec, StepSpec, Target, VendorSpec, Verdict,
+    WindowObservation, WindowSpec,
 };
 
 pub const NOW: u64 = 1_800_000_000;
@@ -48,6 +48,7 @@ pub fn cand(vendor: &str, model: &str, tier: u8) -> CandidateSpec {
         model: model.into(),
         effort: None,
         tier,
+        cost_per_minute: None,
     }
 }
 
@@ -75,7 +76,8 @@ pub fn role(name: &str, ladder: Vec<StepSpec>, reserves: Vec<ReserveSpec>) -> Ro
 }
 
 /// `vendor-a` with two windows and logins `login-1`, `login-2`; `vendor-b` with `five_hour`
-/// only and `login-3`; the given roles; TTL 300 s.
+/// only and `login-3`; the given roles; snapshot TTL 300 s, lease TTL 1 h, cost rate 0.01 per
+/// minute, 429 back-off 60 s, model-dead mark 1 day.
 pub fn spec(roles: Vec<RoleSpec>) -> Spec {
     Spec {
         vendors: vec![
@@ -89,6 +91,10 @@ pub fn spec(roles: Vec<RoleSpec>) -> Spec {
         ],
         roles,
         snapshot_ttl_s: 300,
+        lease_ttl_s: HOUR,
+        cost_per_minute: 0.01,
+        rate_limit_backoff_s: 60,
+        model_unavailable_s: DAY,
     }
 }
 
@@ -101,6 +107,7 @@ pub fn observe(core: &mut Core, login: &str, windows: &[(&str, f64, Option<u64>)
     let input = ReportInput {
         subject: ReportSubject::Login(login.into()),
         outcome: OutcomeClass::Ok,
+        model: None,
         release: false,
         windows: windows
             .iter()
@@ -121,6 +128,8 @@ pub fn input(role: &str, target: Target, avoid_vendor: Option<&str>) -> PickInpu
         resume_of: None,
         avoid_vendor: avoid_vendor.map(Into::into),
         client: "test".into(),
+        expected_minutes: None,
+        run_id: None,
     }
 }
 
@@ -146,4 +155,55 @@ pub fn ran(v: &Verdict) -> (&str, &str) {
         Verdict::Run(g, _) => (g.login.as_str(), g.model.as_str()),
         other => panic!("expected run, got {other:?}"),
     }
+}
+
+/// Reports `outcome` on `subject` with no windows at `at`.
+pub fn outcome(
+    core: &mut Core,
+    subject: ReportSubject,
+    outcome: OutcomeClass,
+    model: Option<&str>,
+    at: u64,
+) -> Result<LoginStatus, ReportError> {
+    let input = ReportInput {
+        subject,
+        outcome,
+        model: model.map(Into::into),
+        release: false,
+        windows: Vec::new(),
+    };
+    core.report(&input, at)
+}
+
+/// Releases lease `id` with an `ok` report at `at`.
+pub fn release(core: &mut Core, id: u64, at: u64) {
+    let input = ReportInput {
+        subject: ReportSubject::Lease(id),
+        outcome: OutcomeClass::Ok,
+        model: None,
+        release: true,
+        windows: Vec::new(),
+    };
+    core.report(&input, at).expect("live lease");
+}
+
+/// A login subject.
+pub fn on(login: &str) -> ReportSubject {
+    ReportSubject::Login(login.into())
+}
+
+/// A ladder pick at `now` for a task of `minutes`.
+pub fn pick_for(core: &mut Core, role: &str, difficulty: u8, minutes: u32, now: u64) -> Verdict {
+    let mut i = input(role, Target::Difficulty(difficulty), None);
+    i.expected_minutes = Some(minutes);
+    core.pick(&i, now)
+}
+
+/// The login's view in a snapshot at `now`.
+pub fn login_view(core: &Core, login: &str, now: u64) -> LoginView {
+    core.snapshot(now)
+        .logins
+        .into_iter()
+        .find(|l| l.name == login)
+        .expect("configured login")
 }

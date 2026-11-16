@@ -1,13 +1,14 @@
 //! Pure scheduling policy of quota-balancer.
 //!
-//! This crate owns the balancer's state (logins and their quota windows) and the two decisions
-//! that change it: [`Core::pick`] and [`Core::report`]. It performs no I/O and reads no clock:
-//! the caller passes `now` in. That keeps the policy deterministic, table-testable and
-//! replayable from a journal.
+//! This crate owns the balancer's state (logins, their quota windows, health marks and leases)
+//! and the decisions that change it: [`Core::pick`], [`Core::report`] and [`Core::tick`]. It
+//! performs no I/O and reads no clock: the caller passes `now` in. That keeps the policy
+//! deterministic, table-testable and replayable from a journal.
 
 #![forbid(unsafe_code)]
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::fmt;
 
 /// Unix time in seconds.
@@ -27,13 +28,15 @@ pub const MAX_LEASES: usize = 256;
 const MIN_HORIZON_S: u64 = 3600;
 /// Tolerance of the reserve comparison: reported fractions are decimal, `1 - used` is binary.
 const EPS: f64 = 1e-9;
+/// A window at or above this used fraction is the one a usage limit refers to.
+const NEAR_FULL: f64 = 0.99;
 
 /// A quota window every login of a vendor has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowSpec {
     /// Window name as clients report it, e.g. `five_hour`.
     pub name: String,
-    /// Window length in seconds.
+    /// Window length in seconds, positive.
     pub length_s: u64,
     /// Inside this many seconds before a reset the role reserves of the window are dropped.
     pub t_burn_s: u64,
@@ -58,7 +61,7 @@ pub struct LoginSpec {
 }
 
 /// A login-independent vendor/model/effort a ladder step may run on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CandidateSpec {
     /// Declared vendor id; the candidate runs on any login of it.
     pub vendor: String,
@@ -68,10 +71,13 @@ pub struct CandidateSpec {
     pub effort: Option<String>,
     /// Lower tiers are preferred.
     pub tier: u8,
+    /// Fraction of the vendor's shortest window one minute of work uses; `None` takes
+    /// [`Spec::cost_per_minute`].
+    pub cost_per_minute: Option<f64>,
 }
 
 /// The candidates of one difficulty, in preference order (at most [`MAX_CANDIDATES`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StepSpec {
     /// Difficulty the step serves.
     pub difficulty: u8,
@@ -112,6 +118,14 @@ pub struct Spec {
     pub roles: Vec<RoleSpec>,
     /// Age in seconds after which a window snapshot is stale.
     pub snapshot_ttl_s: u64,
+    /// A lease expires this long after its pick plus the task's expected minutes.
+    pub lease_ttl_s: u64,
+    /// Cost rate of candidates without their own and of pins without a matching candidate.
+    pub cost_per_minute: f64,
+    /// How long a login stays `rate_limited` after a 429.
+    pub rate_limit_backoff_s: u64,
+    /// How long a (login, model) pair stays dead after `model_unavailable`.
+    pub model_unavailable_s: u64,
 }
 
 /// Why [`Core::new`] refused a [`Spec`].
@@ -121,6 +135,8 @@ pub enum SpecError {
     TooManyLogins,
     /// A vendor with more windows than [`MAX_WINDOWS`].
     TooManyWindows(String),
+    /// A vendor with a window of length 0.
+    EmptyWindow(String),
     /// A ladder step with more candidates than [`MAX_CANDIDATES`]: role and difficulty.
     TooManyCandidates(String, u8),
     /// A login or candidate names a vendor the spec does not declare.
@@ -134,6 +150,7 @@ impl fmt::Display for SpecError {
             Self::TooManyWindows(v) => {
                 write!(f, "vendor `{v}` has more than {MAX_WINDOWS} windows")
             }
+            Self::EmptyWindow(v) => write!(f, "vendor `{v}` has a window of length 0"),
             Self::TooManyCandidates(role, d) => write!(
                 f,
                 "role `{role}` difficulty {d} has more than {MAX_CANDIDATES} candidates"
@@ -202,6 +219,10 @@ pub struct PickInput {
     pub avoid_vendor: Option<String>,
     /// Identity of the calling client, from peer credentials or a bearer token.
     pub client: String,
+    /// Expected duration; without it the task costs nothing.
+    pub expected_minutes: Option<u32>,
+    /// Caller's id of the run, kept in the lease.
+    pub run_id: Option<String>,
 }
 
 /// Why the core decided what it decided.
@@ -213,10 +234,14 @@ pub enum Reason {
     NeighbourStep,
     /// Best admissible login of the pinned vendor.
     Pinned,
-    /// Every candidate is blocked until a known reset.
+    /// Every candidate is blocked until a known time: a reset, a back-off or a lease expiry.
     AllExhausted,
-    /// Every candidate is blocked by a window without a known reset.
+    /// A candidate is admissible but every lease slot is taken.
+    LeasesFull,
+    /// Some candidate is blocked by a window without a known reset, none until a known time.
     NoResetKnown,
+    /// Every candidate's login is `auth_dead` or its (login, model) pair is dead.
+    AllDead,
     /// No configured candidate matches the request.
     NoCandidates,
 }
@@ -229,7 +254,9 @@ impl Reason {
             Self::NeighbourStep => "neighbour_step",
             Self::Pinned => "pinned",
             Self::AllExhausted => "all_exhausted",
+            Self::LeasesFull => "leases_full",
             Self::NoResetKnown => "no_reset_known",
+            Self::AllDead => "all_dead",
             Self::NoCandidates => "no_candidates",
         }
     }
@@ -238,6 +265,10 @@ impl Reason {
 /// A granted run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
+    /// Lease that holds the run's reservation.
+    pub lease: u64,
+    /// When the lease expires unless released first.
+    pub expires_at: UnixSecs,
     /// Login name.
     pub login: String,
     /// Vendor id.
@@ -294,7 +325,7 @@ pub enum OutcomeClass {
 /// What a report refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportSubject {
-    /// A lease id issued by [`Core::pick`].
+    /// A lease id issued by [`Core::pick`]; the report acts on its login and model.
     Lease(u64),
     /// A login by its configured name.
     Login(String),
@@ -318,7 +349,9 @@ pub struct ReportInput {
     pub subject: ReportSubject,
     /// Outcome class.
     pub outcome: OutcomeClass,
-    /// Release the lease.
+    /// Model of a login report; a lease report uses the lease's model.
+    pub model: Option<String>,
+    /// Release the lease; a login report holds none.
     pub release: bool,
     /// Fresh windows; each overwrites the login's snapshot of that window.
     pub windows: Vec<WindowObservation>,
@@ -333,6 +366,10 @@ pub enum ReportError {
     UnknownLogin,
     /// A window's used fraction is outside `0.0..=1.0`.
     InvalidUtilization,
+    /// `model_unavailable` on a login report without a model.
+    MissingModel,
+    /// `model_unavailable` for a model no ladder declares.
+    UnknownModel,
 }
 
 /// A window of a login as `/v1/state` shows it, after reset inference.
@@ -342,6 +379,8 @@ pub struct WindowView {
     pub name: String,
     /// Used fraction.
     pub used: f64,
+    /// Fraction held by live leases.
+    pub reserved: f64,
     /// Next reset, if known.
     pub resets_at: Option<UnixSecs>,
     /// When the value was observed; 0 when never.
@@ -361,8 +400,27 @@ pub struct LoginView {
     pub vendor: String,
     /// Status.
     pub status: LoginStatus,
+    /// End of the `exhausted` or `rate_limited` mark, the later one when both are set.
+    pub dead_until: Option<UnixSecs>,
     /// The vendor's windows in declaration order.
     pub windows: Vec<WindowView>,
+}
+
+/// A live lease as seen in a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseView {
+    /// Lease id.
+    pub id: u64,
+    /// Login name.
+    pub login: String,
+    /// Model.
+    pub model: String,
+    /// Client that took the lease.
+    pub client: String,
+    /// Caller's run id.
+    pub run_id: Option<String>,
+    /// Expiry time.
+    pub expires_at: UnixSecs,
 }
 
 /// Read-only view of the state for `/v1/state`.
@@ -370,6 +428,8 @@ pub struct LoginView {
 pub struct Snapshot {
     /// Configured logins.
     pub logins: Vec<LoginView>,
+    /// Live leases in slot order.
+    pub leases: Vec<LeaseView>,
 }
 
 #[derive(Debug)]
@@ -378,25 +438,28 @@ struct Vendor {
     windows: Vec<WindowSpec>,
     /// Index of the longest window, the one urgency is scored on.
     longest: Option<usize>,
+    /// Length of the shortest window, the unit of cost rates.
+    shortest_s: Option<u64>,
 }
 
 #[derive(Debug)]
 struct Candidate {
     vendor: usize,
-    model: String,
+    model: usize,
     effort: Option<String>,
     tier: u8,
+    cost_per_minute: f64,
 }
 
-/// Reserve per window of one vendor, by the vendor's window index.
-type Reserves = [f64; MAX_WINDOWS];
+/// A fraction per window of one vendor, by the vendor's window index.
+type PerWindow = [f64; MAX_WINDOWS];
 
 #[derive(Debug)]
 struct Step {
     difficulty: u8,
     candidates: Vec<Candidate>,
     /// Reserves of the step by vendor index.
-    reserves: Vec<Reserves>,
+    reserves: Vec<PerWindow>,
 }
 
 #[derive(Debug)]
@@ -413,12 +476,58 @@ struct Reading {
     observed_at: UnixSecs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    Ok,
+    Stale,
+    Dead,
+}
+
 #[derive(Debug)]
 struct Login {
     name: String,
     vendor: usize,
-    status: LoginStatus,
+    /// A declared window was reported at least once.
+    seen: bool,
+    auth: Auth,
+    exhausted_until: Option<UnixSecs>,
+    rate_limited_until: Option<UnixSecs>,
+    /// Dead-until per model index.
+    model_dead: Vec<Option<UnixSecs>>,
     windows: [Option<Reading>; MAX_WINDOWS],
+    /// Sum of the live leases' costs per window.
+    reserved: PerWindow,
+    /// Number of live leases on the login.
+    leases: usize,
+}
+
+#[derive(Debug)]
+struct Lease {
+    id: u64,
+    login: usize,
+    model: String,
+    model_index: Option<usize>,
+    client: String,
+    run_id: Option<String>,
+    cost: PerWindow,
+    expires_at: UnixSecs,
+}
+
+/// What a deadline does when it is due; indexes are login, model and window indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Event {
+    LeaseExpiry(u64),
+    ExhaustedEnd(usize),
+    RateLimitEnd(usize),
+    ModelDeadEnd(usize, usize),
+    WindowReset(usize, usize),
+    SnapshotStale(usize, usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Deadline {
+    at: UnixSecs,
+    event: Event,
 }
 
 /// A window value at `now`: a reset that has passed empties the window.
@@ -438,6 +547,7 @@ struct Choice {
     urgency: f64,
     candidate: usize,
     login: usize,
+    cost: PerWindow,
 }
 
 impl Choice {
@@ -452,28 +562,62 @@ impl Choice {
     }
 }
 
+/// Why a (candidate, login) pair is not admissible.
+#[derive(Debug, Clone, Copy)]
+enum Blocked {
+    /// Admissible again at this time, all else unchanged.
+    Until(UnixSecs),
+    /// Blocked by a window without a known reset.
+    Unknown,
+    /// `auth_dead` login or dead (login, model) pair.
+    Dead,
+}
+
 /// What the rejected candidates of a pick have in common.
 #[derive(Debug, Default)]
 struct Rejected {
     any: bool,
     retry_after: Option<UnixSecs>,
+    unknown: bool,
     stale: bool,
+}
+
+/// The run a pick settled on, before its lease is issued.
+struct Settled {
+    choice: Choice,
+    model: String,
+    model_index: Option<usize>,
+    effort: Option<String>,
+    reason: Reason,
 }
 
 /// The balancer's state and policy. Single owner, no locks: the daemon calls it from one thread.
 #[derive(Debug)]
 pub struct Core {
     vendors: Vec<Vendor>,
+    models: Vec<String>,
     logins: Vec<Login>,
     roles: Vec<Role>,
     ttl_s: u64,
+    lease_ttl_s: u64,
+    cost_per_minute: f64,
+    rate_limit_backoff_s: u64,
+    model_unavailable_s: u64,
+    /// Lease table by slot; a lease id is `issued * MAX_LEASES + slot`.
+    leases: Vec<Option<Lease>>,
+    free_slots: Vec<usize>,
+    issued: u64,
+    /// Min-heap with lazy deletion: an entry counts only while the state still holds its time.
+    deadlines: BinaryHeap<Reverse<Deadline>>,
+    /// Compaction threshold of `deadlines`, twice the number of distinct live deadlines.
+    deadline_cap: usize,
 }
 
 impl Core {
-    /// A core for `spec`; every window starts never observed.
+    /// A core for `spec`; every window starts never observed and no lease is live.
     ///
     /// # Errors
-    /// The spec exceeds a table bound or references an undeclared vendor.
+    /// The spec exceeds a table bound, has an empty window or references an undeclared vendor.
     pub fn new(spec: Spec) -> Result<Self, SpecError> {
         if spec.logins.len() > MAX_LOGINS {
             return Err(SpecError::TooManyLogins);
@@ -483,6 +627,9 @@ impl Core {
             if v.windows.len() > MAX_WINDOWS {
                 return Err(SpecError::TooManyWindows(v.name));
             }
+            if v.windows.iter().any(|w| w.length_s == 0) {
+                return Err(SpecError::EmptyWindow(v.name));
+            }
             let longest = (0..v.windows.len()).max_by(|&a, &b| {
                 v.windows[a]
                     .length_s
@@ -491,6 +638,7 @@ impl Core {
             });
             vendors.push(Vendor {
                 name: v.name,
+                shortest_s: v.windows.iter().map(|w| w.length_s).min(),
                 windows: v.windows,
                 longest,
             });
@@ -506,94 +654,140 @@ impl Core {
             logins.push(Login {
                 vendor: vendor_of(&l.vendor)?,
                 name: l.name,
-                status: LoginStatus::Unknown,
+                seen: false,
+                auth: Auth::Ok,
+                exhausted_until: None,
+                rate_limited_until: None,
+                model_dead: Vec::new(),
                 windows: [None; MAX_WINDOWS],
+                reserved: [0.0; MAX_WINDOWS],
+                leases: 0,
             });
         }
+        let mut models: Vec<String> = Vec::new();
         let mut roles = Vec::with_capacity(spec.roles.len());
         for r in spec.roles {
-            let mut steps = Vec::with_capacity(r.ladder.len());
-            for s in r.ladder {
-                if s.candidates.len() > MAX_CANDIDATES {
-                    return Err(SpecError::TooManyCandidates(r.name, s.difficulty));
-                }
-                let mut candidates = Vec::with_capacity(s.candidates.len());
-                for c in s.candidates {
-                    candidates.push(Candidate {
-                        vendor: vendor_of(&c.vendor)?,
-                        model: c.model,
-                        effort: c.effort,
-                        tier: c.tier,
-                    });
-                }
-                let reserves = vendors
-                    .iter()
-                    .map(|v| {
-                        let mut out = [0.0; MAX_WINDOWS];
-                        for (w, def) in v.windows.iter().enumerate() {
-                            if let Some(res) = r.reserves.iter().find(|res| {
-                                res.difficulty == s.difficulty && res.window == def.name
-                            }) {
-                                out[w] = res.fraction;
-                            }
-                        }
-                        out
-                    })
-                    .collect();
-                steps.push(Step {
-                    difficulty: s.difficulty,
-                    candidates,
-                    reserves,
-                });
-            }
-            steps.sort_by_key(|s| s.difficulty);
-            roles.push(Role {
-                name: r.name,
-                steps,
-            });
+            roles.push(role(r, &vendors, &mut models, spec.cost_per_minute)?);
         }
+        for l in &mut logins {
+            l.model_dead = vec![None; models.len()];
+        }
+        let deadline_cap = 2 * (MAX_LEASES + logins.len() * (2 + models.len() + 2 * MAX_WINDOWS));
         Ok(Self {
             vendors,
+            models,
             logins,
             roles,
             ttl_s: spec.snapshot_ttl_s,
+            lease_ttl_s: spec.lease_ttl_s,
+            cost_per_minute: spec.cost_per_minute,
+            rate_limit_backoff_s: spec.rate_limit_backoff_s,
+            model_unavailable_s: spec.model_unavailable_s,
+            leases: (0..MAX_LEASES).map(|_| None).collect(),
+            free_slots: (0..MAX_LEASES).rev().collect(),
+            issued: 0,
+            deadlines: BinaryHeap::new(),
+            deadline_cap,
         })
     }
 
-    /// Decides where a task should run.
+    /// Decides where a task should run and, for a `run`, issues its lease.
     ///
     /// A ladder target tries the requested step, then the nearest lower step, then the nearest
     /// higher one. Within a step the admissible (candidate, login) pairs are ordered by tier,
-    /// urgency (descending), candidate order and login index.
+    /// urgency (descending), candidate order and login index. Due deadlines apply first.
+    ///
+    /// # Panics
+    /// Never: a full lease table holds leases, so a `leases_full` wait has an expiry to name.
     pub fn pick(&mut self, input: &PickInput, now: UnixSecs) -> Verdict {
-        let Some(role) = self.roles.iter().find(|r| r.name == input.role) else {
-            return Verdict::Dead(Reason::NoCandidates);
-        };
-        let avoid = input.avoid_vendor.as_deref();
+        self.tick(now);
         let mut rejected = Rejected::default();
+        let Some(settled) = self.settle(input, now, &mut rejected) else {
+            return match (rejected.any, rejected.retry_after) {
+                (false, _) => Verdict::Dead(Reason::NoCandidates),
+                (true, Some(retry_after)) => Verdict::Wait {
+                    retry_after,
+                    reason: Reason::AllExhausted,
+                    stale: rejected.stale,
+                },
+                (true, None) if rejected.unknown => Verdict::Dead(Reason::NoResetKnown),
+                (true, None) => Verdict::Dead(Reason::AllDead),
+            };
+        };
+        let Some(slot) = self.free_slots.pop() else {
+            return Verdict::Wait {
+                retry_after: self
+                    .earliest_expiry(None)
+                    .expect("a full table holds leases"),
+                reason: Reason::LeasesFull,
+                stale: self.stale(settled.choice.login, now),
+            };
+        };
+        let c = settled.choice;
+        self.issued += 1;
+        let id = self.issued * MAX_LEASES as u64 + slot as u64;
+        let minutes = u64::from(input.expected_minutes.unwrap_or(0));
+        let expires_at = now + self.lease_ttl_s + 60 * minutes;
+        let login = &mut self.logins[c.login];
+        login.leases += 1;
+        for (r, add) in login.reserved.iter_mut().zip(c.cost) {
+            *r += add;
+        }
+        let login = &self.logins[c.login];
+        let grant = Grant {
+            lease: id,
+            expires_at,
+            login: login.name.clone(),
+            vendor: self.vendors[login.vendor].name.clone(),
+            model: settled.model.clone(),
+            effort: settled.effort,
+            tier: c.tier,
+            stale: self.stale(c.login, now),
+            snapshot_at: self.snapshot_at(c.login, now),
+        };
+        self.leases[slot] = Some(Lease {
+            id,
+            login: c.login,
+            model: settled.model,
+            model_index: settled.model_index,
+            client: input.client.clone(),
+            run_id: input.run_id.clone(),
+            cost: c.cost,
+            expires_at,
+        });
+        self.schedule(expires_at, Event::LeaseExpiry(id));
+        Verdict::Run(grant, settled.reason)
+    }
+
+    /// The best admissible run for `input`, or `None` with the rejections in `rejected`.
+    fn settle(&self, input: &PickInput, now: UnixSecs, rejected: &mut Rejected) -> Option<Settled> {
+        let role = self.roles.iter().find(|r| r.name == input.role)?;
+        let avoid = input.avoid_vendor.as_deref();
+        let minutes = input.expected_minutes;
         match &input.target {
             Target::Difficulty(d) => {
-                let Some(at) = role.steps.iter().position(|s| s.difficulty == *d) else {
-                    return Verdict::Dead(Reason::NoCandidates);
-                };
+                let at = role.steps.iter().position(|s| s.difficulty == *d)?;
                 let order = [Some(at), at.checked_sub(1), Some(at + 1)];
                 for (n, i) in order.into_iter().enumerate() {
                     let Some(step) = i.and_then(|i| role.steps.get(i)) else {
                         continue;
                     };
-                    if let Some(c) = self.best_on_step(step, avoid, now, &mut rejected) {
+                    if let Some(c) = self.best_on_step(step, avoid, minutes, now, rejected) {
                         let cand = &step.candidates[c.candidate];
-                        let reason = if n == 0 {
-                            Reason::SpendBeforeReset
-                        } else {
-                            Reason::NeighbourStep
-                        };
-                        return Verdict::Run(
-                            self.grant(c, &cand.model, cand.effort.as_ref(), now),
-                            reason,
-                        );
+                        return Some(Settled {
+                            choice: c,
+                            model: self.models[cand.model].clone(),
+                            model_index: Some(cand.model),
+                            effort: cand.effort.clone(),
+                            reason: if n == 0 {
+                                Reason::SpendBeforeReset
+                            } else {
+                                Reason::NeighbourStep
+                            },
+                        });
                     }
                 }
+                None
             }
             Target::Pin {
                 vendor,
@@ -601,25 +795,41 @@ impl Core {
                 effort,
                 login,
             } => {
-                if avoid != Some(vendor.as_str()) {
-                    if let Some(c) = self.best_pinned(vendor, login.as_deref(), now, &mut rejected)
-                    {
-                        return Verdict::Run(
-                            self.grant(c, model, effort.as_ref(), now),
-                            Reason::Pinned,
-                        );
-                    }
+                if avoid == Some(vendor.as_str()) {
+                    return None;
                 }
+                let vi = self.vendors.iter().position(|v| v.name == *vendor)?;
+                let model_index = self.models.iter().position(|m| m == model);
+                let rate = role
+                    .steps
+                    .iter()
+                    .flat_map(|s| &s.candidates)
+                    .find(|c| c.vendor == vi && Some(c.model) == model_index)
+                    .map_or(self.cost_per_minute, |c| c.cost_per_minute);
+                let cost = self.cost(vi, rate, minutes);
+                let mut best: Option<Choice> = None;
+                for (li, l) in self.logins.iter().enumerate() {
+                    if l.vendor != vi || login.as_ref().is_some_and(|name| *name != l.name) {
+                        continue;
+                    }
+                    let choice = Choice {
+                        tier: None,
+                        urgency: self.urgency(li, &cost, now),
+                        candidate: 0,
+                        login: li,
+                        cost,
+                    };
+                    let reserves = [0.0; MAX_WINDOWS];
+                    self.consider(choice, model_index, &reserves, now, &mut best, rejected);
+                }
+                Some(Settled {
+                    choice: best?,
+                    model: model.clone(),
+                    model_index,
+                    effort: effort.clone(),
+                    reason: Reason::Pinned,
+                })
             }
-        }
-        match (rejected.any, rejected.retry_after) {
-            (false, _) => Verdict::Dead(Reason::NoCandidates),
-            (true, Some(retry_after)) => Verdict::Wait {
-                retry_after,
-                reason: Reason::AllExhausted,
-                stale: rejected.stale,
-            },
-            (true, None) => Verdict::Dead(Reason::NoResetKnown),
         }
     }
 
@@ -627,6 +837,7 @@ impl Core {
         &self,
         step: &Step,
         avoid: Option<&str>,
+        minutes: Option<u32>,
         now: UnixSecs,
         rejected: &mut Rejected,
     ) -> Option<Choice> {
@@ -635,45 +846,18 @@ impl Core {
             if avoid == Some(self.vendors[cand.vendor].name.as_str()) {
                 continue;
             }
+            let cost = self.cost(cand.vendor, cand.cost_per_minute, minutes);
             for li in (0..self.logins.len()).filter(|&li| self.logins[li].vendor == cand.vendor) {
                 let choice = Choice {
                     tier: Some(cand.tier),
-                    urgency: self.urgency(li, now),
+                    urgency: self.urgency(li, &cost, now),
                     candidate: ci,
                     login: li,
+                    cost,
                 };
-                self.consider(
-                    choice,
-                    &step.reserves[cand.vendor],
-                    now,
-                    &mut best,
-                    rejected,
-                );
+                let reserves = &step.reserves[cand.vendor];
+                self.consider(choice, Some(cand.model), reserves, now, &mut best, rejected);
             }
-        }
-        best
-    }
-
-    fn best_pinned(
-        &self,
-        vendor: &str,
-        login: Option<&str>,
-        now: UnixSecs,
-        rejected: &mut Rejected,
-    ) -> Option<Choice> {
-        let vi = self.vendors.iter().position(|v| v.name == vendor)?;
-        let mut best: Option<Choice> = None;
-        for (li, l) in self.logins.iter().enumerate() {
-            if l.vendor != vi || login.is_some_and(|name| name != l.name) {
-                continue;
-            }
-            let choice = Choice {
-                tier: None,
-                urgency: self.urgency(li, now),
-                candidate: 0,
-                login: li,
-            };
-            self.consider(choice, &[0.0; MAX_WINDOWS], now, &mut best, rejected);
         }
         best
     }
@@ -681,53 +865,119 @@ impl Core {
     fn consider(
         &self,
         choice: Choice,
-        reserves: &Reserves,
+        model: Option<usize>,
+        reserves: &PerWindow,
         now: UnixSecs,
         best: &mut Option<Choice>,
         rejected: &mut Rejected,
     ) {
-        match self.admit(choice.login, reserves, now) {
+        match self.admit(choice.login, model, reserves, &choice.cost, now) {
             Ok(()) => {
                 if best.as_ref().is_none_or(|b| choice.better_than(b)) {
                     *best = Some(choice);
                 }
             }
-            Err(recover) => {
+            Err(blocked) => {
                 rejected.any = true;
                 rejected.stale |= self.stale(choice.login, now);
-                if let Some(t) = recover {
-                    rejected.retry_after = Some(rejected.retry_after.map_or(t, |r| r.min(t)));
+                match blocked {
+                    Blocked::Until(t) => {
+                        rejected.retry_after = Some(rejected.retry_after.map_or(t, |r| r.min(t)));
+                    }
+                    Blocked::Unknown => rejected.unknown = true,
+                    Blocked::Dead => {}
                 }
             }
         }
     }
 
-    /// `Ok` when every window has quota left and at least its reserve, the reserve being
-    /// dropped inside `T_burn`; otherwise the reset that unblocks the login (`None` if unknown).
-    fn admit(&self, li: usize, reserves: &Reserves, now: UnixSecs) -> Result<(), Option<UnixSecs>> {
+    /// `Ok` when the login and the (login, model) pair are not dead, no back-off or exhaustion
+    /// mark is active and every window keeps `left = 1 - used - reserved - cost` above 0 and at
+    /// least its reserve, the reserve being dropped inside `T_burn`. Otherwise the earliest time
+    /// all blocking parts clear.
+    fn admit(
+        &self,
+        li: usize,
+        model: Option<usize>,
+        reserves: &PerWindow,
+        cost: &PerWindow,
+        now: UnixSecs,
+    ) -> Result<(), Blocked> {
         let login = &self.logins[li];
+        let model_dead = model
+            .and_then(|m| login.model_dead[m])
+            .is_some_and(|t| t > now);
+        if login.auth == Auth::Dead || model_dead {
+            return Err(Blocked::Dead);
+        }
         let mut blocked = false;
         let mut recover = Some(0);
+        for t in [login.exhausted_until, login.rate_limited_until]
+            .into_iter()
+            .flatten()
+            .filter(|&t| t > now)
+        {
+            blocked = true;
+            recover = recover.map(|r: UnixSecs| r.max(t));
+        }
         for (w, def) in self.vendors[login.vendor].windows.iter().enumerate() {
             let e = self.effective(login.windows[w], now);
-            let reserve = if e.resets_at.is_some_and(|r| r - now < def.t_burn_s) {
-                0.0
-            } else {
-                reserves[w]
-            };
-            let left = 1.0 - e.used;
-            if !(left > 0.0 && left + EPS >= reserve) {
-                blocked = true;
-                recover = recover.zip(e.resets_at).map(|(a, r)| a.max(r));
+            let in_burn = e.resets_at.is_some_and(|r| r - now < def.t_burn_s);
+            let reserve = if in_burn { 0.0 } else { reserves[w] };
+            let fits = |left: f64| left > 0.0 && left + EPS >= reserve;
+            let unleased = 1.0 - e.used - cost[w];
+            let left = unleased - login.reserved[w];
+            if fits(left) {
+                continue;
+            }
+            blocked = true;
+            let lease_end = (login.reserved[w] > 0.0 && fits(unleased))
+                .then(|| self.earliest_expiry(Some(li)))
+                .flatten();
+            let burn_start = (left > 0.0)
+                .then(|| e.resets_at.map(|r| r - def.t_burn_s.saturating_sub(1)))
+                .flatten();
+            let clears = [lease_end, burn_start, e.resets_at]
+                .into_iter()
+                .flatten()
+                .min();
+            recover = recover.zip(clears).map(|(a, b)| a.max(b));
+        }
+        match (blocked, recover) {
+            (false, _) => Ok(()),
+            (true, Some(t)) => Err(Blocked::Until(t)),
+            (true, None) => Err(Blocked::Unknown),
+        }
+    }
+
+    /// Earliest expiry of the live leases, of login `li` only when given.
+    fn earliest_expiry(&self, li: Option<usize>) -> Option<UnixSecs> {
+        self.leases
+            .iter()
+            .flatten()
+            .filter(|l| li.is_none_or(|li| l.login == li))
+            .map(|l| l.expires_at)
+            .min()
+    }
+
+    /// Per-window cost of `minutes` of work at `rate`: the rate is a fraction of the vendor's
+    /// shortest window per minute and scales down with the window length.
+    #[allow(clippy::cast_precision_loss)] // seconds stay far below 2^53
+    fn cost(&self, vendor: usize, rate: f64, minutes: Option<u32>) -> PerWindow {
+        let mut out = [0.0; MAX_WINDOWS];
+        let v = &self.vendors[vendor];
+        if let (Some(m), Some(shortest)) = (minutes, v.shortest_s) {
+            for (o, def) in out.iter_mut().zip(&v.windows) {
+                *o = f64::from(m) * rate * shortest as f64 / def.length_s as f64;
             }
         }
-        if blocked { Err(recover) } else { Ok(()) }
+        out
     }
 
     /// Spend-before-reset score on the vendor's longest window:
-    /// `left / max(time to reset, 1 h) * length`.
+    /// `left / max(time to reset, 1 h) * length` with `left = 1 - used - reserved - cost`.
     #[allow(clippy::cast_precision_loss)] // seconds stay far below 2^53
-    fn urgency(&self, li: usize, now: UnixSecs) -> f64 {
+    fn urgency(&self, li: usize, cost: &PerWindow, now: UnixSecs) -> f64 {
         let login = &self.logins[li];
         let vendor = &self.vendors[login.vendor];
         let Some(w) = vendor.longest else {
@@ -736,7 +986,7 @@ impl Core {
         let length = vendor.windows[w].length_s;
         let e = self.effective(login.windows[w], now);
         let horizon = e.resets_at.map_or(length, |r| r - now).max(MIN_HORIZON_S);
-        (1.0 - e.used) / horizon as f64 * length as f64
+        (1.0 - e.used - login.reserved[w] - cost[w]) / horizon as f64 * length as f64
     }
 
     fn effective(&self, obs: Option<Reading>, now: UnixSecs) -> Effective {
@@ -779,64 +1029,262 @@ impl Core {
         self.windows_of(li, now).any(|e| e.stale)
     }
 
-    fn grant(&self, c: Choice, model: &str, effort: Option<&String>, now: UnixSecs) -> Grant {
-        let login = &self.logins[c.login];
-        let snapshot_at = if self.windows_of(c.login, now).any(|e| e.observed_at == 0) {
+    fn snapshot_at(&self, li: usize, now: UnixSecs) -> Option<UnixSecs> {
+        if self.windows_of(li, now).any(|e| e.observed_at == 0) {
             None
         } else {
-            self.windows_of(c.login, now).map(|e| e.observed_at).min()
-        };
-        Grant {
-            login: login.name.clone(),
-            vendor: self.vendors[login.vendor].name.clone(),
-            model: model.to_owned(),
-            effort: effort.cloned(),
-            tier: c.tier,
-            stale: self.stale(c.login, now),
-            snapshot_at,
+            self.windows_of(li, now).map(|e| e.observed_at).min()
         }
     }
 
     /// Applies a client's report and returns the login's status afterwards.
     ///
+    /// Windows overwrite the snapshot first, then the outcome class sets its mark; a lease
+    /// report with `release` frees the lease last. Due deadlines apply first.
+    ///
     /// # Errors
-    /// [`ReportError::UnknownLease`] or [`ReportError::UnknownLogin`] when the subject is not
-    /// known; [`ReportError::InvalidUtilization`] when a window fraction is out of range, in
-    /// which case nothing is applied.
+    /// An unknown lease, login or model, a `model_unavailable` login report without a model, or
+    /// a window fraction out of range; nothing is applied then.
     pub fn report(
         &mut self,
         input: &ReportInput,
         now: UnixSecs,
     ) -> Result<LoginStatus, ReportError> {
-        let li = match &input.subject {
-            ReportSubject::Lease(_) => return Err(ReportError::UnknownLease),
-            ReportSubject::Login(name) => self
-                .logins
-                .iter()
-                .position(|l| &l.name == name)
-                .ok_or(ReportError::UnknownLogin)?,
+        self.tick(now);
+        let (li, lease_slot, model) = match &input.subject {
+            ReportSubject::Lease(id) => {
+                let slot = self.lease_slot(*id).ok_or(ReportError::UnknownLease)?;
+                let lease = self.leases[slot]
+                    .as_ref()
+                    .ok_or(ReportError::UnknownLease)?;
+                let model = lease.model_index.ok_or(ReportError::UnknownModel);
+                (lease.login, Some(slot), model)
+            }
+            ReportSubject::Login(name) => {
+                let li = self
+                    .logins
+                    .iter()
+                    .position(|l| &l.name == name)
+                    .ok_or(ReportError::UnknownLogin)?;
+                let model = match &input.model {
+                    Some(name) => self
+                        .models
+                        .iter()
+                        .position(|m| m == name)
+                        .ok_or(ReportError::UnknownModel),
+                    None => Err(ReportError::MissingModel),
+                };
+                (li, None, model)
+            }
         };
         if input.windows.iter().any(|w| !(0.0..=1.0).contains(&w.used)) {
             return Err(ReportError::InvalidUtilization);
         }
+        let dead_model = if input.outcome == OutcomeClass::ModelUnavailable {
+            Some(model?)
+        } else {
+            None
+        };
+
+        let observed = self.observe(li, &input.windows, now);
         let login = &mut self.logins[li];
-        let defs = &self.vendors[login.vendor].windows;
-        for obs in &input.windows {
-            if let Some(w) = defs.iter().position(|d| d.name == obs.name) {
-                login.windows[w] = Some(Reading {
-                    used: obs.used,
-                    resets_at: obs.resets_at,
-                    observed_at: now,
-                });
-                if login.status == LoginStatus::Unknown {
-                    login.status = LoginStatus::Ok;
+        match input.outcome {
+            OutcomeClass::Ok => {
+                if observed && login.auth == Auth::Stale {
+                    login.auth = Auth::Ok;
                 }
             }
+            OutcomeClass::UsageLimit | OutcomeClass::Rejected => {
+                let until = self.exhausted_until(li, now);
+                self.logins[li].exhausted_until = Some(until);
+                self.schedule(until, Event::ExhaustedEnd(li));
+            }
+            OutcomeClass::Http401 => {
+                login.auth = match login.auth {
+                    Auth::Ok => Auth::Stale,
+                    Auth::Stale | Auth::Dead => Auth::Dead,
+                };
+            }
+            OutcomeClass::Http429 => {
+                let until = now + self.rate_limit_backoff_s;
+                login.rate_limited_until = Some(until);
+                self.schedule(until, Event::RateLimitEnd(li));
+            }
+            OutcomeClass::ModelUnavailable => {
+                if let Some(m) = dead_model {
+                    let until = now + self.model_unavailable_s;
+                    login.model_dead[m] = Some(until);
+                    self.schedule(until, Event::ModelDeadEnd(li, m));
+                }
+            }
+            OutcomeClass::Error => {}
         }
-        Ok(login.status)
+        if let (true, Some(slot)) = (input.release, lease_slot) {
+            self.release(slot);
+        }
+        Ok(self.status(li))
     }
 
-    /// Read-only view of the state at `now`.
+    /// Overwrites the login's declared windows named in `windows`; true when any matched.
+    fn observe(&mut self, li: usize, windows: &[WindowObservation], now: UnixSecs) -> bool {
+        let mut observed = false;
+        for obs in windows {
+            let login = &mut self.logins[li];
+            let Some(w) = self.vendors[login.vendor]
+                .windows
+                .iter()
+                .position(|d| d.name == obs.name)
+            else {
+                continue;
+            };
+            let before = login.windows[w].and_then(|r| r.resets_at);
+            login.windows[w] = Some(Reading {
+                used: obs.used,
+                resets_at: obs.resets_at,
+                observed_at: now,
+            });
+            login.seen = true;
+            observed = true;
+            if let Some(r) = obs.resets_at.filter(|&r| r > now && Some(r) != before) {
+                self.schedule(r, Event::WindowReset(li, w));
+            }
+            self.schedule(now + self.ttl_s + 1, Event::SnapshotStale(li, w));
+        }
+        observed
+    }
+
+    /// End of an exhaustion mark: the earliest reset of a window at or above [`NEAR_FULL`],
+    /// else the longest window's reset, else one longest-window length (one hour without
+    /// windows) from `now`.
+    fn exhausted_until(&self, li: usize, now: UnixSecs) -> UnixSecs {
+        let login = &self.logins[li];
+        let vendor = &self.vendors[login.vendor];
+        self.windows_of(li, now)
+            .filter(|e| e.used >= NEAR_FULL)
+            .filter_map(|e| e.resets_at)
+            .min()
+            .or_else(|| {
+                let w = vendor.longest?;
+                self.effective(login.windows[w], now).resets_at
+            })
+            .unwrap_or_else(|| {
+                now + vendor
+                    .longest
+                    .map_or(MIN_HORIZON_S, |w| vendor.windows[w].length_s)
+            })
+    }
+
+    fn status(&self, li: usize) -> LoginStatus {
+        let l = &self.logins[li];
+        if l.auth == Auth::Dead {
+            LoginStatus::AuthDead
+        } else if l.exhausted_until.is_some() {
+            LoginStatus::Exhausted
+        } else if l.rate_limited_until.is_some() {
+            LoginStatus::RateLimited
+        } else if l.auth == Auth::Stale {
+            LoginStatus::AuthStale
+        } else if l.seen {
+            LoginStatus::Ok
+        } else {
+            LoginStatus::Unknown
+        }
+    }
+
+    fn lease_slot(&self, id: u64) -> Option<usize> {
+        let slot = usize::try_from(id % MAX_LEASES as u64).ok()?;
+        self.leases[slot]
+            .as_ref()
+            .is_some_and(|l| l.id == id)
+            .then_some(slot)
+    }
+
+    fn release(&mut self, slot: usize) {
+        let Some(lease) = self.leases[slot].take() else {
+            return;
+        };
+        let login = &mut self.logins[lease.login];
+        login.leases -= 1;
+        if login.leases == 0 {
+            login.reserved = [0.0; MAX_WINDOWS];
+        } else {
+            for (r, sub) in login.reserved.iter_mut().zip(lease.cost) {
+                *r = (*r - sub).max(0.0);
+            }
+        }
+        self.free_slots.push(slot);
+    }
+
+    fn schedule(&mut self, at: UnixSecs, event: Event) {
+        self.deadlines.push(Reverse(Deadline { at, event }));
+        if self.deadlines.len() > self.deadline_cap {
+            let mut live = std::mem::take(&mut self.deadlines).into_vec();
+            live.retain(|Reverse(d)| self.pending(*d));
+            live.sort_unstable();
+            live.dedup();
+            self.deadlines = live.into();
+        }
+    }
+
+    /// The state still holds the deadline's time, so the heap entry is not stale.
+    fn pending(&self, d: Deadline) -> bool {
+        let login = |li: usize| &self.logins[li];
+        let reading = |li: usize, w: usize| login(li).windows[w];
+        match d.event {
+            Event::LeaseExpiry(id) => self
+                .lease_slot(id)
+                .and_then(|s| self.leases[s].as_ref())
+                .is_some_and(|l| l.expires_at == d.at),
+            Event::ExhaustedEnd(li) => login(li).exhausted_until == Some(d.at),
+            Event::RateLimitEnd(li) => login(li).rate_limited_until == Some(d.at),
+            Event::ModelDeadEnd(li, m) => login(li).model_dead[m] == Some(d.at),
+            Event::WindowReset(li, w) => reading(li, w).is_some_and(|r| r.resets_at == Some(d.at)),
+            Event::SnapshotStale(li, w) => {
+                reading(li, w).is_some_and(|r| r.observed_at + self.ttl_s + 1 == d.at)
+            }
+        }
+    }
+
+    /// The earliest pending deadline: a lease expiry, the end of a mark, a window reset or the
+    /// moment a snapshot turns stale. Stale heap entries are dropped on the way.
+    pub fn next_deadline(&mut self) -> Option<UnixSecs> {
+        while let Some(&Reverse(d)) = self.deadlines.peek() {
+            if self.pending(d) {
+                return Some(d.at);
+            }
+            self.deadlines.pop();
+        }
+        None
+    }
+
+    /// Applies every deadline due at `now`: expired leases free their reservation and ended
+    /// marks are lifted. Window resets and staleness need no action; they are inferred from
+    /// `now` wherever they matter.
+    pub fn tick(&mut self, now: UnixSecs) {
+        while let Some(&Reverse(d)) = self.deadlines.peek() {
+            if d.at > now {
+                break;
+            }
+            self.deadlines.pop();
+            if !self.pending(d) {
+                continue;
+            }
+            match d.event {
+                Event::LeaseExpiry(id) => {
+                    if let Some(slot) = self.lease_slot(id) {
+                        self.release(slot);
+                    }
+                }
+                Event::ExhaustedEnd(li) => self.logins[li].exhausted_until = None,
+                Event::RateLimitEnd(li) => self.logins[li].rate_limited_until = None,
+                Event::ModelDeadEnd(li, m) => self.logins[li].model_dead[m] = None,
+                Event::WindowReset(..) | Event::SnapshotStale(..) => {}
+            }
+        }
+    }
+
+    /// View of the state as of the last [`Core::tick`], [`Core::pick`] or [`Core::report`],
+    /// with windows inferred at `now`.
     pub fn snapshot(&self, now: UnixSecs) -> Snapshot {
         Snapshot {
             logins: self
@@ -846,14 +1294,17 @@ impl Core {
                 .map(|(li, l)| LoginView {
                     name: l.name.clone(),
                     vendor: self.vendors[l.vendor].name.clone(),
-                    status: l.status,
+                    status: self.status(li),
+                    dead_until: l.exhausted_until.max(l.rate_limited_until),
                     windows: self.vendors[l.vendor]
                         .windows
                         .iter()
                         .zip(self.windows_of(li, now))
-                        .map(|(def, e)| WindowView {
+                        .zip(l.reserved)
+                        .map(|((def, e), reserved)| WindowView {
                             name: def.name.clone(),
                             used: e.used,
+                            reserved,
                             resets_at: e.resets_at,
                             observed_at: e.observed_at,
                             source: e.source,
@@ -862,6 +1313,81 @@ impl Core {
                         .collect(),
                 })
                 .collect(),
+            leases: self
+                .leases
+                .iter()
+                .flatten()
+                .map(|l| LeaseView {
+                    id: l.id,
+                    login: self.logins[l.login].name.clone(),
+                    model: l.model.clone(),
+                    client: l.client.clone(),
+                    run_id: l.run_id.clone(),
+                    expires_at: l.expires_at,
+                })
+                .collect(),
         }
     }
+}
+
+/// Compiles a role, interning its candidates' models into `models`.
+fn role(
+    r: RoleSpec,
+    vendors: &[Vendor],
+    models: &mut Vec<String>,
+    default_rate: f64,
+) -> Result<Role, SpecError> {
+    let mut steps = Vec::with_capacity(r.ladder.len());
+    for s in r.ladder {
+        if s.candidates.len() > MAX_CANDIDATES {
+            return Err(SpecError::TooManyCandidates(r.name, s.difficulty));
+        }
+        let mut candidates = Vec::with_capacity(s.candidates.len());
+        for c in s.candidates {
+            let vendor = vendors
+                .iter()
+                .position(|v| v.name == c.vendor)
+                .ok_or(SpecError::UnknownVendor(c.vendor))?;
+            let model = models
+                .iter()
+                .position(|m| *m == c.model)
+                .unwrap_or_else(|| {
+                    models.push(c.model);
+                    models.len() - 1
+                });
+            candidates.push(Candidate {
+                vendor,
+                model,
+                effort: c.effort,
+                tier: c.tier,
+                cost_per_minute: c.cost_per_minute.unwrap_or(default_rate),
+            });
+        }
+        let reserves = vendors
+            .iter()
+            .map(|v| {
+                let mut out = [0.0; MAX_WINDOWS];
+                for (w, def) in v.windows.iter().enumerate() {
+                    if let Some(res) = r
+                        .reserves
+                        .iter()
+                        .find(|res| res.difficulty == s.difficulty && res.window == def.name)
+                    {
+                        out[w] = res.fraction;
+                    }
+                }
+                out
+            })
+            .collect();
+        steps.push(Step {
+            difficulty: s.difficulty,
+            candidates,
+            reserves,
+        });
+    }
+    steps.sort_by_key(|s| s.difficulty);
+    Ok(Role {
+        name: r.name,
+        steps,
+    })
 }
