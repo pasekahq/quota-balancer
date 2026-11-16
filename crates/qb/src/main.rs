@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use qb::auth::Gate;
 use qb::journal::{self, Journal};
 use qb::{DEFAULT_CONFIG, DEFAULT_SOCKET, agent, client, config, listen, log, server};
 use qb_core::Core;
@@ -248,6 +249,7 @@ fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
         log::info(&format!("qbd: listening on {}", socket.display()));
         l
     };
-    let Err(e) = server::serve(&listener, &mut core, &mut journal);
+    let mut gate = Gate::new(&config.clients, &config.limits);
+    let Err(e) = server::serve(&listener, &mut core, &mut journal, &mut gate);
     Err(format!("listener failed: {e}"))
 }

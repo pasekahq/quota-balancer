@@ -3,16 +3,18 @@
 #![allow(clippy::unwrap_used)]
 
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use qb::auth::Gate;
 use qb::client::call;
-use qb::config;
-use qb::journal::Journal;
-use qb_core::{Core, Spec};
+use qb::config::{self, Limits};
+use qb::journal::{self, Journal};
+use qb_core::{Core, Record, Spec};
 use qb_proto::{
     Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginStatus, Outcome,
     PickResponse, ReportRequest, ReportResponse, Source, StateResponse, WindowReport, paths,
@@ -51,7 +53,8 @@ fn spawn_server() -> PathBuf {
     let listener = UnixListener::bind(&path).unwrap();
     std::thread::spawn(move || {
         let mut core = Core::new(Spec::default()).unwrap();
-        qb::server::serve(&listener, &mut core, &mut Journal::off())
+        let mut gate = Gate::new(&[], &Limits::default());
+        qb::server::serve(&listener, &mut core, &mut Journal::off(), &mut gate)
     });
     path
 }
@@ -556,21 +559,50 @@ fn leases_reserve_quota_and_reports_steer_the_next_pick() {
     assert_eq!(status, 404, "a released lease is gone");
 }
 
-/// `qbd.toml` with its journal at `dir/journal`, rotated at `rotate_bytes`.
-fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
-    let text = std::fs::read_to_string(example("qbd.toml"))
-        .unwrap()
-        .replace(
-            "path = \"/var/lib/qb/journal\"",
-            &format!("path = \"{}\"", dir.join("journal").display()),
-        )
-        .replace(
-            "rotate_bytes = 1048576",
-            &format!("rotate_bytes = {rotate_bytes}"),
-        );
+/// The uid this test process runs as: the owner of a directory it created.
+fn own_uid() -> u32 {
+    std::fs::metadata(temp_dir("uid")).unwrap().uid()
+}
+
+/// Token of the bearer client `client-b` in the configs below; `BEARER_SHA256` is its hash.
+const BEARER: &str = "token-b";
+const BEARER_SHA256: &str = "49e2bb7eab54cf09b409ffafd3fa8a8a955a60eb972faacaefbed3dbd3207132";
+
+/// `qbd.toml` in `dir` with each `(from, to)` replaced once and its journal at `dir/journal`.
+fn config_copy(dir: &Path, edits: &[(&str, String)]) -> PathBuf {
+    let mut text = std::fs::read_to_string(example("qbd.toml")).unwrap();
+    let journal = format!("path = \"{}\"", dir.join("journal").display());
+    for (from, to) in [("path = \"/var/lib/qb/journal\"", journal)]
+        .iter()
+        .chain(edits)
+    {
+        assert!(text.contains(from), "{from} not in qbd.toml");
+        text = text.replace(from, to);
+    }
     let file = dir.join("qbd.toml");
     std::fs::write(&file, text).unwrap();
     file
+}
+
+/// `qbd.toml` rotated at `rotate_bytes`, with `client-a` on this process's uid, `client-b` on
+/// [`BEARER`] and limits no test reaches.
+fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
+    config_copy(
+        dir,
+        &[
+            (
+                "rotate_bytes = 1048576",
+                format!("rotate_bytes = {rotate_bytes}"),
+            ),
+            ("uid = 1001", format!("uid = {}", own_uid())),
+            (
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                BEARER_SHA256.to_owned(),
+            ),
+            ("rate_per_s = 5.0", "rate_per_s = 1000.0".to_owned()),
+            ("burst = 20", "burst = 1000".to_owned()),
+        ],
+    )
 }
 
 fn start(config: &Path, sock: &Path) -> Daemon {
@@ -713,6 +745,18 @@ fn rotation_keeps_two_bounded_files_and_the_live_state() {
     for (name, len) in &files {
         assert!(*len < ROTATE + LINE, "{name} has {len} bytes");
     }
+    let issued = |name: &str| {
+        let text = std::fs::read(dir.join(name)).unwrap();
+        let first = text.split(|&b| b == b'\n').next().unwrap();
+        match journal::decode(first).unwrap().0 {
+            Record::Issued(n) => n,
+            other => panic!("{name} starts with {other:?}"),
+        }
+    };
+    assert!(
+        issued("journal") > issued("journal.1"),
+        "both files start with a rotation header, the current one later"
+    );
 
     let _d = start(&config, &sock);
     assert_restored(&before, &state(&sock), &released);
@@ -815,4 +859,161 @@ fn journal_off_writes_nothing() {
     drop(d);
     let left: Vec<_> = std::fs::read_dir(&state_dir).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// Sends one request with `Authorization: Bearer <bearer>` and returns `(status, body)`.
+fn call_with_bearer(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    bearer: &str,
+) -> (u16, Vec<u8>) {
+    let mut s = UnixStream::connect(sock).unwrap();
+    let body = body.unwrap_or_default();
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: qb\r\nAuthorization: Bearer {bearer}\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let head = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let status = std::str::from_utf8(&raw[9..12]).unwrap().parse().unwrap();
+    (status, raw[head + 4..].to_vec())
+}
+
+fn lease_clients(sock: &Path) -> Vec<(String, String)> {
+    state(sock)
+        .leases
+        .into_iter()
+        .map(|l| (l.lease_id, l.client))
+        .collect()
+}
+
+#[test]
+fn callers_are_identified_by_bearer_then_uid() {
+    let dir = temp_dir("ident");
+    let sock = dir.join("qb.sock");
+    let _d = start(&journaled_config(&dir, 1 << 20), &sock);
+
+    let by_uid: PickResponse = post(&sock, paths::PICK, TASK);
+    let (status, body) = call_with_bearer(&sock, "POST", paths::PICK, Some(TASK), BEARER);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let by_bearer: PickResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        lease_clients(&sock),
+        [
+            (by_uid.lease_id.unwrap(), "client-a".to_owned()),
+            (by_bearer.lease_id.unwrap(), "client-b".to_owned()),
+        ]
+    );
+
+    for (method, path, body) in [
+        ("POST", paths::PICK, Some(TASK)),
+        ("GET", paths::STATE, None),
+    ] {
+        let (status, resp) = call_with_bearer(&sock, method, path, body, "token-x");
+        assert_eq!(
+            status, 401,
+            "{path}: a wrong bearer does not fall back to the uid"
+        );
+        assert_eq!(error_of(&resp), ErrorCode::Unauthorized);
+    }
+    assert_eq!(lease_clients(&sock).len(), 2);
+}
+
+#[test]
+fn an_undeclared_uid_may_only_ask_for_health() {
+    let dir = temp_dir("stranger");
+    let sock = dir.join("qb.sock");
+    let other = own_uid().wrapping_add(1);
+    let config = config_copy(&dir, &[("uid = 1001", format!("uid = {other}"))]);
+    let _d = start(&config, &sock);
+    let (status, resp) = call(&sock, "POST", paths::PICK, Some(TASK.as_bytes())).unwrap();
+    assert_eq!(status, 401);
+    assert_eq!(error_of(&resp), ErrorCode::Unauthorized);
+    let (status, _) = call(&sock, "GET", paths::STATE, None).unwrap();
+    assert_eq!(status, 401);
+    let (status, _) = call(&sock, "GET", paths::HEALTH, None).unwrap();
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn without_clients_callers_are_named_by_uid() {
+    let sock = temp_socket("open");
+    let _d = start(&example("minimal.toml"), &sock);
+    let p: PickResponse = post(&sock, paths::PICK, TASK);
+    assert_eq!(
+        lease_clients(&sock),
+        [(p.lease_id.unwrap(), format!("uid:{}", own_uid()))]
+    );
+}
+
+#[test]
+fn only_the_holder_reports_a_lease() {
+    let dir = temp_dir("owner");
+    let sock = dir.join("qb.sock");
+    let _d = start(&journaled_config(&dir, 1 << 20), &sock);
+    let lease = post::<PickResponse>(&sock, paths::PICK, TASK)
+        .lease_id
+        .unwrap();
+    let before = state(&sock);
+    let release = format!(r#"{{"lease_id":"{lease}","outcome":"usage_limit","release":true}}"#);
+
+    let (status, resp) = call_with_bearer(&sock, "POST", paths::REPORT, Some(&release), BEARER);
+    assert_eq!(status, 403);
+    assert_eq!(error_of(&resp), ErrorCode::Forbidden);
+    let after = state(&sock);
+    assert_eq!(
+        durable(&after),
+        durable(&before),
+        "the lease and marks are unchanged"
+    );
+
+    let r: ReportResponse = post(&sock, paths::REPORT, &release);
+    assert_eq!(r.login_status, LoginStatus::Exhausted);
+    assert_eq!(lease_clients(&sock), Vec::<(String, String)>::new());
+
+    let by_login = r#"{"login":"login-2","outcome":"ok"}"#;
+    let (status, _) = call_with_bearer(&sock, "POST", paths::REPORT, Some(by_login), BEARER);
+    assert_eq!(status, 200, "login reports are open to every client");
+}
+
+#[test]
+fn each_client_has_a_token_bucket() {
+    let dir = temp_dir("bucket");
+    let sock = dir.join("qb.sock");
+    let config = config_copy(
+        &dir,
+        &[
+            ("uid = 1001", format!("uid = {}", own_uid())),
+            ("rate_per_s = 5.0", "rate_per_s = 0.5".to_owned()),
+            ("burst = 20", "burst = 3".to_owned()),
+        ],
+    );
+    let _d = start(&config, &sock);
+    for _ in 0..5 {
+        let (status, _) = call_with_bearer(&sock, "GET", paths::STATE, None, "token-x");
+        assert_eq!(status, 401);
+    }
+    let started = Instant::now();
+    for i in 0..3 {
+        let (status, _) = call(&sock, "GET", paths::STATE, None).unwrap();
+        assert_eq!(status, 200, "request {i} fits the burst after the 401s");
+    }
+    let (status, resp) = call(&sock, "GET", paths::STATE, None).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "too slow to test the burst"
+    );
+    assert_eq!(status, 429);
+    assert_eq!(error_of(&resp), ErrorCode::TooManyRequests);
+
+    // At 0.5/s one token is back 2 s after the burst began.
+    std::thread::sleep(Duration::from_millis(2500).saturating_sub(started.elapsed()));
+    let (status, _) = call(&sock, "GET", paths::STATE, None).unwrap();
+    assert_eq!(status, 200, "a refilled token lets the next request pass");
 }

@@ -8,13 +8,33 @@ Types are defined in `crates/qb-proto`; example payloads are in `crates/qb-proto
 | Endpoint | Request | Response |
 |---|---|---|
 | `POST /v1/pick` | `PickRequest` | 200 `PickResponse` |
-| `POST /v1/report` | `ReportRequest` | 200 `ReportResponse`, 404 unknown lease/login/model |
+| `POST /v1/report` | `ReportRequest` | 200 `ReportResponse`, 403 another client's lease, 404 unknown lease/login/model |
 | `GET /v1/state` | — | 200 `StateResponse` |
 | `GET /v1/health` | — | 200 `HealthResponse` |
 
 Errors: `{"error": <code>, "message": "..."}` with codes `bad_request` (400), `unauthorized`
 (401), `forbidden` (403), `not_found` (404), `method_not_allowed` (405), `length_required`
 (411), `payload_too_large` (413), `too_many_requests` (429), `internal` (500).
+
+## Callers
+
+Before routing, every request is identified and then charged to its caller's token bucket:
+
+1. With `Authorization: Bearer <token>`, the token's SHA-256 is compared in constant time with
+   every `bearer_sha256` of `[[clients]]` (see [config.md](config.md)); the matching client is
+   the caller. A token that matches none is 401 `unauthorized`, whatever the peer's uid.
+2. Without a bearer, the peer's uid from `SO_PEERCRED` names the client with that `uid`; a uid no
+   client declares is 401.
+3. With no `[[clients]]` declared, every peer without a bearer is the caller `uid:<uid>`; the
+   socket's file mode is the boundary.
+4. The caller takes one token from its own bucket: `[limits] burst` tokens, refilled at
+   `rate_per_s` on a monotonic clock. An empty bucket is 429 `too_many_requests`. A 401 takes
+   no token. Without declared clients at most 64 uids keep a bucket; once all 64 are taken, a
+   new uid replaces the fullest bucket.
+
+`GET /v1/health` answers a peer that is not identified, without a bucket. The caller's name goes
+into the leases it picks and the journal. A report by `lease_id` of a lease another client holds
+is 403 `forbidden` and changes nothing; a report by `login` is open to every caller.
 
 ## `POST /v1/pick`
 

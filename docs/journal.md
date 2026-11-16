@@ -33,7 +33,9 @@ Lease expiries and the ends of marks are not written: they follow from the recor
 Once the file reaches `rotate_bytes` after an append, it is renamed to `<path>.1` (replacing the
 previous `.1`) and a new file starts with the live state at that moment: one `issued` line, one
 `lease` line per live lease and one `marks` line per login with any mark. Each file stays below
-`rotate_bytes` plus one line, unless the live state alone is larger.
+`rotate_bytes` plus one line, unless the live state alone is larger. If the new file cannot be
+created, nothing is written to `<path>.1` any more: each later change retries, and the first one
+that succeeds starts the file with the live state, which already holds that change.
 
 ## Replay
 

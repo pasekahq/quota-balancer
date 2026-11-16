@@ -242,9 +242,11 @@ pub struct Journal {
 #[derive(Debug)]
 struct Appender {
     path: PathBuf,
-    file: File,
+    /// `None` after a rotation could not reopen `path`; the next record retries.
+    file: Option<File>,
     len: u64,
     rotate_bytes: u64,
+    open: fn(&Path) -> io::Result<File>,
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -275,42 +277,140 @@ impl Journal {
         Ok(Self {
             file: Some(Appender {
                 path: path.to_owned(),
-                file,
+                file: Some(file),
                 len: len.min(valid_len),
                 rotate_bytes,
+                open: open_append,
             }),
         })
     }
 
     /// Appends `record` as of `at`. Once the file reaches the rotation size it becomes
     /// `<path>.1` and the new file starts with `core`'s live state, so either file pair
-    /// replays to the same leases and marks.
+    /// replays to the same leases and marks. While the new file cannot be opened nothing is
+    /// written; the first record that opens it writes the live state, which includes `record`.
     ///
     /// # Errors
-    /// Encoding, writing or rotation failed.
+    /// Encoding, writing, rotation or reopening failed.
     pub fn record(&mut self, core: &Core, record: &Record, at: u64) -> io::Result<()> {
         let Some(a) = &mut self.file else {
             return Ok(());
         };
-        a.append(&encode(record, at)?)?;
+        let Some(file) = &mut a.file else {
+            return a.start(core, at);
+        };
+        let line = encode(record, at)?;
+        file.write_all(&line)?;
+        a.len += line.len() as u64;
         if a.len < a.rotate_bytes {
             return Ok(());
         }
         std::fs::rename(&a.path, rotated(&a.path))?;
-        a.file = open_append(&a.path)?;
-        a.len = 0;
-        let mut header = Vec::new();
-        for r in core.records() {
-            header.extend(encode(&r, at)?);
-        }
-        a.append(&header)
+        a.file = None;
+        a.start(core, at)
     }
 }
 
 impl Appender {
-    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)?;
-        self.len += bytes.len() as u64;
+    /// Opens a fresh `path` and writes `core`'s live state as of `at` as its header.
+    fn start(&mut self, core: &Core, at: u64) -> io::Result<()> {
+        let mut header = Vec::new();
+        for r in core.records() {
+            header.extend(encode(&r, at)?);
+        }
+        let file = self.file.insert((self.open)(&self.path)?);
+        self.len = 0;
+        file.write_all(&header)?;
+        self.len = header.len() as u64;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use qb_core::{LoginSpec, OutcomeClass, ReportInput, ReportSubject, Spec, VendorSpec};
+
+    use super::*;
+
+    const NOW: u64 = 1_800_000_000;
+
+    thread_local! {
+        static REOPEN_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn flaky_open(path: &Path) -> io::Result<File> {
+        if REOPEN_FAILS.get() {
+            Err(io::Error::other("injected open failure"))
+        } else {
+            open_append(path)
+        }
+    }
+
+    fn rate_limited_core() -> Core {
+        let mut core = Core::new(Spec {
+            vendors: vec![VendorSpec {
+                name: "vendor-a".into(),
+                windows: Vec::new(),
+            }],
+            logins: vec![LoginSpec {
+                name: "login-1".into(),
+                vendor: "vendor-a".into(),
+            }],
+            rate_limit_backoff_s: 60,
+            ..Spec::default()
+        })
+        .expect("valid spec");
+        let input = ReportInput {
+            subject: ReportSubject::Login("login-1".into()),
+            outcome: OutcomeClass::Http429,
+            model: None,
+            release: false,
+            windows: Vec::new(),
+        };
+        core.report(&input, NOW).expect("known login");
+        core
+    }
+
+    fn records(file: &Path) -> Vec<Record> {
+        std::fs::read(file)
+            .expect("readable")
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| decode(l).expect("valid line").0)
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_reopen_writes_nothing_until_the_live_state_can_start_a_file() {
+        let dir = std::env::temp_dir().join(format!("qb-journal-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("journal");
+        let core = rate_limited_core();
+        let mut journal = Journal::open(&path, 1, 0).expect("open");
+        if let Some(a) = &mut journal.file {
+            a.open = flaky_open;
+        }
+
+        REOPEN_FAILS.set(true);
+        assert!(journal.record(&core, &Record::Release(1), NOW).is_err());
+        let rotated_len = std::fs::metadata(rotated(&path)).expect(".1").len();
+        for id in 2..5 {
+            assert!(journal.record(&core, &Record::Release(id), NOW).is_err());
+        }
+        assert_eq!(
+            std::fs::metadata(rotated(&path)).expect(".1").len(),
+            rotated_len
+        );
+        assert!(!path.exists());
+
+        REOPEN_FAILS.set(false);
+        journal
+            .record(&core, &Record::Release(5), NOW + 1)
+            .expect("reopened");
+        assert_eq!(records(&rotated(&path)), [Record::Release(1)]);
+        assert_eq!(records(&path), core.records());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

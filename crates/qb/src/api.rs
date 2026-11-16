@@ -71,21 +71,26 @@ pub fn handle(
 ) -> Reply {
     let known = [paths::PICK, paths::REPORT, paths::STATE, paths::HEALTH];
     match (req.method, req.path.as_str()) {
-        (Method::Get, paths::HEALTH) => json(
-            200,
-            &HealthResponse {
-                status: HealthStatus::Ok,
-                api_version: API_VERSION.to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                uptime_s: env.uptime_s,
-            },
-        ),
+        (Method::Get, paths::HEALTH) => health(env),
         (Method::Get, paths::STATE) => state(core, env.now),
         (Method::Post, paths::PICK) => pick(core, journal, &req.body, caller, env.now),
-        (Method::Post, paths::REPORT) => report(core, journal, &req.body, env.now),
+        (Method::Post, paths::REPORT) => report(core, journal, &req.body, caller, env.now),
         (_, p) if known.contains(&p) => error(ErrorCode::MethodNotAllowed, "method not allowed"),
         _ => error(ErrorCode::NotFound, "no such endpoint"),
     }
+}
+
+/// The `GET /v1/health` reply, which needs no caller.
+pub fn health(env: Env) -> Reply {
+    json(
+        200,
+        &HealthResponse {
+            status: HealthStatus::Ok,
+            api_version: API_VERSION.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            uptime_s: env.uptime_s,
+        },
+    )
 }
 
 fn record(journal: &mut Journal, core: &Core, record: &Record, now: u64) {
@@ -170,7 +175,7 @@ fn bare(decision: Decision, reason: &str) -> PickResponse {
     }
 }
 
-fn report(core: &mut Core, journal: &mut Journal, body: &[u8], now: u64) -> Reply {
+fn report(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, now: u64) -> Reply {
     let req: ReportRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return error(ErrorCode::BadRequest, format!("invalid report: {e}")),
@@ -203,7 +208,12 @@ fn report(core: &mut Core, journal: &mut Journal, body: &[u8], now: u64) -> Repl
     };
     core.tick(now);
     let login = match &input.subject {
-        ReportSubject::Lease(id) => core.lease(*id).map(|l| l.login),
+        ReportSubject::Lease(id) => match core.lease(*id) {
+            Some(l) if l.client != caller.client => {
+                return error(ErrorCode::Forbidden, "lease held by another client");
+            }
+            l => l.map(|l| l.login),
+        },
         ReportSubject::Login(name) => Some(name.clone()),
     };
     let before = login.as_deref().and_then(|l| core.marks(l));
