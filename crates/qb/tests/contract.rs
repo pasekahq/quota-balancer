@@ -2108,3 +2108,127 @@ fn a_hardened_agent_binary_reports_a_malformed_credential_file_as_a_failed_probe
             .all(|w| w.stale && w.source != Source::Probe)
     );
 }
+
+/// Runs one `clients/python/qb_client.py` call through its contract driver and returns the
+/// driver's JSON line. `-I -S` keeps site-packages and the environment off `sys.path`, so a
+/// client import outside the stdlib fails every test that goes through here.
+fn py_client(
+    sock: &Path,
+    bearer: Option<&str>,
+    timeout: f64,
+    op: &str,
+    request: Option<&str>,
+) -> serde_json::Value {
+    let driver =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../clients/python/contract_driver.py");
+    let out = Command::new("python3")
+        .args(["-I", "-S"])
+        .arg(driver)
+        .arg(sock)
+        .arg(bearer.unwrap_or(""))
+        .arg(timeout.to_string())
+        .arg(op)
+        .args(request)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("the Python client tests need python3 (3.9+) on PATH, running it failed: {e}")
+        });
+    assert!(
+        out.status.success(),
+        "python3 driver {op} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn python_client_picks_reports_and_sends_its_bearer() {
+    let dir = temp_dir("py");
+    let sock = dir.join("qb.sock");
+    let _d = start(&journaled_config(&dir, 1 << 20), &sock);
+
+    let picked = &py_client(&sock, None, 2.0, "pick", Some(TASK))["result"];
+    assert_eq!(picked["decision"], "run", "{picked}");
+    assert!(picked.get("fallback").is_none(), "{picked}");
+    let lease = picked["lease_id"].as_str().unwrap();
+    let report = format!(r#"{{"lease_id":"{lease}","outcome":"ok","release":true}}"#);
+    let reported = py_client(&sock, None, 2.0, "report", Some(&report));
+    assert_eq!(reported["result"]["accepted"], true, "{reported}");
+
+    let by_bearer = py_client(&sock, Some(BEARER), 2.0, "pick", Some(TASK));
+    let lease = by_bearer["result"]["lease_id"].as_str().unwrap();
+    let s = py_client(&sock, Some(BEARER), 2.0, "state", None);
+    let leases = s["result"]["leases"].as_array().unwrap();
+    assert_eq!(leases.len(), 1, "{s}");
+    assert_eq!(leases[0]["lease_id"], lease);
+    assert_eq!(leases[0]["client"], "client-b");
+    let h = py_client(&sock, None, 2.0, "health", None);
+    assert_eq!(h["result"]["status"], "ok", "{h}");
+}
+
+#[test]
+fn python_client_falls_back_when_qbd_is_unreachable() {
+    let dir = temp_dir("pyoff");
+    let missing = dir.join("missing.sock");
+    let refused = dir.join("refused.sock");
+    drop(UnixListener::bind(&refused).unwrap());
+    let silent = dir.join("silent.sock");
+    let listener = UnixListener::bind(&silent).unwrap();
+    std::thread::spawn(move || {
+        let held: Vec<_> = listener.incoming().collect();
+        drop(held);
+    });
+
+    let local = serde_json::json!({
+        "decision": "run", "login": "local-login", "role": "worker", "fallback": true,
+    });
+    for sock in [&missing, &refused, &silent] {
+        let picked = py_client(sock, None, 0.3, "pick", Some(TASK));
+        assert_eq!(picked["result"], local, "{}", sock.display());
+        let reported = py_client(
+            sock,
+            None,
+            0.3,
+            "report",
+            Some(r#"{"login":"login-1","outcome":"ok"}"#),
+        );
+        assert_eq!(
+            reported,
+            serde_json::json!({ "result": null }),
+            "{}",
+            sock.display()
+        );
+    }
+}
+
+#[test]
+fn python_client_raises_http_errors_instead_of_falling_back() {
+    let dir = temp_dir("pyerr");
+    let sock = dir.join("qb.sock");
+    let d = start(&journaled_config(&dir, 1 << 20), &sock);
+    let unknown = py_client(
+        &sock,
+        None,
+        2.0,
+        "report",
+        Some(r#"{"login":"login-9","outcome":"ok"}"#),
+    );
+    assert_eq!(unknown["qb_error"]["status"], 404, "{unknown}");
+    assert_eq!(unknown["qb_error"]["error"], "not_found");
+    drop(d);
+
+    let dir = temp_dir("pyerr");
+    let sock = dir.join("qb.sock");
+    let config = config_copy(
+        &dir,
+        &[
+            client_uid("client-a", foreign_uid(0)),
+            client_uid("agent-1", foreign_uid(1)),
+        ],
+    );
+    let _d = start(&config, &sock);
+    let stranger = py_client(&sock, None, 2.0, "pick", Some(TASK));
+    assert_eq!(stranger["qb_error"]["status"], 401, "{stranger}");
+    assert_eq!(stranger["qb_error"]["error"], "unauthorized");
+    assert!(stranger.get("result").is_none(), "{stranger}");
+}
