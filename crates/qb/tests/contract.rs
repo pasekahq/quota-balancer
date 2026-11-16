@@ -590,7 +590,28 @@ fn own_uid() -> u32 {
 const BEARER: &str = "token-b";
 const BEARER_SHA256: &str = "49e2bb7eab54cf09b409ffafd3fa8a8a955a60eb972faacaefbed3dbd3207132";
 
-/// `qbd.toml` in `dir` with each `(from, to)` replaced once and its journal at `dir/journal`.
+/// Uids no test process runs as and `qbd.toml` does not declare.
+const FOREIGN_UIDS: [u32; 2] = [4_000_000_001, 4_000_000_002];
+
+fn foreign_uid(slot: usize) -> u32 {
+    let uid = FOREIGN_UIDS[slot];
+    assert_ne!(uid, own_uid(), "the test process runs as a foreign uid");
+    uid
+}
+
+/// [`config_copy`] edit giving the example client `client` the uid `uid`. Anchored on the client's
+/// name, so edits of different clients never rewrite each other's result.
+fn client_uid(client: &str, uid: u32) -> (&'static str, String) {
+    let line = match client {
+        "client-a" => "name = \"client-a\"\nuid = 1001",
+        "agent-1" => "name = \"agent-1\"\nuid = 1002",
+        other => panic!("{other} has no uid in qbd.toml"),
+    };
+    (line, format!("name = \"{client}\"\nuid = {uid}"))
+}
+
+/// `qbd.toml` in `dir` with each `(from, to)` replaced, `from` occurring exactly once, and its
+/// journal at `dir/journal`.
 fn config_copy(dir: &Path, edits: &[(&str, String)]) -> PathBuf {
     let mut text = std::fs::read_to_string(example("qbd.toml")).unwrap();
     let journal = format!("path = \"{}\"", dir.join("journal").display());
@@ -598,16 +619,16 @@ fn config_copy(dir: &Path, edits: &[(&str, String)]) -> PathBuf {
         .iter()
         .chain(edits)
     {
-        assert!(text.contains(from), "{from} not in qbd.toml");
-        text = text.replace(from, to);
+        assert_eq!(text.matches(from).count(), 1, "{from} not once in qbd.toml");
+        text = text.replacen(from, to, 1);
     }
     let file = dir.join("qbd.toml");
     std::fs::write(&file, text).unwrap();
     file
 }
 
-/// `qbd.toml` rotated at `rotate_bytes`, with `client-a` on this process's uid, `client-b` on
-/// [`BEARER`] and limits no test reaches.
+/// `qbd.toml` rotated at `rotate_bytes`, with `client-a` on this process's uid, `agent-1` on a
+/// foreign uid, `client-b` on [`BEARER`] and limits no test reaches.
 fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
     config_copy(
         dir,
@@ -616,7 +637,8 @@ fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
                 "rotate_bytes = 1048576",
                 format!("rotate_bytes = {rotate_bytes}"),
             ),
-            ("uid = 1001", format!("uid = {}", own_uid())),
+            client_uid("client-a", own_uid()),
+            client_uid("agent-1", foreign_uid(0)),
             (
                 "0000000000000000000000000000000000000000000000000000000000000001",
                 BEARER_SHA256.to_owned(),
@@ -934,8 +956,13 @@ fn callers_are_identified_by_bearer_then_uid() {
 fn an_undeclared_uid_may_only_ask_for_health() {
     let dir = temp_dir("stranger");
     let sock = dir.join("qb.sock");
-    let other = own_uid().wrapping_add(1);
-    let config = config_copy(&dir, &[("uid = 1001", format!("uid = {other}"))]);
+    let config = config_copy(
+        &dir,
+        &[
+            client_uid("client-a", foreign_uid(0)),
+            client_uid("agent-1", foreign_uid(1)),
+        ],
+    );
     let _d = start(&config, &sock);
     let (status, resp) = call(&sock, "POST", paths::PICK, Some(TASK.as_bytes()), None).unwrap();
     assert_eq!(status, 401);
@@ -1008,7 +1035,8 @@ fn each_client_has_a_token_bucket() {
     let config = config_copy(
         &dir,
         &[
-            ("uid = 1001", format!("uid = {}", own_uid())),
+            client_uid("client-a", own_uid()),
+            client_uid("agent-1", foreign_uid(0)),
             ("rate_per_s = 5.0", "rate_per_s = 0.5".to_owned()),
             ("burst = 20", "burst = 3".to_owned()),
         ],
@@ -1402,12 +1430,12 @@ const BOTS: [(&str, &str); 3] = [
     ),
 ];
 
-/// `qbd.toml` with the agent client `agent-1` on this process's uid, `client-a` on another uid,
+/// `qbd.toml` with the agent client `agent-1` on this process's uid, `client-a` on a foreign uid,
 /// `client-b` on [`BEARER`], limits no test reaches, and `edits` applied.
 fn agent_config(dir: &Path, edits: &[(&str, String)]) -> PathBuf {
     let mut all = vec![
-        ("uid = 1001", format!("uid = {}", own_uid().wrapping_add(1))),
-        ("uid = 1002", format!("uid = {}", own_uid())),
+        client_uid("client-a", foreign_uid(0)),
+        client_uid("agent-1", own_uid()),
         (
             "0000000000000000000000000000000000000000000000000000000000000001",
             BEARER_SHA256.to_owned(),
