@@ -82,6 +82,25 @@ curl --unix-socket /tmp/qb.sock http://qb/v1/state
 windows (`POST /v1/report`, see [docs/api.md](docs/api.md)) every window counts as unused, so
 `pick` answers `run` on `login-1` with `"stale": true`.
 
+More commands (`qb --help` lists every option):
+
+```sh
+qb why l-257                      # the lease, the reason it was granted, its login now
+qb report --login login-1 --from-stream-json run.jsonl   # a Claude stream-json log, - = stdin
+qb simulate --config new.toml /var/lib/qb/journal --pick '{"role":"worker","difficulty":1}'
+qb --bearer-file token state                              # or QB_BEARER_FILE=token
+```
+
+- `report --from-stream-json` posts the windows of the log's last `rate_limit_event` with the
+  outcome `rejected` if that event was rejected, else `ok`. It reads one line at a time, skips
+  lines it cannot parse and lines over 1 MiB, and exits 1 without posting when the log has no
+  such event.
+- `simulate` replays a journal against a config without a daemon and writes nothing; see
+  [docs/journal.md](docs/journal.md).
+- `--bearer-file` sends the file's token, trailing whitespace trimmed, as
+  `Authorization: Bearer`, for a socket forwarded from another host. The token is never taken
+  from the command line; an empty file is a usage error.
+
 ## Install as a service
 
 Templates live in [`deploy/systemd/`](deploy/systemd): `qbd.socket` + `qbd.service` (system

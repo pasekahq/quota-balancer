@@ -17,7 +17,8 @@ use qb::journal::{self, Journal};
 use qb_core::{Core, Record, Spec};
 use qb_proto::{
     Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginStatus, Outcome,
-    PickResponse, ReportRequest, ReportResponse, Source, StateResponse, WindowReport, paths,
+    PickResponse, ReportRequest, ReportResponse, Source, StateResponse, WhyResponse, WindowReport,
+    paths,
 };
 
 /// Room for the directory and file names a test adds under the base.
@@ -66,7 +67,7 @@ fn error_of(body: &[u8]) -> ErrorCode {
 #[test]
 fn health_reports_version() {
     let sock = spawn_server();
-    let (status, body) = call(&sock, "GET", paths::HEALTH, None).unwrap();
+    let (status, body) = call(&sock, "GET", paths::HEALTH, None, None).unwrap();
     assert_eq!(status, 200);
     let h: HealthResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(h.status, HealthStatus::Ok);
@@ -77,7 +78,7 @@ fn health_reports_version() {
 #[test]
 fn state_is_empty_without_config() {
     let sock = spawn_server();
-    let (status, body) = call(&sock, "GET", paths::STATE, None).unwrap();
+    let (status, body) = call(&sock, "GET", paths::STATE, None, None).unwrap();
     assert_eq!(status, 200);
     let s: StateResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(s.logins.len(), 0);
@@ -89,7 +90,7 @@ fn state_is_empty_without_config() {
 fn pick_without_logins_is_dead() {
     let sock = spawn_server();
     let body = br#"{"role":"worker","difficulty":1}"#;
-    let (status, resp) = call(&sock, "POST", paths::PICK, Some(body)).unwrap();
+    let (status, resp) = call(&sock, "POST", paths::PICK, Some(body), None).unwrap();
     assert_eq!(status, 200);
     let p: PickResponse = serde_json::from_slice(&resp).unwrap();
     assert_eq!(p.decision, Decision::Dead);
@@ -106,7 +107,7 @@ fn pick_rejects_invalid_requests() {
         br#"{"role":"worker","difficulty":1,"pin":{"vendor":"v","model":"m"}}"#,
         br#"{"role":"worker","difficulty":1,"unknown":true}"#,
     ] {
-        let (status, resp) = call(&sock, "POST", paths::PICK, Some(body)).unwrap();
+        let (status, resp) = call(&sock, "POST", paths::PICK, Some(body), None).unwrap();
         assert_eq!(status, 400, "{}", String::from_utf8_lossy(body));
         assert_eq!(error_of(&resp), ErrorCode::BadRequest);
     }
@@ -120,6 +121,7 @@ fn report_on_unknown_subjects() {
         "POST",
         paths::REPORT,
         Some(br#"{"lease_id":"l-1","outcome":"ok","release":true}"#),
+        None,
     )
     .unwrap();
     assert_eq!(status, 404);
@@ -129,23 +131,31 @@ fn report_on_unknown_subjects() {
         "POST",
         paths::REPORT,
         Some(br#"{"login":"nope","outcome":"usage_limit"}"#),
+        None,
     )
     .unwrap();
     assert_eq!(status, 404);
-    let (status, _) = call(&sock, "POST", paths::REPORT, Some(br#"{"outcome":"ok"}"#)).unwrap();
+    let (status, _) = call(
+        &sock,
+        "POST",
+        paths::REPORT,
+        Some(br#"{"outcome":"ok"}"#),
+        None,
+    )
+    .unwrap();
     assert_eq!(status, 400);
 }
 
 #[test]
 fn routing_errors() {
     let sock = spawn_server();
-    let (status, resp) = call(&sock, "GET", "/v1/nope", None).unwrap();
+    let (status, resp) = call(&sock, "GET", "/v1/nope", None, None).unwrap();
     assert_eq!(status, 404);
     assert_eq!(error_of(&resp), ErrorCode::NotFound);
-    let (status, resp) = call(&sock, "GET", paths::PICK, None).unwrap();
+    let (status, resp) = call(&sock, "GET", paths::PICK, None, None).unwrap();
     assert_eq!(status, 405);
     assert_eq!(error_of(&resp), ErrorCode::MethodNotAllowed);
-    let (status, _) = call(&sock, "POST", paths::HEALTH, Some(b"{}")).unwrap();
+    let (status, _) = call(&sock, "POST", paths::HEALTH, Some(b"{}"), None).unwrap();
     assert_eq!(status, 405);
 }
 
@@ -153,7 +163,7 @@ fn routing_errors() {
 fn oversized_and_unframed_requests() {
     let sock = spawn_server();
     let big = vec![b' '; qb::http::MAX_BODY + 1];
-    let (status, resp) = call(&sock, "POST", paths::PICK, Some(&big)).unwrap();
+    let (status, resp) = call(&sock, "POST", paths::PICK, Some(&big), None).unwrap();
     assert_eq!(status, 413);
     assert_eq!(error_of(&resp), ErrorCode::PayloadTooLarge);
 
@@ -170,7 +180,7 @@ fn a_silent_client_does_not_wedge_the_daemon() {
     let sock = spawn_server();
     let _idle = UnixStream::connect(&sock).unwrap();
     let t = Instant::now();
-    let (status, _) = call(&sock, "GET", paths::HEALTH, None).unwrap();
+    let (status, _) = call(&sock, "GET", paths::HEALTH, None, None).unwrap();
     assert_eq!(status, 200);
     assert!(t.elapsed() < qb::server::IO_TIMEOUT + Duration::from_secs(2));
 }
@@ -278,7 +288,7 @@ fn daemon_serves_configured_logins() {
             .unwrap(),
     );
     wait_for(&sock);
-    let (status, body) = call(&sock, "GET", paths::STATE, None).unwrap();
+    let (status, body) = call(&sock, "GET", paths::STATE, None, None).unwrap();
     assert_eq!(status, 200);
     let state: StateResponse = serde_json::from_slice(&body).unwrap();
     let served: Vec<(String, String)> = state
@@ -314,7 +324,7 @@ fn report_windows(sock: &Path, login: &str, windows: &[(&str, f64, u64)]) {
         release: false,
     };
     let body = serde_json::to_vec(&req).unwrap();
-    let (status, resp) = call(sock, "POST", paths::REPORT, Some(&body)).unwrap();
+    let (status, resp) = call(sock, "POST", paths::REPORT, Some(&body), None).unwrap();
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
     let r: ReportResponse = serde_json::from_slice(&resp).unwrap();
     assert!(r.accepted);
@@ -326,6 +336,7 @@ fn pick_worker(sock: &Path) -> PickResponse {
         "POST",
         paths::PICK,
         Some(br#"{"role":"worker","difficulty":1}"#),
+        None,
     )
     .unwrap();
     assert_eq!(status, 200);
@@ -387,7 +398,7 @@ fn reported_windows_steer_pick_and_show_in_state() {
     assert_eq!(p.decision, Decision::Run, "{p:?}");
     assert_eq!(p.login.as_deref(), Some("login-2"));
 
-    let (status, body) = call(&sock, "GET", paths::STATE, None).unwrap();
+    let (status, body) = call(&sock, "GET", paths::STATE, None, None).unwrap();
     assert_eq!(status, 200);
     let state: StateResponse = serde_json::from_slice(&body).unwrap();
     let login = |name: &str| {
@@ -472,6 +483,18 @@ fn cli_usage_errors_exit_2() {
         &["pick", "--role", "worker"][..],
         &["report", "--lease", "l-1"],
         &["report", "--lease", "l-1", "--outcome", "bogus"],
+        &[
+            "report",
+            "--lease",
+            "l-1",
+            "--outcome",
+            "ok",
+            "--from-stream-json",
+            "-",
+        ],
+        &["why"],
+        &["simulate"],
+        &["simulate", "journal", "--pick", r#"{"role":"worker"}"#],
         &["frobnicate"],
     ] {
         let st = Command::new(exe)
@@ -492,13 +515,13 @@ fn cli_usage_errors_exit_2() {
 }
 
 fn post<T: serde::de::DeserializeOwned>(sock: &Path, path: &str, body: &str) -> T {
-    let (status, resp) = call(sock, "POST", path, Some(body.as_bytes())).unwrap();
+    let (status, resp) = call(sock, "POST", path, Some(body.as_bytes()), None).unwrap();
     assert_eq!(status, 200, "{body}: {}", String::from_utf8_lossy(&resp));
     serde_json::from_slice(&resp).unwrap()
 }
 
 fn state(sock: &Path) -> StateResponse {
-    let (status, body) = call(sock, "GET", paths::STATE, None).unwrap();
+    let (status, body) = call(sock, "GET", paths::STATE, None, None).unwrap();
     assert_eq!(status, 200);
     serde_json::from_slice(&body).unwrap()
 }
@@ -555,7 +578,7 @@ fn leases_reserve_quota_and_reports_steer_the_next_pick() {
     assert_eq!(live, [second.lease_id.as_deref().unwrap()]);
     assert!(s.logins[0].windows.iter().all(|w| w.reserved == 0.0));
     assert!(s.logins[0].dead_until.is_some());
-    let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes())).unwrap();
+    let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes()), None).unwrap();
     assert_eq!(status, 404, "a released lease is gone");
 }
 
@@ -699,7 +722,7 @@ fn leases_and_marks_survive_a_restart() {
     let after = state(&sock);
     assert_restored(&before, &after, &released);
     let release = format!(r#"{{"lease_id":"{released}","outcome":"ok","release":true}}"#);
-    let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes())).unwrap();
+    let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes()), None).unwrap();
     assert_eq!(status, 404, "a released lease stays released");
 
     let fresh: PickResponse = post(&sock, paths::PICK, TASK);
@@ -861,30 +884,6 @@ fn journal_off_writes_nothing() {
     assert!(left.is_empty(), "{left:?}");
 }
 
-/// Sends one request with `Authorization: Bearer <bearer>` and returns `(status, body)`.
-fn call_with_bearer(
-    sock: &Path,
-    method: &str,
-    path: &str,
-    body: Option<&str>,
-    bearer: &str,
-) -> (u16, Vec<u8>) {
-    let mut s = UnixStream::connect(sock).unwrap();
-    let body = body.unwrap_or_default();
-    write!(
-        s,
-        "{method} {path} HTTP/1.1\r\nHost: qb\r\nAuthorization: Bearer {bearer}\r\n\
-         Content-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).unwrap();
-    let head = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-    let status = std::str::from_utf8(&raw[9..12]).unwrap().parse().unwrap();
-    (status, raw[head + 4..].to_vec())
-}
-
 fn lease_clients(sock: &Path) -> Vec<(String, String)> {
     state(sock)
         .leases
@@ -900,7 +899,14 @@ fn callers_are_identified_by_bearer_then_uid() {
     let _d = start(&journaled_config(&dir, 1 << 20), &sock);
 
     let by_uid: PickResponse = post(&sock, paths::PICK, TASK);
-    let (status, body) = call_with_bearer(&sock, "POST", paths::PICK, Some(TASK), BEARER);
+    let (status, body) = call(
+        &sock,
+        "POST",
+        paths::PICK,
+        Some(TASK.as_bytes()),
+        Some(BEARER),
+    )
+    .unwrap();
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let by_bearer: PickResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(
@@ -912,10 +918,10 @@ fn callers_are_identified_by_bearer_then_uid() {
     );
 
     for (method, path, body) in [
-        ("POST", paths::PICK, Some(TASK)),
+        ("POST", paths::PICK, Some(TASK.as_bytes())),
         ("GET", paths::STATE, None),
     ] {
-        let (status, resp) = call_with_bearer(&sock, method, path, body, "token-x");
+        let (status, resp) = call(&sock, method, path, body, Some("token-x")).unwrap();
         assert_eq!(
             status, 401,
             "{path}: a wrong bearer does not fall back to the uid"
@@ -932,12 +938,12 @@ fn an_undeclared_uid_may_only_ask_for_health() {
     let other = own_uid().wrapping_add(1);
     let config = config_copy(&dir, &[("uid = 1001", format!("uid = {other}"))]);
     let _d = start(&config, &sock);
-    let (status, resp) = call(&sock, "POST", paths::PICK, Some(TASK.as_bytes())).unwrap();
+    let (status, resp) = call(&sock, "POST", paths::PICK, Some(TASK.as_bytes()), None).unwrap();
     assert_eq!(status, 401);
     assert_eq!(error_of(&resp), ErrorCode::Unauthorized);
-    let (status, _) = call(&sock, "GET", paths::STATE, None).unwrap();
+    let (status, _) = call(&sock, "GET", paths::STATE, None, None).unwrap();
     assert_eq!(status, 401);
-    let (status, _) = call(&sock, "GET", paths::HEALTH, None).unwrap();
+    let (status, _) = call(&sock, "GET", paths::HEALTH, None, None).unwrap();
     assert_eq!(status, 200);
 }
 
@@ -963,7 +969,14 @@ fn only_the_holder_reports_a_lease() {
     let before = state(&sock);
     let release = format!(r#"{{"lease_id":"{lease}","outcome":"usage_limit","release":true}}"#);
 
-    let (status, resp) = call_with_bearer(&sock, "POST", paths::REPORT, Some(&release), BEARER);
+    let (status, resp) = call(
+        &sock,
+        "POST",
+        paths::REPORT,
+        Some(release.as_bytes()),
+        Some(BEARER),
+    )
+    .unwrap();
     assert_eq!(status, 403);
     assert_eq!(error_of(&resp), ErrorCode::Forbidden);
     let after = state(&sock);
@@ -978,7 +991,14 @@ fn only_the_holder_reports_a_lease() {
     assert_eq!(lease_clients(&sock), Vec::<(String, String)>::new());
 
     let by_login = r#"{"login":"login-2","outcome":"ok"}"#;
-    let (status, _) = call_with_bearer(&sock, "POST", paths::REPORT, Some(by_login), BEARER);
+    let (status, _) = call(
+        &sock,
+        "POST",
+        paths::REPORT,
+        Some(by_login.as_bytes()),
+        Some(BEARER),
+    )
+    .unwrap();
     assert_eq!(status, 200, "login reports are open to every client");
 }
 
@@ -996,19 +1016,349 @@ fn each_client_has_a_token_bucket() {
     );
     let _d = start(&config, &sock);
     for _ in 0..5 {
-        let (status, _) = call_with_bearer(&sock, "GET", paths::STATE, None, "token-x");
+        let (status, _) = call(&sock, "GET", paths::STATE, None, Some("token-x")).unwrap();
         assert_eq!(status, 401);
     }
     let started = Instant::now();
     for i in 0..3 {
-        let (status, _) = call(&sock, "GET", paths::STATE, None).unwrap();
+        let (status, _) = call(&sock, "GET", paths::STATE, None, None).unwrap();
         assert_eq!(status, 200, "request {i} fits the burst after the 401s");
     }
-    let (status, resp) = call(&sock, "GET", paths::STATE, None).unwrap();
+    let (status, resp) = call(&sock, "GET", paths::STATE, None, None).unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "too slow to test the burst"
     );
     assert_eq!(status, 429);
     assert_eq!(error_of(&resp), ErrorCode::TooManyRequests);
+}
+
+/// Runs the `qb` binary on `sock` with `args` and returns its output.
+fn qb(sock: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_qb"))
+        .env_remove("QB_BEARER_FILE")
+        .arg("--socket")
+        .arg(sock)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn why(sock: &Path, lease: &str) -> (u16, Vec<u8>) {
+    call(sock, "GET", &format!("{}{lease}", paths::WHY), None, None).unwrap()
+}
+
+#[test]
+fn why_explains_a_live_lease_across_a_restart() {
+    let dir = temp_dir("why");
+    let config = journaled_config(&dir, 1 << 20);
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    let task = r#"{"role":"worker","difficulty":1,"expected_minutes":30,"run_id":"run-1"}"#;
+    let p: PickResponse = post(&sock, paths::PICK, task);
+    let lease = p.lease_id.clone().unwrap();
+
+    let out = qb(&sock, &["why", &lease]);
+    assert!(out.status.success(), "{out:?}");
+    let w: WhyResponse = serde_json::from_slice(&out.stdout).unwrap();
+    let s = state(&sock);
+    let held = &s.leases[0];
+    assert_eq!(
+        (
+            &w.lease_id,
+            &w.login,
+            &w.model,
+            &w.client,
+            &w.run_id,
+            w.expires_at
+        ),
+        (
+            &held.lease_id,
+            &held.login,
+            &held.model,
+            &held.client,
+            &held.run_id,
+            held.expires_at
+        )
+    );
+    assert_eq!(w.reason.as_deref(), Some(p.reason.as_str()));
+    assert_eq!(&w.login_state, &s.logins[0]);
+    let cost: Vec<(&str, f64)> = w.cost.iter().map(|c| (c.name.as_str(), c.cost)).collect();
+    let reserved: Vec<(&str, f64)> = s.logins[0]
+        .windows
+        .iter()
+        .map(|w| (w.name.as_str(), w.reserved))
+        .collect();
+    assert_eq!(cost, reserved);
+
+    let (status, resp) = why(&sock, "l-999999");
+    assert_eq!(status, 404);
+    assert_eq!(error_of(&resp), ErrorCode::NotFound);
+    assert_eq!(qb(&sock, &["why", "l-999999"]).status.code(), Some(1));
+    let ended: PickResponse = post(&sock, paths::PICK, task);
+    let ended = ended.lease_id.unwrap();
+    let _: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        &format!(r#"{{"lease_id":"{ended}","outcome":"ok","release":true}}"#),
+    );
+    assert_eq!(why(&sock, &ended).0, 404, "a released lease is gone");
+    drop(d);
+
+    let _d = start(&config, &sock);
+    let (status, body) = why(&sock, &lease);
+    assert_eq!(status, 200);
+    let again: WhyResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(again.reason, w.reason, "the journal keeps the reason");
+}
+
+#[test]
+fn a_lease_line_without_reason_replays() {
+    let dir = temp_dir("oldline");
+    let config = journaled_config(&dir, 1 << 20);
+    std::fs::write(
+        dir.join("journal"),
+        format!("{}\n", lease_line(257, qb::server::unix_now())),
+    )
+    .unwrap();
+    let sock = dir.join("qb.sock");
+    let _d = start(&config, &sock);
+    let (status, body) = why(&sock, "l-257");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let w: WhyResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!((w.login.as_str(), w.reason), ("login-1", None));
+}
+
+fn rate_limit_line(status: &str, five_hour: f64, seven_day: f64, now: u64) -> String {
+    format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"{status}","unifiedWindows":{{"five_hour":{{"utilization":{five_hour},"resetsAt":{}}},"seven_day":{{"utilization":{seven_day},"resetsAt":{}}}}}}}}}"#,
+        now + 7200,
+        now + 6 * 86_400
+    )
+}
+
+#[test]
+fn report_from_stream_json_posts_the_last_rate_limit_event() {
+    let dir = temp_dir("stream");
+    let sock = dir.join("qb.sock");
+    let _d = start(&journaled_config(&dir, 1 << 20), &sock);
+    let now = qb::server::unix_now();
+    let log = dir.join("run.jsonl");
+    std::fs::write(
+        &log,
+        [
+            r#"{"type":"system","subtype":"init"}"#.to_owned(),
+            "not json".to_owned(),
+            rate_limit_line("allowed", 0.3, 0.2, now),
+            r#"{"type":"assistant","message":{}}"#.to_owned(),
+            rate_limit_line("rejected", 1.0, 0.5, now),
+            r#"{"type":"result","subtype":"success"}"#.to_owned(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let log_arg = log.to_str().unwrap();
+    let out = qb(
+        &sock,
+        &[
+            "report",
+            "--login",
+            "login-1",
+            "--from-stream-json",
+            log_arg,
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let r: ReportResponse = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r.login_status, LoginStatus::Exhausted);
+    let s = state(&sock);
+    assert_eq!(s.logins[0].status, LoginStatus::Exhausted);
+    let windows: Vec<(&str, f64, Option<u64>, Source)> = s.logins[0]
+        .windows
+        .iter()
+        .map(|w| (w.name.as_str(), w.used, w.resets_at, w.source))
+        .collect();
+    assert_eq!(
+        windows,
+        [
+            ("five_hour", 1.0, Some(now + 7200), Source::Stream),
+            ("seven_day", 0.5, Some(now + 6 * 86_400), Source::Stream),
+        ]
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qb"))
+        .env_remove("QB_BEARER_FILE")
+        .arg("--socket")
+        .arg(&sock)
+        .args(["report", "--login", "login-2", "--from-stream-json", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"type\":\"system\"}\nnot json\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no rate_limit_event"),
+        "{out:?}"
+    );
+    let login2 = &state(&sock).logins[1];
+    assert_eq!(login2.status, LoginStatus::Unknown);
+    assert!(
+        login2.windows.iter().all(|w| w.observed_at == 0),
+        "{login2:?}"
+    );
+}
+
+/// Every file of `dir` with its bytes, sorted by name.
+fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().into_string().unwrap(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn simulate(config: &Path, journal: &Path, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_qb"))
+        .arg("simulate")
+        .arg("--config")
+        .arg(config)
+        .arg(journal)
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// The JSON documents of a `simulate` output, one per line.
+fn documents(out: &std::process::Output) -> Vec<serde_json::Value> {
+    assert!(out.status.success(), "{out:?}");
+    out.stdout
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn simulate_replays_a_daemon_journal_without_writing() {
+    let dir = temp_dir("sim");
+    let config = journaled_config(&dir, 1 << 20);
+    let sock = temp_socket("simsock");
+    let d = start(&config, &sock);
+    mark_and_lease(&sock);
+    let live = state(&sock);
+    drop(d);
+    let journal = dir.join("journal");
+    let before = contents(&dir);
+
+    let docs = documents(&simulate(&config, &journal, &[]));
+    assert_eq!(docs.len(), 1);
+    let simulated: StateResponse = serde_json::from_value(docs[0].clone()).unwrap();
+    assert_eq!(simulated.leases, live.leases);
+    assert_eq!(durable(&simulated), durable(&live));
+
+    let task = ["--pick", r#"{"role":"worker","difficulty":1}"#];
+    let docs = documents(&simulate(&config, &journal, &task));
+    let recorded: PickResponse = serde_json::from_value(docs[1].clone()).unwrap();
+    assert_eq!(
+        (recorded.login.as_deref(), recorded.model.as_deref()),
+        (Some("login-2"), Some("model-small"))
+    );
+    let changed = config_copy(
+        &temp_dir("simcfg"),
+        &[(
+            r#"{ vendor = "vendor-a", model = "model-small", effort = "low", tier = 1 }"#,
+            r#"{ vendor = "vendor-a", model = "model-tiny", tier = 1 }"#.to_owned(),
+        )],
+    );
+    let docs = documents(&simulate(&changed, &journal, &task));
+    let tried: PickResponse = serde_json::from_value(docs[1].clone()).unwrap();
+    assert_eq!(tried.decision, Decision::Run, "{tried:?}");
+    assert_eq!(
+        (tried.login.as_deref(), tried.model.as_deref(), tried.effort),
+        (Some("login-2"), Some("model-tiny"), None)
+    );
+    assert_eq!(contents(&dir), before, "the journal directory is untouched");
+}
+
+#[test]
+fn simulate_stops_on_a_corrupt_middle_line() {
+    let dir = temp_dir("simbad");
+    let config = journaled_config(&dir, 1 << 20);
+    let journal = dir.join("journal");
+    let now = qb::server::unix_now();
+    let text = format!(
+        "{}\nnot json\n{}\n",
+        lease_line(257, now),
+        lease_line(513, now)
+    );
+    std::fs::write(&journal, text).unwrap();
+    let out = simulate(&config, &journal, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}: line 2: ", journal.display())),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn a_bearer_file_names_the_caller() {
+    let dir = temp_dir("bearerfile");
+    let sock = dir.join("qb.sock");
+    let _d = start(&journaled_config(&dir, 1 << 20), &sock);
+    let (good, wrong, empty) = (dir.join("good"), dir.join("wrong"), dir.join("empty"));
+    std::fs::write(&good, format!("{BEARER}\n")).unwrap();
+    std::fs::write(&wrong, "token-x\n").unwrap();
+    std::fs::write(&empty, " \n").unwrap();
+
+    let out = qb(
+        &sock,
+        &[
+            "--bearer-file",
+            good.to_str().unwrap(),
+            "pick",
+            "--role",
+            "worker",
+            "--difficulty",
+            "1",
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let p: PickResponse = serde_json::from_slice(&out.stdout).unwrap();
+    let lease = p.lease_id.unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_qb"))
+        .env("QB_BEARER_FILE", &good)
+        .arg("--socket")
+        .arg(&sock)
+        .args(["why", &lease])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let w: WhyResponse = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(w.client, "client-b");
+
+    let out = qb(&sock, &["--bearer-file", wrong.to_str().unwrap(), "state"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(error_of(&out.stdout), ErrorCode::Unauthorized);
+    let out = qb(&sock, &["--bearer-file", empty.to_str().unwrap(), "state"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
 }

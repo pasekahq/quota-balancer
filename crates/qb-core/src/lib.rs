@@ -247,6 +247,22 @@ pub enum Reason {
 }
 
 impl Reason {
+    const ALL: [Self; 8] = [
+        Self::SpendBeforeReset,
+        Self::NeighbourStep,
+        Self::Pinned,
+        Self::AllExhausted,
+        Self::LeasesFull,
+        Self::NoResetKnown,
+        Self::AllDead,
+        Self::NoCandidates,
+    ];
+
+    /// The reason whose [`Reason::as_str`] is `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == name)
+    }
+
     /// Stable machine-readable name used on the wire and in the journal.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -474,6 +490,8 @@ pub struct LeaseRecord {
     pub cost: Vec<f64>,
     /// Expiry time.
     pub expires_at: UnixSecs,
+    /// Why the pick granted the lease; `None` when the record did not keep it.
+    pub reason: Option<Reason>,
 }
 
 /// A state change as a journal keeps it. Restoring the records of a run in order rebuilds its
@@ -601,6 +619,7 @@ struct Lease {
     run_id: Option<String>,
     cost: PerWindow,
     expires_at: UnixSecs,
+    reason: Option<Reason>,
 }
 
 /// What a deadline does when it is due; indexes are login, model and window indexes.
@@ -844,6 +863,7 @@ impl Core {
             run_id: input.run_id.clone(),
             cost: c.cost,
             expires_at,
+            reason: Some(settled.reason),
         });
         self.schedule(expires_at, Event::LeaseExpiry(id));
         Verdict::Run(grant, settled.reason)
@@ -1431,6 +1451,7 @@ impl Core {
             run_id: l.run_id.clone(),
             cost: l.cost[..windows].to_vec(),
             expires_at: l.expires_at,
+            reason: l.reason,
         })
     }
 
@@ -1550,6 +1571,7 @@ impl Core {
             run_id: r.run_id.clone(),
             cost,
             expires_at: r.expires_at,
+            reason: r.reason,
         });
         self.schedule(r.expires_at, Event::LeaseExpiry(r.id));
         Ok(())

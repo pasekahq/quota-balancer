@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 qb-core.workspace = true
 qb-proto.workspace = true
+qb-vendors.workspace = true
 httparse.workspace = true
 lexopt.workspace = true
 rustix.workspace = true

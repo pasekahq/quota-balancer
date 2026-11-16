@@ -15,7 +15,7 @@ use crate::{client, log};
 /// # Errors
 /// The daemon is unreachable or unhealthy.
 pub fn run(socket: &Path) -> Result<(), String> {
-    let (status, _) = client::call(socket, "GET", paths::HEALTH, None)
+    let (status, _) = client::call(socket, "GET", paths::HEALTH, None, None)
         .map_err(|e| format!("cannot reach qbd at {}: {e}", socket.display()))?;
     if status != 200 {
         return Err(format!("qbd health returned HTTP {status}"));
