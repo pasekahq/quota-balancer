@@ -432,6 +432,103 @@ pub struct Snapshot {
     pub leases: Vec<LeaseView>,
 }
 
+/// Authentication state of a login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Auth {
+    /// No 401 since the last successful report.
+    #[default]
+    Ok,
+    /// One 401 seen.
+    Stale,
+    /// Repeated 401.
+    Dead,
+}
+
+/// The health marks of a login, everything about it that outlives a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Marks {
+    /// Authentication state.
+    pub auth: Auth,
+    /// End of the `exhausted` mark.
+    pub exhausted_until: Option<UnixSecs>,
+    /// End of the `rate_limited` mark.
+    pub rate_limited_until: Option<UnixSecs>,
+    /// Dead-until per model name.
+    pub model_dead: Vec<(String, UnixSecs)>,
+}
+
+/// A live lease with everything [`Core::restore`] needs to rebuild it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeaseRecord {
+    /// Lease id; it names the lease's slot.
+    pub id: u64,
+    /// Login name.
+    pub login: String,
+    /// Model.
+    pub model: String,
+    /// Client that took the lease.
+    pub client: String,
+    /// Caller's run id.
+    pub run_id: Option<String>,
+    /// Reserved fraction per window of the login's vendor, in declaration order.
+    pub cost: Vec<f64>,
+    /// Expiry time.
+    pub expires_at: UnixSecs,
+}
+
+/// A state change as a journal keeps it. Restoring the records of a run in order rebuilds its
+/// leases, marks and lease counter; restoring a record twice changes nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Record {
+    /// Lease ids issued so far; later ids are higher.
+    Issued(u64),
+    /// A granted lease.
+    Lease(LeaseRecord),
+    /// A lease released by a report.
+    Release(u64),
+    /// The marks of a login after they changed.
+    Marks {
+        /// Login name.
+        login: String,
+        /// All marks of the login.
+        marks: Marks,
+    },
+}
+
+/// Why [`Core::restore`] could not apply a record to this core's config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreError {
+    /// The record names a login the config does not declare.
+    UnknownLogin(String),
+    /// A lease's cost does not have one entry per window of the login's vendor.
+    CostWindows {
+        /// Login name.
+        login: String,
+        /// Windows of the login's vendor.
+        expected: usize,
+        /// Entries in the record.
+        got: usize,
+    },
+}
+
+impl fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownLogin(l) => write!(f, "undeclared login `{l}`"),
+            Self::CostWindows {
+                login,
+                expected,
+                got,
+            } => write!(
+                f,
+                "lease cost has {got} windows, login `{login}` has {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
 #[derive(Debug)]
 struct Vendor {
     name: String,
@@ -474,13 +571,6 @@ struct Reading {
     used: f64,
     resets_at: Option<UnixSecs>,
     observed_at: UnixSecs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Auth {
-    Ok,
-    Stale,
-    Dead,
 }
 
 #[derive(Debug)]
@@ -1327,6 +1417,149 @@ impl Core {
                 })
                 .collect(),
         }
+    }
+
+    /// The live lease `id`.
+    pub fn lease(&self, id: u64) -> Option<LeaseRecord> {
+        let l = self.leases[self.lease_slot(id)?].as_ref()?;
+        let windows = self.vendors[self.logins[l.login].vendor].windows.len();
+        Some(LeaseRecord {
+            id: l.id,
+            login: self.logins[l.login].name.clone(),
+            model: l.model.clone(),
+            client: l.client.clone(),
+            run_id: l.run_id.clone(),
+            cost: l.cost[..windows].to_vec(),
+            expires_at: l.expires_at,
+        })
+    }
+
+    /// The marks of the configured login `login`.
+    pub fn marks(&self, login: &str) -> Option<Marks> {
+        let l = self.logins.iter().find(|l| l.name == login)?;
+        Some(Marks {
+            auth: l.auth,
+            exhausted_until: l.exhausted_until,
+            rate_limited_until: l.rate_limited_until,
+            model_dead: self
+                .models
+                .iter()
+                .zip(&l.model_dead)
+                .filter_map(|(m, t)| Some((m.clone(), (*t)?)))
+                .collect(),
+        })
+    }
+
+    /// The live state as records: the lease counter, every live lease in slot order and the
+    /// marks of every login that has any.
+    pub fn records(&self) -> Vec<Record> {
+        let mut out = vec![Record::Issued(self.issued)];
+        out.extend(
+            self.leases
+                .iter()
+                .flatten()
+                .filter_map(|l| self.lease(l.id))
+                .map(Record::Lease),
+        );
+        out.extend(
+            self.logins
+                .iter()
+                .filter_map(|l| Some((l.name.clone(), self.marks(&l.name)?)))
+                .filter(|(_, m)| *m != Marks::default())
+                .map(|(login, marks)| Record::Marks { login, marks }),
+        );
+        out
+    }
+
+    /// Applies `record` as of `at`, after the deadlines due at `at`. A lease replaces whatever
+    /// holds its slot; marks replace the login's marks, models no ladder declares are ignored.
+    ///
+    /// # Errors
+    /// The record does not fit this core's config; nothing is applied then.
+    pub fn restore(&mut self, record: &Record, at: UnixSecs) -> Result<(), RestoreError> {
+        self.tick(at);
+        match record {
+            Record::Issued(n) => self.issued = self.issued.max(*n),
+            Record::Lease(r) => self.restore_lease(r)?,
+            Record::Release(id) => {
+                if let Some(slot) = self.lease_slot(*id) {
+                    self.release(slot);
+                }
+            }
+            Record::Marks { login, marks } => {
+                let li = self.login_index(login)?;
+                let models: Vec<Option<UnixSecs>> = self
+                    .models
+                    .iter()
+                    .map(|m| {
+                        marks
+                            .model_dead
+                            .iter()
+                            .find(|(name, _)| name == m)
+                            .map(|&(_, t)| t)
+                    })
+                    .collect();
+                let l = &mut self.logins[li];
+                l.auth = marks.auth;
+                l.exhausted_until = marks.exhausted_until;
+                l.rate_limited_until = marks.rate_limited_until;
+                l.model_dead.clone_from(&models);
+                if let Some(t) = marks.exhausted_until {
+                    self.schedule(t, Event::ExhaustedEnd(li));
+                }
+                if let Some(t) = marks.rate_limited_until {
+                    self.schedule(t, Event::RateLimitEnd(li));
+                }
+                for (m, t) in models.into_iter().enumerate() {
+                    if let Some(t) = t {
+                        self.schedule(t, Event::ModelDeadEnd(li, m));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_lease(&mut self, r: &LeaseRecord) -> Result<(), RestoreError> {
+        let li = self.login_index(&r.login)?;
+        let windows = self.vendors[self.logins[li].vendor].windows.len();
+        if r.cost.len() != windows {
+            return Err(RestoreError::CostWindows {
+                login: r.login.clone(),
+                expected: windows,
+                got: r.cost.len(),
+            });
+        }
+        let mut cost = [0.0; MAX_WINDOWS];
+        cost[..windows].copy_from_slice(&r.cost);
+        let slot = usize::try_from(r.id % MAX_LEASES as u64).expect("a slot index fits usize");
+        self.release(slot);
+        self.free_slots.retain(|&s| s != slot);
+        let login = &mut self.logins[li];
+        login.leases += 1;
+        for (sum, add) in login.reserved.iter_mut().zip(cost) {
+            *sum += add;
+        }
+        self.issued = self.issued.max(r.id / MAX_LEASES as u64);
+        self.leases[slot] = Some(Lease {
+            id: r.id,
+            login: li,
+            model: r.model.clone(),
+            model_index: self.models.iter().position(|m| *m == r.model),
+            client: r.client.clone(),
+            run_id: r.run_id.clone(),
+            cost,
+            expires_at: r.expires_at,
+        });
+        self.schedule(r.expires_at, Event::LeaseExpiry(r.id));
+        Ok(())
+    }
+
+    fn login_index(&self, name: &str) -> Result<usize, RestoreError> {
+        self.logins
+            .iter()
+            .position(|l| l.name == name)
+            .ok_or_else(|| RestoreError::UnknownLogin(name.to_owned()))
     }
 }
 

@@ -15,7 +15,7 @@ qb-core = { path = "crates/qb-core" }
 qb-proto = { path = "crates/qb-proto" }
 httparse = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"
-rustix = { version = "1", default-features = false, features = ["std", "net"] }
+rustix = { version = "1", default-features = false, features = ["std", "net", "event"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 serde_path_to_error = "0.1"

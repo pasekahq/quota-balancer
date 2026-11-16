@@ -11,21 +11,38 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qb::client::call;
 use qb::config;
+use qb::journal::Journal;
 use qb_core::{Core, Spec};
 use qb_proto::{
     Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginStatus, Outcome,
     PickResponse, ReportRequest, ReportResponse, Source, StateResponse, WindowReport, paths,
 };
 
-fn temp_socket(tag: &str) -> PathBuf {
+/// Room for the directory and file names a test adds under the base.
+const NAME_ROOM: usize = 40;
+/// `sun_path` holds 108 bytes including the terminating NUL.
+const SUN_PATH: usize = 108;
+
+/// A fresh directory for one test under a base short enough for unix socket paths.
+fn temp_dir(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "qb-test-{}-{tag}-{}",
+    let tmp = std::env::temp_dir();
+    let base = if tmp.as_os_str().len() + NAME_ROOM < SUN_PATH {
+        tmp
+    } else {
+        PathBuf::from("/tmp")
+    };
+    let dir = base.join(format!(
+        "qb-{}-{tag}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::SeqCst)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join("qb.sock")
+    dir
+}
+
+fn temp_socket(tag: &str) -> PathBuf {
+    temp_dir(tag).join("qb.sock")
 }
 
 /// Starts an in-process daemon on a fresh socket. The thread lives until the test binary exits.
@@ -34,7 +51,7 @@ fn spawn_server() -> PathBuf {
     let listener = UnixListener::bind(&path).unwrap();
     std::thread::spawn(move || {
         let mut core = Core::new(Spec::default()).unwrap();
-        qb::server::serve(&listener, &mut core);
+        qb::server::serve(&listener, &mut core, &mut Journal::off())
     });
     path
 }
@@ -245,8 +262,8 @@ fn binary_roles_end_to_end() {
 #[test]
 fn daemon_serves_configured_logins() {
     let exe = env!("CARGO_BIN_EXE_qb");
-    let file = example("qbd.toml");
     let sock = temp_socket("cfg");
+    let file = journaled_config(sock.parent().unwrap(), 1 << 20);
     let _d = Daemon(
         Command::new(exe)
             .arg("--socket")
@@ -321,7 +338,7 @@ fn reported_windows_steer_pick_and_show_in_state() {
             .arg("--socket")
             .arg(&sock)
             .args(["daemon", "--config"])
-            .arg(example("qbd.toml"))
+            .arg(journaled_config(sock.parent().unwrap(), 1 << 20))
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
@@ -492,7 +509,7 @@ fn leases_reserve_quota_and_reports_steer_the_next_pick() {
             .arg("--socket")
             .arg(&sock)
             .args(["daemon", "--config"])
-            .arg(example("qbd.toml"))
+            .arg(journaled_config(sock.parent().unwrap(), 1 << 20))
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
@@ -537,4 +554,272 @@ fn leases_reserve_quota_and_reports_steer_the_next_pick() {
     assert!(s.logins[0].dead_until.is_some());
     let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes())).unwrap();
     assert_eq!(status, 404, "a released lease is gone");
+}
+
+/// `qbd.toml` with its journal at `dir/journal`, rotated at `rotate_bytes`.
+fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
+    let text = std::fs::read_to_string(example("qbd.toml"))
+        .unwrap()
+        .replace(
+            "path = \"/var/lib/qb/journal\"",
+            &format!("path = \"{}\"", dir.join("journal").display()),
+        )
+        .replace(
+            "rotate_bytes = 1048576",
+            &format!("rotate_bytes = {rotate_bytes}"),
+        );
+    let file = dir.join("qbd.toml");
+    std::fs::write(&file, text).unwrap();
+    file
+}
+
+fn start(config: &Path, sock: &Path) -> Daemon {
+    let d = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_qb"))
+            .arg("--socket")
+            .arg(sock)
+            .args(["daemon", "--config"])
+            .arg(config)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(sock);
+    d
+}
+
+const TASK: &str = r#"{"role":"worker","difficulty":1,"expected_minutes":30}"#;
+
+/// Leaves a live lease on login-1, `exhausted` on login-1, `auth_dead` on login-3, and a
+/// released lease on login-2 whose id it returns.
+fn mark_and_lease(sock: &Path) -> String {
+    for _ in 0..2 {
+        let r: ReportResponse = post(
+            sock,
+            paths::REPORT,
+            r#"{"login":"login-3","outcome":"http_401"}"#,
+        );
+        assert!(r.accepted);
+    }
+    let live: PickResponse = post(sock, paths::PICK, TASK);
+    assert_eq!(live.login.as_deref(), Some("login-1"), "{live:?}");
+    let r: ReportResponse = post(
+        sock,
+        paths::REPORT,
+        &format!(
+            r#"{{"lease_id":"{}","outcome":"usage_limit"}}"#,
+            live.lease_id.unwrap()
+        ),
+    );
+    assert_eq!(r.login_status, LoginStatus::Exhausted);
+    let gone: PickResponse = post(sock, paths::PICK, TASK);
+    assert_eq!(gone.login.as_deref(), Some("login-2"), "{gone:?}");
+    let gone = gone.lease_id.unwrap();
+    let _: ReportResponse = post(
+        sock,
+        paths::REPORT,
+        &format!(r#"{{"lease_id":"{gone}","outcome":"ok","release":true}}"#),
+    );
+    gone
+}
+
+/// A login's status, dead-until mark and reserved fractions.
+type LoginMarks = (LoginStatus, Option<u64>, Vec<f64>);
+
+/// What a restart must keep: leases, statuses with their dead-until marks, reservations.
+fn durable(s: &StateResponse) -> (Vec<String>, Vec<LoginMarks>) {
+    let leases = s
+        .leases
+        .iter()
+        .map(|l| format!("{} {} {} {}", l.lease_id, l.login, l.model, l.expires_at))
+        .collect();
+    let logins = s
+        .logins
+        .iter()
+        .map(|l| {
+            let reserved = l.windows.iter().map(|w| w.reserved).collect();
+            (l.status, l.dead_until, reserved)
+        })
+        .collect();
+    (leases, logins)
+}
+
+fn assert_restored(before: &StateResponse, after: &StateResponse, released: &str) {
+    assert_eq!(durable(after), durable(before));
+    assert_eq!(after.leases.len(), 1);
+    assert_eq!(after.logins[0].status, LoginStatus::Exhausted);
+    assert!(after.logins[0].dead_until.is_some());
+    assert_eq!(after.logins[2].status, LoginStatus::AuthDead);
+    assert!(after.leases.iter().all(|l| l.lease_id != released));
+}
+
+#[test]
+fn leases_and_marks_survive_a_restart() {
+    let dir = temp_dir("restart");
+    let config = journaled_config(&dir, 1 << 20);
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    let released = mark_and_lease(&sock);
+    let before = state(&sock);
+    drop(d);
+
+    let _d = start(&config, &sock);
+    let after = state(&sock);
+    assert_restored(&before, &after, &released);
+    let release = format!(r#"{{"lease_id":"{released}","outcome":"ok","release":true}}"#);
+    let (status, _) = call(&sock, "POST", paths::REPORT, Some(release.as_bytes())).unwrap();
+    assert_eq!(status, 404, "a released lease stays released");
+
+    let fresh: PickResponse = post(&sock, paths::PICK, TASK);
+    let fresh = fresh.lease_id.unwrap();
+    assert!(fresh != released && after.leases.iter().all(|l| l.lease_id != fresh));
+}
+
+#[test]
+fn rotation_keeps_two_bounded_files_and_the_live_state() {
+    const ROTATE: u64 = 1024;
+    const LINE: u64 = 400;
+    let dir = temp_dir("rotate");
+    let config = journaled_config(&dir, ROTATE);
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    let released = mark_and_lease(&sock);
+    for _ in 0..12 {
+        let p: PickResponse = post(&sock, paths::PICK, TASK);
+        let lease = p.lease_id.unwrap();
+        let _: ReportResponse = post(
+            &sock,
+            paths::REPORT,
+            &format!(r#"{{"lease_id":"{lease}","outcome":"ok","release":true}}"#),
+        );
+    }
+    let before = state(&sock);
+    drop(d);
+
+    let mut files: Vec<(String, u64)> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .map(|e| {
+            (
+                e.file_name().into_string().unwrap(),
+                e.metadata().unwrap().len(),
+            )
+        })
+        .filter(|(name, _)| name.starts_with("journal"))
+        .collect();
+    files.sort();
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["journal", "journal.1"]);
+    for (name, len) in &files {
+        assert!(*len < ROTATE + LINE, "{name} has {len} bytes");
+    }
+
+    let _d = start(&config, &sock);
+    assert_restored(&before, &state(&sock), &released);
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn lease_line(id: u64, now: u64) -> String {
+    format!(
+        r#"{{"at":{now},"lease":{{"id":{id},"login":"login-1","model":"model-small","client":"uid:1","cost":[0.06,0.0005],"expires_at":{}}}}}"#,
+        now + 3600
+    )
+}
+
+#[test]
+fn a_torn_final_line_is_skipped() {
+    let dir = temp_dir("torn");
+    let config = journaled_config(&dir, 1 << 20);
+    let journal = dir.join("journal");
+    let now = now();
+    let torn = lease_line(513, now);
+    let torn = &torn[..torn.len() / 2];
+    std::fs::write(&journal, format!("{}\n{torn}", lease_line(257, now))).unwrap();
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    let ids: Vec<String> = state(&sock)
+        .leases
+        .into_iter()
+        .map(|l| l.lease_id)
+        .collect();
+    assert_eq!(ids, ["l-257"]);
+    let _: PickResponse = post(&sock, paths::PICK, TASK);
+    drop(d);
+
+    let _d = start(&config, &sock);
+    assert_eq!(
+        state(&sock).leases.len(),
+        2,
+        "appends after a torn line replay"
+    );
+}
+
+#[test]
+fn a_corrupt_middle_line_stops_start_up() {
+    let dir = temp_dir("corrupt");
+    let config = journaled_config(&dir, 1 << 20);
+    let journal = dir.join("journal");
+    let now = now();
+    let text = format!(
+        "{}\nnot json\n{}\n",
+        lease_line(257, now),
+        lease_line(513, now)
+    );
+    std::fs::write(&journal, text).unwrap();
+    let sock = dir.join("qb.sock");
+    let out = Command::new(env!("CARGO_BIN_EXE_qb"))
+        .arg("--socket")
+        .arg(&sock)
+        .args(["daemon", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}: line 2: ", journal.display())),
+        "{stderr}"
+    );
+    assert!(!sock.exists(), "the socket is bound only after replay");
+}
+
+#[test]
+fn journal_off_writes_nothing() {
+    let state_dir = temp_dir("off-state");
+    let sock = temp_socket("off");
+    let d = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_qb"))
+            .current_dir(&state_dir)
+            .env("TMPDIR", &state_dir)
+            .arg("--socket")
+            .arg(&sock)
+            .args(["daemon", "--config"])
+            .arg(example("minimal.toml"))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&sock);
+    let p: PickResponse = post(&sock, paths::PICK, TASK);
+    assert_eq!(p.decision, Decision::Run, "{p:?}");
+    let lease = p.lease_id.unwrap();
+    let _: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        &format!(r#"{{"lease_id":"{lease}","outcome":"usage_limit","release":true}}"#),
+    );
+    let _: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        r#"{"login":"login-1","outcome":"http_401"}"#,
+    );
+    drop(d);
+    let left: Vec<_> = std::fs::read_dir(&state_dir).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
 }
