@@ -1699,6 +1699,55 @@ fn stale_and_foreign_probe_results_change_nothing() {
     assert_eq!(status, 404, "an answered probe is gone");
 }
 
+fn status_of(sock: &Path, login: &str) -> LoginStatus {
+    state(sock)
+        .logins
+        .into_iter()
+        .find(|l| l.login == login)
+        .unwrap()
+        .status
+}
+
+#[test]
+fn auth_recovered_by_a_probe_survives_a_restart() {
+    let dir = temp_dir("probeauth");
+    let sock = dir.join("qb.sock");
+    let config = agent_config(&dir, &[probe_on()]);
+    let d = start(&config, &sock);
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        r#"{"login":"login-1","outcome":"http_401"}"#,
+    );
+    assert_eq!(r.login_status, LoginStatus::AuthStale);
+    pick_worker(&sock);
+    let (status, resp) = next_now(&sock, None, &["login-1"]);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    let job: AgentJob = serde_json::from_slice(&resp).unwrap();
+    let ok = format!(
+        r#"{{"probe_id":"{}","outcome":"ok","windows":[{{"name":"five_hour","utilization":0.5}}]}}"#,
+        job.probe_id
+    );
+    let (status, resp) = result(&sock, None, &ok);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    assert_eq!(status_of(&sock, "login-1"), LoginStatus::Ok);
+
+    drop(d);
+    let _d = start(&config, &sock);
+    // Windows are not journaled, so without an auth mark the replayed login is `unknown`.
+    assert_eq!(status_of(&sock, "login-1"), LoginStatus::Unknown);
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        r#"{"login":"login-1","outcome":"http_401"}"#,
+    );
+    assert_eq!(
+        r.login_status,
+        LoginStatus::AuthStale,
+        "one 401 after recovery"
+    );
+}
+
 #[test]
 fn parked_connections_are_bounded_per_agent_and_in_total() {
     let dir = temp_dir("parkcap");

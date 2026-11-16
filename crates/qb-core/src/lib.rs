@@ -1718,6 +1718,17 @@ impl Core {
         })
     }
 
+    /// The login of the probe `id` while it is in flight.
+    pub fn probe_login(&self, id: u64) -> Option<&str> {
+        Some(self.logins[self.probe_slot(id)?].name.as_str())
+    }
+
+    fn probe_slot(&self, id: u64) -> Option<usize> {
+        self.logins
+            .iter()
+            .position(|l| l.probe.in_flight.as_ref().is_some_and(|p| p.id == id))
+    }
+
     /// Applies the result of probe `id` from `client` and returns the login and its status.
     ///
     /// `Ok` overwrites the named declared windows with `source = probe`, as a stream report
@@ -1736,11 +1747,7 @@ impl Core {
         now: UnixSecs,
     ) -> Result<(String, LoginStatus), ProbeError> {
         self.tick(now);
-        let li = self
-            .logins
-            .iter()
-            .position(|l| l.probe.in_flight.as_ref().is_some_and(|p| p.id == id))
-            .ok_or(ProbeError::UnknownProbe)?;
+        let li = self.probe_slot(id).ok_or(ProbeError::UnknownProbe)?;
         if self.logins[li]
             .probe
             .in_flight

@@ -1,8 +1,8 @@
 //! `/v1` routing: HTTP request in, status and JSON body out. No sockets here.
 
 use qb_core::{
-    Core, LoginStatus as CoreStatus, LoginView, OutcomeClass, PickInput, ProbeError, ProbeJob,
-    ProbeOutcome as CoreProbeOutcome, Record, ReportError, ReportInput, ReportSubject,
+    Core, LoginStatus as CoreStatus, LoginView, Marks, OutcomeClass, PickInput, ProbeError,
+    ProbeJob, ProbeOutcome as CoreProbeOutcome, Record, ReportError, ReportInput, ReportSubject,
     Source as CoreSource, Target, Verdict, WindowObservation,
 };
 use qb_proto::{
@@ -131,6 +131,19 @@ pub fn health(env: Env) -> Reply {
 fn record(journal: &mut Journal, core: &Core, record: &Record, now: u64) {
     if let Err(e) = journal.record(core, record, now) {
         log::error(&format!("journal write failed: {e}"));
+    }
+}
+
+/// Journals the marks of `login` when they differ from `before`, its marks before the change.
+fn record_marks(
+    journal: &mut Journal,
+    core: &Core,
+    login: String,
+    before: Option<&Marks>,
+    now: u64,
+) {
+    if let Some(marks) = core.marks(&login).filter(|m| Some(m) != before) {
+        record(journal, core, &Record::Marks { login, marks }, now);
     }
 }
 
@@ -264,10 +277,7 @@ fn report(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, 
     match core.report(&input, now) {
         Ok(status) => {
             if let Some(login) = login {
-                let after = core.marks(&login);
-                if let Some(marks) = after.filter(|m| Some(m) != before.as_ref()) {
-                    record(journal, core, &Record::Marks { login, marks }, now);
-                }
+                record_marks(journal, core, login, before.as_ref(), now);
             }
             if let (true, ReportSubject::Lease(id)) = (input.release, &input.subject) {
                 record(journal, core, &Record::Release(*id), now);
@@ -348,13 +358,11 @@ fn agent_result(
         },
         ProbeOutcome::Error => CoreProbeOutcome::Error,
     };
+    core.tick(now);
+    let before = core.probe_login(id).and_then(|l| core.marks(l));
     match core.probe_result(id, &caller.client, &outcome, now) {
         Ok((login, status)) => {
-            if outcome == CoreProbeOutcome::Http401 {
-                if let Some(marks) = core.marks(&login) {
-                    record(journal, core, &Record::Marks { login, marks }, now);
-                }
-            }
+            record_marks(journal, core, login, before.as_ref(), now);
             json(
                 200,
                 &ReportResponse {

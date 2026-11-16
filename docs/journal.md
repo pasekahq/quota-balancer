@@ -14,7 +14,7 @@ exactly one record key. Unknown keys are rejected.
 |---|---|---|
 | `lease` | a `pick` grants a run | `{"at":1800000000,"lease":{"id":257,"login":"login-1","model":"model-small","client":"uid:1001","run_id":"run-1","cost":[0.06,0.0018],"expires_at":1800005400,"reason":"spend_before_reset"}}` |
 | `release` | a report releases a lease | `{"at":1800000600,"release":257}` |
-| `marks` | a report changes a login's marks | `{"at":1800000600,"marks":{"login":"login-1","exhausted_until":1800018000}}` |
+| `marks` | a report or a probe result changes a login's marks | `{"at":1800000600,"marks":{"login":"login-1","exhausted_until":1800018000}}` |
 | `issued` | a rotation starts a new file | `{"at":1800000600,"issued":12}` |
 
 - `lease`: `id` is the number in the wire id `l-<id>`; `run_id` is omitted when the pick had
