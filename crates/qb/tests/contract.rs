@@ -718,13 +718,6 @@ fn rotation_keeps_two_bounded_files_and_the_live_state() {
     assert_restored(&before, &state(&sock), &released);
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 fn lease_line(id: u64, now: u64) -> String {
     format!(
         r#"{{"at":{now},"lease":{{"id":{id},"login":"login-1","model":"model-small","client":"uid:1","cost":[0.06,0.0005],"expires_at":{}}}}}"#,
@@ -737,7 +730,7 @@ fn a_torn_final_line_is_skipped() {
     let dir = temp_dir("torn");
     let config = journaled_config(&dir, 1 << 20);
     let journal = dir.join("journal");
-    let now = now();
+    let now = qb::server::unix_now();
     let torn = lease_line(513, now);
     let torn = &torn[..torn.len() / 2];
     std::fs::write(&journal, format!("{}\n{torn}", lease_line(257, now))).unwrap();
@@ -765,7 +758,7 @@ fn a_corrupt_middle_line_stops_start_up() {
     let dir = temp_dir("corrupt");
     let config = journaled_config(&dir, 1 << 20);
     let journal = dir.join("journal");
-    let now = now();
+    let now = qb::server::unix_now();
     let text = format!(
         "{}\nnot json\n{}\n",
         lease_line(257, now),
