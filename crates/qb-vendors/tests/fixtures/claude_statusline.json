@@ -1,0 +1,1 @@
+{"hook_event_name":"Status","model":{"id":"model-a","display_name":"Model A"},"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1800018000},"seven_day":{"used_percentage":41,"resets_at":1800432000}}}

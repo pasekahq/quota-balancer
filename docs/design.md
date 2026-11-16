@@ -24,6 +24,9 @@ concurrent workers do not oversubscribe the same window.
 
 When nobody asks, `qb` makes no network requests at all.
 
+How each vendor's stream and usage-endpoint data becomes window reports is in
+[vendors.md](vendors.md).
+
 ## Roles and privilege separation
 
 ```

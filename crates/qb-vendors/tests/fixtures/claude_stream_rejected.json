@@ -1,0 +1,1 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":1800018000},"seven_day":null}}}
