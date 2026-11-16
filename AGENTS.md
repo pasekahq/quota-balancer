@@ -17,6 +17,7 @@ socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan: `docs/roadmap.m
 | `crates/qb` | The binary: `http.rs` (framing), `server.rs` (accept loop), `api.rs` (routing), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs`, `main.rs` (CLI). |
 | `deploy/systemd/` | Unit templates with hardening. |
 | `ci/budgets.sh` | Binary size and RSS budgets. |
+| `ci/broad_check.py` | Stdlib-only driver for fmt + clippy + test (`python3 -m ci.broad_check`); external harnesses call this. |
 
 ## Commands (all must pass before you push)
 
