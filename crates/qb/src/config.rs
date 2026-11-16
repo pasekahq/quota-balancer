@@ -5,7 +5,10 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use qb_core::{LoginSpec, MAX_CANDIDATES, MAX_LOGINS, MAX_WINDOWS};
+use qb_core::{
+    CandidateSpec, LoginSpec, MAX_CANDIDATES, MAX_LOGINS, MAX_WINDOWS, ReserveSpec, RoleSpec, Spec,
+    StepSpec, VendorSpec, WindowSpec,
+};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
@@ -325,15 +328,68 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
 type Fault = (String, String);
 
 impl Config {
-    /// The configured logins as core types, in config order.
-    pub fn login_specs(&self) -> Vec<LoginSpec> {
-        self.logins
-            .iter()
-            .map(|l| LoginSpec {
-                name: l.name.clone(),
-                vendor: l.vendor.clone(),
-            })
-            .collect()
+    /// The policy part of the config as the core's spec, in config order.
+    pub fn core_spec(&self) -> Spec {
+        Spec {
+            vendors: self
+                .vendors
+                .iter()
+                .map(|v| VendorSpec {
+                    name: v.name.clone(),
+                    windows: v
+                        .windows
+                        .iter()
+                        .map(|w| WindowSpec {
+                            name: w.name.clone(),
+                            length_s: w.length_s,
+                            t_burn_s: w.t_burn_s,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            logins: self
+                .logins
+                .iter()
+                .map(|l| LoginSpec {
+                    name: l.name.clone(),
+                    vendor: l.vendor.clone(),
+                })
+                .collect(),
+            roles: self
+                .roles
+                .iter()
+                .map(|r| RoleSpec {
+                    name: r.name.clone(),
+                    ladder: r
+                        .ladder
+                        .iter()
+                        .map(|s| StepSpec {
+                            difficulty: s.difficulty,
+                            candidates: s
+                                .candidates
+                                .iter()
+                                .map(|c| CandidateSpec {
+                                    vendor: c.vendor.clone(),
+                                    model: c.model.clone(),
+                                    effort: c.effort.clone(),
+                                    tier: c.tier,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    reserves: r
+                        .reserves
+                        .iter()
+                        .map(|res| ReserveSpec {
+                            difficulty: res.difficulty,
+                            window: res.window.clone(),
+                            fraction: res.fraction.get(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            snapshot_ttl_s: self.snapshot.ttl_s,
+        }
     }
 
     fn validate(&self) -> Result<(), Fault> {
