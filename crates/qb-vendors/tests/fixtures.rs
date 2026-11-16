@@ -82,6 +82,9 @@ fn expected(name: &str) -> Option<Parsed> {
                 window("seven_day", 0.645, Some(NOW + 86_400), D7),
             ],
         ),
+        "codex_usage_same_length.json" => {
+            (None, vec![window("five_hour", 0.2, Some(NOW + 3600), H5)])
+        }
         "claude_stream_other.json"
         | "claude_statusline_no_limits.json"
         | "codex_rollout_other.jsonl" => return None,

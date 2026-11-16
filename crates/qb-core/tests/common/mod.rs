@@ -77,7 +77,7 @@ pub fn role(name: &str, ladder: Vec<StepSpec>, reserves: Vec<ReserveSpec>) -> Ro
 
 /// `vendor-a` with two windows and logins `login-1`, `login-2`; `vendor-b` with `five_hour`
 /// only and `login-3`; the given roles; snapshot TTL 300 s, lease TTL 1 h, cost rate 0.01 per
-/// minute, 429 back-off 60 s, model-dead mark 1 day.
+/// minute, 429 back-off 60 s, model-dead mark 1 day, probes off.
 pub fn spec(roles: Vec<RoleSpec>) -> Spec {
     Spec {
         vendors: vec![
@@ -95,6 +95,7 @@ pub fn spec(roles: Vec<RoleSpec>) -> Spec {
         cost_per_minute: 0.01,
         rate_limit_backoff_s: 60,
         model_unavailable_s: DAY,
+        probe: None,
     }
 }
 

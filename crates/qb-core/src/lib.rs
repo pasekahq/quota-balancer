@@ -30,6 +30,8 @@ const MIN_HORIZON_S: u64 = 3600;
 const EPS: f64 = 1e-9;
 /// A window at or above this used fraction is the one a usage limit refers to.
 const NEAR_FULL: f64 = 0.99;
+/// A probe job without a result this long after it was handed out counts as a failure.
+pub const PROBE_TIMEOUT_S: u64 = 30;
 
 /// A quota window every login of a vendor has.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +128,53 @@ pub struct Spec {
     pub rate_limit_backoff_s: u64,
     /// How long a (login, model) pair stays dead after `model_unavailable`.
     pub model_unavailable_s: u64,
+    /// Back-off of lazy probes; `None` turns probes off, so no job is ever handed out.
+    pub probe: Option<ProbeSpec>,
+}
+
+/// Exponential back-off of a login's failed probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeSpec {
+    /// Back-off after the first failure, positive.
+    pub backoff_initial_s: u64,
+    /// Ceiling of the doubling back-off, at least `backoff_initial_s`.
+    pub backoff_max_s: u64,
+}
+
+/// What an agent's probe of a login's usage endpoint returned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeOutcome {
+    /// The vendor answered with these windows.
+    Ok(Vec<WindowObservation>),
+    /// HTTP 401.
+    Http401,
+    /// HTTP 429, with the vendor's `Retry-After` in seconds when it sent one.
+    Http429 {
+        /// Seconds the vendor asked to wait.
+        retry_after_s: Option<u64>,
+    },
+    /// Any other failure.
+    Error,
+}
+
+/// A probe handed to an agent by [`Core::probe_next`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeJob {
+    /// Probe id; the result names it.
+    pub id: u64,
+    /// Login to probe.
+    pub login: String,
+}
+
+/// Why [`Core::probe_result`] refused a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeError {
+    /// No probe with that id is in flight: never issued, answered or timed out.
+    UnknownProbe,
+    /// The probe was handed to another client.
+    OtherClient,
+    /// A window's used fraction is outside `0.0..=1.0`.
+    InvalidUtilization,
 }
 
 /// Why [`Core::new`] refused a [`Spec`].
@@ -184,6 +233,8 @@ pub enum LoginStatus {
 pub enum Source {
     /// Reported by a client from the vendor's stream.
     Stream,
+    /// Fetched by an agent's probe of the vendor's usage endpoint.
+    Probe,
     /// Inferred: never observed, or the window passed its reset.
     Assumed,
 }
@@ -225,57 +276,54 @@ pub struct PickInput {
     pub run_id: Option<String>,
 }
 
-/// Why the core decided what it decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
-    /// Best admissible candidate of the requested step by tier and urgency.
-    SpendBeforeReset,
-    /// Nothing admissible on the requested step; chosen from a neighbouring step.
-    NeighbourStep,
-    /// Best admissible login of the pinned vendor.
-    Pinned,
-    /// Every candidate is blocked until a known time: a reset, a back-off or a lease expiry.
-    AllExhausted,
-    /// A candidate is admissible but every lease slot is taken.
-    LeasesFull,
-    /// Some candidate is blocked by a window without a known reset, none until a known time.
-    NoResetKnown,
-    /// Every candidate's login is `auth_dead` or its (login, model) pair is dead.
-    AllDead,
-    /// No configured candidate matches the request.
-    NoCandidates,
+/// Declares [`Reason`] from one table, so `as_str`, `from_name` and `ALL` cannot disagree.
+macro_rules! reasons {
+    ($($(#[$doc:meta])* $variant:ident = $name:literal,)*) => {
+        /// Why the core decided what it decided.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Reason {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl Reason {
+            /// Every reason in declaration order.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+
+            /// The reason whose [`Reason::as_str`] is `name`.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+
+            /// Stable machine-readable name used on the wire and in the journal.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)*
+                }
+            }
+        }
+    };
 }
 
-impl Reason {
-    const ALL: [Self; 8] = [
-        Self::SpendBeforeReset,
-        Self::NeighbourStep,
-        Self::Pinned,
-        Self::AllExhausted,
-        Self::LeasesFull,
-        Self::NoResetKnown,
-        Self::AllDead,
-        Self::NoCandidates,
-    ];
-
-    /// The reason whose [`Reason::as_str`] is `name`.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|r| r.as_str() == name)
-    }
-
-    /// Stable machine-readable name used on the wire and in the journal.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SpendBeforeReset => "spend_before_reset",
-            Self::NeighbourStep => "neighbour_step",
-            Self::Pinned => "pinned",
-            Self::AllExhausted => "all_exhausted",
-            Self::LeasesFull => "leases_full",
-            Self::NoResetKnown => "no_reset_known",
-            Self::AllDead => "all_dead",
-            Self::NoCandidates => "no_candidates",
-        }
-    }
+reasons! {
+    /// Best admissible candidate of the requested step by tier and urgency.
+    SpendBeforeReset = "spend_before_reset",
+    /// Nothing admissible on the requested step; chosen from a neighbouring step.
+    NeighbourStep = "neighbour_step",
+    /// Best admissible login of the pinned vendor.
+    Pinned = "pinned",
+    /// Every candidate is blocked until a known time: a reset, a back-off or a lease expiry.
+    AllExhausted = "all_exhausted",
+    /// A candidate is admissible but every lease slot is taken.
+    LeasesFull = "leases_full",
+    /// Some candidate is blocked by a window without a known reset, none until a known time.
+    NoResetKnown = "no_reset_known",
+    /// Every candidate's login is `auth_dead` or its (login, model) pair is dead.
+    AllDead = "all_dead",
+    /// No configured candidate matches the request.
+    NoCandidates = "no_candidates",
 }
 
 /// A granted run.
@@ -589,6 +637,26 @@ struct Reading {
     used: f64,
     resets_at: Option<UnixSecs>,
     observed_at: UnixSecs,
+    source: Source,
+}
+
+#[derive(Debug)]
+struct InFlight {
+    id: u64,
+    client: String,
+    timeout_at: UnixSecs,
+}
+
+/// Lazy-probe bookkeeping of one login.
+#[derive(Debug, Default)]
+struct ProbeState {
+    /// A pick considered the login while its data was stale, and nothing was observed since.
+    wanted: bool,
+    in_flight: Option<InFlight>,
+    /// Back-off of the last failure; 0 after a success or before any failure.
+    backoff_s: u64,
+    /// No job is handed out before this time.
+    backoff_until: Option<UnixSecs>,
 }
 
 #[derive(Debug)]
@@ -607,6 +675,7 @@ struct Login {
     reserved: PerWindow,
     /// Number of live leases on the login.
     leases: usize,
+    probe: ProbeState,
 }
 
 #[derive(Debug)]
@@ -631,6 +700,8 @@ enum Event {
     ModelDeadEnd(usize, usize),
     WindowReset(usize, usize),
     SnapshotStale(usize, usize),
+    ProbeTimeout(usize),
+    ProbeBackoffEnd(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -689,6 +760,8 @@ struct Rejected {
     retry_after: Option<UnixSecs>,
     unknown: bool,
     stale: bool,
+    /// Bit per login index of every considered login with stale data, admissible or not.
+    stale_logins: u32,
 }
 
 /// The run a pick settled on, before its lease is issued.
@@ -712,6 +785,9 @@ pub struct Core {
     cost_per_minute: f64,
     rate_limit_backoff_s: u64,
     model_unavailable_s: u64,
+    probe: Option<ProbeSpec>,
+    /// Probe ids issued so far; the next id is one higher.
+    probes_issued: u64,
     /// Lease table by slot; a lease id is `issued * MAX_LEASES + slot`.
     leases: Vec<Option<Lease>>,
     free_slots: Vec<usize>,
@@ -771,6 +847,7 @@ impl Core {
                 windows: [None; MAX_WINDOWS],
                 reserved: [0.0; MAX_WINDOWS],
                 leases: 0,
+                probe: ProbeState::default(),
             });
         }
         let mut models: Vec<String> = Vec::new();
@@ -781,7 +858,7 @@ impl Core {
         for l in &mut logins {
             l.model_dead = vec![None; models.len()];
         }
-        let deadline_cap = 2 * (MAX_LEASES + logins.len() * (2 + models.len() + 2 * MAX_WINDOWS));
+        let deadline_cap = 2 * (MAX_LEASES + logins.len() * (4 + models.len() + 2 * MAX_WINDOWS));
         Ok(Self {
             vendors,
             models,
@@ -792,6 +869,8 @@ impl Core {
             cost_per_minute: spec.cost_per_minute,
             rate_limit_backoff_s: spec.rate_limit_backoff_s,
             model_unavailable_s: spec.model_unavailable_s,
+            probe: spec.probe,
+            probes_issued: 0,
             leases: (0..MAX_LEASES).map(|_| None).collect(),
             free_slots: (0..MAX_LEASES).rev().collect(),
             issued: 0,
@@ -804,14 +883,21 @@ impl Core {
     ///
     /// A ladder target tries the requested step, then the nearest lower step, then the nearest
     /// higher one. Within a step the admissible (candidate, login) pairs are ordered by tier,
-    /// urgency (descending), candidate order and login index. Due deadlines apply first.
+    /// urgency (descending), candidate order and login index. Due deadlines apply first. With
+    /// probes on, every considered login whose data is stale is wanted for a probe.
     ///
     /// # Panics
     /// Never: a full lease table holds leases, so a `leases_full` wait has an expiry to name.
     pub fn pick(&mut self, input: &PickInput, now: UnixSecs) -> Verdict {
         self.tick(now);
         let mut rejected = Rejected::default();
-        let Some(settled) = self.settle(input, now, &mut rejected) else {
+        let settled = self.settle(input, now, &mut rejected);
+        if self.probe.is_some() {
+            for (li, login) in self.logins.iter_mut().enumerate() {
+                login.probe.wanted |= rejected.stale_logins & (1 << li) != 0;
+            }
+        }
+        let Some(settled) = settled else {
             return match (rejected.any, rejected.retry_after) {
                 (false, _) => Verdict::Dead(Reason::NoCandidates),
                 (true, Some(retry_after)) => Verdict::Wait {
@@ -981,6 +1067,9 @@ impl Core {
         best: &mut Option<Choice>,
         rejected: &mut Rejected,
     ) {
+        if self.stale(choice.login, now) {
+            rejected.stale_logins |= 1 << choice.login;
+        }
         match self.admit(choice.login, model, reserves, &choice.cost, now) {
             Ok(()) => {
                 if best.as_ref().is_none_or(|b| choice.better_than(b)) {
@@ -1115,7 +1204,7 @@ impl Core {
                 used: o.used,
                 resets_at: o.resets_at,
                 observed_at: o.observed_at,
-                source: Source::Stream,
+                source: o.source,
                 stale,
             }
         } else {
@@ -1196,7 +1285,7 @@ impl Core {
             None
         };
 
-        let observed = self.observe(li, &input.windows, now);
+        let observed = self.observe(li, &input.windows, Source::Stream, now);
         let login = &mut self.logins[li];
         match input.outcome {
             OutcomeClass::Ok => {
@@ -1209,12 +1298,7 @@ impl Core {
                 self.logins[li].exhausted_until = Some(until);
                 self.schedule(until, Event::ExhaustedEnd(li));
             }
-            OutcomeClass::Http401 => {
-                login.auth = match login.auth {
-                    Auth::Ok => Auth::Stale,
-                    Auth::Stale | Auth::Dead => Auth::Dead,
-                };
-            }
+            OutcomeClass::Http401 => login.auth = unauthorized(login.auth),
             OutcomeClass::Http429 => {
                 let until = now + self.rate_limit_backoff_s;
                 login.rate_limited_until = Some(until);
@@ -1235,8 +1319,15 @@ impl Core {
         Ok(self.status(li))
     }
 
-    /// Overwrites the login's declared windows named in `windows`; true when any matched.
-    fn observe(&mut self, li: usize, windows: &[WindowObservation], now: UnixSecs) -> bool {
+    /// Overwrites the login's declared windows named in `windows`; true when any matched, which
+    /// also satisfies a wanted probe.
+    fn observe(
+        &mut self,
+        li: usize,
+        windows: &[WindowObservation],
+        source: Source,
+        now: UnixSecs,
+    ) -> bool {
         let mut observed = false;
         for obs in windows {
             let login = &mut self.logins[li];
@@ -1252,8 +1343,10 @@ impl Core {
                 used: obs.used,
                 resets_at: obs.resets_at,
                 observed_at: now,
+                source,
             });
             login.seen = true;
+            login.probe.wanted = false;
             observed = true;
             if let Some(r) = obs.resets_at.filter(|&r| r > now && Some(r) != before) {
                 self.schedule(r, Event::WindowReset(li, w));
@@ -1352,11 +1445,16 @@ impl Core {
             Event::SnapshotStale(li, w) => {
                 reading(li, w).is_some_and(|r| r.observed_at + self.ttl_s + 1 == d.at)
             }
+            Event::ProbeTimeout(li) => {
+                login(li).probe.in_flight.as_ref().map(|p| p.timeout_at) == Some(d.at)
+            }
+            Event::ProbeBackoffEnd(li) => login(li).probe.backoff_until == Some(d.at),
         }
     }
 
-    /// The earliest pending deadline: a lease expiry, the end of a mark, a window reset or the
-    /// moment a snapshot turns stale. Stale heap entries are dropped on the way.
+    /// The earliest pending deadline: a lease expiry, the end of a mark, a window reset, the
+    /// moment a snapshot turns stale, a probe timeout or the end of a probe back-off. Stale heap
+    /// entries are dropped on the way.
     pub fn next_deadline(&mut self) -> Option<UnixSecs> {
         while let Some(&Reverse(d)) = self.deadlines.peek() {
             if self.pending(d) {
@@ -1367,9 +1465,9 @@ impl Core {
         None
     }
 
-    /// Applies every deadline due at `now`: expired leases free their reservation and ended
-    /// marks are lifted. Window resets and staleness need no action; they are inferred from
-    /// `now` wherever they matter.
+    /// Applies every deadline due at `now`: expired leases free their reservation, ended marks
+    /// are lifted and a timed-out probe fails at its timeout. Window resets, staleness and
+    /// back-off ends need no action; they are inferred from `now` wherever they matter.
     pub fn tick(&mut self, now: UnixSecs) {
         while let Some(&Reverse(d)) = self.deadlines.peek() {
             if d.at > now {
@@ -1388,7 +1486,11 @@ impl Core {
                 Event::ExhaustedEnd(li) => self.logins[li].exhausted_until = None,
                 Event::RateLimitEnd(li) => self.logins[li].rate_limited_until = None,
                 Event::ModelDeadEnd(li, m) => self.logins[li].model_dead[m] = None,
-                Event::WindowReset(..) | Event::SnapshotStale(..) => {}
+                Event::ProbeTimeout(li) => {
+                    self.logins[li].probe.in_flight = None;
+                    self.probe_failed(li, d.at, 0);
+                }
+                Event::WindowReset(..) | Event::SnapshotStale(..) | Event::ProbeBackoffEnd(_) => {}
             }
         }
     }
@@ -1577,11 +1679,142 @@ impl Core {
         Ok(())
     }
 
+    /// Hands `client` a probe of the first due login among `logins`, in their order, and puts
+    /// it in flight until its result or [`PROBE_TIMEOUT_S`]. A login is due while it is wanted,
+    /// not `auth_dead`, has no probe in flight and is not backing off. Always `None` with probes
+    /// off; names the config does not declare are skipped. Due deadlines apply first.
+    pub fn probe_next(
+        &mut self,
+        client: &str,
+        logins: &[String],
+        now: UnixSecs,
+    ) -> Option<ProbeJob> {
+        self.tick(now);
+        self.probe?;
+        let li = logins.iter().find_map(|name| {
+            let li = self.logins.iter().position(|l| l.name == *name)?;
+            let l = &self.logins[li];
+            let p = &l.probe;
+            let due = p.wanted
+                && l.auth != Auth::Dead
+                && p.in_flight.is_none()
+                && p.backoff_until.is_none_or(|t| t <= now);
+            due.then_some(li)
+        })?;
+        self.probes_issued += 1;
+        let id = self.probes_issued;
+        let timeout_at = now + PROBE_TIMEOUT_S;
+        let probe = &mut self.logins[li].probe;
+        probe.wanted = false;
+        probe.in_flight = Some(InFlight {
+            id,
+            client: client.to_owned(),
+            timeout_at,
+        });
+        self.schedule(timeout_at, Event::ProbeTimeout(li));
+        Some(ProbeJob {
+            id,
+            login: self.logins[li].name.clone(),
+        })
+    }
+
+    /// The login of the probe `id` while it is in flight.
+    pub fn probe_login(&self, id: u64) -> Option<&str> {
+        Some(self.logins[self.probe_slot(id)?].name.as_str())
+    }
+
+    fn probe_slot(&self, id: u64) -> Option<usize> {
+        self.logins
+            .iter()
+            .position(|l| l.probe.in_flight.as_ref().is_some_and(|p| p.id == id))
+    }
+
+    /// Applies the result of probe `id` from `client` and returns the login and its status.
+    ///
+    /// `Ok` overwrites the named declared windows with `source = probe`, as a stream report
+    /// does, and ends the back-off. `Http401` steps the login's auth like a 401 report. It,
+    /// `Http429` and `Error` are failures: the back-off starts at the configured initial value
+    /// and doubles up to the ceiling; a 429 waits at least its `retry_after_s`.
+    ///
+    /// # Errors
+    /// The probe is not in flight, was handed to another client, or a window fraction is out
+    /// of range; nothing is applied then.
+    pub fn probe_result(
+        &mut self,
+        id: u64,
+        client: &str,
+        outcome: &ProbeOutcome,
+        now: UnixSecs,
+    ) -> Result<(String, LoginStatus), ProbeError> {
+        self.tick(now);
+        let li = self.probe_slot(id).ok_or(ProbeError::UnknownProbe)?;
+        if self.logins[li]
+            .probe
+            .in_flight
+            .as_ref()
+            .is_some_and(|p| p.client != client)
+        {
+            return Err(ProbeError::OtherClient);
+        }
+        if let ProbeOutcome::Ok(windows) = outcome {
+            if windows.iter().any(|w| !(0.0..=1.0).contains(&w.used)) {
+                return Err(ProbeError::InvalidUtilization);
+            }
+        }
+        self.logins[li].probe.in_flight = None;
+        match outcome {
+            ProbeOutcome::Ok(windows) => {
+                let observed = self.observe(li, windows, Source::Probe, now);
+                let login = &mut self.logins[li];
+                if observed && login.auth == Auth::Stale {
+                    login.auth = Auth::Ok;
+                }
+                login.probe.backoff_s = 0;
+                login.probe.backoff_until = None;
+            }
+            ProbeOutcome::Http401 => {
+                let login = &mut self.logins[li];
+                login.auth = unauthorized(login.auth);
+                self.probe_failed(li, now, 0);
+            }
+            ProbeOutcome::Http429 { retry_after_s } => {
+                self.probe_failed(li, now, retry_after_s.unwrap_or(0));
+            }
+            ProbeOutcome::Error => self.probe_failed(li, now, 0),
+        }
+        Ok((self.logins[li].name.clone(), self.status(li)))
+    }
+
+    /// Doubles the login's probe back-off from the initial value up to the ceiling and holds
+    /// its next job until `at` plus the longer of that back-off and `at_least_s`.
+    fn probe_failed(&mut self, li: usize, at: UnixSecs, at_least_s: u64) {
+        let Some(spec) = self.probe else {
+            return;
+        };
+        let probe = &mut self.logins[li].probe;
+        probe.backoff_s = if probe.backoff_s == 0 {
+            spec.backoff_initial_s
+        } else {
+            probe.backoff_s.saturating_mul(2).min(spec.backoff_max_s)
+        };
+        let until = at.saturating_add(probe.backoff_s.max(at_least_s));
+        probe.backoff_until = Some(until);
+        self.schedule(until, Event::ProbeBackoffEnd(li));
+    }
+
     fn login_index(&self, name: &str) -> Result<usize, RestoreError> {
         self.logins
             .iter()
             .position(|l| l.name == name)
             .ok_or_else(|| RestoreError::UnknownLogin(name.to_owned()))
+    }
+}
+
+/// Auth after a 401: `ok` becomes `stale`, a repeated 401 makes it `dead`.
+fn unauthorized(auth: Auth) -> Auth {
+    match auth {
+        Auth::Ok => Auth::Stale,
+        Auth::Stale | Auth::Dead => Auth::Dead,
     }
 }
 

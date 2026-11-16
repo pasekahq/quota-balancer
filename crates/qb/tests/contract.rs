@@ -2,21 +2,26 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use qb::agent::{Fetched, Fetcher};
 use qb::auth::Gate;
 use qb::client::call;
+use qb::config::Kind;
 use qb::config::{self, Limits};
 use qb::journal::{self, Journal};
 use qb_core::{Core, Record, Spec};
 use qb_proto::{
-    Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginStatus, Outcome,
+    AgentJob, Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginStatus, Outcome,
     PickResponse, ReportRequest, ReportResponse, Source, StateResponse, WhyResponse, WindowReport,
     paths,
 };
@@ -55,7 +60,7 @@ fn spawn_server() -> PathBuf {
     std::thread::spawn(move || {
         let mut core = Core::new(Spec::default()).unwrap();
         let mut gate = Gate::new(&[], &Limits::default());
-        qb::server::serve(&listener, &mut core, &mut Journal::off(), &mut gate)
+        qb::server::serve(&listener, &mut core, &mut Journal::off(), &mut gate, &[])
     });
     path
 }
@@ -249,14 +254,6 @@ fn binary_roles_end_to_end() {
         .output()
         .unwrap();
     assert_eq!(report.status.code(), Some(1), "404 maps to exit 1");
-
-    let agent = Command::new(exe)
-        .env("QB_SOCKET", &sock)
-        .arg("agent")
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(agent.success());
 
     let second = Command::new(exe)
         .env("QB_SOCKET", &sock)
@@ -493,6 +490,8 @@ fn cli_usage_errors_exit_2() {
             "-",
         ],
         &["why"],
+        &["agent"],
+        &["agent", "--config", "/nonexistent/agent.toml"],
         &["simulate"],
         &["simulate", "journal", "--pick", r#"{"role":"worker"}"#],
         &["frobnicate"],
@@ -591,7 +590,28 @@ fn own_uid() -> u32 {
 const BEARER: &str = "token-b";
 const BEARER_SHA256: &str = "49e2bb7eab54cf09b409ffafd3fa8a8a955a60eb972faacaefbed3dbd3207132";
 
-/// `qbd.toml` in `dir` with each `(from, to)` replaced once and its journal at `dir/journal`.
+/// Uids no test process runs as and `qbd.toml` does not declare.
+const FOREIGN_UIDS: [u32; 2] = [4_000_000_001, 4_000_000_002];
+
+fn foreign_uid(slot: usize) -> u32 {
+    let uid = FOREIGN_UIDS[slot];
+    assert_ne!(uid, own_uid(), "the test process runs as a foreign uid");
+    uid
+}
+
+/// [`config_copy`] edit giving the example client `client` the uid `uid`. Anchored on the client's
+/// name, so edits of different clients never rewrite each other's result.
+fn client_uid(client: &str, uid: u32) -> (&'static str, String) {
+    let line = match client {
+        "client-a" => "name = \"client-a\"\nuid = 1001",
+        "agent-1" => "name = \"agent-1\"\nuid = 1002",
+        other => panic!("{other} has no uid in qbd.toml"),
+    };
+    (line, format!("name = \"{client}\"\nuid = {uid}"))
+}
+
+/// `qbd.toml` in `dir` with each `(from, to)` replaced, `from` occurring exactly once, and its
+/// journal at `dir/journal`.
 fn config_copy(dir: &Path, edits: &[(&str, String)]) -> PathBuf {
     let mut text = std::fs::read_to_string(example("qbd.toml")).unwrap();
     let journal = format!("path = \"{}\"", dir.join("journal").display());
@@ -599,16 +619,16 @@ fn config_copy(dir: &Path, edits: &[(&str, String)]) -> PathBuf {
         .iter()
         .chain(edits)
     {
-        assert!(text.contains(from), "{from} not in qbd.toml");
-        text = text.replace(from, to);
+        assert_eq!(text.matches(from).count(), 1, "{from} not once in qbd.toml");
+        text = text.replacen(from, to, 1);
     }
     let file = dir.join("qbd.toml");
     std::fs::write(&file, text).unwrap();
     file
 }
 
-/// `qbd.toml` rotated at `rotate_bytes`, with `client-a` on this process's uid, `client-b` on
-/// [`BEARER`] and limits no test reaches.
+/// `qbd.toml` rotated at `rotate_bytes`, with `client-a` on this process's uid, `agent-1` on a
+/// foreign uid, `client-b` on [`BEARER`] and limits no test reaches.
 fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
     config_copy(
         dir,
@@ -617,7 +637,8 @@ fn journaled_config(dir: &Path, rotate_bytes: u64) -> PathBuf {
                 "rotate_bytes = 1048576",
                 format!("rotate_bytes = {rotate_bytes}"),
             ),
-            ("uid = 1001", format!("uid = {}", own_uid())),
+            client_uid("client-a", own_uid()),
+            client_uid("agent-1", foreign_uid(0)),
             (
                 "0000000000000000000000000000000000000000000000000000000000000001",
                 BEARER_SHA256.to_owned(),
@@ -935,8 +956,13 @@ fn callers_are_identified_by_bearer_then_uid() {
 fn an_undeclared_uid_may_only_ask_for_health() {
     let dir = temp_dir("stranger");
     let sock = dir.join("qb.sock");
-    let other = own_uid().wrapping_add(1);
-    let config = config_copy(&dir, &[("uid = 1001", format!("uid = {other}"))]);
+    let config = config_copy(
+        &dir,
+        &[
+            client_uid("client-a", foreign_uid(0)),
+            client_uid("agent-1", foreign_uid(1)),
+        ],
+    );
     let _d = start(&config, &sock);
     let (status, resp) = call(&sock, "POST", paths::PICK, Some(TASK.as_bytes()), None).unwrap();
     assert_eq!(status, 401);
@@ -1009,7 +1035,8 @@ fn each_client_has_a_token_bucket() {
     let config = config_copy(
         &dir,
         &[
-            ("uid = 1001", format!("uid = {}", own_uid())),
+            client_uid("client-a", own_uid()),
+            client_uid("agent-1", foreign_uid(0)),
             ("rate_per_s = 5.0", "rate_per_s = 0.5".to_owned()),
             ("burst = 20", "burst = 3".to_owned()),
         ],
@@ -1361,4 +1388,465 @@ fn a_bearer_file_names_the_caller() {
     let out = qb(&sock, &["--bearer-file", empty.to_str().unwrap(), "state"]);
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn an_invalid_agent_config_exits_2_naming_the_field() {
+    let dir = temp_dir("agentcfg");
+    let file = dir.join("agent.toml");
+    std::fs::write(
+        &file,
+        "[[logins]]\nname = \"login-1\"\nkind = \"vendor-x\"\ncredentials = \"c\"\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_qb"))
+        .arg("--socket")
+        .arg(dir.join("qb.sock"))
+        .args(["agent", "--config"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}: logins[0].kind", file.display())),
+        "{stderr}"
+    );
+}
+
+/// Bearer tokens of the extra agent clients `bot-1`..`bot-3` and their SHA-256.
+const BOTS: [(&str, &str); 3] = [
+    (
+        "token-1",
+        "3f08aace122ee2368432c1ca23a049bc640bafbf00fdf33a52429f38ba12dbf9",
+    ),
+    (
+        "token-2",
+        "0f6bffa9661cb5dd2f3f7b2929f33061f58a7ba7fdd689530b1a306f8ed8f3ec",
+    ),
+    (
+        "token-3",
+        "a2f2b0b588bcc84fbf4d2ac8cc086b6f84de3e00fa3c1ba11e38ac078eb03192",
+    ),
+];
+
+/// `qbd.toml` with the agent client `agent-1` on this process's uid, `client-a` on a foreign uid,
+/// `client-b` on [`BEARER`], limits no test reaches, and `edits` applied.
+fn agent_config(dir: &Path, edits: &[(&str, String)]) -> PathBuf {
+    let mut all = vec![
+        client_uid("client-a", foreign_uid(0)),
+        client_uid("agent-1", own_uid()),
+        (
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            BEARER_SHA256.to_owned(),
+        ),
+        ("rate_per_s = 5.0", "rate_per_s = 1000.0".to_owned()),
+        ("burst = 20", "burst = 1000".to_owned()),
+    ];
+    all.extend(edits.iter().cloned());
+    config_copy(dir, &all)
+}
+
+const PROBE_ON: (&str, &str) = ("enabled = false", "enabled = true");
+
+fn probe_on() -> (&'static str, String) {
+    (PROBE_ON.0, PROBE_ON.1.to_owned())
+}
+
+/// Opens `POST /v1/agent/next` for `logins` and leaves the connection waiting.
+fn park(sock: &Path, bearer: Option<&str>, logins: &[&str]) -> UnixStream {
+    let body = serde_json::json!({ "logins": logins }).to_string();
+    let auth = bearer.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+    let mut s = UnixStream::connect(sock).unwrap();
+    write!(
+        s,
+        "POST {} HTTP/1.1\r\nHost: qb\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+        paths::AGENT_NEXT,
+        body.len()
+    )
+    .unwrap();
+    s
+}
+
+/// The response on a parked connection within `wait`, `None` while it is still parked.
+fn answer(s: &mut UnixStream, wait: Duration) -> Option<(u16, Vec<u8>)> {
+    s.set_read_timeout(Some(wait)).unwrap();
+    let mut raw = Vec::new();
+    match s.read_to_end(&mut raw) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            assert!(raw.is_empty(), "partial answer");
+            return None;
+        }
+        Err(e) => panic!("{e}"),
+    }
+    let text = String::from_utf8(raw).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    Some((status, body.as_bytes().to_vec()))
+}
+
+fn next_now(sock: &Path, bearer: Option<&str>, logins: &[&str]) -> (u16, Vec<u8>) {
+    let body = serde_json::json!({ "logins": logins }).to_string();
+    call(
+        sock,
+        "POST",
+        paths::AGENT_NEXT,
+        Some(body.as_bytes()),
+        bearer,
+    )
+    .unwrap()
+}
+
+fn result(sock: &Path, bearer: Option<&str>, body: &str) -> (u16, Vec<u8>) {
+    call(
+        sock,
+        "POST",
+        paths::AGENT_RESULT,
+        Some(body.as_bytes()),
+        bearer,
+    )
+    .unwrap()
+}
+
+/// `(name, used, resets_at, source)` of each window of `login`.
+fn windows_of(sock: &Path, login: &str) -> Vec<(String, f64, Option<u64>, Source)> {
+    state(sock)
+        .logins
+        .into_iter()
+        .find(|l| l.login == login)
+        .unwrap()
+        .windows
+        .into_iter()
+        .map(|w| (w.name, w.used, w.resets_at, w.source))
+        .collect()
+}
+
+/// Claude `oauth/usage` body with resets in 2099 (Unix 4070908800 and 4071513600).
+const CLAUDE_USAGE: &str = r#"{"five_hour":{"utilization":6.0,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":35.0,"resets_at":"2099-01-08T00:00:00Z"},"seven_day_opus":{"utilization":50.0,"resets_at":"2099-01-08T00:00:00Z"}}"#;
+
+fn probed_windows() -> Vec<(String, f64, Option<u64>, Source)> {
+    vec![
+        ("five_hour".into(), 0.06, Some(4_070_908_800), Source::Probe),
+        ("seven_day".into(), 0.35, Some(4_071_513_600), Source::Probe),
+    ]
+}
+
+/// A fetcher that reports each login it is asked for on `calls`, then waits for `release` when
+/// given, and answers 200 with [`CLAUDE_USAGE`].
+struct TestFetcher {
+    calls: Sender<String>,
+    release: Option<Arc<Mutex<Receiver<()>>>>,
+}
+
+impl Fetcher for TestFetcher {
+    fn fetch(&mut self, login: &str, kind: Kind, _: &Path) -> Result<Fetched, String> {
+        assert_eq!(kind, Kind::Claude);
+        let _ = self.calls.send(login.to_owned());
+        if let Some(release) = &self.release {
+            let _ = release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+        }
+        Ok(Fetched {
+            status: 200,
+            retry_after_s: None,
+            body: CLAUDE_USAGE.as_bytes().to_vec(),
+        })
+    }
+}
+
+/// Runs `qb agent` in this process for `login-1` until the test binary exits.
+fn spawn_agent(sock: &Path, bearer: Option<&'static str>, fetcher: TestFetcher) {
+    let config = qb::config::parse_agent(
+        Path::new("agent.toml"),
+        "[[logins]]\nname = \"login-1\"\nkind = \"claude\"\ncredentials = \"unused\"\n",
+    )
+    .unwrap();
+    let sock = sock.to_owned();
+    let mut fetcher = fetcher;
+    std::thread::spawn(move || qb::agent::run(&sock, bearer, &config, &mut fetcher));
+}
+
+#[test]
+fn with_probes_off_a_parked_agent_gets_no_job_and_others_are_served() {
+    let dir = temp_dir("probeoff");
+    let sock = dir.join("qb.sock");
+    let _d = start(&agent_config(&dir, &[]), &sock);
+    let mut parked = park(&sock, None, &["login-1", "login-2", "login-3"]);
+    for _ in 0..3 {
+        let p = pick_worker(&sock);
+        assert_eq!(p.decision, Decision::Run, "{p:?}");
+        assert!(p.stale, "the pick relied on a stale login");
+        assert_eq!(state(&sock).logins.len(), 3);
+    }
+    assert_eq!(answer(&mut parked, Duration::from_millis(500)), None);
+}
+
+#[test]
+fn a_pick_on_a_stale_login_sends_one_probe_whose_windows_show_in_state() {
+    let dir = temp_dir("probe");
+    let sock = dir.join("qb.sock");
+    let config = agent_config(
+        &dir,
+        &[
+            probe_on(),
+            (
+                "agents = [\"agent-1\"]",
+                "agents = [\"agent-1\", \"client-b\"]".to_owned(),
+            ),
+        ],
+    );
+    let _d = start(&config, &sock);
+    let (calls, called) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let released = Arc::new(Mutex::new(released));
+    for bearer in [None, Some(BEARER)] {
+        let fetcher = TestFetcher {
+            calls: calls.clone(),
+            release: Some(Arc::clone(&released)),
+        };
+        spawn_agent(&sock, bearer, fetcher);
+    }
+
+    assert!(pick_worker(&sock).stale);
+    let login = called.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(login, "login-1");
+    assert!(pick_worker(&sock).stale, "the probe has not answered yet");
+    assert_eq!(
+        called.recv_timeout(Duration::from_secs(1)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "no second job while one is in flight"
+    );
+
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while windows_of(&sock, "login-1") != probed_windows() {
+        assert!(
+            Instant::now() < deadline,
+            "{:?}",
+            windows_of(&sock, "login-1")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let s = state(&sock);
+    assert_eq!(s.logins[0].status, LoginStatus::Ok);
+    assert!(s.logins[0].windows.iter().all(|w| !w.stale));
+    assert_eq!(
+        called.recv_timeout(Duration::from_millis(300)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "exactly one job"
+    );
+}
+
+#[test]
+fn only_declared_agents_may_wait_for_jobs() {
+    let dir = temp_dir("notagent");
+    let sock = dir.join("qb.sock");
+    let _d = start(&agent_config(&dir, &[probe_on()]), &sock);
+    let (status, resp) = next_now(&sock, Some(BEARER), &["login-1"]);
+    assert_eq!(status, 403);
+    assert_eq!(error_of(&resp), ErrorCode::Forbidden);
+    for logins in [&["login-9"][..], &[]] {
+        let (status, resp) = next_now(&sock, None, logins);
+        assert_eq!(status, 400, "{logins:?}");
+        assert_eq!(error_of(&resp), ErrorCode::BadRequest);
+    }
+}
+
+#[test]
+fn stale_and_foreign_probe_results_change_nothing() {
+    let dir = temp_dir("probeids");
+    let sock = dir.join("qb.sock");
+    let _d = start(&agent_config(&dir, &[probe_on()]), &sock);
+    pick_worker(&sock);
+    let (status, resp) = next_now(&sock, None, &["login-1"]);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    let job: AgentJob = serde_json::from_slice(&resp).unwrap();
+    assert_eq!(job.login, "login-1");
+
+    let ok = |id: &str| {
+        format!(
+            r#"{{"probe_id":"{id}","outcome":"ok","windows":[{{"name":"five_hour","utilization":0.5}}]}}"#
+        )
+    };
+    let before = state(&sock).logins;
+    for (bearer, id, status, code) in [
+        (None, "p-999", 404, ErrorCode::NotFound),
+        (None, "l-1", 404, ErrorCode::NotFound),
+        (
+            Some(BEARER),
+            job.probe_id.as_str(),
+            403,
+            ErrorCode::Forbidden,
+        ),
+    ] {
+        let (got, resp) = result(&sock, bearer, &ok(id));
+        assert_eq!((got, error_of(&resp)), (status, code), "{id}");
+        assert_eq!(state(&sock).logins, before, "{id}");
+    }
+    let (status, resp) = result(&sock, None, &ok(&job.probe_id));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    let w = &windows_of(&sock, "login-1")[0];
+    assert_eq!((w.1, w.3), (0.5, Source::Probe));
+    let (status, _) = result(&sock, None, &ok(&job.probe_id));
+    assert_eq!(status, 404, "an answered probe is gone");
+}
+
+fn status_of(sock: &Path, login: &str) -> LoginStatus {
+    state(sock)
+        .logins
+        .into_iter()
+        .find(|l| l.login == login)
+        .unwrap()
+        .status
+}
+
+#[test]
+fn auth_recovered_by_a_probe_survives_a_restart() {
+    let dir = temp_dir("probeauth");
+    let sock = dir.join("qb.sock");
+    let config = agent_config(&dir, &[probe_on()]);
+    let d = start(&config, &sock);
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        r#"{"login":"login-1","outcome":"http_401"}"#,
+    );
+    assert_eq!(r.login_status, LoginStatus::AuthStale);
+    pick_worker(&sock);
+    let (status, resp) = next_now(&sock, None, &["login-1"]);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    let job: AgentJob = serde_json::from_slice(&resp).unwrap();
+    let ok = format!(
+        r#"{{"probe_id":"{}","outcome":"ok","windows":[{{"name":"five_hour","utilization":0.5}}]}}"#,
+        job.probe_id
+    );
+    let (status, resp) = result(&sock, None, &ok);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    assert_eq!(status_of(&sock, "login-1"), LoginStatus::Ok);
+
+    drop(d);
+    let _d = start(&config, &sock);
+    // Windows are not journaled, so without an auth mark the replayed login is `unknown`.
+    assert_eq!(status_of(&sock, "login-1"), LoginStatus::Unknown);
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        r#"{"login":"login-1","outcome":"http_401"}"#,
+    );
+    assert_eq!(
+        r.login_status,
+        LoginStatus::AuthStale,
+        "one 401 after recovery"
+    );
+}
+
+#[test]
+fn parked_connections_are_bounded_per_agent_and_in_total() {
+    let dir = temp_dir("parkcap");
+    let sock = dir.join("qb.sock");
+    let mut edits = vec![(
+        "agents = [\"agent-1\"]",
+        "agents = [\"agent-1\", \"client-b\", \"bot-1\", \"bot-2\", \"bot-3\"]".to_owned(),
+    )];
+    let bots = BOTS
+        .iter()
+        .enumerate()
+        .fold(String::new(), |mut out, (i, (_, hash))| {
+            let _ = write!(
+                out,
+                "\n[[clients]]\nname = \"bot-{}\"\nbearer_sha256 = \"{hash}\"\nrole = \"worker\"\n",
+                i + 1
+            );
+            out
+        });
+    edits.push((
+        "role = \"reviewer\"\n",
+        format!("role = \"reviewer\"\n{bots}"),
+    ));
+    let _d = start(&agent_config(&dir, &edits), &sock);
+    let logins = ["login-1"];
+
+    let mut waiting = vec![park(&sock, None, &logins)];
+    let (status, resp) = next_now(&sock, None, &logins);
+    assert_eq!(status, 429, "one parked connection per agent");
+    assert_eq!(error_of(&resp), ErrorCode::TooManyRequests);
+    waiting.push(park(&sock, Some(BEARER), &logins));
+    waiting.push(park(&sock, Some(BOTS[0].0), &logins));
+    waiting.push(park(&sock, Some(BOTS[1].0), &logins));
+    let (status, resp) = next_now(&sock, Some(BOTS[2].0), &logins);
+    assert_eq!(status, 429, "at most 4 parked in total");
+    assert_eq!(error_of(&resp), ErrorCode::TooManyRequests);
+    assert_eq!(state(&sock).logins.len(), 3, "others are still served");
+
+    drop(waiting.pop());
+    let mut last = park(&sock, Some(BOTS[2].0), &logins);
+    assert_eq!(
+        answer(&mut last, Duration::from_millis(300)),
+        None,
+        "a closed connection frees its place"
+    );
+    for mut w in waiting {
+        assert_eq!(answer(&mut w, Duration::from_millis(10)), None);
+    }
+}
+
+#[test]
+fn an_agent_reconnects_after_a_daemon_restart() {
+    let dir = temp_dir("agentre");
+    let sock = dir.join("qb.sock");
+    let config = agent_config(&dir, &[probe_on()]);
+    let d = start(&config, &sock);
+    let (calls, called) = mpsc::channel();
+    spawn_agent(
+        &sock,
+        None,
+        TestFetcher {
+            calls,
+            release: None,
+        },
+    );
+    pick_worker(&sock);
+    assert_eq!(
+        called.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "login-1"
+    );
+    drop(d);
+    let _d = start(&config, &sock);
+    assert!(pick_worker(&sock).stale, "snapshots are not persisted");
+    assert_eq!(
+        called.recv_timeout(Duration::from_secs(15)).unwrap(),
+        "login-1"
+    );
+}
+
+/// Context switches of process `pid` so far.
+fn switches(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("ctxt_switches"))
+        .map(|l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap())
+        .sum()
+}
+
+#[test]
+fn an_idle_daemon_with_a_parked_agent_does_not_wake_up() {
+    let dir = temp_dir("idle");
+    let sock = dir.join("qb.sock");
+    let d = start(&agent_config(&dir, &[probe_on()]), &sock);
+    let mut parked = park(&sock, None, &["login-1"]);
+    assert_eq!(state(&sock).logins.len(), 3);
+    std::thread::sleep(Duration::from_millis(100));
+    let before = switches(d.0.id());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(switches(d.0.id()), before);
+    assert_eq!(answer(&mut parked, Duration::from_millis(10)), None);
 }

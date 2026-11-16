@@ -72,14 +72,23 @@ pub fn usage(body: &[u8], now: u64) -> Result<Vec<WindowReport>, Error> {
     ))
 }
 
+/// The readable windows under `keys`, in key order; a window named like an earlier one, because
+/// both have the same length, is dropped.
 fn windows(
     limits: &Map<String, Value>,
     keys: [&str; 2],
     window: impl Fn(&Map<String, Value>) -> Option<WindowReport>,
 ) -> Vec<WindowReport> {
-    keys.iter()
+    let mut out: Vec<WindowReport> = Vec::with_capacity(keys.len());
+    for w in keys
+        .iter()
         .filter_map(|key| window(get(limits, key)?.as_object()?))
-        .collect()
+    {
+        if out.iter().all(|seen| seen.name != w.name) {
+            out.push(w);
+        }
+    }
+    out
 }
 
 fn report(

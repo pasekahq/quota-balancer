@@ -29,6 +29,10 @@ pub mod paths {
     pub const HEALTH: &str = "/v1/health";
     /// `GET`, followed by a lease id: why a live lease was granted.
     pub const WHY: &str = "/v1/why/";
+    /// `POST`: an agent waits for a probe job.
+    pub const AGENT_NEXT: &str = "/v1/agent/next";
+    /// `POST`: an agent answers a probe job.
+    pub const AGENT_RESULT: &str = "/v1/agent/result";
 }
 
 /// `POST /v1/pick` request.
@@ -224,6 +228,55 @@ pub struct ReportRequest {
     /// The run is over; release the lease.
     #[serde(default)]
     pub release: bool,
+}
+
+/// `POST /v1/agent/next` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentNextRequest {
+    /// Logins this agent can probe, by config name.
+    pub logins: Vec<String>,
+}
+
+/// `POST /v1/agent/next` response: probe one login now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentJob {
+    /// Id the result must name.
+    pub probe_id: String,
+    /// Login to probe.
+    pub login: String,
+}
+
+/// What an agent's probe of a usage endpoint returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeOutcome {
+    /// HTTP 200 with a body the vendor's parser read.
+    Ok,
+    /// HTTP 401.
+    #[serde(rename = "http_401")]
+    Http401,
+    /// HTTP 429.
+    #[serde(rename = "http_429")]
+    Http429,
+    /// Any other status, an unreadable body or a transport failure.
+    Error,
+}
+
+/// `POST /v1/agent/result` request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResultRequest {
+    /// The job's `probe_id`.
+    pub probe_id: String,
+    /// Outcome class.
+    pub outcome: ProbeOutcome,
+    /// Windows of an `ok` outcome.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<WindowReport>,
+    /// The vendor's `Retry-After` in seconds, for `http_429`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_s: Option<u64>,
 }
 
 /// Health of a login as the balancer sees it.

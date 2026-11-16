@@ -12,6 +12,8 @@ Types are defined in `crates/qb-proto`; example payloads are in `crates/qb-proto
 | `GET /v1/state` | — | 200 `StateResponse` |
 | `GET /v1/why/{lease_id}` | — | 200 `WhyResponse`, 404 unknown or ended lease |
 | `GET /v1/health` | — | 200 `HealthResponse` |
+| `POST /v1/agent/next` | `AgentNextRequest` | 200 `AgentJob`, 400 unknown login, 403 not an agent, 429 too many waiting |
+| `POST /v1/agent/result` | `AgentResultRequest` | 200 `ReportResponse`, 403 another client's probe, 404 unknown or expired probe |
 
 Errors: `{"error": <code>, "message": "..."}` with codes `bad_request` (400), `unauthorized`
 (401), `forbidden` (403), `not_found` (404), `method_not_allowed` (405), `length_required`
@@ -148,3 +150,57 @@ lease; the request takes a token like any other.
 ## `GET /v1/health`
 
 `{"status": "ok", "api_version": "v1", "version": "0.0.1", "uptime_s": 12}`
+
+## Agents and probes
+
+`qb agent` connects to the daemon like any client and waits for probe jobs; the daemon never
+opens a connection. Only clients listed in `[probe] agents` (see [config.md](config.md)) may
+call these endpoints; another caller gets 403 `forbidden` from `next`.
+
+`POST /v1/agent/next` names the logins this agent can probe:
+
+```json
+{"logins": ["login-1", "login-2"]}
+```
+
+An empty list or a login the config does not declare is 400. The daemon then parks the
+connection: it stays open with no server timeout while other clients are served, until one of
+the listed logins is due and the daemon answers
+
+```json
+{"probe_id": "p-7", "login": "login-1"}
+```
+
+Each agent client parks at most one connection and at most 4 are parked in total; a further
+`next` is 429 `too_many_requests`. A parked connection the agent closes is dropped.
+
+A login is due when a `pick` considered it as a candidate while one of its windows was stale or
+never reported, nothing has reported a window of it since, it is not `auth_dead`, it has no
+probe in flight and it is not backing off. With `[probe] enabled = false` no login is ever due.
+A job is in flight until its result arrives or 30 seconds pass; a timeout counts as a failed
+probe. There is at most one probe in flight per login.
+
+`POST /v1/agent/result` answers the job:
+
+```json
+{"probe_id": "p-7", "outcome": "ok",
+ "windows": [{"name": "five_hour", "utilization": 0.06, "resets_at": 1800018000}]}
+{"probe_id": "p-8", "outcome": "http_429", "retry_after_s": 120}
+```
+
+| `outcome` | Effect |
+|---|---|
+| `ok` | The windows apply as a report's do, with `source = probe` in `GET /v1/state`: names the login's vendor does not declare are ignored, `unknown` and `auth_stale` become `ok` when a declared window is among them. The back-off ends. |
+| `http_401` | As a report `http_401`: `auth_stale`, then `auth_dead`. It also counts as a failed probe. |
+| `http_429` | A failed probe that waits at least `retry_after_s`. |
+| `error` | A failed probe. |
+
+After a failed probe the login is not due for a back-off that starts at
+`[probe] backoff_initial_s`, doubles with each further failure up to `backoff_max_s` and resets
+on `ok`; a 429 waits the longer of `retry_after_s` and that back-off. A login backing off is
+probed again only if a `pick` wants it in the meantime. Job timeouts and back-off ends are
+deadlines of the daemon's loop, which sleeps without a timeout when nothing is pending.
+
+The response is `{"accepted": true, "login_status": ...}` as for a report. A `probe_id` that is
+unknown, already answered or timed out is 404 `not_found`; a probe handed to another client is
+403 `forbidden`; a `utilization` outside `0.0..=1.0` is 400. None of them changes anything.

@@ -1,0 +1,13 @@
+# Example qb agent config: the logins this agent holds credentials for.
+# Format: docs/config.md. Pass with `qb agent --config PATH`; relative paths start at the
+# agent's working directory, the user's home under deploy/systemd/qb-agent.service.
+
+[[logins]]
+name = "login-1"
+kind = "claude"
+credentials = ".claude/.credentials.json"
+
+[[logins]]
+name = "login-3"
+kind = "codex"
+credentials = ".codex/auth.json"

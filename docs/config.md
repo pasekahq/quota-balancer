@@ -141,12 +141,15 @@ Optional. How long the marks of report outcomes last.
 
 ## `[probe]`
 
-Optional. Back-off of the agent's vendor probes.
+Optional. Lazy probes: an agent fetches a login's usage endpoint when a `pick` needs its data;
+the protocol is in [api.md](api.md#agents-and-probes).
 
 | Key | Type | Meaning |
 |---|---|---|
-| `backoff_initial_s` | integer > 0 | First back-off, default 30. |
-| `backoff_max_s` | integer ≥ `backoff_initial_s` | Ceiling, default 3600. |
+| `enabled` | bool | Hand out probe jobs, default `false`. Off, agents may wait but never get a job. |
+| `agents` | array of strings | Declared client names that may act as agents, default none. |
+| `backoff_initial_s` | integer > 0 | Back-off after a login's first failed probe, default 30. |
+| `backoff_max_s` | integer ≥ `backoff_initial_s` | Ceiling of the doubling back-off, default 3600. |
 
 ## `[limits]`
 
@@ -156,3 +159,25 @@ Optional. A token bucket per client; see [api.md](api.md#callers).
 |---|---|---|
 | `rate_per_s` | float > 0 | Refill rate in requests per second, default 5.0. |
 | `burst` | integer > 0 | Bucket size, default 20. |
+
+## Agent config
+
+`qb agent` reads its own TOML file, given with `qb agent --config PATH`, under the same rules
+for the whole file and with the same exit code 2 and one-line errors. It lists the logins this
+agent holds credentials for, 1 to 32:
+
+```toml
+[[logins]]
+name = "login-1"
+kind = "claude"
+credentials = ".claude/.credentials.json"
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | Login name as declared in the daemon's config. |
+| `kind` | `"claude"` or `"codex"` | Usage endpoint and response format: Claude `oauth/usage` or Codex `wham/usage` (see [vendors.md](vendors.md)). |
+| `credentials` | string | Non-empty path of the vendor CLI's credential file; a relative path starts at the agent's working directory. |
+
+The agent connects as a client of the daemon, so it needs a `[[clients]]` entry listed in
+`[probe] agents` there, and `--bearer-file` or `$QB_BEARER_FILE` when it connects by bearer.

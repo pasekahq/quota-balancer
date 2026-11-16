@@ -50,7 +50,7 @@ impl Source {
     }
 }
 
-pub const FIXTURES: [(&str, Source); 14] = [
+pub const FIXTURES: [(&str, Source); 15] = [
     ("claude_stream_seconds.json", Source::Stream),
     ("claude_stream_ms.json", Source::Stream),
     ("claude_stream_rejected.json", Source::Stream),
@@ -68,6 +68,7 @@ pub const FIXTURES: [(&str, Source); 14] = [
     ("codex_rollout_other.jsonl", Source::Rollout),
     ("codex_usage_reset_at.json", Source::CodexUsage),
     ("codex_usage_reset_after.json", Source::CodexUsage),
+    ("codex_usage_same_length.json", Source::CodexUsage),
 ];
 
 pub fn fixture(name: &str) -> Vec<u8> {
