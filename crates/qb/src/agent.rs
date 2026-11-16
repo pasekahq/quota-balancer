@@ -2,10 +2,13 @@
 //! fetches the login's usage endpoint through a [`Fetcher`] and answers with window numbers only.
 //! The protocol is `POST /v1/agent/next` and `POST /v1/agent/result` in `docs/api.md`.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Duration;
 
 use qb_proto::{AgentJob, AgentNextRequest, AgentResultRequest, ProbeOutcome, paths};
+use serde::Deserialize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{AgentConfig, Kind};
 use crate::{client, log, server};
@@ -35,13 +38,215 @@ pub trait Fetcher {
     fn fetch(&mut self, login: &str, kind: Kind, credentials: &Path) -> Result<Fetched, String>;
 }
 
-/// The fetcher of this build: it makes no request, so every probe ends in `error`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoHttps;
+/// Connect timeout of a usage request.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Limit on a whole usage request: connect, TLS, request and response body.
+pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest usage response body read.
+const MAX_BODY: u64 = 1024 * 1024;
 
-impl Fetcher for NoHttps {
-    fn fetch(&mut self, _: &str, _: Kind, _: &Path) -> Result<Fetched, String> {
-        Err("no HTTPS fetcher built in".to_owned())
+/// A usage request: the endpoint and its headers. Header values are zeroized on drop.
+pub struct UsageRequest {
+    /// The vendor's usage endpoint.
+    pub url: &'static str,
+    /// Header names and values.
+    pub headers: Vec<(&'static str, Zeroizing<String>)>,
+}
+
+/// A credential string, borrowed from the file's bytes unless it had JSON escapes; an owned copy
+/// is zeroized on drop.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Secret<'a>(#[serde(borrow)] Cow<'a, str>);
+
+impl Drop for Secret<'_> {
+    fn drop(&mut self) {
+        if let Cow::Owned(s) = &mut self.0 {
+            s.zeroize();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ClaudeFile<'a> {
+    #[serde(rename = "claudeAiOauth", borrow)]
+    oauth: Option<ClaudeOauth<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeOauth<'a> {
+    #[serde(rename = "accessToken", borrow)]
+    access_token: Option<Secret<'a>>,
+}
+
+#[derive(Deserialize)]
+struct CodexFile<'a> {
+    #[serde(borrow)]
+    tokens: Option<CodexTokens<'a>>,
+}
+
+#[derive(Deserialize)]
+struct CodexTokens<'a> {
+    #[serde(borrow)]
+    access_token: Option<Secret<'a>>,
+    #[serde(borrow)]
+    account_id: Option<Secret<'a>>,
+}
+
+/// The usage request of a login of `kind` whose credential file holds `credentials`.
+///
+/// # Errors
+/// The bytes are not JSON or a field is missing or unusable; the message names the field and
+/// never quotes the file.
+pub fn usage_request(kind: Kind, credentials: &[u8]) -> Result<UsageRequest, String> {
+    match kind {
+        Kind::Claude => {
+            let file: ClaudeFile = credential_json(credentials)?;
+            let token = file.oauth.and_then(|o| o.access_token);
+            let token = header_value("claudeAiOauth.accessToken", token.as_ref())?;
+            Ok(UsageRequest {
+                url: "https://api.anthropic.com/api/oauth/usage",
+                headers: vec![
+                    ("Authorization", bearer_value(&token)),
+                    (
+                        "anthropic-beta",
+                        Zeroizing::new("oauth-2025-04-20".to_owned()),
+                    ),
+                ],
+            })
+        }
+        Kind::Codex => {
+            let file: CodexFile = credential_json(credentials)?;
+            let (token, account) = file
+                .tokens
+                .map_or((None, None), |t| (t.access_token, t.account_id));
+            let token = header_value("tokens.access_token", token.as_ref())?;
+            let mut headers = vec![("Authorization", bearer_value(&token))];
+            if let Some(account) = &account {
+                let value = header_value("tokens.account_id", Some(account))?;
+                headers.push(("ChatGPT-Account-Id", value));
+            }
+            Ok(UsageRequest {
+                url: "https://chatgpt.com/backend-api/wham/usage",
+                headers,
+            })
+        }
+    }
+}
+
+/// `bytes` as JSON of type `T`; errors give the position or field path, never a value.
+fn credential_json<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, String> {
+    let syntax = |e: &serde_json::Error| {
+        format!("not valid JSON (line {}, column {})", e.line(), e.column())
+    };
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let value = serde_path_to_error::deserialize(&mut de).map_err(|e| {
+        if e.inner().is_data() {
+            format!("`{}` has the wrong type", e.path())
+        } else {
+            syntax(e.inner())
+        }
+    })?;
+    de.end().map_err(|e| syntax(&e))?;
+    Ok(value)
+}
+
+/// `secret` copied into a zeroizing header value, if it is a non-empty run of visible ASCII.
+fn header_value(field: &str, secret: Option<&Secret>) -> Result<Zeroizing<String>, String> {
+    let value = secret.map_or("", |s| &s.0);
+    if value.is_empty() {
+        return Err(format!("no `{field}`"));
+    }
+    if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(format!("`{field}` is not a visible ASCII string"));
+    }
+    Ok(Zeroizing::new(value.to_owned()))
+}
+
+/// `Bearer <token>`, allocated once at its final size so no unzeroized copy is left behind.
+fn bearer_value(token: &str) -> Zeroizing<String> {
+    const PREFIX: &str = "Bearer ";
+    let mut value = Zeroizing::new(String::with_capacity(PREFIX.len() + token.len()));
+    value.push_str(PREFIX);
+    value.push_str(token);
+    value
+}
+
+/// The usage request of `kind` built from the credential file at `path`, read now into a buffer
+/// that is zeroized on every path.
+///
+/// # Errors
+/// The file cannot be read or [`usage_request`] fails; the message names the file.
+pub fn read_request(kind: Kind, path: &Path) -> Result<UsageRequest, String> {
+    let bytes =
+        Zeroizing::new(std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    usage_request(kind, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `Retry-After` as whole seconds; an HTTP-date or any other form is `None`.
+pub fn retry_after(value: Option<&str>) -> Option<u64> {
+    let value = value?.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// Fetches usage endpoints over HTTPS with each login's credential file, read right before the
+/// request. Redirects and proxies are not followed.
+pub struct Https {
+    agent: ureq::Agent,
+}
+
+impl Https {
+    /// A fetcher with [`CONNECT_TIMEOUT`] and [`TOTAL_TIMEOUT`].
+    pub fn new() -> Self {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .proxy(None)
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_global(Some(TOTAL_TIMEOUT))
+            .build();
+        Self {
+            agent: ureq::Agent::new_with_config(config),
+        }
+    }
+}
+
+impl Default for Https {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fetcher for Https {
+    fn fetch(&mut self, _: &str, kind: Kind, credentials: &Path) -> Result<Fetched, String> {
+        let request = read_request(kind, credentials)?;
+        let mut builder = self.agent.get(request.url);
+        for (name, value) in &request.headers {
+            builder = builder.header(*name, value.as_str());
+        }
+        let sent = builder.call();
+        drop(request);
+        let mut response = sent.map_err(|e| e.to_string())?;
+        let retry_after_s = retry_after(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY)
+            .read_to_vec()
+            .map_err(|e| e.to_string())?;
+        Ok(Fetched {
+            status: response.status().as_u16(),
+            retry_after_s,
+            body,
+        })
     }
 }
 
@@ -205,6 +410,159 @@ mod tests {
             outcome(Kind::Codex, Err("refused".into())),
             (Error, None, 0)
         );
+    }
+
+    /// A synthetic marker standing in for a token; it must never appear in an error.
+    const MARK: &str = "synthetic-token-7f3a";
+
+    /// `(url, headers)` of the request built from `credentials`.
+    fn built(kind: Kind, credentials: &str) -> (&'static str, Vec<(&'static str, String)>) {
+        let r = usage_request(kind, credentials.as_bytes()).unwrap();
+        let headers = r.headers.iter().map(|(n, v)| (*n, v.to_string())).collect();
+        (r.url, headers)
+    }
+
+    #[test]
+    fn requests_carry_the_credential_fields() {
+        let claude = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{MARK}","refreshToken":"other","expiresAt":1}}}}"#
+        );
+        assert_eq!(
+            built(Kind::Claude, &claude),
+            (
+                "https://api.anthropic.com/api/oauth/usage",
+                vec![
+                    ("Authorization", format!("Bearer {MARK}")),
+                    ("anthropic-beta", "oauth-2025-04-20".to_owned()),
+                ]
+            )
+        );
+        let codex = format!(
+            r#"{{"OPENAI_API_KEY":null,"tokens":{{"id_token":"x","access_token":"{MARK}","refresh_token":"y","account_id":"acct-1"}}}}"#
+        );
+        assert_eq!(
+            built(Kind::Codex, &codex),
+            (
+                "https://chatgpt.com/backend-api/wham/usage",
+                vec![
+                    ("Authorization", format!("Bearer {MARK}")),
+                    ("ChatGPT-Account-Id", "acct-1".to_owned()),
+                ]
+            )
+        );
+        for account in [r#","account_id":null"#, ""] {
+            let codex = format!(r#"{{"tokens":{{"access_token":"{MARK}"{account}}}}}"#);
+            assert_eq!(
+                built(Kind::Codex, &codex).1,
+                vec![("Authorization", format!("Bearer {MARK}"))],
+                "{account}"
+            );
+        }
+        let escaped = r#"{"claudeAiOauth":{"accessToken":"token"}}"#;
+        assert_eq!(
+            built(Kind::Claude, escaped).1[0].1,
+            "Bearer token",
+            "an escaped token is decoded"
+        );
+    }
+
+    fn temp_file(name: &str, contents: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("qb-agent-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(name);
+        if let Some(c) = contents {
+            std::fs::write(&file, c).unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn unusable_credentials_are_errors_naming_file_and_field_without_content() {
+        let cases = [
+            (Kind::Claude, "missing.json", None, "No such file"),
+            (
+                Kind::Claude,
+                "truncated.json",
+                Some(format!(r#"{{"claudeAiOauth":{{"accessToken":"{MARK}"#)),
+                "not valid JSON",
+            ),
+            (
+                Kind::Codex,
+                "trailing.json",
+                Some(format!(
+                    r#"{{"tokens":{{"access_token":"{MARK}"}}}} {MARK}"#
+                )),
+                "not valid JSON",
+            ),
+            (
+                Kind::Claude,
+                "no-token.json",
+                Some(format!(
+                    r#"{{"claudeAiOauth":{{"refreshToken":"{MARK}"}}}}"#
+                )),
+                "no `claudeAiOauth.accessToken`",
+            ),
+            (
+                Kind::Claude,
+                "empty-token.json",
+                Some(r#"{"claudeAiOauth":{"accessToken":""}}"#.to_owned()),
+                "no `claudeAiOauth.accessToken`",
+            ),
+            (
+                Kind::Codex,
+                "no-tokens.json",
+                Some(format!(r#"{{"OPENAI_API_KEY":"{MARK}"}}"#)),
+                "no `tokens.access_token`",
+            ),
+            (
+                Kind::Codex,
+                "number-token.json",
+                Some(r#"{"tokens":{"access_token":73519}}"#.to_owned()),
+                "`tokens.access_token` has the wrong type",
+            ),
+            (
+                Kind::Codex,
+                "object-account.json",
+                Some(format!(
+                    r#"{{"tokens":{{"access_token":"a","account_id":{{"x":"{MARK}"}}}}}}"#
+                )),
+                "`tokens.account_id` has the wrong type",
+            ),
+            (
+                Kind::Codex,
+                "newline-token.json",
+                Some(format!(
+                    r#"{{"tokens":{{"access_token":"{MARK}\r\nX-Injected: 1"}}}}"#
+                )),
+                "`tokens.access_token` is not a visible ASCII string",
+            ),
+        ];
+        for (kind, name, contents, expected) in cases {
+            let file = temp_file(name, contents.as_deref());
+            let Err(e) = read_request(kind, &file) else {
+                panic!("{name} was accepted");
+            };
+            assert!(e.starts_with(&format!("{}: ", file.display())), "{e}");
+            assert!(e.contains(expected), "{name}: {e}");
+            assert!(!e.contains(MARK) && !e.contains("73519"), "{name}: {e}");
+        }
+    }
+
+    #[test]
+    fn retry_after_is_whole_seconds_only() {
+        assert_eq!(retry_after(Some("120")), Some(120));
+        assert_eq!(retry_after(Some(" 7 ")), Some(7));
+        for value in [
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "",
+            "-5",
+            "+5",
+            "1.5",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(retry_after(Some(value)), None, "{value}");
+        }
+        assert_eq!(retry_after(None), None);
     }
 
     #[test]

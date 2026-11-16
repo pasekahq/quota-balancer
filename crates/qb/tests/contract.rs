@@ -1850,3 +1850,106 @@ fn an_idle_daemon_with_a_parked_agent_does_not_wake_up() {
     assert_eq!(switches(d.0.id()), before);
     assert_eq!(answer(&mut parked, Duration::from_millis(10)), None);
 }
+
+/// Stands in for a token in credential files; it must never reach a log.
+const CREDENTIAL_MARK: &str = "synthetic-token-5c1e";
+
+/// Lines the child writes to stderr, as they come.
+fn stderr_lines(child: &mut Child) -> Receiver<String> {
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stderr)) {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// The next line of `lines` within `wait` that contains `needle`.
+fn line_with(lines: &Receiver<String>, needle: &str, wait: Duration) -> Option<String> {
+    let deadline = Instant::now() + wait;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match lines.recv_timeout(left) {
+            Ok(line) if line.contains(needle) => return Some(line),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[test]
+fn a_hardened_agent_binary_reports_a_malformed_credential_file_as_a_failed_probe() {
+    let dir = temp_dir("agentbin");
+    let sock = dir.join("qb.sock");
+    let config = agent_config(
+        &dir,
+        &[
+            probe_on(),
+            ("backoff_initial_s = 30", "backoff_initial_s = 2".to_owned()),
+        ],
+    );
+    let _d = start(&config, &sock);
+    std::fs::create_dir_all(dir.join("creds")).unwrap();
+    let credentials = dir.join("creds/.credentials.json");
+    std::fs::write(
+        &credentials,
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"{CREDENTIAL_MARK}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("agent.toml"),
+        "[[logins]]\nname = \"login-1\"\nkind = \"claude\"\n\
+         credentials = \"creds/.credentials.json\"\n",
+    )
+    .unwrap();
+    let mut agent = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_qb"))
+            .arg("--socket")
+            .arg(&sock)
+            .args(["agent", "--config", "agent.toml"])
+            .current_dir(&dir)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let lines = stderr_lines(&mut agent.0);
+    let failure = "probe of login-1: creds/.credentials.json: not valid JSON";
+
+    assert!(pick_worker(&sock).stale);
+    let first = line_with(&lines, "probe of login-1", Duration::from_secs(10));
+    let first = first.expect("the agent took the job");
+    assert!(first.contains(failure), "{first}");
+    assert!(!first.contains(CREDENTIAL_MARK), "{first}");
+    let status = std::fs::metadata(format!("/proc/{}/status", agent.0.id())).unwrap();
+    assert_eq!(
+        status.uid(),
+        0,
+        "a non-dumpable process's /proc files belong to root"
+    );
+
+    assert!(pick_worker(&sock).stale);
+    assert_eq!(
+        line_with(&lines, "probe of login-1", Duration::from_millis(500)),
+        None,
+        "the failed probe backs the login off"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(pick_worker(&sock).stale);
+    let second = line_with(&lines, "probe of login-1", Duration::from_secs(5));
+    let second = second.expect("a job after the back-off, well before the probe timeout");
+    assert!(second.contains(failure), "{second}");
+    let s = state(&sock);
+    assert_eq!(s.logins[0].login, "login-1");
+    assert_eq!(s.logins[0].status, LoginStatus::Unknown);
+    assert!(
+        s.logins[0]
+            .windows
+            .iter()
+            .all(|w| w.stale && w.source != Source::Probe)
+    );
+}

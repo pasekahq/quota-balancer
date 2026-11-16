@@ -16,11 +16,14 @@ qb-proto = { path = "crates/qb-proto" }
 qb-vendors = { path = "crates/qb-vendors" }
 httparse = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"
-rustix = { version = "1", default-features = false, features = ["std", "net", "event"] }
+rustix = { version = "1", default-features = false, features = ["std", "net", "event", "process"] }
+landlock = "0.4"
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 serde_path_to_error = "0.1"
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

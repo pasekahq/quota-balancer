@@ -21,6 +21,27 @@ an `Event` with the windows and `rate_limit_info.status` passed through as a str
 `Ok(None)` when the input carries no rate limits (absent or `null`). The usage parsers return the
 windows they find, possibly none.
 
+## Usage endpoints
+
+`qb agent` fetches the usage endpoint of a login's `kind` (see [config.md](config.md)) with the
+vendor CLI's own credential file, read right before the request:
+
+| Kind | Request | Headers | Credential fields |
+|---|---|---|---|
+| `claude` | `GET https://api.anthropic.com/api/oauth/usage` | `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20` | `claudeAiOauth.accessToken` of `.claude/.credentials.json` |
+| `codex` | `GET https://chatgpt.com/backend-api/wham/usage` | `Authorization: Bearer <token>`, `ChatGPT-Account-Id: <account>` when the file has one | `tokens.access_token`, optional `tokens.account_id`, of `.codex/auth.json` |
+
+- The connect timeout and the limit on the whole request are 10 s each. Redirects are not
+  followed and no proxy is used; the response body is read up to 1 MiB.
+- 200 goes to `claude::usage` or `codex::usage`; 401 and 429 become the probe outcomes
+  `http_401` and `http_429`; any other status, a transport error or an unreadable body is
+  `error`.
+- `Retry-After` counts only as whole seconds (`120`). An HTTP-date or any other value is absent,
+  and the daemon's back-off applies.
+- A missing or unreadable file, a file that is not JSON, and a field that is missing, empty, not
+  a string or not visible ASCII make the probe `error`. The log line names the file and the
+  field and never quotes the file.
+
 ## Errors
 
 | Error | When |
@@ -35,6 +56,8 @@ A single window that cannot be read is dropped; the other windows of the input s
 
 - Names: Claude windows keep the source's key and are taken only for `five_hour`,
   `seven_day` and `seven_day_<model>` (for example `seven_day_opus`); other keys are ignored.
+  The daemon keeps only windows the login's vendor declares, so a `seven_day_*` key that is not
+  a model's window never reaches state unless a config declares it.
   Codex windows are named by length: 300 min is `five_hour`, 10080 min is `seven_day`, any other
   length is `window_<minutes>m`. Claude windows are returned sorted by name, Codex windows in
   `primary`, `secondary` order. Two readable Codex windows of the same length would share a

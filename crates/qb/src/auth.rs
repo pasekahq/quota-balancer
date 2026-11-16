@@ -150,7 +150,7 @@ mod tests {
             name: name.into(),
             uid,
             bearer_sha256: token.map(|t| BearerHash(sha256::digest(t.as_bytes()))),
-            role: "worker".into(),
+            role: Some("worker".into()),
         }
     }
 
