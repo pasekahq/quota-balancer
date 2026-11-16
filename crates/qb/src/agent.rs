@@ -2,7 +2,6 @@
 //! fetches the login's usage endpoint through a [`Fetcher`] and answers with window numbers only.
 //! The protocol is `POST /v1/agent/next` and `POST /v1/agent/result` in `docs/api.md`.
 
-use std::convert::Infallible;
 use std::path::Path;
 use std::time::Duration;
 
@@ -98,7 +97,7 @@ pub fn run(
     bearer: Option<&str>,
     config: &AgentConfig,
     fetcher: &mut impl Fetcher,
-) -> Infallible {
+) -> ! {
     let mut wait = RECONNECT_INITIAL;
     loop {
         match answer_one(socket, bearer, config, fetcher) {

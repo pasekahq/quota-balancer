@@ -293,12 +293,12 @@ fn run(args: Args) -> Result<ExitCode, String> {
         Cmd::Agent(file) => {
             let config = config::load_agent(&file).map_err(|e| e.to_string())?;
             let bearer = bearer(args.bearer_file)?;
-            match agent::run(
+            agent::run(
                 &args.socket,
                 bearer.as_deref(),
                 &config,
                 &mut agent::NoHttps,
-            ) {}
+            )
         }
         Cmd::Simulate(sim) => simulate(sim),
         Cmd::Call(call) => {
