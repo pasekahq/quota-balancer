@@ -1,0 +1,1 @@
+{"probe_id":"p-7","outcome":"ok","windows":[{"name":"five_hour","utilization":0.06,"resets_at":1800018000,"length_s":18000},{"name":"seven_day","utilization":0.35,"resets_at":1800432000,"length_s":604800}]}

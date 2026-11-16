@@ -24,7 +24,8 @@ USAGE:
 COMMANDS:
     daemon [--config PATH]              run the policy daemon; config default: $QB_CONFIG,
                                         else /etc/qb/qbd.toml
-    agent                               run the credential-owner agent
+    agent --config PATH                 run the credential-owner agent: wait for the daemon's
+                                        probe jobs and answer them
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -59,7 +60,7 @@ connection errors. qb sends no telemetry.
 
 enum Cmd {
     Daemon(PathBuf),
-    Agent,
+    Agent(PathBuf),
     Simulate(Simulate),
     Call(Call),
     Version,
@@ -169,7 +170,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             Value(v) if matches!(sub, Some("why" | "simulate")) && operand.is_none() => {
                 operand = Some(v);
             }
-            Long("config") if matches!(sub, Some("daemon" | "simulate")) => {
+            Long("config") if matches!(sub, Some("daemon" | "simulate" | "agent")) => {
                 config = Some(PathBuf::from(p.value()?));
             }
             Long("at") if sub == Some("simulate") => at = Some(p.value()?.parse()?),
@@ -218,7 +219,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
     let cmd = match name.as_deref() {
         None => Cmd::Help,
         Some("daemon") => Cmd::Daemon(config.unwrap_or_else(default_config)),
-        Some("agent") => Cmd::Agent,
+        Some("agent") => Cmd::Agent(config.ok_or("--config is required")?),
         Some("health") => Cmd::Call(Call::Health),
         Some("state") => Cmd::Call(Call::State),
         Some("version") => Cmd::Version,
@@ -289,7 +290,16 @@ fn run(args: Args) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Daemon(config) => daemon(&args.socket, &config),
-        Cmd::Agent => agent::run(&args.socket).map(|()| ExitCode::SUCCESS),
+        Cmd::Agent(file) => {
+            let config = config::load_agent(&file).map_err(|e| e.to_string())?;
+            let bearer = bearer(args.bearer_file)?;
+            match agent::run(
+                &args.socket,
+                bearer.as_deref(),
+                &config,
+                &mut agent::NoHttps,
+            ) {}
+        }
         Cmd::Simulate(sim) => simulate(sim),
         Cmd::Call(call) => {
             let bearer = bearer(args.bearer_file)?;
@@ -421,6 +431,12 @@ fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
         l
     };
     let mut gate = Gate::new(&config.clients, &config.limits);
-    let Err(e) = server::serve(&listener, &mut core, &mut journal, &mut gate);
+    let Err(e) = server::serve(
+        &listener,
+        &mut core,
+        &mut journal,
+        &mut gate,
+        &config.probe.agents,
+    );
     Err(format!("listener failed: {e}"))
 }

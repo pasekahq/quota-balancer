@@ -107,7 +107,10 @@ Templates live in [`deploy/systemd/`](deploy/systemd): `qbd.socket` + `qbd.servi
 units, socket activation) and `qb-agent.service` (a user unit for the credential owner). Copy
 the binary to `/usr/local/bin/qb`, write `/etc/qb/qbd.toml` (start from
 [`deploy/examples/qbd.toml`](deploy/examples/qbd.toml)), create a `qb-clients` group for the
-users allowed to talk to the daemon, then `systemctl enable --now qbd.socket`.
+users allowed to talk to the daemon, then `systemctl enable --now qbd.socket`. The agent reads
+`~/.config/qb/agent.toml` of its user (start from
+[`deploy/examples/agent.toml`](deploy/examples/agent.toml)); probes stay off until
+`[probe] enabled = true` in the daemon's config.
 
 ## Terms of service
 

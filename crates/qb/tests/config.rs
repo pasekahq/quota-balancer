@@ -5,7 +5,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use qb::config::{self, Journal};
+use qb::config::{self, Journal, Kind};
+use qb_core::ProbeSpec;
 
 const BASE: &str = r#"
 [journal]
@@ -114,6 +115,30 @@ model_unavailable_s = 7200",
 }
 
 #[test]
+fn probe_settings_reach_the_core_spec_only_when_enabled() {
+    let off = config::parse(Path::new(FILE), BASE).unwrap();
+    assert_eq!(
+        (off.probe.enabled, off.probe.agents.len()),
+        (false, 0),
+        "documented defaults"
+    );
+    assert_eq!(off.core_spec().probe, None);
+    let on = with(&format!(
+        "{}\nuid = 1\n[probe]\nenabled = true\nagents = [\"client-a\"]\nbackoff_initial_s = 10\nbackoff_max_s = 40",
+        client("")
+    ));
+    let cfg = config::parse(Path::new(FILE), &on).unwrap();
+    assert_eq!(cfg.probe.agents, ["client-a"]);
+    assert_eq!(
+        cfg.core_spec().probe,
+        Some(ProbeSpec {
+            backoff_initial_s: 10,
+            backoff_max_s: 40
+        })
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // one flat table of cases reads best
 fn rejections_name_the_field() {
     let hex64 = "ab".repeat(32);
@@ -197,6 +222,15 @@ fn rejections_name_the_field() {
             with(&client("uid = 1").replace("\"worker\"", "\"admin\"")),
             "clients[0].role",
             "undeclared role `admin`",
+        ),
+        (
+            "undeclared client as an agent",
+            with(&format!(
+                "{}\nuid = 1\n[probe]\nagents = [\"client-z\"]",
+                client("")
+            )),
+            "probe.agents[0]",
+            "undeclared client `client-z`",
         ),
         (
             "more than 32 logins",
@@ -369,11 +403,81 @@ fn shipped_examples_validate() {
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "toml") {
-            if let Err(e) = config::load(&path) {
+            let loaded = if path.file_name().is_some_and(|n| n == "agent.toml") {
+                config::load_agent(&path).map(drop)
+            } else {
+                config::load(&path).map(drop)
+            };
+            if let Err(e) = loaded {
                 panic!("{e}");
             }
             seen += 1;
         }
     }
-    assert!(seen > 0, "no examples in {}", dir.display());
+    assert!(seen > 1, "no examples in {}", dir.display());
+}
+
+const AGENT: &str = r#"
+[[logins]]
+name = "login-1"
+kind = "claude"
+credentials = ".claude/.credentials.json"
+"#;
+
+#[test]
+fn agent_config_lists_logins_with_kind_and_credentials() {
+    let cfg = config::parse_agent(Path::new(FILE), AGENT).unwrap();
+    let login = &cfg.logins[0];
+    assert_eq!(
+        (login.name.as_str(), login.kind, login.credentials.as_path()),
+        (
+            "login-1",
+            Kind::Claude,
+            Path::new(".claude/.credentials.json")
+        )
+    );
+}
+
+#[test]
+fn agent_config_rejections_name_the_field() {
+    let codex = "[[logins]]\nname = \"login-2\"\nkind = \"codex\"\ncredentials = \"c\"";
+    let cases: Vec<(&str, String, &str, &str)> = vec![
+        ("no logins", String::new(), "", "missing field `logins`"),
+        ("empty logins", "logins = []".into(), "logins", "is empty"),
+        (
+            "duplicate login",
+            format!("{AGENT}{}", AGENT.replace("claude", "codex")),
+            "logins[1].name",
+            "duplicate name `login-1`",
+        ),
+        (
+            "unknown kind",
+            AGENT.replace("claude", "vendor-x"),
+            "logins[0].kind",
+            "unknown variant",
+        ),
+        (
+            "empty credentials",
+            AGENT.replace(".claude/.credentials.json", ""),
+            "logins[0].credentials",
+            "is empty",
+        ),
+        (
+            "unknown key",
+            format!("{AGENT}token = \"s3cret\""),
+            "logins[0].token",
+            "unknown field `token`",
+        ),
+        (
+            "missing credentials",
+            codex.replace("\ncredentials = \"c\"", ""),
+            "logins[0]",
+            "missing field `credentials`",
+        ),
+    ];
+    for (what, text, field, reason) in cases {
+        let err = config::parse_agent(Path::new(FILE), &text).unwrap_err();
+        assert_eq!(err.field, field, "{what}: {err}");
+        assert!(err.reason.contains(reason), "{what}: {err}");
+    }
 }

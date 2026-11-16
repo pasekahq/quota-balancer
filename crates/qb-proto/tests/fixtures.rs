@@ -1,8 +1,9 @@
 //! Contract fixtures: every fixture decodes into its type and re-encodes to the same JSON.
 
 use qb_proto::{
-    Decision, ErrorBody, HealthResponse, Outcome, PickRequest, PickResponse, ReportRequest,
-    ReportResponse, StateResponse, WhyResponse,
+    AgentJob, AgentNextRequest, AgentResultRequest, Decision, ErrorBody, HealthResponse, Outcome,
+    PickRequest, PickResponse, ProbeOutcome, ReportRequest, ReportResponse, StateResponse,
+    WhyResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -66,9 +67,29 @@ fn why() {
 }
 
 #[test]
+fn agent_protocol() {
+    let next: AgentNextRequest = roundtrip("agent_next_request.json");
+    assert_eq!(next.logins, ["login-1", "login-2"]);
+    let job: AgentJob = roundtrip("agent_job.json");
+    assert_eq!(job.probe_id, "p-7");
+    let ok: AgentResultRequest = roundtrip("agent_result_request_ok.json");
+    assert_eq!((ok.outcome, ok.windows.len()), (ProbeOutcome::Ok, 2));
+    let limited: AgentResultRequest = roundtrip("agent_result_request_429.json");
+    assert_eq!(
+        (limited.outcome, limited.retry_after_s),
+        (ProbeOutcome::Http429, Some(120))
+    );
+}
+
+#[test]
 fn requests_reject_unknown_fields() {
     let err = serde_json::from_str::<PickRequest>(r#"{"role":"worker","difficulty":1,"x":1}"#);
     assert!(err.is_err());
     let err = serde_json::from_str::<ReportRequest>(r#"{"outcome":"ok","token":"t"}"#);
+    assert!(err.is_err());
+    let err = serde_json::from_str::<AgentNextRequest>(r#"{"logins":[],"kind":"claude"}"#);
+    assert!(err.is_err());
+    let err =
+        serde_json::from_str::<AgentResultRequest>(r#"{"probe_id":"p-1","outcome":"ok","x":1}"#);
     assert!(err.is_err());
 }

@@ -3,7 +3,7 @@
 //! - `qbd` (or `qb daemon`): the policy daemon. Holds state in RAM, serves `/v1/*` as JSON over
 //!   HTTP/1.1 on a unix socket, identifies callers by bearer token or `SO_PEERCRED`. Holds no
 //!   vendor secrets and needs no network.
-//! - `qb agent`: runs as the owner of vendor CLI credentials and answers the daemon's probes.
+//! - `qb agent`: runs as the owner of vendor CLI credentials and answers the daemon's probe jobs.
 //! - `qb <command>`: CLI client (`health`, `state`, `why`, `pick`, `report`) and the offline
 //!   `simulate`.
 

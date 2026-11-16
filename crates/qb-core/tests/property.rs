@@ -95,6 +95,7 @@ fn random_spec(rng: &mut Rng) -> Spec {
         cost_per_minute: 0.01,
         rate_limit_backoff_s: 60,
         model_unavailable_s: DAY,
+        probe: None,
     }
 }
 

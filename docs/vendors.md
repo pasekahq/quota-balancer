@@ -37,7 +37,8 @@ A single window that cannot be read is dropped; the other windows of the input s
   `seven_day` and `seven_day_<model>` (for example `seven_day_opus`); other keys are ignored.
   Codex windows are named by length: 300 min is `five_hour`, 10080 min is `seven_day`, any other
   length is `window_<minutes>m`. Claude windows are returned sorted by name, Codex windows in
-  `primary`, `secondary` order.
+  `primary`, `secondary` order. Two readable Codex windows of the same length would share a
+  name: the first in that order is kept and the later one is dropped.
 - Length: `length_s` is always set: 18000 for `five_hour`, 604800 for `seven_day*`, and the
   stated length for Codex. A Codex length of 0, one that is not a whole number of minutes, or
   one that does not fit `u32` seconds drops the window.

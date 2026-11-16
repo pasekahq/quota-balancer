@@ -1,13 +1,14 @@
-//! The daemon's TOML config: schema, parsing and validation. The format is described in
-//! `docs/config.md`; [`load`] is the only way `qbd` obtains a [`Config`].
+//! The TOML configs of the daemon and the agent: schema, parsing and validation. The formats are
+//! described in `docs/config.md`; [`load`] is the only way `qbd` obtains a [`Config`] and
+//! [`load_agent`] the only way `qb agent` obtains an [`AgentConfig`].
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use qb_core::{
-    CandidateSpec, LoginSpec, MAX_CANDIDATES, MAX_LOGINS, MAX_WINDOWS, ReserveSpec, RoleSpec, Spec,
-    StepSpec, VendorSpec, WindowSpec,
+    CandidateSpec, LoginSpec, MAX_CANDIDATES, MAX_LOGINS, MAX_WINDOWS, ProbeSpec, ReserveSpec,
+    RoleSpec, Spec, StepSpec, VendorSpec, WindowSpec,
 };
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -65,7 +66,7 @@ pub struct Config {
     /// How long report outcome marks last.
     #[serde(default)]
     pub outcomes: Outcomes,
-    /// Back-off of the agent's vendor probes.
+    /// Lazy probes by agents: on or off, who may act as an agent, back-off.
     #[serde(default)]
     pub probe: Probe,
     /// Per-client request rate limit.
@@ -243,10 +244,14 @@ impl Default for Outcomes {
     }
 }
 
-/// Exponential back-off of the agent's vendor probes.
+/// Lazy probes by agents and their exponential back-off.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Probe {
+    /// Hand out probe jobs; off, agents may wait but never get one.
+    pub enabled: bool,
+    /// Declared clients that may act as agents.
+    pub agents: Vec<String>,
     /// First back-off in seconds.
     pub backoff_initial_s: u64,
     /// Back-off ceiling in seconds.
@@ -256,6 +261,8 @@ pub struct Probe {
 impl Default for Probe {
     fn default() -> Self {
         Self {
+            enabled: false,
+            agents: Vec::new(),
             backoff_initial_s: 30,
             backoff_max_s: 3600,
         }
@@ -278,6 +285,54 @@ impl Default for Limits {
             rate_per_s: 5.0,
             burst: 20,
         }
+    }
+}
+
+/// A validated agent config: the logins this agent probes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    /// Logins, 1 to [`MAX_LOGINS`], named as in the daemon's config.
+    pub logins: Vec<AgentLogin>,
+}
+
+/// A login the agent holds credentials for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLogin {
+    /// Login name in the daemon's config.
+    pub name: String,
+    /// Which vendor's usage endpoint and response format the login uses.
+    pub kind: Kind,
+    /// The vendor CLI's credential file; relative paths start at the working directory.
+    pub credentials: PathBuf,
+}
+
+/// The usage endpoint family of a login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// Claude `oauth/usage`.
+    Claude,
+    /// Codex `wham/usage`.
+    Codex,
+}
+
+impl AgentConfig {
+    fn validate(&self) -> Result<(), Fault> {
+        if self.logins.is_empty() {
+            return Err(("logins".into(), "is empty".into()));
+        }
+        if self.logins.len() > MAX_LOGINS {
+            return Err(too_many("logins".into(), self.logins.len(), MAX_LOGINS));
+        }
+        declare("logins", self.logins.iter().map(|l| l.name.as_str()))?;
+        for (i, login) in self.logins.iter().enumerate() {
+            if login.credentials.as_os_str().is_empty() {
+                return Err((format!("logins[{i}].credentials"), "is empty".into()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -342,6 +397,44 @@ pub fn load(file: &Path) -> Result<Config, Error> {
 /// # Errors
 /// The text is not TOML or does not validate.
 pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
+    let config: Config = deserialize(file, text)?;
+    config.validate().map_err(|(field, reason)| Error {
+        file: file.to_owned(),
+        field,
+        reason,
+    })?;
+    Ok(config)
+}
+
+/// Reads and validates the agent config file at `file`.
+///
+/// # Errors
+/// The file cannot be read or does not validate.
+pub fn load_agent(file: &Path) -> Result<AgentConfig, Error> {
+    let text = std::fs::read_to_string(file).map_err(|e| Error {
+        file: file.to_owned(),
+        field: String::new(),
+        reason: format!("cannot read: {e}"),
+    })?;
+    parse_agent(file, &text)
+}
+
+/// Parses and validates agent config `text`; `file` only names the source in errors.
+///
+/// # Errors
+/// The text is not TOML or does not validate.
+pub fn parse_agent(file: &Path, text: &str) -> Result<AgentConfig, Error> {
+    let config: AgentConfig = deserialize(file, text)?;
+    config.validate().map_err(|(field, reason)| Error {
+        file: file.to_owned(),
+        field,
+        reason,
+    })?;
+    Ok(config)
+}
+
+/// `text` as TOML of type `T`, errors on one line with the field path and no quoted values.
+fn deserialize<T: serde::de::DeserializeOwned>(file: &Path, text: &str) -> Result<T, Error> {
     let error = |field: String, reason: String| Error {
         file: file.to_owned(),
         field,
@@ -360,15 +453,11 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
     };
     let document =
         toml::Deserializer::parse(text).map_err(|e| error(String::new(), describe(&e)))?;
-    let config: Config = serde_path_to_error::deserialize(document).map_err(|e| {
+    serde_path_to_error::deserialize(document).map_err(|e| {
         let field = e.path().to_string();
         let field = if field == "." { String::new() } else { field };
         error(field, describe(e.inner()))
-    })?;
-    config
-        .validate()
-        .map_err(|(field, reason)| error(field, reason))?;
-    Ok(config)
+    })
 }
 
 /// `message` without the string values serde quotes in type and variant errors, so a token
@@ -484,6 +573,10 @@ impl Config {
             cost_per_minute: self.leases.cost_per_minute.get(),
             rate_limit_backoff_s: self.outcomes.rate_limit_backoff_s,
             model_unavailable_s: self.outcomes.model_unavailable_s,
+            probe: self.probe.enabled.then_some(ProbeSpec {
+                backoff_initial_s: self.probe.backoff_initial_s,
+                backoff_max_s: self.probe.backoff_max_s,
+            }),
         }
     }
 
@@ -526,7 +619,7 @@ impl Config {
             role.validate(&format!("roles[{i}]"), &vendors, &windows)?;
         }
 
-        declare("clients", self.clients.iter().map(|c| c.name.as_str()))?;
+        let clients = declare("clients", self.clients.iter().map(|c| c.name.as_str()))?;
         let (mut uids, mut bearers) = (HashSet::new(), HashSet::new());
         for (i, client) in self.clients.iter().enumerate() {
             let at = format!("clients[{i}]");
@@ -544,6 +637,9 @@ impl Config {
                 }
             }
             known(&roles, format!("{at}.role"), "role", &client.role)?;
+        }
+        for (i, agent) in self.probe.agents.iter().enumerate() {
+            known(&clients, format!("probe.agents[{i}]"), "client", agent)?;
         }
 
         self.validate_settings()

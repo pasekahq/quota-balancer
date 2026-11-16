@@ -1,13 +1,15 @@
 //! `/v1` routing: HTTP request in, status and JSON body out. No sockets here.
 
 use qb_core::{
-    Core, LoginStatus as CoreStatus, LoginView, OutcomeClass, PickInput, Record, ReportError,
-    ReportInput, ReportSubject, Source as CoreSource, Target, Verdict, WindowObservation,
+    Core, LoginStatus as CoreStatus, LoginView, OutcomeClass, PickInput, ProbeError, ProbeJob,
+    ProbeOutcome as CoreProbeOutcome, Record, ReportError, ReportInput, ReportSubject,
+    Source as CoreSource, Target, Verdict, WindowObservation,
 };
 use qb_proto::{
-    API_VERSION, Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LeaseState,
-    LoginState, LoginStatus, Outcome, PickRequest, PickRequestError, PickResponse, ReportRequest,
-    ReportResponse, Source, StateResponse, WhyResponse, WindowCost, WindowState, paths,
+    API_VERSION, AgentJob, AgentNextRequest, AgentResultRequest, Decision, ErrorBody, ErrorCode,
+    HealthResponse, HealthStatus, LeaseState, LoginState, LoginStatus, Outcome, PickRequest,
+    PickRequestError, PickResponse, ProbeOutcome, ReportRequest, ReportResponse, Source,
+    StateResponse, WhyResponse, WindowCost, WindowReport, WindowState, paths,
 };
 use serde::Serialize;
 
@@ -40,6 +42,21 @@ pub struct Reply {
     pub body: Vec<u8>,
 }
 
+/// What the transport does with a routed request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Reply now.
+    Reply(Reply),
+    /// Keep the agent's connection open until a probe of one of these declared logins is due.
+    Park(Vec<String>),
+}
+
+impl From<Reply> for Answer {
+    fn from(reply: Reply) -> Self {
+        Self::Reply(reply)
+    }
+}
+
 fn json<T: Serialize>(status: u16, value: &T) -> Reply {
     match serde_json::to_vec(value) {
         Ok(body) => Reply { status, body },
@@ -61,26 +78,40 @@ pub fn error(code: ErrorCode, message: impl Into<String>) -> Reply {
     )
 }
 
-/// Routes one request; granted leases, changed marks and releases go to `journal`.
+/// Routes one request; granted leases, changed marks and releases go to `journal`. Only the
+/// clients in `agents` may wait for probe jobs.
 pub fn handle(
     core: &mut Core,
     journal: &mut Journal,
     req: &Request,
     caller: &Caller,
+    agents: &[String],
     env: Env,
-) -> Reply {
-    let known = [paths::PICK, paths::REPORT, paths::STATE, paths::HEALTH];
+) -> Answer {
+    let known = [
+        paths::PICK,
+        paths::REPORT,
+        paths::STATE,
+        paths::HEALTH,
+        paths::AGENT_NEXT,
+        paths::AGENT_RESULT,
+    ];
     let why_of = req.path.strip_prefix(paths::WHY);
+    let now = env.now;
     match (req.method, req.path.as_str(), why_of) {
-        (Method::Get, paths::HEALTH, _) => health(env),
-        (Method::Get, paths::STATE, _) => json(200, &state(core, env.now)),
-        (Method::Get, _, Some(lease)) => why(core, lease, env.now),
-        (Method::Post, paths::PICK, _) => pick(core, journal, &req.body, caller, env.now),
-        (Method::Post, paths::REPORT, _) => report(core, journal, &req.body, caller, env.now),
-        (_, p, why_of) if known.contains(&p) || why_of.is_some() => {
-            error(ErrorCode::MethodNotAllowed, "method not allowed")
+        (Method::Get, paths::HEALTH, _) => health(env).into(),
+        (Method::Get, paths::STATE, _) => json(200, &state(core, now)).into(),
+        (Method::Get, _, Some(lease)) => why(core, lease, now).into(),
+        (Method::Post, paths::PICK, _) => pick(core, journal, &req.body, caller, now).into(),
+        (Method::Post, paths::REPORT, _) => report(core, journal, &req.body, caller, now).into(),
+        (Method::Post, paths::AGENT_NEXT, _) => agent_next(core, &req.body, caller, agents),
+        (Method::Post, paths::AGENT_RESULT, _) => {
+            agent_result(core, journal, &req.body, caller, now).into()
         }
-        _ => error(ErrorCode::NotFound, "no such endpoint"),
+        (_, p, why_of) if known.contains(&p) || why_of.is_some() => {
+            error(ErrorCode::MethodNotAllowed, "method not allowed").into()
+        }
+        _ => error(ErrorCode::NotFound, "no such endpoint").into(),
     }
 }
 
@@ -217,15 +248,7 @@ fn report(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, 
         outcome: outcome(req.outcome),
         model: req.model,
         release: req.release,
-        windows: req
-            .windows
-            .into_iter()
-            .map(|w| WindowObservation {
-                name: w.name,
-                used: w.utilization,
-                resets_at: w.resets_at,
-            })
-            .collect(),
+        windows: observations(req.windows),
     };
     core.tick(now);
     let login = match &input.subject {
@@ -269,6 +292,97 @@ fn report(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, 
         ),
         Err(ReportError::UnknownModel) => error(ErrorCode::NotFound, "unknown model"),
     }
+}
+
+fn agent_next(core: &Core, body: &[u8], caller: &Caller, agents: &[String]) -> Answer {
+    if !agents.contains(&caller.client) {
+        return error(ErrorCode::Forbidden, "not a probe agent").into();
+    }
+    let req: AgentNextRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return error(ErrorCode::BadRequest, format!("invalid next request: {e}")).into(),
+    };
+    if req.logins.is_empty() {
+        return error(ErrorCode::BadRequest, "`logins` is empty").into();
+    }
+    if let Some(unknown) = req.logins.iter().find(|l| core.marks(l).is_none()) {
+        return error(ErrorCode::BadRequest, format!("unknown login `{unknown}`")).into();
+    }
+    Answer::Park(req.logins)
+}
+
+/// The `POST /v1/agent/next` reply that hands out `job`.
+pub fn job(job: &ProbeJob) -> Reply {
+    json(
+        200,
+        &AgentJob {
+            probe_id: format!("{PROBE_PREFIX}{}", job.id),
+            login: job.login.clone(),
+        },
+    )
+}
+
+fn agent_result(
+    core: &mut Core,
+    journal: &mut Journal,
+    body: &[u8],
+    caller: &Caller,
+    now: u64,
+) -> Reply {
+    let req: AgentResultRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return error(ErrorCode::BadRequest, format!("invalid probe result: {e}")),
+    };
+    let Some(id) = req
+        .probe_id
+        .strip_prefix(PROBE_PREFIX)
+        .and_then(|n| n.parse().ok())
+    else {
+        return error(ErrorCode::NotFound, "unknown probe");
+    };
+    let outcome = match req.outcome {
+        ProbeOutcome::Ok => CoreProbeOutcome::Ok(observations(req.windows)),
+        ProbeOutcome::Http401 => CoreProbeOutcome::Http401,
+        ProbeOutcome::Http429 => CoreProbeOutcome::Http429 {
+            retry_after_s: req.retry_after_s,
+        },
+        ProbeOutcome::Error => CoreProbeOutcome::Error,
+    };
+    match core.probe_result(id, &caller.client, &outcome, now) {
+        Ok((login, status)) => {
+            if outcome == CoreProbeOutcome::Http401 {
+                if let Some(marks) = core.marks(&login) {
+                    record(journal, core, &Record::Marks { login, marks }, now);
+                }
+            }
+            json(
+                200,
+                &ReportResponse {
+                    accepted: true,
+                    login_status: login_status(status),
+                },
+            )
+        }
+        Err(ProbeError::UnknownProbe) => error(ErrorCode::NotFound, "unknown probe"),
+        Err(ProbeError::OtherClient) => {
+            error(ErrorCode::Forbidden, "probe handed to another client")
+        }
+        Err(ProbeError::InvalidUtilization) => error(
+            ErrorCode::BadRequest,
+            "window utilization must be within 0.0..=1.0",
+        ),
+    }
+}
+
+fn observations(windows: Vec<WindowReport>) -> Vec<WindowObservation> {
+    windows
+        .into_iter()
+        .map(|w| WindowObservation {
+            name: w.name,
+            used: w.utilization,
+            resets_at: w.resets_at,
+        })
+        .collect()
 }
 
 /// The `GET /v1/state` body at `now`, after the deadlines due by then.
@@ -355,6 +469,7 @@ fn why(core: &mut Core, lease: &str, now: u64) -> Reply {
 }
 
 const LEASE_PREFIX: &str = "l-";
+const PROBE_PREFIX: &str = "p-";
 
 fn lease_id(id: u64) -> String {
     format!("{LEASE_PREFIX}{id}")
@@ -390,6 +505,7 @@ fn login_status(s: CoreStatus) -> LoginStatus {
 fn source(s: CoreSource) -> Source {
     match s {
         CoreSource::Stream => Source::Stream,
+        CoreSource::Probe => Source::Probe,
         CoreSource::Assumed => Source::Assumed,
     }
 }
