@@ -23,6 +23,9 @@ an `Event` with the windows and `rate_limit_info.status` passed through as a str
 `Ok(None)` when the input carries no rate limits (absent or `null`). The usage parsers return the
 windows they find, possibly none.
 
+The gateway reads the same Codex windows from the `x-codex-*` headers of Responses API answers;
+that mapping is in [openai.md](openai.md).
+
 ## Usage endpoints
 
 `qb agent` fetches the usage endpoint of a login's `kind` (see [config.md](config.md)) with the
