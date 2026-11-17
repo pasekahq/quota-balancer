@@ -1,8 +1,9 @@
 //! Self-restriction of `qb agent` and `qb gateway` before their first connection: the process
 //! becomes non-dumpable, and landlock limits it to the credential directories (read-only for the
 //! agent; for the gateway also writing, creating and removing regular files, as a refreshed
-//! token is written back by rename), the resolver files and TCP connections to port 443. The
-//! gateway may also read the files of its config's directory, for a reload. The only TCP bind
+//! token is written back by rename, and the same in the directory of its spend file), the
+//! resolver files and TCP connections to port 443. The gateway may also read the files of its
+//! config's directory, for a reload. The only TCP bind
 //! allowed is the gateway's on the port of its loopback Messages listener.
 
 use std::path::{Path, PathBuf};
@@ -43,8 +44,9 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
 
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
 /// truncate files, create regular files and remove files, so a refreshed token can be written
-/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. Read
-/// files beneath the directory of `config.file`, so a reload sees the file an editor replaced.
+/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. The
+/// same beneath the directory of `spend_file`. Read files beneath the directory of
+/// `config.file`, so a reload sees the file an editor replaced.
 /// TCP bind only on the port of `fronts.listen`, whose listener must exist before. Call it
 /// before starting any thread.
 ///
@@ -55,6 +57,7 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
         .logins
         .iter()
         .map(|l| l.credentials.as_path())
+        .chain(config.spend_file.as_deref())
         .collect();
     let bind = config
         .fronts
@@ -65,7 +68,7 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
 }
 
 fn confine(
-    credential_files: &[&Path],
+    owned_files: &[&Path],
     writable: bool,
     config_file: Option<&Path>,
     bind: Option<u16>,
@@ -74,7 +77,7 @@ fn confine(
         .map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;
     let mut gaps = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for file in credential_files {
+    for file in owned_files {
         match file_dir(file) {
             Ok(dir) if !dirs.contains(&dir) => dirs.push(dir),
             Ok(_) => {}

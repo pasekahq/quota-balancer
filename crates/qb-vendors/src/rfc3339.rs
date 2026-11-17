@@ -78,7 +78,8 @@ fn digits(b: &[u8]) -> Result<u32, InvalidTimestamp> {
     })
 }
 
-fn days_in_month(year: u32, month: u32) -> u32 {
+/// Days in `month` (1 to 12) of the proleptic Gregorian `year`.
+pub fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
         2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
         2 => 28,

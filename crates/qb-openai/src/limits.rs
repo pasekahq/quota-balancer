@@ -543,13 +543,15 @@ fn answered(status: u16, message: &str) -> String {
 /// A model id the vendor does not know, in an OpenAI-compatible vendor's words.
 const CHAT_MODEL_PHRASES: &[&str] = &["not a valid model"];
 
-/// The failure kind of a Chat Completions vendor's `status`; the error object refines only a
-/// 400, 413 or 422 with a JSON body.
+/// The failure kind of a Chat Completions vendor's `status`; the error object refines a 429
+/// whose code or type is `insufficient_quota`, spent credit, into a usage limit without a reset,
+/// and a 400, 413 or 422 with a JSON body.
 fn chat_kind(status: u16, d: &Detail, retry_after: Option<u64>) -> FailureKind {
     let has = |names: &[&str]| names.contains(&d.code.as_str()) || names.contains(&d.kind.as_str());
     match status {
         401 | 403 => FailureKind::Auth,
         402 => FailureKind::UsageLimit { resets_at: None },
+        429 if has(&["insufficient_quota"]) => FailureKind::UsageLimit { resets_at: None },
         429 => FailureKind::RateLimited { retry_after },
         404 => FailureKind::ModelUnavailable,
         400 | 413 | 422 if d.json => {

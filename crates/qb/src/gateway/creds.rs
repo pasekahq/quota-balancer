@@ -457,6 +457,7 @@ mod tests {
             title: None,
             token_url: None,
             credentials: file.to_owned(),
+            spend_cap: None,
         }
     }
 

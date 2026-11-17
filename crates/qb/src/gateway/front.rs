@@ -1,6 +1,6 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
-//! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload` and `/v1/health`, and the HTTP
-//! fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
+//! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
+//! `/v1/model/spend/reset` and `/v1/health`, and the HTTP fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
 //! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
 //! clients with the client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once. On the C4
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use qb_proto::{
     API_VERSION, CancelAnswer, CancelRequest, ErrorClass, GatewayError, HealthResponse,
-    HealthStatus, StreamEvent, TurnRequest, paths,
+    HealthStatus, SpendReset, StreamEvent, TurnRequest, paths,
 };
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -443,6 +443,9 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         }
         (Method::Get, paths::MODEL_ROUTES) => reply(&mut stream, 200, &gateway.routes()),
         (Method::Post, paths::MODEL_RELOAD) => reload(&mut stream, gateway, uid == Some(own_uid)),
+        (Method::Get, paths::MODEL_SPEND) | (Method::Post, paths::MODEL_SPEND_RESET) => {
+            spend(&mut stream, gateway, &req, uid == Some(own_uid));
+        }
         (Method::Post, paths::MODEL_CANCEL) => {
             let c = match serde_json::from_slice::<CancelRequest>(&req.body) {
                 Ok(c) => c,
@@ -481,6 +484,8 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             | paths::MODEL_ROUTES
             | paths::MODEL_CANCEL
             | paths::MODEL_RELOAD
+            | paths::MODEL_SPEND
+            | paths::MODEL_SPEND_RESET
             | paths::HEALTH,
         ) => {
             reject(
@@ -506,6 +511,27 @@ fn reload(stream: &mut Conn, gateway: &Gateway, own: bool) {
             let message = format!("reload refused: {e}");
             reject(stream, 400, ErrorClass::BadRequest, &message);
         }
+    }
+}
+
+/// Answers `GET /v1/model/spend` and `POST /v1/model/spend/reset`, which only the gateway's
+/// `own` uid may send.
+fn spend(stream: &mut Conn, gateway: &Gateway, req: &http::Request, own: bool) {
+    if !own {
+        let message = "only the gateway's own uid may read or reset the spend";
+        return reject(stream, 403, ErrorClass::Auth, message);
+    }
+    if req.method == Method::Get {
+        return reply(stream, 200, &gateway.spend());
+    }
+    let r = match serde_json::from_slice::<SpendReset>(&req.body) {
+        Ok(r) => r,
+        Err(e) => return reject(stream, 400, ErrorClass::BadRequest, &e.to_string()),
+    };
+    match gateway.reset_spend(&r.login) {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(e) if e.class == ErrorClass::BadRequest => reply(stream, 400, &e),
+        Err(e) => reply(stream, 500, &e),
     }
 }
 

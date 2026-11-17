@@ -144,6 +144,72 @@
         }
       }
     },
+    "/v1/model/spend": {
+      "get": {
+        "operationId": "spend",
+        "summary": "The spend of each login with a `spend_cap` in the current UTC calendar month, in config order; only the gateway's own uid, 403 for any other caller.",
+        "responses": {
+          "200": {
+            "description": "The capped logins.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpendAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/spend/reset": {
+      "post": {
+        "operationId": "spendReset",
+        "summary": "Set a capped login's spend count to zero and report its `spend` window to qbd, so the login runs again; only the gateway's own uid, 403 for any other caller. 400 `bad_request` for a login without a `spend_cap`, 500 `unavailable` when the spend file cannot be written.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpendReset"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The login's count is zero.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginSpend"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -956,6 +1022,67 @@
           "routes",
           "logins"
         ]
+      },
+      "LoginSpend": {
+        "type": "object",
+        "description": "The spend of one login with a `spend_cap` in the current UTC calendar month.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Login name."
+          },
+          "spent_usd": {
+            "type": "number",
+            "minimum": 0,
+            "description": "USD counted this month."
+          },
+          "cap_usd": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "The login's `spend_cap`; at or above it the login is not called."
+          },
+          "period_end": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Unix time the month ends and the count starts again from zero."
+          }
+        },
+        "required": [
+          "login",
+          "spent_usd",
+          "cap_usd",
+          "period_end"
+        ]
+      },
+      "SpendAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/spend`.",
+        "properties": {
+          "logins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoginSpend"
+            },
+            "description": "Every login of the config with a `spend_cap`, in config order."
+          }
+        },
+        "required": [
+          "logins"
+        ]
+      },
+      "SpendReset": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/spend/reset`.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "The login whose count goes back to zero."
+          }
+        },
+        "required": [
+          "login"
+        ],
+        "additionalProperties": false
       },
       "Health": {
         "type": "object",

@@ -219,6 +219,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `GET /v1/model/routes` | — | 200 `RoutesAnswer` |
 | `POST /v1/model/cancel` | `CancelRequest` | 200 `CancelAnswer`, 403 another caller's turn, 404 no such running turn |
 | `POST /v1/model/reload` | — | 200 `ReloadAnswer`, 400 refused, 403 a caller other than the gateway's own uid |
+| `GET /v1/model/spend` | — | 200 `SpendAnswer`, 403 a caller other than the gateway's own uid |
+| `POST /v1/model/spend/reset` | `SpendReset` | 200 `LoginSpend`, 400 a login without `spend_cap`, 403 a caller other than the gateway's own uid, 500 the spend file could not be written |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -314,6 +316,7 @@ vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
 | unreadable or invalid credential file, or a refresh token the vendor refused | `http_401` | as above, and the login is dead (below) |
 | overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn. On a chain route: the next step |
 | invalid request, context too long | `error` | the turn ends |
+| no call: the login reached its `spend_cap` | `error`, with the `spend` window at 1.0 | as after a usage limit |
 
 Once an event has reached the client the gateway never retries: a failure ends the stream
 with an `error` event. A turn is bounded by `max_attempts` attempts (default 4), picks whose
@@ -388,3 +391,20 @@ later turn, and the answer is `{"routes": 3, "logins": 2}`, its counts. Otherwis
 400 `bad_request` with the message `reload refused: <file>: <field>: <reason>`, naming the line
 where the file has one, and the running config stays. What a reload changes:
 [config.md](config.md#reload).
+
+### `GET /v1/model/spend` and `POST /v1/model/spend/reset`
+
+The month's spend of the logins with a `spend_cap` ([config.md](config.md#spend-caps)). Only the
+gateway's own uid may call them: any other caller gets 403 `auth`. `qb --socket <gateway socket>
+spend` sends the `GET`, which answers each capped login of the current config in config order:
+
+```json
+{"logins": [{"login": "key-1", "spent_usd": 12.5, "cap_usd": 50.0, "period_end": 1800000000}]}
+```
+
+`period_end` is the next UTC month's start, when the count starts again from zero. `qb --socket
+<gateway socket> spend reset <login>` sends `{"login": "key-1"}`: the login's count becomes zero,
+the gateway reports its `spend` window to `qbd` so the login runs again, and the answer is the
+login's entry as above. A login without a `spend_cap` in the current config is 400
+`bad_request`; a spend file that cannot be written is 500 `unavailable`, with the count zero
+until the next restart.

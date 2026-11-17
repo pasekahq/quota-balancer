@@ -208,16 +208,16 @@ a failed stream emits no `usage`.
 
 ### Chat Completions failures
 
-`limits::classify_chat_response(status, headers, body, now)` classifies by status; only a 400,
-413 or 422 with a JSON error body is refined by its `code`, `type` and message. The failure
+`limits::classify_chat_response(status, headers, body, now)` classifies by status; only a 429
+and a 400, 413 or 422 with a JSON error body are refined by its `code`, `type` and message. The failure
 carries no windows; its message is cut and cleaned as in the Responses failures and never
 carries a header value.
 
 | Answer | Failure kind |
 |---|---|
 | 401, 403 | `auth` |
-| 402 | `usage_limit` without reset |
-| 429 | `rate_limited{retry_after}`, from `retry-after` or `retry-after-ms` |
+| 402; a 429 whose code or type is `insufficient_quota` (the key's credit is spent) | `usage_limit` without reset |
+| other 429 | `rate_limited{retry_after}`, from `retry-after` or `retry-after-ms` |
 | 404; a 400, 413 or 422 whose code is `model_not_found` or whose message names an unknown model (`model not found`, `does not exist`, `is not a valid model`, …) | `model_unavailable` |
 | a 400, 413 or 422 whose code is `context_length_exceeded` or whose message says `context length`, `maximum context`, `context window`, … | `context_too_long` |
 | other 400, 413, 422 | `bad_request` |
@@ -283,7 +283,8 @@ Every login of `api = "chat_completions"`, an `api_key` login, runs through `cha
 `auth` failure. The endpoint is the login's `base_url` followed by `chat_upstream::PATH`, the
 headers are `chat_upstream::headers` of the login's `referer` and `title`, and the key goes in
 `chat_upstream::secret_header()`. A 200 streams through `chat_upstream::Reader` into the turn
-and ends with the stop reason and no windows; the reader's cost is not passed on. Any other
+and ends with the stop reason, no windows and the reader's cost, which a failed stream carries
+too, for the spend count of a capped login ([config.md](config.md#spend-caps)). Any other
 status reads up to 64 KiB of the body and ends with `limits::classify_chat_response`. The
 runbook [openai-live-smoke.md](runbooks/openai-live-smoke.md) checks the usage, the charge and
 the 402 answer against OpenRouter with one short turn per key, and names what a short turn

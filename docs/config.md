@@ -217,7 +217,7 @@ it: [ADR 0001](adr/0001-model-gateway.md); its API: [api.md](api.md#model-gatewa
 Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml).
 
 Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`,
-`[openai_models]`, `[fronts]`):
+`[openai_models]`, `[prices]`, `[fronts]`):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -228,6 +228,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
+| `spend_file` | string | Absolute path of the file that counts the spend of the logins with a `spend_cap`; required when one has it ([Spend caps](#spend-caps)). |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
 the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
@@ -252,6 +253,7 @@ or put the socket in a directory outside it.
 | `title` | string | Only for a `chat_completions` login: sent as `x-title`, OpenRouter's app name. Non-empty printable ASCII. |
 | `token_url` | string | Only for an `oauth_anthropic` or `chatgpt_oauth` login: the full URL of the OAuth token endpoint its refreshes go to, instead of the vendor's endpoints ([anthropic.md](anthropic.md#oauth-token-refresh), [openai.md](openai.md#serving-the-upstream)). Same rules as `base_url`. |
 | `credentials` | string | Absolute path of the credential file. |
+| `spend_cap` | number > 0 | Only for an `api_key` login: USD it may spend per UTC calendar month ([Spend caps](#spend-caps)). |
 
 The sandbox lets the gateway connect to TCP port 443 only, on every host: a loopback `http`
 `base_url` or `token_url` must name port 443 too (`http://127.0.0.1:443`), or its requests fail
@@ -280,7 +282,7 @@ access token of a ChatGPT subscription login and its account id
 `expires_at` are optional. Without `refresh_token` the token is used as it is, and a token the
 vendor rejects makes the login unusable: the attempt is reported to `qbd` as `http_401` and the
 turn moves to the next login. Any other field is refused. The gateway may create, write and remove files in the credential files'
-directories and nowhere else.
+directories and the directory of `spend_file`, and nowhere else.
 
 `[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to a `qbd` pick target: a
 ladder step, a pin, or a chain of pins.
@@ -321,6 +323,55 @@ reasoning = false
 | Key | Type | Meaning |
 |---|---|---|
 | `reasoning` | boolean | Required. `false`: the model's Responses requests carry no `reasoning`, no effort (of the request or the pick) and no `include`, for a model that refuses the parameter ([openai.md](openai.md#serving-the-upstream)). `true` is the default. |
+
+`[prices]`, optional: USD per million tokens of a model id as `qbd` picks it, at most 256. A
+price is all four keys, each a number ≥ 0; it prices a turn of a capped login whose vendor
+reports no cost.
+
+```toml
+[prices."model-large"]
+input = 3.0
+output = 15.0
+cache_read = 0.3
+cache_write = 3.75
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `input` | number | Input tokens not read from cache. |
+| `output` | number | Output tokens. |
+| `cache_read` | number | Input tokens read from the prompt cache. |
+| `cache_write` | number | Input tokens written to the prompt cache. |
+
+### Spend caps
+
+An `api_key` login with a `spend_cap` has its spend counted in USD per UTC calendar month. Each
+adapter call on it, finished or failed, adds its cost: the cost the vendor reports (OpenRouter's
+`usage.cost`), else the call's last `usage` at the model's `[prices]` entry, also when the turn
+ended in an error after content. A call with neither counts nothing, and the gateway logs one
+warning per such model and run. The counts live in `spend_file`, which the gateway alone writes
+(temporary 0600 file in the same directory, fsync, rename); they survive a restart and a reload
+and start from zero at each month's start. A file that is not a spend file stops the start.
+
+A login whose count reached its cap is not called: the gateway checks before each adapter call,
+whatever `qbd` picked, and the turn moves on as after a usage limit before the first event, to
+another login or the next chain step, else ends `quota_exhausted` with `resets_at` at the next
+month's start. The gateway reports the count to `qbd` as the login's window `spend`
+(`utilization` = spent / cap, `resets_at` = the next month's start) after every call on the
+login, so `qbd` stops picking it and `GET /v1/model/routes` shows the route `exhausted` with that
+reset. `qbd` keeps only windows its vendor declares, so declare it on the vendor of each capped
+login, at most 4 windows per vendor:
+
+```toml
+[[vendors]]
+name = "vendor-d"
+windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
+```
+
+`qb --socket <gateway socket> spend` prints each capped login's `spent_usd`, `cap_usd` and
+`period_end`; `qb --socket <gateway socket> spend reset <login>` sets its count to zero
+([api.md](api.md#get-v1modelspend-and-post-v1modelspendreset)). A reset, or a cap raised by a
+reload, makes the login run again: the gateway reports the new `spend` window to `qbd` at once.
 
 `[fronts]`, optional: the HTTP fronts, `POST /v1/messages`
 ([anthropic.md](anthropic.md#the-v1messages-front)), `POST /v1/chat/completions` and
@@ -370,8 +421,9 @@ SIGHUP, `systemctl --user reload qb-gateway` or `qb --socket <gateway socket> re
 ([api.md](api.md#post-v1modelreload)) makes the running gateway read its config file again. The
 new file goes through the same parsing and validation as at startup. A valid file that changes
 no restart-only key becomes the config of every turn admitted from then on: routes and their
-chains, logins and their credential files, `token_url`, `max_turns`, `max_request_bytes`,
-`max_attempts`, `[openai_models]`, `[[clients]]`, and `[fronts]` but `listen`, so the fronts'
+chains, logins and their credential files, `token_url`, `spend_cap`, `max_turns`,
+`max_request_bytes`, `max_attempts`, `[openai_models]`, `[prices]`, `[[clients]]`, and `[fronts]`
+but `listen`, so the fronts'
 `models`, the client token and the fronts served. The gateway logs
 `gateway: reloaded <file>: <n> routes, <m> logins`.
 
@@ -379,7 +431,8 @@ A turn already admitted finishes on the config of its admission, its retries and
 included; its stream is not cut. Refresh locks of the credential files carry over.
 
 These keys need a restart: `socket`, `socket_mode`, `fronts.listen` (the listeners exist before
-the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup), and a
+the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup),
+`spend_file` (the sandbox opens its directory once), and a
 login whose `credentials` lies in a directory no login of the startup config uses (the sandbox
 opens the credential directories once). A file that cannot be read, does not validate or
 changes one of them is refused: the running config stays, the gateway logs one line

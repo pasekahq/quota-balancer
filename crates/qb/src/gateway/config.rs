@@ -28,7 +28,7 @@ pub const MAX_ROUTES: usize = 64;
 pub const MAX_CHAIN: usize = 8;
 /// Most attempts `max_attempts` may allow.
 pub const MAX_ATTEMPTS: u32 = 16;
-/// Most entries of `fronts.models`, and of `openai_models`.
+/// Most entries of `fronts.models`, of `openai_models` and of `prices`.
 pub const MAX_MODELS: usize = 256;
 /// Default of `fronts.ping_interval_s`.
 pub const PING_INTERVAL_S: u32 = 10;
@@ -36,7 +36,7 @@ pub const PING_INTERVAL_S: u32 = 10;
 pub const MAX_PING_INTERVAL_S: u32 = 30;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
-/// `[[routes]]`, `[openai_models]` and `[fronts]` tables.
+/// `[[routes]]`, `[openai_models]`, `[prices]` and `[fronts]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// The file the config was read from; a reload reads it again.
@@ -63,6 +63,11 @@ pub struct GatewayConfig {
     pub routes: Vec<Route>,
     /// Settings of models of the `openai` API family, at most [`MAX_MODELS`].
     pub openai_models: Vec<OpenaiModel>,
+    /// Absolute path of the file that counts the spend of the logins with a `spend_cap`; set
+    /// when any login has one.
+    pub spend_file: Option<PathBuf>,
+    /// Token prices by model id, at most [`MAX_MODELS`].
+    pub prices: Vec<Price>,
     /// The HTTP fronts; without it their endpoints answer 404.
     pub fronts: Option<Fronts>,
 }
@@ -74,6 +79,21 @@ pub struct OpenaiModel {
     pub model: String,
     /// Whether its Responses requests carry `reasoning` and `include`.
     pub reasoning: bool,
+}
+
+/// USD per million tokens of one model id; it prices a turn whose vendor reports no cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Price {
+    /// Model id as qbd picks it.
+    pub model: String,
+    /// Input tokens not read from cache.
+    pub input: f64,
+    /// Output tokens.
+    pub output: f64,
+    /// Input tokens read from the prompt cache.
+    pub cache_read: f64,
+    /// Input tokens written to the prompt cache.
+    pub cache_write: f64,
 }
 
 /// The settings the HTTP fronts share and the fronts this gateway serves; at least one is set.
@@ -165,7 +185,7 @@ impl Api {
 }
 
 /// A login and its credential file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatewayLogin {
     /// Login name as declared in qbd's config.
     pub name: String,
@@ -185,6 +205,8 @@ pub struct GatewayLogin {
     pub token_url: Option<String>,
     /// Absolute path of the credential file, mode 0600.
     pub credentials: PathBuf,
+    /// USD an `api_key` login may spend per UTC calendar month; more than 0.
+    pub spend_cap: Option<f64>,
 }
 
 /// A route alias and what to ask qbd for: a ladder step of a role, a pin, or a chain of pins.
@@ -418,6 +440,8 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         logins: Vec::new(),
         routes: Vec::new(),
         openai_models: Vec::new(),
+        spend_file: None,
+        prices: Vec::new(),
         fronts: None,
     };
     let known = [
@@ -432,6 +456,8 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         "logins",
         "routes",
         "openai_models",
+        "spend_file",
+        "prices",
         "fronts",
     ];
     let required = ["socket", "logins", "routes"];
@@ -460,6 +486,8 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
                 }
             }
             "openai_models" => c.openai_models = walk_openai_models(at, table(at, v)?)?,
+            "spend_file" => c.spend_file = Some(string(at, v)?.into()),
+            "prices" => c.prices = walk_prices(at, table(at, v)?)?,
             _ => c.fronts = Some(walk_fronts(at, table(at, v)?)?),
         }
         Ok(())
@@ -484,6 +512,63 @@ fn walk_openai_models(at: &str, t: &DeTable<'_>) -> Result<Vec<OpenaiModel>, Wal
         models.push(m);
     }
     Ok(models)
+}
+
+fn walk_prices(at: &str, t: &DeTable<'_>) -> Result<Vec<Price>, WalkError> {
+    let mut prices = Vec::new();
+    for (model, rates) in t {
+        let model = model.get_ref().as_ref();
+        let at = format!("{at}.\"{model}\"");
+        let mut p = Price {
+            model: model.to_owned(),
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        };
+        let keys = ["input", "output", "cache_read", "cache_write"];
+        fields(&at, table(&at, rates)?, &keys, &keys, |key, at, v| {
+            let usd = usd(at, v)?;
+            match key {
+                "input" => p.input = usd,
+                "output" => p.output = usd,
+                "cache_read" => p.cache_read = usd,
+                _ => p.cache_write = usd,
+            }
+            Ok(())
+        })?;
+        prices.push(p);
+    }
+    Ok(prices)
+}
+
+/// A finite amount of USD of at least 0, written as an integer or a float.
+fn usd(at: &str, v: &Value<'_>) -> Result<f64, WalkError> {
+    let amount = match v.get_ref() {
+        DeValue::Integer(_) => f64::from(integer::<u32>(at, v)?),
+        DeValue::Float(f) => f.as_str().parse().unwrap_or(f64::NAN),
+        _ => return Err(wrong(at, v, "a number")),
+    };
+    if amount.is_finite() && amount >= 0.0 {
+        Ok(amount)
+    } else {
+        let reason = "must be a finite amount of at least 0".into();
+        Err((at.to_owned(), reason, Some(v.span().start)))
+    }
+}
+
+/// A [`usd`] amount of more than 0.
+fn positive_usd(at: &str, v: &Value<'_>) -> Result<f64, WalkError> {
+    let amount = usd(at, v)?;
+    if amount > 0.0 {
+        Ok(amount)
+    } else {
+        Err((
+            at.to_owned(),
+            "must be more than 0".into(),
+            Some(v.span().start),
+        ))
+    }
 }
 
 fn table<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<&'v DeTable<'i>, WalkError> {
@@ -613,9 +698,11 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
         title: None,
         token_url: None,
         credentials: PathBuf::new(),
+        spend_cap: None,
     };
     let mut api = None;
     let mut token_url_at = None;
+    let mut cap_at = None;
     let mut header_at = None;
     let keys = [
         "name",
@@ -626,6 +713,7 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
         "title",
         "token_url",
         "credentials",
+        "spend_cap",
     ];
     let required = ["name", "kind", "credentials"];
     fields(at, t, &keys, &required, |key, at, v| {
@@ -660,6 +748,10 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
                 l.token_url = Some(url(at, v)?);
                 token_url_at = Some(v.span().start);
             }
+            "spend_cap" => {
+                l.spend_cap = Some(positive_usd(at, v)?);
+                cap_at = Some(v.span().start);
+            }
             "kind" => {
                 l.kind = match string(at, v)?.as_str() {
                     "oauth_anthropic" => CredentialKind::OauthAnthropic,
@@ -680,6 +772,10 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
     if let (CredentialKind::ApiKey, Some(span)) = (l.kind, token_url_at) {
         let reason = "belongs to an `oauth_anthropic` or `chatgpt_oauth` login".into();
         return Err((format!("{at}.token_url"), reason, Some(span)));
+    }
+    if let (false, Some(span)) = (l.kind == CredentialKind::ApiKey, cap_at) {
+        let reason = "belongs to an `api_key` login".into();
+        return Err((format!("{at}.spend_cap"), reason, Some(span)));
     }
     if l.api == Api::ChatCompletions {
         if l.base_url.is_none() {
@@ -880,6 +976,13 @@ impl GatewayConfig {
         declare("logins", self.logins.iter().map(|l| l.name.as_str()))?;
         for (i, login) in self.logins.iter().enumerate() {
             absolute(&format!("logins[{i}].credentials"), &login.credentials)?;
+            if login.spend_cap.is_some() && self.spend_file.is_none() {
+                let reason = "needs a top-level `spend_file` to count in".into();
+                return Err((format!("logins[{i}].spend_cap"), reason));
+            }
+        }
+        if let Some(f) = &self.spend_file {
+            absolute("spend_file", f)?;
         }
         self.validate_routes()?;
         if self.openai_models.len() > MAX_MODELS {
@@ -888,6 +991,12 @@ impl GatewayConfig {
         }
         if self.openai_models.iter().any(|m| m.model.is_empty()) {
             return Err(("openai_models".into(), "an empty model id".into()));
+        }
+        if self.prices.len() > MAX_MODELS {
+            return Err(too_many("prices".into(), self.prices.len(), MAX_MODELS));
+        }
+        if self.prices.iter().any(|p| p.model.is_empty()) {
+            return Err(("prices".into(), "an empty model id".into()));
         }
         self.validate_fronts()
     }
@@ -998,6 +1107,11 @@ impl GatewayConfig {
             .iter()
             .find(|m| m.model == model)
             .is_none_or(|m| m.reasoning)
+    }
+
+    /// The price of `model`, if `prices` has one.
+    pub fn price(&self, model: &str) -> Option<&Price> {
+        self.prices.iter().find(|p| p.model == model)
     }
 
     /// The credential entry of `login`.
@@ -1571,6 +1685,123 @@ difficulty = 1
         ];
         for (extra, want) in cases {
             let err = check("", extra).unwrap_err();
+            assert!(err.contains(want), "{extra}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_key_login_may_carry_a_spend_cap_counted_in_the_spend_file() {
+        let capped = |cap: &str| {
+            format!(
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\napi = \"openai\"\nspend_cap = {cap}\ncredentials = \"/c.json\"\n"
+            )
+        };
+        let file = "spend_file = \"/var/lib/qb-gateway/spend.json\"";
+        let c = check(file, &capped("25")).unwrap();
+        assert_eq!(c.login("login-2").unwrap().spend_cap, Some(25.0));
+        assert_eq!(c.login("login-1").unwrap().spend_cap, None);
+        assert_eq!(
+            c.spend_file.as_deref(),
+            Some(Path::new("/var/lib/qb-gateway/spend.json"))
+        );
+        let c = check(file, &capped("0.5")).unwrap();
+        assert_eq!(c.login("login-2").unwrap().spend_cap, Some(0.5));
+        assert_eq!(check("", "").unwrap().spend_file, None);
+
+        let oauth = "[[logins]]\nname = \"login-2\"\nkind = \"oauth_anthropic\"\nspend_cap = 5\ncredentials = \"/c.json\"\n";
+        let cases = [
+            (
+                file,
+                capped("0"),
+                "logins[1].spend_cap: must be more than 0 (line 17)",
+            ),
+            (
+                file,
+                capped("-1.5"),
+                "logins[1].spend_cap: must be a finite amount of at least 0 (line 17)",
+            ),
+            (
+                file,
+                capped("nan"),
+                "logins[1].spend_cap: must be a finite amount of at least 0 (line 17)",
+            ),
+            (
+                file,
+                capped("\"25\""),
+                "logins[1].spend_cap: expected a number, found string (line 17)",
+            ),
+            (
+                "",
+                capped("25"),
+                "logins[1].spend_cap: needs a top-level `spend_file` to count in (line 17)",
+            ),
+            (
+                file,
+                oauth.to_owned(),
+                "logins[1].spend_cap: belongs to an `api_key` login (line 16)",
+            ),
+            (
+                "spend_file = \"spend.json\"",
+                capped("25"),
+                "spend_file: must be an absolute path (line 1)",
+            ),
+        ];
+        for (top, extra, want) in cases {
+            let err = check(top, &extra).unwrap_err();
+            assert!(err.contains(want), "{top}{extra}: {err}");
+        }
+    }
+
+    #[test]
+    fn prices_give_usd_per_million_tokens_per_model_id() {
+        let c = check(
+            "",
+            "[prices.\"model-a\"]\ninput = 3\noutput = 15.0\ncache_read = 0.3\ncache_write = 3.75\n",
+        )
+        .unwrap();
+        let p = c.price("model-a").unwrap();
+        assert_eq!(
+            (p.input, p.output, p.cache_read, p.cache_write),
+            (3.0, 15.0, 0.3, 3.75)
+        );
+        assert_eq!(c.price("model-b"), None);
+
+        let rates = "input = 1\noutput = 2\ncache_read = 0\ncache_write = 0\n";
+        let cases = [
+            (
+                "[prices.\"m\"]\ninput = 1\noutput = 2\ncache_read = 0\n".to_owned(),
+                "prices.\"m\".cache_write: is missing",
+            ),
+            (
+                format!("[prices.\"m\"]\n{rates}cache = 1\n"),
+                "prices.\"m\".cache: unknown field, expected one of input, output, cache_read, cache_write (line 18)",
+            ),
+            (
+                "[prices.\"m\"]\ninput = -1\noutput = 2\ncache_read = 0\ncache_write = 0\n"
+                    .to_owned(),
+                "prices.\"m\".input: is out of range (line 14)",
+            ),
+            (
+                "[prices.\"m\"]\ninput = 1\noutput = inf\ncache_read = 0\ncache_write = 0\n"
+                    .to_owned(),
+                "prices.\"m\".output: must be a finite amount of at least 0 (line 15)",
+            ),
+            (
+                "[prices.\"m\"]\ninput = true\noutput = 2\ncache_read = 0\ncache_write = 0\n"
+                    .to_owned(),
+                "prices.\"m\".input: expected a number, found boolean (line 14)",
+            ),
+            (
+                "[prices]\nm = 1\n".to_owned(),
+                "prices.\"m\": expected a table, found integer (line 14)",
+            ),
+            (
+                format!("[prices.\"\"]\n{rates}"),
+                "prices: an empty model id",
+            ),
+        ];
+        for (extra, want) in cases {
+            let err = check("", &extra).unwrap_err();
             assert!(err.contains(want), "{extra}: {err}");
         }
     }

@@ -66,6 +66,7 @@ fn failure(f: limits::Failure) -> Failure {
         kind,
         windows,
         message: f.message,
+        cost: None,
     }
 }
 
@@ -131,6 +132,7 @@ impl Upstream for Anthropic {
         Ok(Finished {
             stop,
             windows: reader.windows().to_vec(),
+            cost: None,
         })
     }
 }

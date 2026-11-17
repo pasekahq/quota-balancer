@@ -76,7 +76,7 @@ impl Upstream for ChatCompletions {
             return Err(failure(classified));
         }
         let mut reader = Reader::new();
-        let stop = answer.stream(cancel, sink, |chunk, events| {
+        let ended = answer.stream(cancel, sink, |chunk, events| {
             let progress = if chunk.is_empty() {
                 reader.finish(events).map(Progress::Finished)
             } else {
@@ -86,10 +86,15 @@ impl Upstream for ChatCompletions {
                 Progress::Finished(stop) => Ok(Some(stop)),
                 Progress::Continue => Ok(None),
             }
-        })?;
-        Ok(Finished {
-            stop,
-            windows: Vec::new(),
-        })
+        });
+        let cost = reader.cost();
+        match ended {
+            Ok(stop) => Ok(Finished {
+                stop,
+                windows: Vec::new(),
+                cost,
+            }),
+            Err(f) => Err(Failure { cost, ..f }),
+        }
     }
 }

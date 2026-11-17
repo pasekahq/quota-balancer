@@ -36,9 +36,9 @@ use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
-    Block, CancelAnswer, ErrorClass, GatewayError, LoginStatus, ReloadAnswer, RouteState,
-    RouteStatus, RoutesAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall,
-    TurnRequest, Usage, WindowReport, paths,
+    Block, CancelAnswer, ErrorClass, GatewayError, LoginSpend, LoginStatus, ReloadAnswer,
+    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent,
+    Thinking, ToolCall, TurnRequest, Usage, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -86,6 +86,8 @@ enum Script {
     Finish(Vec<StreamEvent>, StopReason, Vec<WindowReport>),
     /// Emit the events, then fail.
     Fail(Vec<StreamEvent>, FailureKind, Vec<WindowReport>),
+    /// Emit the events, then finish with `end` or fail with that kind, reporting the cost.
+    Costed(Vec<StreamEvent>, Option<FailureKind>, Option<f64>),
     /// Emit the events, then wait for the cancel.
     Hang(Vec<StreamEvent>),
     /// Emit the events, then finish with `end` once the sender sends or hangs up.
@@ -159,7 +161,11 @@ impl Upstream for Shared {
         match script {
             Script::Finish(events, stop, windows) => {
                 emit(events, sink)?;
-                Ok(Finished { stop, windows })
+                Ok(Finished {
+                    stop,
+                    windows,
+                    cost: None,
+                })
             }
             Script::Fail(events, kind, windows) => {
                 emit(events, sink)?;
@@ -167,7 +173,24 @@ impl Upstream for Shared {
                     kind,
                     windows,
                     message: format!("scripted {kind:?}"),
+                    cost: None,
                 })
+            }
+            Script::Costed(events, end, cost) => {
+                emit(events, sink)?;
+                match end {
+                    None => Ok(Finished {
+                        stop: StopReason::End,
+                        windows: Vec::new(),
+                        cost,
+                    }),
+                    Some(kind) => Err(Failure {
+                        kind,
+                        windows: Vec::new(),
+                        message: format!("scripted {kind:?}"),
+                        cost,
+                    }),
+                }
             }
             Script::Leak => Err(Failure::new(
                 FailureKind::BadRequest,
@@ -188,6 +211,7 @@ impl Upstream for Shared {
                 Ok(Finished {
                     stop: StopReason::End,
                     windows: Vec::new(),
+                    cost: None,
                 })
             }
             Script::Hang(events) => {
@@ -400,7 +424,7 @@ fn serve_gateway(
     std::fs::write(&file, text).unwrap();
     let config = qb::gateway::config::load(&file).unwrap();
     let gw = config.socket.clone();
-    let gateway = Gateway::new(config, upstreams, refresher, None);
+    let gateway = Gateway::new(config, upstreams, refresher, None).unwrap();
     let listener = UnixListener::bind(&gw).unwrap();
     std::thread::spawn(move || {
         front::serve(
@@ -1067,7 +1091,8 @@ fn health_answers_and_only_the_starting_caller_may_cancel() {
         &gateway_toml(&r.dir, &r.qbd, 4, [ANTHROPIC_KEY; 2], ""),
     )
     .unwrap();
-    let gateway = Gateway::new(config, Vec::new(), Box::new(Counting(Arc::default())), None);
+    let gateway =
+        Gateway::new(config, Vec::new(), Box::new(Counting(Arc::default())), None).unwrap();
     let req: TurnRequest = serde_json::from_value(turn_body("turn-9")).unwrap();
     let admitted = gateway.admit("client-a", &req).unwrap();
     assert_eq!(gateway.cancel("client-b", "turn-9"), Cancel::Forbidden);
@@ -1098,7 +1123,8 @@ fn a_turn_that_sent_its_last_event_can_no_longer_be_cancelled() {
         vec![(Api::Anthropic, upstream)],
         Box::new(Counting(Arc::default())),
         None,
-    );
+    )
+    .unwrap();
     let req: TurnRequest = serde_json::from_value(turn_body("turn-1")).unwrap();
     let admitted = gateway.admit("client-a", &req).unwrap();
     let (mut cancel, mut slot_free) = (None, None);
@@ -1444,6 +1470,12 @@ burst = 1000
 
 /// A rig whose route `chat` is the chain vendor-a, vendor-b, vendor-c with one login each.
 fn chain_rig() -> Rig {
+    chain_rig_with(QBD_THREE_VENDORS, None, "")
+}
+
+/// [`chain_rig`] with qbd's config `qbd_text`, the logins' `spend_cap` amounts in USD when
+/// given, the spend file `state/spend.json` with them, and `extra` after the routes.
+fn chain_rig_with(qbd_text: &str, caps: Option<[f64; 3]>, extra: &str) -> Rig {
     let dir = temp_dir("chain");
     let logins = ["login-1", "login-2", "login-3"];
     let files: Vec<_> = logins
@@ -1451,16 +1483,21 @@ fn chain_rig() -> Rig {
         .map(|l| (*l, api_key(&format!("test-token-{l}")), 0o600))
         .collect();
     credentials(&dir, &files);
-    let qbd = start_qbd(&dir, QBD_THREE_VENDORS);
+    let qbd = start_qbd(&dir, qbd_text);
     let mut text = format!(
         "socket = \"{dir}/gw.sock\"\nqbd_socket = \"{qbd}\"\n",
         dir = dir.display(),
         qbd = qbd.display()
     );
-    for login in logins {
+    if caps.is_some() {
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        writeln!(text, "spend_file = \"{}/state/spend.json\"", dir.display()).unwrap();
+    }
+    for (i, login) in logins.into_iter().enumerate() {
+        let cap = caps.map_or(String::new(), |c| format!("spend_cap = {:?}\n", c[i]));
         write!(
             text,
-            "[[logins]]\nname = \"{login}\"\n{ANTHROPIC_KEY}\ncredentials = \"{}/creds/{login}.json\"\n",
+            "[[logins]]\nname = \"{login}\"\n{ANTHROPIC_KEY}\n{cap}credentials = \"{}/creds/{login}.json\"\n",
             dir.display()
         )
         .unwrap();
@@ -1476,6 +1513,7 @@ chain = [
 ]
 "#,
     );
+    text.push_str(extra);
     let fake = Arc::new(Fake::default());
     let refreshes = Arc::new(AtomicUsize::new(0));
     let gw = serve_gateway(
@@ -1872,6 +1910,315 @@ fn only_the_gateway_s_own_uid_may_reload_it() {
     let e: GatewayError = serde_json::from_slice(&body).unwrap();
     assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
     assert_eq!(aliases(&r.gw), ["chat", "spare"]);
+}
+
+/// qbd's config of [`chain_rig`] whose vendors also declare the `spend` window of capped logins.
+fn qbd_with_spend() -> String {
+    QBD_THREE_VENDORS.replace(
+        "windows = [{ name = \"five_hour\", length_s = 18000, t_burn_s = 1800 }]",
+        "windows = [\n  { name = \"five_hour\", length_s = 18000, t_burn_s = 1800 },\n  { name = \"spend\", length_s = 2678400, t_burn_s = 0 },\n]",
+    )
+}
+
+/// Prices of model-a and model-b; model-c has none.
+const PRICES: &str = r#"
+[prices."model-a"]
+input = 1
+output = 2
+cache_read = 0
+cache_write = 0
+
+[prices."model-b"]
+input = 3.0
+output = 6.0
+cache_read = 0
+cache_write = 0
+"#;
+
+/// A [`chain_rig`] whose logins have the spend caps `caps`, with [`PRICES`].
+fn spend_rig(caps: [f64; 3]) -> Rig {
+    chain_rig_with(&qbd_with_spend(), Some(caps), PRICES)
+}
+
+fn usage(input: u64, output: u64) -> StreamEvent {
+    StreamEvent::Usage {
+        usage: Usage {
+            input,
+            output,
+            cache_read: 0,
+            cache_write: 0,
+        },
+    }
+}
+
+fn spend_of(gw: &Path) -> SpendAnswer {
+    let (status, body) = call(gw, "GET", paths::MODEL_SPEND, "");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// USD `login` spent this month, by the gateway on `gw`.
+fn spent(gw: &Path, login: &str) -> f64 {
+    let answer = spend_of(gw);
+    answer
+        .logins
+        .iter()
+        .find(|l| l.login == login)
+        .unwrap()
+        .spent_usd
+}
+
+fn assert_usd(got: f64, want: f64) {
+    assert!((got - want).abs() < 1e-9, "{got} USD, not {want}");
+}
+
+/// The end of the current UTC calendar month.
+fn month_end() -> u64 {
+    qb::gateway::spend::month(unix_now()).1
+}
+
+/// `(used, resets_at)` of `login`'s `spend` window in qbd.
+fn spend_window(qbd: &Path, login: &str) -> (f64, Option<u64>) {
+    let s = state(qbd);
+    let l = s.logins.iter().find(|l| l.login == login).unwrap();
+    let w = l.windows.iter().find(|w| w.name == "spend").unwrap();
+    (w.used, w.resets_at)
+}
+
+/// Makes qbd forget the `spend` window of `login`, as if the gateway never reported it.
+fn forget_spend(qbd: &Path, login: &str) {
+    let body = json!({
+        "login": login,
+        "outcome": "error",
+        "windows": [{"name": "spend", "utilization": 0.0}],
+    })
+    .to_string();
+    let (status, answer) =
+        qb::client::call(qbd, "POST", paths::REPORT, Some(body.as_bytes()), None).unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+}
+
+#[test]
+fn a_login_at_its_spend_cap_is_not_called_and_the_next_turn_takes_the_next_step() {
+    let r = spend_rig([1.0, 100.0, 100.0]);
+    r.fake.script(
+        "login-1",
+        Script::Costed(vec![text("hi"), usage(10, 5)], None, Some(1.5)),
+    );
+    let first = turn(&r.gw, &turn_body("turn-1")).2;
+    assert_eq!(
+        kinds(&first),
+        ["route login-1", "text_delta", "usage", "stop End"]
+    );
+    assert_usd(spent(&r.gw, "login-1"), 1.5);
+    assert_eq!(spend_window(&r.qbd, "login-1"), (1.0, Some(month_end())));
+
+    let second = turn(&r.gw, &turn_body("turn-2")).2;
+    assert_eq!(kinds(&second), ["route login-2", "text_delta", "stop End"]);
+    assert_eq!(logins_called(&r), ["login-1", "login-2"]);
+
+    forget_spend(&r.qbd, "login-1");
+    let third = turn(&r.gw, &turn_body("turn-3")).2;
+    assert_eq!(kinds(&third), ["route login-2", "text_delta", "stop End"]);
+    assert_eq!(
+        logins_called(&r),
+        ["login-1", "login-2", "login-2"],
+        "the gateway refuses the capped login qbd picked"
+    );
+    assert_eq!(spend_window(&r.qbd, "login-1"), (1.0, Some(month_end())));
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn turns_without_a_reported_cost_are_priced_per_model_from_the_table() {
+    let r = spend_rig([100.0, 100.0, 100.0]);
+    for login in ["login-1", "login-2"] {
+        r.fake.script(
+            login,
+            Script::Costed(vec![text("hi"), usage(1_000_000, 500_000)], None, None),
+        );
+    }
+    let resets = unix_now() + 3600;
+    turn(&r.gw, &turn_body("turn-1"));
+    exhaust(&r.qbd, "login-1", resets);
+    turn(&r.gw, &turn_body("turn-2"));
+    exhaust(&r.qbd, "login-2", resets);
+    assert_eq!(logins_called(&r), ["login-1", "login-2"]);
+    assert_usd(spent(&r.gw, "login-1"), 2.0);
+    assert_usd(spent(&r.gw, "login-2"), 6.0);
+
+    for _ in 0..2 {
+        r.fake.script(
+            "login-3",
+            Script::Costed(vec![text("hi"), usage(1_000_000, 0)], None, None),
+        );
+    }
+    let logged = stderr_until("has no price", || {
+        turn(&r.gw, &turn_body("turn-3"));
+        turn(&r.gw, &turn_body("turn-4"));
+    });
+    let warned = logged
+        .lines()
+        .filter(|l| l.contains("gateway: model `model-c` has no price"))
+        .count();
+    assert_eq!(warned, 1, "{logged}");
+    assert_usd(spent(&r.gw, "login-3"), 0.0);
+}
+
+#[test]
+fn when_every_login_is_at_its_cap_the_turn_and_the_routes_wait_for_the_month_end() {
+    let r = spend_rig([0.5, 0.5, 0.5]);
+    for login in ["login-1", "login-2", "login-3"] {
+        r.fake
+            .script(login, Script::Costed(vec![text("hi")], None, Some(1.0)));
+    }
+    for (i, login) in ["login-1", "login-2", "login-3"].into_iter().enumerate() {
+        let events = turn(&r.gw, &turn_body(&format!("turn-{i}"))).2;
+        assert_eq!(kinds(&events)[0], format!("route {login}"));
+    }
+    let events = turn(&r.gw, &turn_body("turn-last")).2;
+    assert_eq!(kinds(&events), ["error QuotaExhausted"]);
+    let e = last_error(&events);
+    assert_eq!(e.resets_at, Some(month_end()));
+    assert!(e.retryable);
+    assert_eq!(r.fake.calls().len(), 3);
+    let route = routes_of(&r.gw).remove(0);
+    assert_eq!(
+        (route.state, route.resets_at),
+        (RouteState::Exhausted, Some(month_end()))
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn the_spend_count_survives_a_gateway_restart_on_the_same_file() {
+    let r = spend_rig([1.0, 100.0, 100.0]);
+    r.fake
+        .script("login-1", Script::Costed(vec![text("hi")], None, Some(0.6)));
+    turn(&r.gw, &turn_body("turn-1"));
+    let file = r.dir.join("state/spend.json");
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    let config = std::fs::read_to_string(config_file(&r.gw))
+        .unwrap()
+        .replace("gw.sock", "gw2.sock");
+    let fake = Arc::new(Fake::default());
+    let gw2 = serve_gateway(
+        &config,
+        vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
+        Box::new(Counting(Arc::default())),
+        own_uid(),
+        None,
+    );
+    assert_usd(spent(&gw2, "login-1"), 0.6);
+    fake.script("login-1", Script::Costed(vec![text("hi")], None, Some(0.6)));
+    let events = turn(&gw2, &turn_body("turn-2")).2;
+    assert_eq!(kinds(&events)[0], "route login-1");
+    assert_usd(spent(&gw2, "login-1"), 1.2);
+    let events = turn(&gw2, &turn_body("turn-3")).2;
+    assert_eq!(
+        kinds(&events)[0],
+        "route login-2",
+        "the restored count reached the cap"
+    );
+}
+
+/// Runs `qb --socket <gw> spend <args>` and parses its JSON output.
+fn qb_spend<T: serde::de::DeserializeOwned>(gw: &Path, args: &[&str]) -> T {
+    let out = Command::new(env!("CARGO_BIN_EXE_qb"))
+        .arg("--socket")
+        .arg(gw)
+        .arg("spend")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn a_spend_reset_or_a_raised_cap_makes_the_login_run_again() {
+    let r = spend_rig([1.0, 100.0, 100.0]);
+    for _ in 0..2 {
+        r.fake
+            .script("login-1", Script::Costed(vec![text("hi")], None, Some(2.0)));
+    }
+    let first_login = |id: &str| kinds(&turn(&r.gw, &turn_body(id)).2).remove(0);
+    assert_eq!(first_login("turn-1"), "route login-1");
+    assert_eq!(first_login("turn-2"), "route login-2");
+
+    let reset: LoginSpend = qb_spend(&r.gw, &["reset", "login-1"]);
+    assert_eq!(
+        (reset.login.as_str(), reset.spent_usd, reset.period_end),
+        ("login-1", 0.0, month_end())
+    );
+    assert_eq!(first_login("turn-3"), "route login-1");
+    assert_eq!(first_login("turn-4"), "route login-2");
+
+    let (status, body) = reload_with(&r.gw, |t| t.replace("spend_cap = 1.0", "spend_cap = 5.0"));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(first_login("turn-5"), "route login-1");
+    let answer: SpendAnswer = qb_spend(&r.gw, &[]);
+    let shown: Vec<_> = answer
+        .logins
+        .iter()
+        .map(|l| (l.login.as_str(), l.spent_usd, l.cap_usd, l.period_end))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("login-1", 2.0, 5.0, month_end()),
+            ("login-2", 0.0, 100.0, month_end()),
+            ("login-3", 0.0, 100.0, month_end()),
+        ]
+    );
+
+    let body = json!({"login": "login-9"}).to_string();
+    let (status, e) = rejection(&r.gw, "POST", paths::MODEL_SPEND_RESET, &body);
+    assert_eq!((status, e.class), (400, ErrorClass::BadRequest), "{e:?}");
+    assert_eq!(
+        e.message.as_deref(),
+        Some("login `login-9` has no spend_cap")
+    );
+}
+
+#[test]
+fn only_the_gateway_s_own_uid_may_read_or_reset_the_spend() {
+    let files = [("login-1", api_key("test-token-1"), 0o600)];
+    let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
+    let r = rig_as(4, &files, &extra, own_uid() + 1);
+    for (method, path, body) in [
+        ("GET", paths::MODEL_SPEND, ""),
+        ("POST", paths::MODEL_SPEND_RESET, r#"{"login":"login-1"}"#),
+    ] {
+        let (status, e) = rejection(&r.gw, method, path, body);
+        assert_eq!((status, e.class), (403, ErrorClass::Auth), "{path}: {e:?}");
+    }
+}
+
+#[test]
+fn a_turn_that_fails_after_content_still_counts_its_cost() {
+    let r = spend_rig([100.0, 100.0, 100.0]);
+    let unavailable = Some(FailureKind::Unavailable);
+    r.fake.script(
+        "login-1",
+        Script::Costed(
+            vec![text("partial"), usage(1_000_000, 0)],
+            unavailable,
+            None,
+        ),
+    );
+    r.fake.script(
+        "login-1",
+        Script::Costed(vec![text("partial")], unavailable, Some(0.25)),
+    );
+    for id in ["turn-1", "turn-2"] {
+        let events = turn(&r.gw, &turn_body(id)).2;
+        assert_eq!(kinds(&events).last().unwrap(), "error Unavailable");
+        assert_eq!(kinds(&events)[0], "route login-1");
+    }
+    assert_usd(spent(&r.gw, "login-1"), 1.25);
 }
 
 /// Runs `f` with this process's stderr in a file and returns what was written there.

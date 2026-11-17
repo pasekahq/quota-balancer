@@ -54,6 +54,7 @@ pub(super) fn failure(f: limits::Failure) -> Failure {
         kind,
         windows: f.windows,
         message: f.message,
+        cost: None,
     }
 }
 
@@ -123,6 +124,7 @@ impl Upstream for Openai {
         Ok(Finished {
             stop,
             windows: reader.windows().to_vec(),
+            cost: None,
         })
     }
 }

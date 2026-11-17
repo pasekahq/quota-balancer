@@ -5,7 +5,7 @@
 
 use qb_proto::{
     Block, CancelAnswer, CancelRequest, ErrorClass, GatewayError, Message, ReloadAnswer, Role,
-    RouteState, RoutesAnswer, StopReason, StreamEvent, TurnRequest,
+    RouteState, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -130,6 +130,10 @@ fn errors_routes_cancel() {
     assert!(answer.cancelled);
     let reloaded: ReloadAnswer = roundtrip("gateway_reload_answer.json");
     assert_eq!((reloaded.routes, reloaded.logins), (3, 2));
+    let spend: SpendAnswer = roundtrip("gateway_spend_answer.json");
+    assert_eq!(spend.logins[0].period_end, 1_800_000_000);
+    let reset: SpendReset = roundtrip("gateway_spend_reset_request.json");
+    assert_eq!(reset.login, "key-1");
 }
 
 /// A turn request around one block, for the block fixtures.

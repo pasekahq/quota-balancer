@@ -507,6 +507,7 @@ mod tests {
             title: None,
             token_url: None,
             credentials: "/creds/login-2.json".into(),
+            spend_cap: None,
         };
         let e = OauthRefresher::new().refresh(&login, MARK).err().unwrap();
         assert!(!e.rejected);
