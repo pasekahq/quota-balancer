@@ -244,11 +244,18 @@ impl Failure {
     }
 }
 
+/// The first [`MAX_MESSAGE`] characters of a vendor message, with control characters (line ends
+/// included) as spaces: the message ends up in log lines and client errors.
 fn shorten(s: &str) -> String {
-    match s.char_indices().nth(MAX_MESSAGE) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s.to_owned(),
+    let mut out: String = s
+        .chars()
+        .take(MAX_MESSAGE)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if s.chars().nth(MAX_MESSAGE).is_some() {
+        out.push('…');
     }
+    out
 }
 
 fn says_usage_limit(message: &str) -> bool {
@@ -381,6 +388,16 @@ mod tests {
         assert_eq!(unix_time("1800000000.9"), Some(1_800_000_000));
         assert_eq!(unix_time("-1"), None);
         assert_eq!(unix_time("soon"), None);
+    }
+
+    #[test]
+    fn control_characters_become_spaces() {
+        let f = classify_response(502, &[], b"<html>\r\nPRIORITY<3>forged\n\x1b[31m\t</html>");
+        assert_eq!(
+            f.message,
+            "vendor answered HTTP 502: <html>  PRIORITY<3>forged  [31m </html>"
+        );
+        assert!(!f.message.chars().any(char::is_control));
     }
 
     #[test]

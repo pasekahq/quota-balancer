@@ -136,7 +136,8 @@ unreadable utilisation or reset drops that window only.
 
 `resets_at` of a usage limit is the unified reset, else the representative window's reset, else
 the latest reset of a window at 1.0. The failure carries the windows of the headers and the
-vendor's message, cut to 300 characters; it never carries a header value.
+vendor's message, cut to 300 characters with control characters (line ends included) replaced
+by spaces; it never carries a header value.
 
 ## The `/v1/messages` front
 
