@@ -147,7 +147,8 @@ pub fn decode_request(
         session_key: req
             .metadata
             .and_then(|m| m.user_id)
-            .filter(|k| !k.is_empty() && k.len() <= MAX_SESSION_KEY),
+            .filter(|k| !k.is_empty())
+            .map(session_key),
         cache,
         request_id: request_id.to_owned(),
     };
@@ -177,6 +178,25 @@ fn has_cache_control(v: &Value) -> bool {
                 .iter()
                 .any(|b| set(b) || blocks(b.get("content")).iter().any(set))
         })
+}
+
+/// `metadata.user_id` as a session key: itself when it fits, else `qb-sk:` and 32 hex digits
+/// derived from all of it, so long SDK ids still keep a session on one login.
+fn session_key(user_id: String) -> String {
+    if user_id.len() <= MAX_SESSION_KEY {
+        return user_id;
+    }
+    // Two FNV-1a passes with different offsets; stickiness needs determinism, not secrecy.
+    let fnv = |offset: u64| {
+        user_id.bytes().fold(offset, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    format!(
+        "qb-sk:{:016x}{:016x}",
+        fnv(0xcbf2_9ce4_8422_2325),
+        fnv(0x6c62_272e_07bb_0142)
+    )
 }
 
 fn media_type(s: &str) -> Option<MediaType> {

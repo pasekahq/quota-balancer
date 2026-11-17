@@ -386,3 +386,36 @@ fn cache_control_counts_only_at_block_positions() {
         assert_eq!(got.turn.cache, Some(CacheMode::Auto), "{what}");
     }
 }
+
+#[test]
+fn a_long_user_id_gives_a_fixed_length_session_key() {
+    let user_id = |session: &str| {
+        format!(
+            "user_{}_account_00000000-0000-4000-8000-000000000001_session_{session}",
+            "0123456789abcdef".repeat(4)
+        )
+    };
+    let key_of = |id: &str| {
+        let body = json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 16,
+            "metadata": {"user_id": id},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        decode_request(body.to_string().as_bytes(), "m", VENDOR, &route_of)
+            .expect("ok")
+            .turn
+            .session_key
+    };
+    let a = user_id("00000000-0000-4000-8000-00000000000a");
+    let b = user_id("00000000-0000-4000-8000-00000000000b");
+    assert!((150..=170).contains(&a.len()), "{}", a.len());
+    let ka = key_of(&a).expect("a key for a long id");
+    let kb = key_of(&b).expect("a key for a long id");
+    assert!(ka.len() <= 128);
+    assert_eq!(ka.len(), kb.len());
+    assert_eq!(key_of(&a), Some(ka.clone()), "deterministic");
+    assert_ne!(ka, kb);
+    assert_eq!(key_of("session-test-1").as_deref(), Some("session-test-1"));
+    assert_eq!(key_of(""), None);
+}

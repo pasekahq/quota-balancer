@@ -149,7 +149,9 @@ by spaces; it never carries a header value.
   map one to one; `thinking` and `redacted_thinking` become `thinking` of `native_vendor` with the
   block as JSON, except a `redacted_thinking` this front wrapped for another vendor (below);
 - `output_config.effort`: `xhigh` reads as `high`; an unknown effort is `bad_request`;
-- `metadata.user_id` of 1 to 128 bytes is the `session_key`;
+- `metadata.user_id` of 1 to 128 bytes is the `session_key`; a longer one (SDK ids such as
+  `user_<hex>_account_<uuid>_session_<uuid>` run to about 160 bytes) gives `qb-sk:` and 32 hex
+  digits of a deterministic non-cryptographic hash (two FNV-1a passes) of the whole id;
 - `cache` is `auto` when `cache_control` is set at the top level, on a `system` block, a tool, a
   message content block or a block inside a tool result, else absent; a `cache_control` key
   inside a tool schema or tool input is data and does not count;
