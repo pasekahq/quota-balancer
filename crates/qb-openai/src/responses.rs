@@ -422,8 +422,8 @@ impl SseEncoder {
             StreamEvent::Error { error } => {
                 self.start(&mut out);
                 self.close_text(&mut out);
-                let body = crate::front::error_body(error);
-                let (_, code) = error_kind(error.class);
+                let body = crate::front::error_body(error, self.created);
+                let (_, code) = error_kind(error, self.created);
                 let code = code.unwrap_or(body.error.kind.as_str()).to_owned();
                 self.emit(
                     ResponseEvent {

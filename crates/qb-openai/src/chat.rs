@@ -404,7 +404,7 @@ impl SseEncoder {
             StreamEvent::Error { error } => {
                 self.started = true;
                 out.extend(sse::encode_data(
-                    &serde_json::to_string(&error_body(error)).unwrap_or_default(),
+                    &serde_json::to_string(&error_body(error, self.created)).unwrap_or_default(),
                 ));
                 self.done = true;
             }

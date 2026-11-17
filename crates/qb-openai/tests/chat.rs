@@ -364,3 +364,45 @@ fn a_vendor_back_off_is_a_rate_limit_as_on_the_c4_front() {
     assert_eq!(r.body.error.code.as_deref(), Some("rate_limit_exceeded"));
     assert_eq!(r.headers(), vec![("retry-after", "20".to_owned())]);
 }
+
+#[test]
+fn a_short_wait_is_a_rate_limit_and_a_far_reset_is_out_of_quota() {
+    let quota = |resets_at: Option<u64>, retry_after: Option<u64>| {
+        let mut e = GatewayError::new(ErrorClass::QuotaExhausted, true, "all logins wait");
+        e.resets_at = resets_at;
+        e.retry_after = retry_after;
+        e
+    };
+    let kind = |e: &GatewayError| {
+        let r = error_response(e, NOW);
+        assert_eq!(r.status, 429);
+        (r.body.error.kind.clone(), r.body.error.code.clone())
+    };
+    let rate = (
+        "requests".to_owned(),
+        Some("rate_limit_exceeded".to_owned()),
+    );
+    let spent = (
+        "insufficient_quota".to_owned(),
+        Some("insufficient_quota".to_owned()),
+    );
+    // A full lease table or a short back-off in qbd.
+    assert_eq!(kind(&quota(Some(NOW + 20), None)), rate);
+    assert_eq!(kind(&quota(None, Some(300))), rate);
+    assert_eq!(kind(&quota(None, None)), rate);
+    // A window that resets in hours.
+    assert_eq!(kind(&quota(Some(NOW + 301), None)), spent);
+    assert_eq!(kind(&quota(None, Some(7200))), spent);
+
+    // The stream labels it the same way at its own time.
+    for (e, code) in [
+        (quota(Some(NOW + 20), None), "rate_limit_exceeded"),
+        (quota(Some(NOW + 3600), None), "insufficient_quota"),
+    ] {
+        let mut enc = SseEncoder::new("test1", "gpt-chat", NOW, false);
+        enc.push(&StreamEvent::TextDelta { text: "Hi".into() });
+        let f = frames(&enc.push(&StreamEvent::Error { error: e }));
+        let v: Value = serde_json::from_str(&f[0].1).expect("JSON");
+        assert_eq!(v["error"]["code"], code);
+    }
+}

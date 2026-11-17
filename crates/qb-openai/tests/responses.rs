@@ -281,3 +281,16 @@ fn the_object_equals_the_streamed_final_response() {
         ErrorClass::Overloaded
     );
 }
+
+#[test]
+fn a_short_wait_in_the_stream_is_a_rate_limit() {
+    for (resets_in, code) in [(20, "rate_limit_exceeded"), (3600, "insufficient_quota")] {
+        let mut enc = SseEncoder::new("test1", "gpt-chat", NOW, VENDOR);
+        let mut out = enc.push(&StreamEvent::TextDelta { text: "Hi".into() });
+        let mut e = GatewayError::new(ErrorClass::QuotaExhausted, true, "all logins wait");
+        e.resets_at = Some(NOW + resets_in);
+        out.extend(enc.push(&StreamEvent::Error { error: e }));
+        let (_, response) = check_responses(&out);
+        assert_eq!(response["error"]["code"], code, "{resets_in}");
+    }
+}

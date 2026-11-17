@@ -215,9 +215,14 @@ impl ErrorResponse {
     }
 }
 
-/// The OpenAI `type` and `code` of a canonical error class.
-pub fn error_kind(class: ErrorClass) -> (&'static str, Option<&'static str>) {
-    match class {
+/// The OpenAI `type` and `code` of a canonical error at `now`. A `quota_exhausted` error whose
+/// wait is at most [`NO_RETRY_AFTER_S`] (a full lease table, a short back-off) is a rate limit;
+/// only a longer one is `insufficient_quota`, which clients read as spent until a reset.
+pub fn error_kind(e: &GatewayError, now: u64) -> (&'static str, Option<&'static str>) {
+    match e.class {
+        ErrorClass::QuotaExhausted if wait_s(e, now).is_some_and(|s| s <= NO_RETRY_AFTER_S) => {
+            ("requests", Some("rate_limit_exceeded"))
+        }
         ErrorClass::QuotaExhausted => ("insufficient_quota", Some("insufficient_quota")),
         ErrorClass::Overloaded => ("requests", Some("rate_limit_exceeded")),
         ErrorClass::Unavailable => ("server_error", Some("upstream_unavailable")),
@@ -229,9 +234,9 @@ pub fn error_kind(class: ErrorClass) -> (&'static str, Option<&'static str>) {
     }
 }
 
-/// The OpenAI error body of a canonical error.
-pub fn error_body(e: &GatewayError) -> ErrorBody {
-    let (kind, code) = error_kind(e.class);
+/// The OpenAI error body of a canonical error at `now`.
+pub fn error_body(e: &GatewayError, now: u64) -> ErrorBody {
+    let (kind, code) = error_kind(e, now);
     let default = match e.class {
         ErrorClass::QuotaExhausted => "every login of the route is out of quota",
         ErrorClass::Overloaded => "the vendor asked to back off",
@@ -256,11 +261,24 @@ pub const NO_RETRY_AFTER_S: u64 = 300;
 /// The `retry-after` of a `quota_exhausted` error that names neither a reset nor a delay.
 pub const QUOTA_RETRY_AFTER_S: u64 = 60;
 
+/// Seconds to wait before retrying `e` at `now`: for `quota_exhausted` until `resets_at`
+/// (at least 1), else `retry_after`, else [`QUOTA_RETRY_AFTER_S`]; for others `retry_after`.
+fn wait_s(e: &GatewayError, now: u64) -> Option<u64> {
+    match e.class {
+        ErrorClass::QuotaExhausted => e
+            .resets_at
+            .map(|r| r.saturating_sub(now).max(1))
+            .or(e.retry_after)
+            .or(Some(QUOTA_RETRY_AFTER_S)),
+        _ => e.retry_after,
+    }
+}
+
 /// The OpenAI error answer of a canonical error at `now`:
 ///
-/// - `quota_exhausted`: 429 `insufficient_quota` with `retry-after` until `resets_at`, else
-///   `retry_after`, else [`QUOTA_RETRY_AFTER_S`], and `x-should-retry: false` beyond
-///   [`NO_RETRY_AFTER_S`];
+/// - `quota_exhausted`: 429 with `retry-after` until `resets_at`, else `retry_after`, else
+///   [`QUOTA_RETRY_AFTER_S`]; up to [`NO_RETRY_AFTER_S`] a `rate_limit_exceeded`, beyond it
+///   `insufficient_quota` with `x-should-retry: false`;
 /// - `overloaded`: 429 `rate_limit_exceeded` with the vendor's `retry-after`;
 /// - `unavailable` and `no_route`: 503; `auth`, which is the vendor rejecting the
 ///   gateway's credential and not the client's, 502;
@@ -275,14 +293,7 @@ pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
         ErrorClass::BadRequest | ErrorClass::ContextTooLong => 400,
         ErrorClass::Cancelled => 409,
     };
-    let retry_after = match e.class {
-        ErrorClass::QuotaExhausted => e
-            .resets_at
-            .map(|r| r.saturating_sub(now).max(1))
-            .or(e.retry_after)
-            .or(Some(QUOTA_RETRY_AFTER_S)),
-        _ => e.retry_after,
-    };
+    let retry_after = wait_s(e, now);
     let should_retry = match e.class {
         ErrorClass::QuotaExhausted => retry_after.is_some_and(|s| s > NO_RETRY_AFTER_S),
         // A retry hits the same rejected credentials, cancelled turn or empty route.
@@ -294,7 +305,7 @@ pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
         status,
         retry_after,
         should_retry,
-        body: error_body(e),
+        body: error_body(e, now),
     }
 }
 

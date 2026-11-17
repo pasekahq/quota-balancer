@@ -239,7 +239,8 @@ and the body `{"error": {"message", "type", "param", "code"}}`:
 
 | Class | Status | `type` | `code` | Headers |
 |---|---|---|---|---|
-| `quota_exhausted` | 429 | `insufficient_quota` | `insufficient_quota` | `retry-after`: seconds to `resets_at` (at least 1), else `retry_after`, else 60; `x-should-retry: false` when that is over 300 s |
+| `quota_exhausted`, wait ≤ 300 s | 429 | `requests` | `rate_limit_exceeded` | `retry-after`: seconds to `resets_at` (at least 1), else `retry_after`, else 60 |
+| `quota_exhausted`, wait > 300 s | 429 | `insufficient_quota` | `insufficient_quota` | the same `retry-after`; `x-should-retry: false` |
 | `overloaded` | 429 | `requests` | `rate_limit_exceeded` | `retry-after` when known |
 | `unavailable` | 503 | `server_error` | `upstream_unavailable` | `retry-after` when known |
 | `no_route` | 503 | `server_error` | `no_route` | `x-should-retry: false` |
@@ -248,11 +249,14 @@ and the body `{"error": {"message", "type", "param", "code"}}`:
 | `context_too_long` | 400 | `invalid_request_error` | `context_length_exceeded` | — |
 | `cancelled` | 409 | `server_error` | `cancelled` | `x-should-retry: false` |
 
-`quota_exhausted` uses `insufficient_quota` rather than `rate_limit_exceeded`: every login of the
-route is spent until a reset, which is what OpenAI clients understand by that code, and they stop
-hammering it; OpenAI SDKs still honour `retry-after` and `x-should-retry`. A vendor rejecting the
-gateway's credential is `502`, not `401`: to an SDK a `401` means the client's own key is wrong.
-`overloaded` is what the core makes of a vendor's rate limit or overload back-off, so it is a
+`quota_exhausted` is every candidate of the route waiting in qbd. That is a spent window until a
+reset, but also a full lease table or a short back-off after a 429, so the code follows the wait:
+up to 300 s it is OpenAI's request rate limit, which clients retry; beyond it is
+`insufficient_quota`, which clients read as spent until a reset, with `x-should-retry: false`.
+Errors inside a stream are labelled the same way, measured from the encoder's `created` time.
+
+A vendor rejecting the gateway's credential is `502`, not `401`: to an SDK a `401` means the
+client's own key is wrong. `overloaded` is what the core makes of a vendor's rate limit or overload back-off, so it is a
 429 here as on the C4 front, in the shape of OpenAI's own request rate limit.
 `auth`, `cancelled` and `no_route` say `x-should-retry: false`, as OpenAI SDKs otherwise retry
 502, 409 and 503 and a retry would only meet the same rejected credentials, cancelled turn or
