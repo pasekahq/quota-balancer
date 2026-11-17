@@ -12,6 +12,10 @@ use crate::request::thinking_to_opaque;
 use crate::sse::{self, Frame};
 use crate::wire::{ContentBlock, Delta, Event, WireUsage};
 
+/// Bound of the bytes one open block accumulates (tool input JSON, thinking text and signature).
+/// About 190 000 characters, beyond the longest output a model writes into one block.
+pub const MAX_BLOCK_BYTES: usize = 768 << 10;
+
 /// Where a stream is after an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
@@ -105,7 +109,8 @@ impl Translator {
     ///
     /// # Errors
     /// The stream's `error` event, classified, or [`FailureKind::Unavailable`] for events out of
-    /// order, tool input that is not a JSON object, or events after `message_stop`.
+    /// order, tool input that is not a JSON object, a block over [`MAX_BLOCK_BYTES`], or events
+    /// after `message_stop`.
     pub fn push(&mut self, event: Event, out: &mut Vec<StreamEvent>) -> Result<Progress, Failure> {
         if self.finished.is_some() {
             return match event {
@@ -229,6 +234,20 @@ impl Translator {
         };
         if *at != index {
             return Err(malformed("delta for another block"));
+        }
+        let held = match open {
+            Open::ToolUse { json, .. } => json.len(),
+            Open::Thinking { text, signature } => text.len() + signature.len(),
+            Open::Text | Open::Redacted(_) | Open::Skipped => 0,
+        };
+        let added = match &delta {
+            Delta::InputJsonDelta { partial_json: s }
+            | Delta::ThinkingDelta { thinking: s }
+            | Delta::SignatureDelta { signature: s } => s.len(),
+            Delta::TextDelta { .. } | Delta::Other => 0,
+        };
+        if held + added > MAX_BLOCK_BYTES {
+            return Err(malformed("a content block exceeds the size bound"));
         }
         match (open, delta) {
             (Open::Text, Delta::TextDelta { text }) => {

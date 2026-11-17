@@ -13,8 +13,9 @@ pub struct Frame {
     pub data: String,
 }
 
-/// Default bound of one event: line buffer plus data.
-pub const MAX_EVENT_BYTES: usize = 4 << 20;
+/// Default bound of one event: line buffer plus data. With [`crate::stream::MAX_BLOCK_BYTES`] it
+/// keeps what one stream holds at 1 MiB, the per-turn allowance of the gateway's memory budget.
+pub const MAX_EVENT_BYTES: usize = 256 << 10;
 
 /// An event grew beyond the parser's bound; the stream cannot be trusted further.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

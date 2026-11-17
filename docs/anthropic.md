@@ -66,8 +66,15 @@ All identity values (version, betas, user agent, `x-app`, identity line) are con
 
 `stream::Reader` takes response bytes in chunks of any size. Its SSE parser accepts `\n`,
 `\r\n` and `\r` line ends split anywhere, ignores comments, `id` and `retry`, joins multi-line
-`data`, and fails once one event exceeds 4 MiB. Unknown event types, unknown block types and
+`data`, and fails once one event exceeds 256 KiB. Unknown event types, unknown block types and
 unknown delta types are skipped.
+
+Text deltas go out as they arrive; a tool call's input JSON and a thinking block's text and
+signature are held until the block stops, and one such block may hold at most 768 KiB. Together
+the two bounds keep what one upstream stream holds at 1 MiB, the per-turn allowance of the
+gateway's memory budget in [ADR 0001](adr/0001-model-gateway.md) ("≲ 1 MiB plus twice its
+request body"). 768 KiB is beyond the longest output a model writes into one block. Either bound
+exceeded is an `unavailable` failure (`malformed vendor stream`).
 
 | Messages event | Canonical event |
 |---|---|

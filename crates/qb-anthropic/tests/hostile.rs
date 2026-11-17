@@ -128,3 +128,64 @@ fn mutated_requests_and_headers_never_panic() {
         let _ = classify_response(429, &pairs, &answer.body);
     }
 }
+
+/// Feeds a stream that opens `block` and then sends `delta` (one SSE event each) until the
+/// reader fails or 2 MiB went in; returns the failure.
+fn grow_one_block(block: &str, delta: &str) -> Option<qb_anthropic::limits::Failure> {
+    let mut reader = Reader::new(VENDOR, RateLimits::default());
+    let mut out = Vec::new();
+    let head = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test_1\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"model\":\"model-a\",\"content\":[],\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+    );
+    reader.feed(head.as_bytes(), &mut out).expect("start");
+    let start = format!(
+        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{block}}}\n\n"
+    );
+    reader
+        .feed(start.as_bytes(), &mut out)
+        .expect("block start");
+    let event = format!(
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{delta}}}\n\n"
+    );
+    let mut fed = 0;
+    while fed < 2 << 20 {
+        if let Err(f) = reader.feed(event.as_bytes(), &mut out) {
+            return Some(f);
+        }
+        fed += event.len();
+    }
+    None
+}
+
+#[test]
+fn one_block_and_one_event_are_bounded_to_a_mebibyte() {
+    use qb_anthropic::limits::FailureKind;
+    let chunk = "a".repeat(64 << 10);
+    let cases = [
+        (
+            "tool input",
+            r#"{"type":"tool_use","id":"toolu_test_1","name":"write","input":{}}"#.to_owned(),
+            format!(r#"{{"type":"input_json_delta","partial_json":"{chunk}"}}"#),
+        ),
+        (
+            "thinking",
+            r#"{"type":"thinking","thinking":"","signature":""}"#.to_owned(),
+            format!(r#"{{"type":"thinking_delta","thinking":"{chunk}"}}"#),
+        ),
+    ];
+    for (what, block, delta) in cases {
+        let f = grow_one_block(&block, &delta).expect(what);
+        assert_eq!(f.kind, FailureKind::Unavailable, "{what}");
+        assert!(f.message.starts_with("malformed vendor stream"), "{what}");
+    }
+
+    let mut reader = Reader::new(VENDOR, RateLimits::default());
+    let mut out = Vec::new();
+    let mut event = b"data: ".to_vec();
+    event.extend(std::iter::repeat_n(b'a', 1 << 20));
+    let f = reader.feed(&event, &mut out).expect_err("a 1 MiB event");
+    assert_eq!(f.kind, FailureKind::Unavailable);
+}
