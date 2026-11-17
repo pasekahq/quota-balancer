@@ -1,0 +1,7 @@
+{
+  "routes": [
+    {"alias": "chat", "state": "degraded", "vendor": "vendor-b", "model": "model-b"},
+    {"alias": "compact", "state": "exhausted", "resets_at": 1800018000},
+    {"alias": "vision", "state": "ready", "vendor": "vendor-a", "model": "model-large"}
+  ]
+}

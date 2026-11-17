@@ -14,6 +14,14 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod gateway;
+
+pub use gateway::{
+    Attempt, Block, CacheMode, CancelAnswer, CancelRequest, Effort, ErrorClass, GatewayError,
+    MediaType, Message, Object, Role, RouteInfo, RouteState, RouteStatus, RoutesAnswer, StopReason,
+    StreamEvent, Thinking, Tool, ToolCall, TurnRequest, TurnRequestError, Usage,
+};
+
 /// API version reported by `/v1/health` and used as the URL prefix.
 pub const API_VERSION: &str = "v1";
 
@@ -33,6 +41,12 @@ pub mod paths {
     pub const AGENT_NEXT: &str = "/v1/agent/next";
     /// `POST`: an agent answers a probe job.
     pub const AGENT_RESULT: &str = "/v1/agent/result";
+    /// Gateway, `POST`: run one model turn and stream its events as NDJSON.
+    pub const MODEL_TURN: &str = "/v1/model/turn";
+    /// Gateway, `GET`: route aliases and where a turn would run now.
+    pub const MODEL_ROUTES: &str = "/v1/model/routes";
+    /// Gateway, `POST`: stop a running turn of the caller.
+    pub const MODEL_CANCEL: &str = "/v1/model/cancel";
 }
 
 /// `POST /v1/pick` request.

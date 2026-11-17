@@ -1,0 +1,2 @@
+{"route": "chat", "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}], "max_tokens": 16, "request_id": "turn-0007",
+ "tools": [{"name": "read", "description": "a", "input_schema": {}}, {"name": "read", "description": "b", "input_schema": {}}]}
