@@ -219,7 +219,7 @@ impl ErrorResponse {
 pub fn error_kind(class: ErrorClass) -> (&'static str, Option<&'static str>) {
     match class {
         ErrorClass::QuotaExhausted => ("insufficient_quota", Some("insufficient_quota")),
-        ErrorClass::Overloaded => ("server_error", Some("server_is_overloaded")),
+        ErrorClass::Overloaded => ("requests", Some("rate_limit_exceeded")),
         ErrorClass::Unavailable => ("server_error", Some("upstream_unavailable")),
         ErrorClass::Auth => ("server_error", Some("upstream_auth_failed")),
         ErrorClass::BadRequest => ("invalid_request_error", None),
@@ -261,14 +261,16 @@ pub const QUOTA_RETRY_AFTER_S: u64 = 60;
 /// - `quota_exhausted`: 429 `insufficient_quota` with `retry-after` until `resets_at`, else
 ///   `retry_after`, else [`QUOTA_RETRY_AFTER_S`], and `x-should-retry: false` beyond
 ///   [`NO_RETRY_AFTER_S`];
-/// - `overloaded`, `unavailable` and `no_route`: 503; `auth`, which is the vendor rejecting the
+/// - `overloaded`: 429 `rate_limit_exceeded` with the vendor's `retry-after`;
+/// - `unavailable` and `no_route`: 503; `auth`, which is the vendor rejecting the
 ///   gateway's credential and not the client's, 502;
 /// - `bad_request`, `context_too_long` (`context_length_exceeded`): 400; `cancelled`: 409;
 /// - `auth`, `cancelled` and `no_route` also carry `x-should-retry: false`.
 pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
     let status = match e.class {
-        ErrorClass::QuotaExhausted => 429,
-        ErrorClass::Overloaded | ErrorClass::Unavailable | ErrorClass::NoRoute => 503,
+        // A vendor back-off is `overloaded` in the core, a 429 on the C4 front too.
+        ErrorClass::QuotaExhausted | ErrorClass::Overloaded => 429,
+        ErrorClass::Unavailable | ErrorClass::NoRoute => 503,
         ErrorClass::Auth => 502,
         ErrorClass::BadRequest | ErrorClass::ContextTooLong => 400,
         ErrorClass::Cancelled => 409,

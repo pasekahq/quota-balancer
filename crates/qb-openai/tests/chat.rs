@@ -296,7 +296,7 @@ fn error_answers() {
         ),
         (ErrorClass::BadRequest, 400, None),
         (ErrorClass::Auth, 502, Some("upstream_auth_failed")),
-        (ErrorClass::Overloaded, 503, Some("server_is_overloaded")),
+        (ErrorClass::Overloaded, 429, Some("rate_limit_exceeded")),
         (ErrorClass::Unavailable, 503, Some("upstream_unavailable")),
         (ErrorClass::NoRoute, 503, Some("no_route")),
         (ErrorClass::Cancelled, 409, Some("cancelled")),
@@ -352,4 +352,15 @@ fn a_quota_error_without_a_known_reset_still_says_when_to_retry() {
     assert_eq!(r.status, 429);
     assert_eq!(r.retry_after, Some(qb_openai::front::QUOTA_RETRY_AFTER_S));
     assert_eq!(r.should_retry, None, "a short default lets the SDK retry");
+}
+
+#[test]
+fn a_vendor_back_off_is_a_rate_limit_as_on_the_c4_front() {
+    let mut e = GatewayError::new(ErrorClass::Overloaded, true, "");
+    e.retry_after = Some(20);
+    let r = error_response(&e, NOW);
+    assert_eq!(r.status, ErrorClass::Overloaded.http_status());
+    assert_eq!(r.body.error.kind, "requests");
+    assert_eq!(r.body.error.code.as_deref(), Some("rate_limit_exceeded"));
+    assert_eq!(r.headers(), vec![("retry-after", "20".to_owned())]);
 }
