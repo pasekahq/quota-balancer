@@ -148,9 +148,11 @@ pub struct Finished {
 /// try another login.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
-    /// The login's usage limit is reached; `resets_at` when the vendor said so.
+    /// The login's usage limit is reached; `resets_at` when the vendor said so. qbd learns the
+    /// reset only from [`Failure::windows`], by the window names its vendor declares, so the
+    /// adapter also puts the limiting window there with `utilization` 1.0 and this `resets_at`.
     UsageLimit {
-        /// Unix time the limit lifts.
+        /// Unix time the limit lifts; the client's `error.resets_at` after content.
         resets_at: Option<u64>,
     },
     /// The credential was rejected (HTTP 401 or equivalent).
