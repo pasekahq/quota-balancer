@@ -4,8 +4,12 @@
 //!
 //! - [`config`]: the gateway's TOML config;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
-//! - [`upstream`]: the seam vendor adapters implement.
+//! - [`upstream`]: the seam vendor adapters implement;
+//! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
+//! - [`front`]: the C4 front over the unix socket.
 
 pub mod config;
+pub mod core;
 pub mod creds;
+pub mod front;
 pub mod upstream;

@@ -61,11 +61,24 @@ impl From<io::Error> for ReadError {
     }
 }
 
-/// Reads one request. `buf` is a scratch buffer reused across connections.
+/// Reads one request with a body of at most [`MAX_BODY`]. `buf` is a scratch buffer reused
+/// across connections.
 ///
 /// # Errors
 /// See [`ReadError`].
 pub fn read_request<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<Request, ReadError> {
+    read_request_limited(r, buf, MAX_BODY)
+}
+
+/// [`read_request`] with a body of at most `max_body` bytes.
+///
+/// # Errors
+/// See [`ReadError`].
+pub fn read_request_limited<R: Read>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    max_body: usize,
+) -> Result<Request, ReadError> {
     buf.clear();
     let mut chunk = [0u8; 2048];
     loop {
@@ -103,7 +116,7 @@ pub fn read_request<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<Request, Re
                     return Err(ReadError::LengthRequired);
                 }
                 let want = content_length.unwrap_or(0);
-                if want > MAX_BODY {
+                if want > max_body {
                     let unread = want.saturating_sub(buf.len() - head_len);
                     return Err(ReadError::BodyTooLarge { unread });
                 }
@@ -157,6 +170,8 @@ fn reason_phrase(status: u16) -> &'static str {
         413 => "Content Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
         _ => "Unknown",
     }
 }
@@ -175,6 +190,45 @@ pub fn write_response<W: Write>(w: &mut W, status: u16, body: &[u8]) -> io::Resu
     )?;
     out.extend_from_slice(body);
     w.write_all(&out)?;
+    w.flush()
+}
+
+/// Starts a `200` response whose body follows in chunks of `content_type`; the connection
+/// closes after the last chunk.
+///
+/// # Errors
+/// Socket errors.
+pub fn write_stream_head<W: Write>(w: &mut W, content_type: &str) -> io::Result<()> {
+    write!(
+        w,
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )?;
+    w.flush()
+}
+
+/// Writes `data` as one chunk and flushes; empty data writes nothing, since a zero-size chunk
+/// would end the body.
+///
+/// # Errors
+/// Socket errors.
+pub fn write_chunk<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut out = Vec::with_capacity(data.len() + 12);
+    write!(out, "{:x}\r\n", data.len())?;
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+    w.write_all(&out)?;
+    w.flush()
+}
+
+/// Ends a chunked body.
+///
+/// # Errors
+/// Socket errors.
+pub fn write_stream_end<W: Write>(w: &mut W) -> io::Result<()> {
+    w.write_all(b"0\r\n\r\n")?;
     w.flush()
 }
 
@@ -240,6 +294,35 @@ mod tests {
         let mut head = b"GET / HTTP/1.1\r\nX: ".to_vec();
         head.extend(std::iter::repeat_n(b'a', MAX_HEAD));
         assert!(matches!(parse(&head), Err(ReadError::HeadTooLarge)));
+    }
+
+    #[test]
+    fn writes_chunks() {
+        let mut out = Vec::new();
+        write_stream_head(&mut out, "application/x-ndjson").expect("head");
+        write_chunk(&mut out, b"{}\n").expect("chunk");
+        write_chunk(&mut out, b"").expect("empty");
+        write_chunk(&mut out, &[b'a'; 26]).expect("chunk");
+        write_stream_end(&mut out).expect("end");
+        let text = String::from_utf8(out).expect("utf8");
+        let (head, body) = text.split_once("\r\n\r\n").expect("head");
+        assert!(head.contains("Transfer-Encoding: chunked"));
+        assert_eq!(
+            body,
+            format!("3\r\n{{}}\n\r\n1a\r\n{}\r\n0\r\n\r\n", "a".repeat(26))
+        );
+    }
+
+    #[test]
+    fn body_limit_is_a_parameter() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_request_limited(&mut &raw[..], &mut buf, 4),
+            Err(ReadError::BodyTooLarge { .. })
+        ));
+        let r = read_request_limited(&mut &raw[..], &mut buf, 5).expect("fits");
+        assert_eq!(r.body, b"hello");
     }
 
     #[test]

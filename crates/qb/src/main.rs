@@ -8,6 +8,9 @@ use std::process::ExitCode;
 
 use qb::auth::Gate;
 use qb::config::Config;
+use qb::gateway::core::Gateway;
+use qb::gateway::creds::NoRefresher;
+use qb::gateway::front;
 use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb::{
@@ -30,6 +33,8 @@ COMMANDS:
                                         else /etc/qb/qbd.toml
     agent --config PATH                 run the credential-owner agent: wait for the daemon's
                                         probe jobs and answer them
+    gateway --config PATH               run the model gateway: serve /v1/model/* on the socket
+                                        named in its config, picking and reporting via qbd
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -65,6 +70,7 @@ connection errors. qb sends no telemetry.
 enum Cmd {
     Daemon(PathBuf),
     Agent(PathBuf),
+    Gateway(PathBuf),
     Simulate(Simulate),
     Call(Call),
     Version,
@@ -174,7 +180,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             Value(v) if matches!(sub, Some("why" | "simulate")) && operand.is_none() => {
                 operand = Some(v);
             }
-            Long("config") if matches!(sub, Some("daemon" | "simulate" | "agent")) => {
+            Long("config") if matches!(sub, Some("daemon" | "simulate" | "agent" | "gateway")) => {
                 config = Some(PathBuf::from(p.value()?));
             }
             Long("at") if sub == Some("simulate") => at = Some(p.value()?.parse()?),
@@ -224,6 +230,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
         None => Cmd::Help,
         Some("daemon") => Cmd::Daemon(config.unwrap_or_else(default_config)),
         Some("agent") => Cmd::Agent(config.ok_or("--config is required")?),
+        Some("gateway") => Cmd::Gateway(config.ok_or("--config is required")?),
         Some("health") => Cmd::Call(Call::Health),
         Some("state") => Cmd::Call(Call::State),
         Some("version") => Cmd::Version,
@@ -307,6 +314,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
             }
             agent::run(&args.socket, bearer.as_deref(), &config, &mut fetcher)
         }
+        Cmd::Gateway(file) => gateway(&file),
         Cmd::Simulate(sim) => simulate(sim),
         Cmd::Call(call) => {
             let bearer = bearer(args.bearer_file)?;
@@ -416,6 +424,35 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
         let _ = out.write_all(b"\n");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs the model gateway of the config in `file`. Vendor adapters are not part of this build
+/// yet, so every turn ends with `unavailable`; the credential and qbd paths run in full.
+fn gateway(file: &Path) -> Result<ExitCode, String> {
+    let config = qb::gateway::config::load(file).map_err(|e| e.to_string())?;
+    let qbd_bearer = bearer(config.qbd.bearer_file.clone())?.map(zeroize::Zeroizing::new);
+    let listener = if let Some(l) = listen::from_systemd().map_err(|e| e.to_string())? {
+        log::info("qb gateway: using the socket passed by systemd");
+        l
+    } else {
+        let l = listen::bind(&config.socket)
+            .map_err(|e| format!("{}: {e}", config.socket.display()))?;
+        log::info(&format!(
+            "qb gateway: listening on {}",
+            config.socket.display()
+        ));
+        l
+    };
+    let gaps = sandbox::harden_gateway(&config)?;
+    if !gaps.is_empty() {
+        log::warn(&format!(
+            "qb gateway: sandbox incomplete: {}",
+            gaps.join("; ")
+        ));
+    }
+    let gateway = Gateway::new(config, Vec::new(), Box::new(NoRefresher), qbd_bearer);
+    let Err(e) = front::serve(&listener, &std::sync::Arc::new(gateway));
+    Err(format!("listener failed: {e}"))
 }
 
 fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
