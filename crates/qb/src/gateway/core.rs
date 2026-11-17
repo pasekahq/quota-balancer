@@ -493,6 +493,7 @@ impl Gateway {
                     progress.tried.push(attempt);
                     if e.unusable {
                         self.report(&lease, Outcome::Http401, Vec::new());
+                        self.report_dead(&login);
                         progress.failed.push(login);
                         return Next::Retry;
                     }
@@ -595,6 +596,9 @@ impl Gateway {
         progress.tried.push(attempt);
         if !relay.emitted {
             if login_scoped(failure.kind) {
+                if failure.kind == FailureKind::Auth {
+                    self.report_dead(&login);
+                }
                 progress.failed.push(login);
                 return Next::Retry;
             }
@@ -755,25 +759,44 @@ impl Gateway {
 
     /// Reports `outcome` and `windows` for `lease` and releases it; failures are logged only.
     fn report(&self, lease: &str, outcome: Outcome, windows: Vec<WindowReport>) {
-        let req = ReportRequest {
+        self.send_report(&ReportRequest {
             lease_id: Some(lease.to_owned()),
             login: None,
             outcome,
             model: None,
             windows,
             release: true,
-        };
-        let Ok(body) = serde_json::to_vec(&req) else {
+        });
+    }
+
+    /// Reports one more `http_401` on `login` after its lease report, so qbd marks it
+    /// `auth_dead` and the next pick of the turn skips it: the credential failed even after a
+    /// refresh, or its file is unusable, and neither passes by itself.
+    fn report_dead(&self, login: &str) {
+        self.send_report(&ReportRequest {
+            lease_id: None,
+            login: Some(login.to_owned()),
+            outcome: Outcome::Http401,
+            model: None,
+            windows: Vec::new(),
+            release: false,
+        });
+    }
+
+    fn send_report(&self, req: &ReportRequest) {
+        let Ok(body) = serde_json::to_vec(req) else {
             return;
         };
+        let of = req.lease_id.as_ref().or(req.login.as_ref());
+        let of = of.map_or("", String::as_str);
         let socket = &self.config.qbd_socket;
         match client::call(socket, "POST", paths::REPORT, Some(&body), self.bearer()) {
             Ok((200, _)) => {}
             Ok((status, resp)) => log::warn(&format!(
-                "gateway: qbd report of {lease} answered HTTP {status}: {}",
+                "gateway: qbd report of {of} answered HTTP {status}: {}",
                 String::from_utf8_lossy(&resp)
             )),
-            Err(e) => log::warn(&format!("gateway: qbd report of {lease}: {e}")),
+            Err(e) => log::warn(&format!("gateway: qbd report of {of}: {e}")),
         }
     }
 }

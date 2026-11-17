@@ -295,16 +295,19 @@ vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
 | a stream, finished or not | `ok` | — |
 | usage limit | `usage_limit` | next pick; the login is not tried again in this turn |
 | 429 without usage limit | `http_429` | as above |
-| 401 | `http_401` | an OAuth login first refreshes its token and retries once on the same lease; then as above |
+| 401 | `http_401` | an OAuth login first refreshes its token and retries once on the same lease; then as above, and the login is dead (below) |
 | model unavailable to the login | `model_unavailable` | as above |
-| unreadable or invalid credential file | `http_401` | as above |
+| unreadable or invalid credential file | `http_401` | as above, and the login is dead (below) |
 | overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn |
 | invalid request, context too long | `error` | the turn ends |
 
 Once an event has reached the client the gateway never retries: a failure ends the stream
-with an `error` event. A turn is bounded by `max_attempts` picks (default 4). When a pick
-returns a login that already failed in the turn (`qbd` keeps an `auth_stale` login pickable)
-the lease is released with `error` and the turn ends with the last failure's class.
+with an `error` event. A turn is bounded by `max_attempts` picks (default 4). A 401 that the
+one refresh did not cure, or an unusable credential file, does not pass by itself: after the
+lease report the gateway also sends `POST /v1/report {"login", "outcome": "http_401"}`, which
+makes the login `auth_dead` in `qbd`, so the next pick of the same turn skips it. When a pick
+still returns a login that already failed in the turn, the lease is released with `error` and
+the turn ends with the last failure's class.
 
 #### Errors
 

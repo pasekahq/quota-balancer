@@ -904,7 +904,7 @@ fn a_rejected_token_is_refreshed_and_the_turn_retried() {
 }
 
 #[test]
-fn an_unusable_credential_file_is_never_used_and_its_login_dies() {
+fn an_unusable_credential_file_is_never_used_and_the_turn_moves_on() {
     let r = rig_with(
         4,
         &[
@@ -912,17 +912,52 @@ fn an_unusable_credential_file_is_never_used_and_its_login_dies() {
             ("login-2", api_key("test-token-2"), 0o600),
         ],
     );
-    // qbd keeps a login pickable after one 401, and a failed login is not tried again in the
-    // same turn: the first turn ends with `auth`.
     let (_, _, first) = turn(&r.gw, &turn_body("turn-1"));
-    assert_eq!(kinds(&first), ["error Auth"]);
-    assert_eq!(last_error(&first).tried.len(), 1);
-    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthStale);
-    // The second 401 makes it auth_dead, and the turn moves on to login-2.
-    let (_, _, second) = turn(&r.gw, &turn_body("turn-2"));
-    assert_eq!(kinds(&second), ["route login-2", "text_delta", "stop End"]);
+    assert_eq!(kinds(&first), ["route login-2", "text_delta", "stop End"]);
     let logins: Vec<String> = r.fake.calls().into_iter().map(|c| c.0).collect();
     assert_eq!(logins, ["login-2"], "the open file is never used");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
+    let (_, _, second) = turn(&r.gw, &turn_body("turn-2"));
+    assert_eq!(kinds(&second), ["route login-2", "text_delta", "stop End"]);
+}
+
+#[test]
+fn a_401_after_the_refresh_moves_to_the_next_login_in_the_same_turn() {
+    let oauth = format!(
+        r#"{{"type":"oauth_anthropic","access_token":"access-0","refresh_token":"refresh-0","expires_at":{}}}"#,
+        unix_now() + 3600
+    );
+    let r = rig_with(
+        4,
+        &[
+            ("login-1", oauth, 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    for _ in 0..2 {
+        r.fake.script(
+            "login-1",
+            Script::Fail(Vec::new(), FailureKind::Auth, Vec::new()),
+        );
+    }
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    let calls: Vec<(String, String)> = r.fake.calls().into_iter().map(|c| (c.0, c.1)).collect();
+    let calls: Vec<(&str, &str)> = calls
+        .iter()
+        .map(|(l, s)| (l.as_str(), s.as_str()))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("login-1", "access-0"),
+            ("login-1", "access-1"),
+            ("login-2", "test-token-2")
+        ]
+    );
+    assert_eq!(r.refreshes.load(Ordering::SeqCst), 1);
     let s = state(&r.qbd);
     assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
     assert_eq!(s.leases, Vec::new());
