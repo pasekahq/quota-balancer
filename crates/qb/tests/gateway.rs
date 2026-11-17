@@ -226,7 +226,7 @@ fn gateway_toml(dir: &Path, qbd: &Path, max_turns: u32, kinds: [&str; 2], extra:
         r#"socket = "{dir}/gw.sock"
 qbd_socket = "{qbd}"
 max_turns = {max_turns}
-max_request_bytes = 65536
+max_request_bytes = 131072
 
 [[logins]]
 name = "login-1"
@@ -277,11 +277,20 @@ fn kind_of(contents: &str) -> &'static str {
 }
 
 fn rig_with(max_turns: u32, files: &[(&str, String, u32)]) -> Rig {
+    rig_as(max_turns, files, "", own_uid())
+}
+
+fn own_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// A rig whose gateway config ends with `extra` and whose gateway runs as `gateway_uid`.
+fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_uid: u32) -> Rig {
     let dir = temp_dir("gw");
     credentials(&dir, files);
     let qbd = start_qbd(&dir);
     let kind = |i: usize| files.get(i).map_or("api_key", |f| kind_of(&f.1));
-    let text = gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], "");
+    let text = gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], extra);
     let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
     let gw = config.socket.clone();
     let fake = Arc::new(Fake::default());
@@ -299,7 +308,7 @@ fn rig_with(max_turns: u32, files: &[(&str, String, u32)]) -> Rig {
         None,
     );
     let listener = UnixListener::bind(&gw).unwrap();
-    std::thread::spawn(move || front::serve(&listener, &Arc::new(gateway)));
+    std::thread::spawn(move || front::serve(&listener, &Arc::new(gateway), gateway_uid));
     Rig {
         dir,
         qbd,
@@ -780,7 +789,7 @@ fn cancel_stops_an_in_flight_turn_and_frees_its_slot() {
 fn malformed_and_oversized_requests_are_rejected_before_any_work() {
     let r = rig();
     let big = json!({"route": "chat", "messages": [{"role": "user", "content": [
-        {"type": "text", "text": "x".repeat(70_000)}]}], "max_tokens": 1, "request_id": "t"});
+        {"type": "text", "text": "x".repeat(140_000)}]}], "max_tokens": 1, "request_id": "t"});
     let mut unknown = turn_body("t");
     unknown["route"] = json!("nope");
     let mut extra = turn_body("t");
@@ -795,7 +804,7 @@ fn malformed_and_oversized_requests_are_rejected_before_any_work() {
             paths::MODEL_TURN,
             big.to_string(),
             413,
-            "over 65536 bytes",
+            "over 131072 bytes",
         ),
         (
             "POST",
@@ -840,6 +849,17 @@ fn malformed_and_oversized_requests_are_rejected_before_any_work() {
     }
     assert_eq!(r.fake.calls(), Vec::new());
     assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn a_configured_client_uid_is_served() {
+    let files = [("login-1", api_key("test-token-1"), 0o600)];
+    let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
+    let r = rig_as(4, &files, &extra, own_uid() + 1);
+    let (status, _) = call(&r.gw, "GET", paths::HEALTH, "");
+    assert_eq!(status, 200);
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
 }
 
 #[test]

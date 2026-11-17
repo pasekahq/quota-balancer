@@ -35,14 +35,17 @@ pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Content type of the turn stream.
 pub const NDJSON: &str = "application/x-ndjson";
 
-/// Serves `gateway` on `listener`. The main thread only accepts; each connection runs on its
-/// own thread.
+/// Serves `gateway` on `listener` to peers of uid `own_uid`, the gateway's own, and the
+/// configured clients. The main thread only accepts; each connection runs on its own thread.
 ///
 /// # Errors
 /// Never in practice; the type leaves room for a fatal listener error.
-pub fn serve(listener: &UnixListener, gateway: &Arc<Gateway>) -> io::Result<Infallible> {
+pub fn serve(
+    listener: &UnixListener,
+    gateway: &Arc<Gateway>,
+    own_uid: u32,
+) -> io::Result<Infallible> {
     let cap = gateway.config().max_turns as usize + EXTRA_CONNECTIONS;
-    let own_uid = rustix::process::geteuid().as_raw();
     let started = Instant::now();
     let live = Arc::new(AtomicUsize::new(0));
     loop {

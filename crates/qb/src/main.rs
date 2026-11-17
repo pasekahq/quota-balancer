@@ -451,7 +451,11 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         ));
     }
     let gateway = Gateway::new(config, Vec::new(), Box::new(NoRefresher), qbd_bearer);
-    let Err(e) = front::serve(&listener, &std::sync::Arc::new(gateway));
+    let Err(e) = front::serve(
+        &listener,
+        &std::sync::Arc::new(gateway),
+        rustix::process::geteuid().as_raw(),
+    );
     Err(format!("listener failed: {e}"))
 }
 
