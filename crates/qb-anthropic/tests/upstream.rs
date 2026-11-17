@@ -291,6 +291,21 @@ fn oauth_mode_adds_the_identity_prefix_and_headers() {
 }
 
 #[test]
+fn oauth_user_agent_meets_the_subscription_endpoint_minimum() {
+    // The subscription endpoint refuses newer models for older CLI versions with HTTP 400
+    // "version 2.1.280 or newer is required" (claude-opus-5-5, November 2026).
+    let version = identity::OAUTH_USER_AGENT
+        .strip_prefix("claude-cli/")
+        .and_then(|rest| rest.split(' ').next())
+        .expect("claude-cli/<version> user agent");
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|p| p.parse().expect("numeric version part"))
+        .collect();
+    assert!(parts >= vec![2, 1, 280], "{version} is below 2.1.280");
+}
+
+#[test]
 fn ladder_effort_applies_without_a_request_effort_and_unknown_efforts_are_dropped() {
     let mut req = turn();
     req.effort = None;
