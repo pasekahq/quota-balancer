@@ -111,7 +111,8 @@ fn conversation(input: Vec<ChatMessage>) -> Result<(Vec<String>, Vec<Message>), 
             }
             "assistant" => {
                 let mut blocks = Vec::new();
-                let text = text_of(m.content, &at)?;
+                let mut text = text_of(m.content, &at)?;
+                text.push_str(m.refusal.as_deref().unwrap_or_default());
                 if !text.is_empty() {
                     blocks.push(Block::Text { text });
                 }

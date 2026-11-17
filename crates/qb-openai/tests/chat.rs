@@ -160,7 +160,8 @@ fn golden_stream() {
         acc.usage,
         Some(
             json!({"prompt_tokens": 2125, "completion_tokens": 90, "total_tokens": 2215,
-                    "prompt_tokens_details": {"cached_tokens": 2000}})
+                    "prompt_tokens_details": {"cached_tokens": 2000},
+                    "completion_tokens_details": {"reasoning_tokens": 0}})
         )
     );
     assert!(acc.done);
@@ -242,7 +243,8 @@ fn non_streaming_body() {
                 "logprobs": null
             }],
             "usage": {"prompt_tokens": 2125, "completion_tokens": 90, "total_tokens": 2215,
-                      "prompt_tokens_details": {"cached_tokens": 2000}}
+                      "prompt_tokens_details": {"cached_tokens": 2000},
+                    "completion_tokens_details": {"reasoning_tokens": 0}}
         })
     );
 
@@ -311,4 +313,21 @@ fn error_answers() {
         );
         assert_eq!(r.retry_after, Some(5));
     }
+}
+
+#[test]
+fn an_assistant_refusal_stays_in_the_history() {
+    let body = json!({"model": "gpt-chat", "messages": [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": null, "refusal": "I can't"},
+        {"role": "user", "content": "b"}
+    ]});
+    let req = decode(&body).expect("decodes");
+    assert_eq!(req.turn.messages.len(), 3);
+    assert_eq!(
+        req.turn.messages[1].content,
+        vec![qb_proto::Block::Text {
+            text: "I can't".into()
+        }]
+    );
 }

@@ -159,7 +159,8 @@ fn golden_stream() {
     assert_eq!(
         response["usage"],
         json!({"input_tokens": 2125, "input_tokens_details": {"cached_tokens": 2000},
-               "output_tokens": 90, "total_tokens": 2215})
+               "output_tokens": 90, "output_tokens_details": {"reasoning_tokens": 0},
+               "total_tokens": 2215})
     );
 }
 

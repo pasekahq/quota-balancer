@@ -10,7 +10,7 @@ data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":18000000
 
 data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"gpt-chat","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
 
-data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"gpt-chat","choices":[],"usage":{"prompt_tokens":2125,"completion_tokens":90,"total_tokens":2215,"prompt_tokens_details":{"cached_tokens":2000}}}
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"gpt-chat","choices":[],"usage":{"prompt_tokens":2125,"completion_tokens":90,"total_tokens":2215,"prompt_tokens_details":{"cached_tokens":2000},"completion_tokens_details":{"reasoning_tokens":0}}}
 
 data: [DONE]
 

@@ -16,6 +16,13 @@ use crate::wire::{Content, Item, ResponseEvent, ResponseObject, ResponsesUsage, 
 /// 190 000 characters, beyond the longest output a model writes into one call.
 pub const MAX_BLOCK_BYTES: usize = 768 << 10;
 
+/// The event bound for an answer to an upstream body of `request_bytes`: the vendor repeats the
+/// request's instructions and tools in every lifecycle event, and `response.completed` the whole
+/// output too, so the bound is the body plus [`sse::MAX_EVENT_BYTES`].
+pub fn event_bound(request_bytes: usize) -> usize {
+    request_bytes.saturating_add(sse::MAX_EVENT_BYTES)
+}
+
 /// Bound of the items open at once.
 const MAX_OPEN_ITEMS: usize = 64;
 
@@ -409,10 +416,16 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// A reader for one response of `vendor` with `limits` from its headers.
+    /// A reader for one response of `vendor` with `limits` from its headers, with the default
+    /// event bound [`sse::MAX_EVENT_BYTES`].
     pub fn new(vendor: &str, limits: RateLimits) -> Self {
+        Self::with_event_bound(vendor, limits, sse::MAX_EVENT_BYTES)
+    }
+
+    /// As [`Reader::new`] with an event bound of `max_event` bytes; see [`event_bound`].
+    pub fn with_event_bound(vendor: &str, limits: RateLimits, max_event: usize) -> Self {
         Self {
-            parser: sse::Parser::default(),
+            parser: sse::Parser::new(max_event),
             frames: Vec::new(),
             translator: Translator::new(vendor, limits),
         }

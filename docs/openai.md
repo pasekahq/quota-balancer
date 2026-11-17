@@ -30,7 +30,7 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | `cache_control` breakpoints of a Messages client on an OpenAI upstream | Not sent: OpenAI caches prompts on its own; `session_key` becomes `prompt_cache_key`. |
 | Any OpenAI front | `cache` is always `auto`, since OpenAI clients expect caching without asking; on an Anthropic API key that means cache writes at their price. |
 | `tool_result.is_error` to an OpenAI upstream | Dropped: `function_call_output` has no error flag. |
-| Usage | OpenAI reports no cache writes: `cache_write` reads as 0 upstream, and fronts fold it into `prompt_tokens`/`input_tokens`. The canonical usage has no reasoning count, so fronts omit `*_tokens_details.reasoning_tokens`. |
+| Usage | OpenAI reports no cache writes: `cache_write` reads as 0 upstream, and fronts fold it into `prompt_tokens`/`input_tokens`. The canonical usage has no reasoning count, so fronts write `reasoning_tokens: 0`. |
 | `reasoning.summary`, `include`, `store` of a Responses client | Ignored: the upstream adapter always asks for summaries and encrypted reasoning and never stores. |
 | `n` > 1, logprobs, audio, structured output (`response_format`, `text.format`), non-function tools, image URLs, files | Refused with a clear `400`. |
 | `tool_choice`, `parallel_tool_calls`, sampling parameters, `stop` | Ignored, as on the Messages front. |
@@ -53,7 +53,7 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | `thinking` of another vendor, or another `opaque`; empty text | dropped |
 | `image` with `path` | `BuildError`: the gateway reads no file a client names |
 | `tools[]` | `tools[]{type: function, name, description, parameters, strict: false}`, `tool_choice: auto`, `parallel_tool_calls: true` |
-| `max_tokens` | `max_output_tokens` (API key only; the subscription endpoint refuses it) |
+| `max_tokens` | `max_output_tokens`, at least 16, the vendor's minimum (API key only; the subscription endpoint refuses it) |
 | `effort`, else the ladder candidate's effort | `reasoning.effort`: `low`, `medium`, `high`; `max` is `xhigh`; a candidate effort other than `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` is dropped |
 | `session_key` | `prompt_cache_key`, and the subscription mode's `session_id` header when it is visible ASCII |
 | — | `store: false`, `stream: true`; with `target.reasoning`, `reasoning.summary: auto` and `include: ["reasoning.encrypted_content"]` |
@@ -75,8 +75,11 @@ of the gateway never see or send them.
 
 `stream::Reader` takes response bytes in chunks of any size. Its SSE parser accepts `\n`,
 `\r\n` and `\r` line ends split anywhere, ignores comments, `id` and `retry`, joins multi-line
-`data`, and fails once one event exceeds 1 MiB: `response.completed` repeats the whole output,
-so the bound is the turn's memory allowance.
+`data`, and fails once one event exceeds its bound. The vendor repeats the request's
+instructions and tools in every lifecycle event and the whole output in `response.completed`, so
+the caller sizes the bound with `Reader::with_event_bound(vendor, limits,
+stream::event_bound(request_bytes))`: the upstream body plus 1 MiB, the turn's memory allowance.
+`Reader::new` uses 1 MiB alone.
 Events are decoded by their `type`; unknown types (such as `codex.rate_limits`,
 `response.content_part.*` or the reasoning summary events) are skipped.
 
@@ -123,18 +126,18 @@ usage limit. An unreadable value drops only its own window.
 | Answer | Failure kind | Client class | `qbd` outcome |
 |---|---|---|---|
 | `usage_limit_reached` (ChatGPT plan), `insufficient_quota` (API key out of credit), `billing_hard_limit_reached`, `billing_not_active`; a 429 when a subscription window is at 100 %; a 400 or 429 whose message says `usage limit`, `hit your limit`, `exceeded your current quota` or `credit balance` | `usage_limit{resets_at}` | `quota_exhausted` | `usage_limit` |
-| `usage_not_included`, `model_not_found`, 404; a 400 whose message says `model is not supported`, `does not exist` or `model not found` | `model_unavailable` | `unavailable` | `model_unavailable` |
-| `context_length_exceeded`; a 400, 413 or 422 whose message says `context length`, `context window`, `maximum context`, `too many tokens`, `prompt is too long` or `input is too long` | `context_too_long` | `context_too_long` | `error` |
-| 401, 403, `invalid_api_key`, `token_expired`, `account_deactivated` | `auth` | `auth` | `http_401` |
+| `usage_not_included`, `model_not_found`, 404; a 400 whose message says `model is not supported`, `does not exist`, `model not found` or `must be verified` (an organisation not verified for the model) | `model_unavailable` | `unavailable` | `model_unavailable` |
+| `context_length_exceeded`; any answer whose message says `request too large` or `must be reduced` (a request over a per-minute token limit, which no login with that limit can serve); a 400, 413 or 422 whose message says `context length`, `context window`, `maximum context`, `too many tokens`, `prompt is too long` or `input is too long` | `context_too_long` | `context_too_long` | `error` |
+| 401, 403 with a JSON body, `invalid_api_key`, `token_expired`, `account_deactivated` | `auth` | `auth` | `http_401` |
 | other 429, `rate_limit_exceeded`, type `requests` or `tokens` | `rate_limited{retry_after}` | `overloaded` | `http_429` |
 | 402 | `usage_limit` without reset | `quota_exhausted` | `usage_limit` |
 | 503, 529, `server_is_overloaded`, `slow_down` | `overloaded{retry_after}` | `overloaded` | `error` |
 | other 400, 413, 422, `invalid_request_error`, `invalid_prompt` | `bad_request` | `bad_request` | `error` |
-| anything else (5xx, `server_error`, a body that is not JSON) | `unavailable` | `unavailable` | `error` |
+| anything else (5xx, `server_error`, a 403 whose body is not JSON such as a bot wall, another body that is not JSON) | `unavailable` | `unavailable` | `error` |
 
 `resets_at` of a usage limit is the body's `resets_at`, else `now` + `resets_in_seconds`, else
 the latest reset of a subscription window at 100 %. `retry_after` is the header, else the
-duration after `try again in` in the message. The failure carries the windows of the headers and
+duration after `try again in` in the message (`1.8s`, `6m0s`, `5 minutes`). The failure carries the windows of the headers and
 the vendor's message, cut to 300 characters with control characters as spaces; it never carries a
 header value.
 
@@ -146,7 +149,7 @@ header value.
 - `system` and `developer` messages, wherever they stand, join into `system` (blank line between);
 - `user` content as a string or `text` and `image_url` parts; an image must be a base64 `data:`
   URL of PNG, JPEG, GIF or WebP;
-- `assistant` content (text and refusal parts joined) is a text block, followed by one
+- `assistant` content (text and refusal parts joined, then the `refusal` field) is a text block, followed by one
   `tool_use` per `tool_calls[]` entry with its arguments parsed as a JSON object;
 - each `tool` message is a `tool_result` for its `tool_call_id`, which an earlier assistant
   message must have made; consecutive messages of one role merge, so the results of one

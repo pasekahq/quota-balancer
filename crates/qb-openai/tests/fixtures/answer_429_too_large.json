@@ -1,0 +1,17 @@
+{
+  "status": 429,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "error": {
+      "message": "Request too large for model-o in organization org-test on tokens per min (TPM): Limit 30000, Requested 50000. The input or output tokens must be reduced in order to run successfully.",
+      "type": "tokens",
+      "param": null,
+      "code": "rate_limit_exceeded"
+    }
+  }
+}

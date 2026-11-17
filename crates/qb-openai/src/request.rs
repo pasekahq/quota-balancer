@@ -129,6 +129,9 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// Smallest `max_output_tokens` the vendor accepts.
+pub const MIN_OUTPUT_TOKENS: u32 = 16;
+
 /// Effort values the vendor accepts in `reasoning.effort`.
 const EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -196,7 +199,7 @@ pub fn build(req: &TurnRequest, at: &Target<'_>) -> Result<CreateResponse, Build
         tool_choice: has_tools.then(|| Value::String("auto".into())),
         parallel_tool_calls: has_tools.then_some(true),
         max_output_tokens: match at.auth {
-            AuthMode::ApiKey => Some(req.max_tokens),
+            AuthMode::ApiKey => Some(req.max_tokens.max(MIN_OUTPUT_TOKENS)),
             AuthMode::ChatgptOauth => None,
         },
         reasoning: at.reasoning.then(|| ReasoningConfig {

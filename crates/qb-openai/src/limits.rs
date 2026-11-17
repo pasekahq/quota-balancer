@@ -153,10 +153,22 @@ pub fn retry_in(message: &str) -> Option<u64> {
     let lower = message.to_ascii_lowercase();
     let start = lower.find(AT)? + AT.len();
     let tail = &lower[start..];
-    let end = tail
-        .find(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ')')
-        .unwrap_or(tail.len());
-    duration_secs(tail[..end].trim_end_matches('.'))
+    let mut words = tail
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ')')
+        .map(|w| w.trim_end_matches('.'));
+    let first = words.next()?;
+    if !first.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return duration_secs(first);
+    }
+    // A bare number names its unit in the next word: `5 minutes`, `1 second`.
+    let scale = match words.next().unwrap_or_default() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+        "min" | "mins" | "minute" | "minutes" => 60.0,
+        "h" | "hour" | "hours" => 3600.0,
+        "ms" | "millisecond" | "milliseconds" => 1e-3,
+        _ => return None,
+    };
+    ceil_secs(number(first)? * scale)
 }
 
 /// Reads the subscription and API key rate-limit headers and `retry-after` of an answer at `now`.
@@ -356,11 +368,16 @@ const MODEL_PHRASES: &[&str] = &[
     "model is not supported",
     "does not exist",
     "model not found",
+    "must be verified",
 ];
+
+/// A request over a per-minute token limit: no login with the same limit can ever serve it.
+const TOO_LARGE_PHRASES: &[&str] = &["request too large", "must be reduced"];
 
 /// The error object of an answer body, read leniently.
 #[derive(Debug, Default)]
 struct Detail {
+    json: bool,
     kind: String,
     code: String,
     message: String,
@@ -407,6 +424,7 @@ fn detail_of(body: &[u8], now: u64) -> Detail {
             now.checked_add(ceil_secs(after)?)
         });
     Detail {
+        json: true,
         kind: text(obj.get("type")),
         code: text(obj.get("code")),
         message,
@@ -431,7 +449,7 @@ fn by_detail(status: Option<u16>, d: &Detail, limits: &RateLimits) -> FailureKin
     if has(&["usage_not_included", "model_not_found"]) {
         return FailureKind::ModelUnavailable;
     }
-    if has(&["context_length_exceeded"]) {
+    if has(&["context_length_exceeded"]) || says(&d.message, TOO_LARGE_PHRASES) {
         return FailureKind::ContextTooLong;
     }
     let auth = has(&[
@@ -450,6 +468,8 @@ fn by_detail(status: Option<u16>, d: &Detail, limits: &RateLimits) -> FailureKin
     let overloaded = has(&["server_is_overloaded", "slow_down", "overloaded_error"]);
     let invalid = has(&["invalid_request_error", "invalid_prompt"]);
     match status {
+        // A 403 that is not an API error is a proxy or bot wall, not a rejected credential.
+        Some(403) if !d.json => FailureKind::Unavailable,
         Some(401 | 403) => FailureKind::Auth,
         _ if auth => FailureKind::Auth,
         Some(429) => {
@@ -504,6 +524,7 @@ pub fn classify_response(status: u16, headers: &[(&str, &str)], body: &[u8], now
 /// started with `limits` in its response headers.
 pub fn classify_stream_error(code: &str, message: &str, limits: &RateLimits) -> Failure {
     let detail = Detail {
+        json: true,
         kind: String::new(),
         code: code.to_owned(),
         message: message.to_owned(),
@@ -541,6 +562,10 @@ mod tests {
         );
         assert_eq!(retry_in("Please try again in 6m0s. Visit …"), Some(360));
         assert_eq!(retry_in("slow down"), None);
+        assert_eq!(retry_in("Please try again in 5 minutes."), Some(300));
+        assert_eq!(retry_in("try again in 1 second"), Some(1));
+        assert_eq!(retry_in("try again in 20 seconds."), Some(20));
+        assert_eq!(retry_in("try again in 3 days"), None);
     }
 
     #[test]

@@ -13,8 +13,9 @@ pub struct Frame {
     pub data: String,
 }
 
-/// Default bound of one event: line buffer plus data. A `response.completed` event repeats the
-/// whole output, so the bound is the per-turn allowance of the gateway's memory budget, 1 MiB.
+/// Default bound of one event: line buffer plus data, the per-turn allowance of the gateway's
+/// memory budget. A Responses stream repeats the request in its lifecycle events, so its reader
+/// adds the request size (`stream::event_bound`).
 pub const MAX_EVENT_BYTES: usize = 1 << 20;
 
 /// An event grew beyond the parser's bound; the stream cannot be trusted further.

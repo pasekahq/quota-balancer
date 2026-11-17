@@ -4,8 +4,9 @@
 mod common;
 
 use common::{Answer, NOW, OTHER, VENDOR, fixture, object, run};
-use qb_openai::limits::{FailureKind, classify_response, rate_limits};
+use qb_openai::limits::{FailureKind, RateLimits, classify_response, rate_limits};
 use qb_openai::request::{AuthMode, BuildError, Target, build, identity};
+use qb_openai::stream::{Progress, Reader, event_bound};
 use qb_proto::{
     Block, Effort, ErrorClass, MediaType, Message, Outcome, Role, StopReason, StreamEvent,
     Thinking, Tool, ToolCall, TurnRequest, Usage, WindowReport,
@@ -394,7 +395,25 @@ struct Case {
     outcome: Outcome,
 }
 
-const CASES: [Case; 14] = [
+const CASES: [Case; 17] = [
+    Case {
+        fixture: "answer_429_too_large.json",
+        kind: FailureKind::ContextTooLong,
+        class: ErrorClass::ContextTooLong,
+        outcome: Outcome::Error,
+    },
+    Case {
+        fixture: "answer_400_unverified.json",
+        kind: FailureKind::ModelUnavailable,
+        class: ErrorClass::Unavailable,
+        outcome: Outcome::ModelUnavailable,
+    },
+    Case {
+        fixture: "answer_403_html.json",
+        kind: FailureKind::Unavailable,
+        class: ErrorClass::Unavailable,
+        outcome: Outcome::Error,
+    },
     Case {
         fixture: "answer_429_usage_limit.json",
         kind: FailureKind::UsageLimit {
@@ -540,4 +559,41 @@ fn a_429_without_body_reads_exhaustion_from_the_headers() {
         }
     );
     assert_eq!(f.message, "vendor answered HTTP 429");
+}
+
+#[test]
+fn small_output_bounds_are_raised_to_the_vendor_minimum() {
+    let mut req = turn();
+    req.max_tokens = 1;
+    let body = build(&req, &target(AuthMode::ApiKey)).expect("builds");
+    assert_eq!(
+        body.max_output_tokens,
+        Some(qb_openai::request::MIN_OUTPUT_TOKENS)
+    );
+}
+
+#[test]
+fn lifecycle_events_that_repeat_a_large_request_fit_the_event_bound() {
+    let instructions = "x".repeat(1_200_000);
+    let created = json!({"type": "response.created", "response": {"status": "in_progress",
+        "instructions": instructions, "output": []}});
+    let completed = json!({"type": "response.completed", "response": {"status": "completed",
+        "instructions": instructions, "output": []}});
+    let bytes = format!(
+        "event: response.created\ndata: {created}\n\nevent: response.completed\ndata: {completed}\n\n"
+    );
+    let mut small = Reader::new(VENDOR, RateLimits::default());
+    assert!(
+        small.feed(bytes.as_bytes(), &mut Vec::new()).is_err(),
+        "the default bound"
+    );
+    let mut reader = Reader::with_event_bound(
+        VENDOR,
+        RateLimits::default(),
+        event_bound(instructions.len() + 100),
+    );
+    assert_eq!(
+        reader.feed(bytes.as_bytes(), &mut Vec::new()),
+        Ok(Progress::Finished(StopReason::End))
+    );
 }

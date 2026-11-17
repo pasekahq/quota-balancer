@@ -153,31 +153,38 @@ pub fn finish_reason(r: StopReason) -> &'static str {
 }
 
 /// Chat Completions counts of canonical counts: `prompt_tokens` includes cached and cache-written
-/// tokens, `cached_tokens` is `cache_read`.
+/// tokens, `cached_tokens` is `cache_read`; the canonical counts have no reasoning count, so
+/// `reasoning_tokens` is 0.
 pub fn chat_usage(u: Usage) -> ChatUsage {
-    let prompt = u.input + u.cache_read + u.cache_write;
+    let prompt = u
+        .input
+        .saturating_add(u.cache_read)
+        .saturating_add(u.cache_write);
     ChatUsage {
         prompt_tokens: prompt,
         completion_tokens: u.output,
-        total_tokens: prompt + u.output,
+        total_tokens: prompt.saturating_add(u.output),
         prompt_tokens_details: Some(PromptTokensDetails {
             cached_tokens: u.cache_read,
         }),
-        completion_tokens_details: None::<CompletionTokensDetails>,
+        completion_tokens_details: Some(CompletionTokensDetails::default()),
     }
 }
 
 /// Responses counts of canonical counts, as [`chat_usage`].
 pub fn responses_usage(u: Usage) -> ResponsesUsage {
-    let input = u.input + u.cache_read + u.cache_write;
+    let input = u
+        .input
+        .saturating_add(u.cache_read)
+        .saturating_add(u.cache_write);
     ResponsesUsage {
         input_tokens: input,
         input_tokens_details: Some(PromptTokensDetails {
             cached_tokens: u.cache_read,
         }),
         output_tokens: u.output,
-        output_tokens_details: None,
-        total_tokens: input + u.output,
+        output_tokens_details: Some(CompletionTokensDetails::default()),
+        total_tokens: input.saturating_add(u.output),
     }
 }
 
