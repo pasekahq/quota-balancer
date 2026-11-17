@@ -6,6 +6,7 @@
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
 //! - [`upstream`]: the seam vendor adapters implement;
 //! - [`anthropic`]: the adapter of the `anthropic` API family;
+//! - [`oauth`]: the token refresher of `oauth_anthropic` logins;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`front`]: the C4 front over the unix socket.
 
@@ -14,4 +15,5 @@ pub mod config;
 pub mod core;
 pub mod creds;
 pub mod front;
+pub mod oauth;
 pub mod upstream;

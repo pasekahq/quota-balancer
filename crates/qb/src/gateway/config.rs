@@ -109,6 +109,9 @@ pub struct GatewayLogin {
     /// Base URL of the vendor API without a trailing `/`; `None` for the adapter's public
     /// endpoint.
     pub base_url: Option<String>,
+    /// URL of the OAuth token endpoint of an `oauth_anthropic` login; `None` for the vendor's
+    /// endpoints.
+    pub token_url: Option<String>,
     /// Absolute path of the credential file, mode 0600.
     pub credentials: PathBuf,
 }
@@ -353,10 +356,19 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
         kind: CredentialKind::ApiKey,
         api: Api::Anthropic,
         base_url: None,
+        token_url: None,
         credentials: PathBuf::new(),
     };
     let mut api = None;
-    let keys = ["name", "kind", "api", "base_url", "credentials"];
+    let mut token_url_at = None;
+    let keys = [
+        "name",
+        "kind",
+        "api",
+        "base_url",
+        "token_url",
+        "credentials",
+    ];
     let required = ["name", "kind", "credentials"];
     fields(at, t, &keys, &required, |key, at, v| {
         match key {
@@ -372,7 +384,11 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
                 };
                 api = Some((family, v.span().start));
             }
-            "base_url" => l.base_url = Some(base_url(at, v)?),
+            "base_url" => l.base_url = Some(url(at, v)?),
+            "token_url" => {
+                l.token_url = Some(url(at, v)?);
+                token_url_at = Some(v.span().start);
+            }
             "kind" => {
                 l.kind = match string(at, v)?.as_str() {
                     "oauth_anthropic" => CredentialKind::OauthAnthropic,
@@ -399,12 +415,16 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
             return Err((format!("{at}.api"), reason, None));
         }
     };
+    if let (CredentialKind::ApiKey, Some(span)) = (l.kind, token_url_at) {
+        let reason = "belongs to an `oauth_anthropic` login".into();
+        return Err((format!("{at}.token_url"), reason, Some(span)));
+    }
     Ok(l)
 }
 
-/// A base URL without its trailing `/`: `https://` with port 443, or `http://` with a loopback
-/// host, then an optional path; no user, query or fragment.
-fn base_url(at: &str, v: &Value<'_>) -> Result<String, WalkError> {
+/// A URL without its trailing `/`: `https://` with port 443, or `http://` with a loopback host,
+/// then an optional path; no user, query or fragment.
+fn url(at: &str, v: &Value<'_>) -> Result<String, WalkError> {
     let url = string(at, v)?;
     let bad = |reason: &str| (at.to_owned(), reason.to_owned(), Some(v.span().start));
     let (https, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
@@ -430,7 +450,7 @@ fn base_url(at: &str, v: &Value<'_>) -> Result<String, WalkError> {
     };
     if https && port.is_some_and(|p| p != 443) {
         return Err(bad(
-            "an `https` base URL uses port 443, the only one the sandbox connects to",
+            "an `https` URL uses port 443, the only one the sandbox connects to",
         ));
     }
     let bare = host.trim_start_matches('[').trim_end_matches(']');
@@ -713,7 +733,7 @@ difficulty = 1
             (
                 "",
                 "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\napi = \"openai\"\nbase_url = \"https://example.com:8443\"\ncredentials = \"/c.json\"\n",
-                "logins[1].base_url: an `https` base URL uses port 443",
+                "logins[1].base_url: an `https` URL uses port 443",
             ),
             (
                 "",
@@ -747,6 +767,43 @@ difficulty = 1
         for (top, extra, want) in cases {
             let err = check(top, extra).unwrap_err();
             assert!(err.contains(want), "{top}{extra}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_token_url_follows_the_url_rules_on_oauth_logins_only() {
+        let login = |kind: &str, url: &str| {
+            format!(
+                "[[logins]]\nname = \"login-2\"\n{kind}\ntoken_url = \"{url}\"\ncredentials = \"/c.json\"\n"
+            )
+        };
+        let oauth = "kind = \"oauth_anthropic\"";
+        let c = check("", &login(oauth, "http://127.0.0.1:443/v1/oauth/token/")).unwrap();
+        assert_eq!(
+            c.login("login-2").unwrap().token_url.as_deref(),
+            Some("http://127.0.0.1:443/v1/oauth/token")
+        );
+        assert_eq!(c.login("login-1").unwrap().token_url, None);
+        let cases = [
+            (
+                login(oauth, "https://example.com:8443/t"),
+                "logins[1].token_url: an `https` URL uses port 443",
+            ),
+            (
+                login(oauth, "http://example.com/t"),
+                "logins[1].token_url: plain `http` is accepted only for a loopback host",
+            ),
+            (
+                login(
+                    "kind = \"api_key\"\napi = \"anthropic\"",
+                    "https://example.com/t",
+                ),
+                "logins[1].token_url: belongs to an `oauth_anthropic` login (line 17)",
+            ),
+        ];
+        for (extra, want) in cases {
+            let err = check("", &extra).unwrap_err();
+            assert!(err.contains(want), "{extra}: {err}");
         }
     }
 }

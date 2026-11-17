@@ -13,7 +13,7 @@ adapters of its own can instead send its model requests through the optional `qb
 it runs as the owner of the logins, holds their OAuth tokens and API keys, refreshes the tokens,
 picks and rotates logins through `qbd` and streams the answers back. It carries model traffic
 only for its own credential owner. The decision is [ADR 0001](docs/adr/0001-model-gateway.md);
-the gateway is not built yet.
+the gateway serves logins of the Anthropic Messages API, by OAuth token or API key.
 
 > **Status: pre-alpha skeleton (0.0.x).** The API contract, transport, CLI and service templates
 > are in place, and the agent probes the vendors' usage endpoints; the scheduling policy and

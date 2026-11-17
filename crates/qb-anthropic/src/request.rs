@@ -27,6 +27,13 @@ pub mod identity {
         "You are Claude Code, Anthropic's official CLI for Claude.";
     /// `user-agent` of the API key mode.
     pub const API_KEY_USER_AGENT: &str = "qb-gateway";
+    /// The vendor CLI's public OAuth client id, sent with every token refresh.
+    pub const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+    /// OAuth token endpoints of the vendor, the primary first.
+    pub const OAUTH_TOKEN_URLS: [&str; 2] = [
+        "https://platform.claude.com/v1/oauth/token",
+        "https://console.anthropic.com/v1/oauth/token",
+    ];
 }
 
 /// How the gateway authenticates to the vendor.
