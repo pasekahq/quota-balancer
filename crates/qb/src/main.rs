@@ -435,7 +435,7 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         log::info("qb gateway: using the socket passed by systemd");
         l
     } else {
-        let l = listen::bind(&config.socket)
+        let l = listen::bind_with_mode(&config.socket, config.socket_mode)
             .map_err(|e| format!("{}: {e}", config.socket.display()))?;
         log::info(&format!(
             "qb gateway: listening on {}",

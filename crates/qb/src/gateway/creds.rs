@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
+use super::config::CredentialKind;
 use super::upstream::Credential;
 
 /// An OAuth token is refreshed when it expires within this many seconds.
@@ -135,7 +136,7 @@ impl CredentialStore {
         }
     }
 
-    /// The credential of `login` in `file` at `now`. An OAuth token expiring within
+    /// The credential of `login` in `file`, which must hold `kind`, at `now`. An OAuth token expiring within
     /// [`REFRESH_MARGIN_S`], or any token when `stale` (the vendor just rejected it), is
     /// refreshed first unless another attempt already replaced it.
     ///
@@ -145,10 +146,25 @@ impl CredentialStore {
         &self,
         login: &str,
         file: &Path,
+        kind: CredentialKind,
         now: u64,
         stale: bool,
     ) -> Result<Credential, CredError> {
         let first = read(file)?;
+        let found = match first.kind {
+            Kind::OauthAnthropic => CredentialKind::OauthAnthropic,
+            Kind::ApiKey => CredentialKind::ApiKey,
+        };
+        if found != kind {
+            return Err(unusable(
+                file,
+                format_args!(
+                    "has type `{}`, the config says `{}`",
+                    found.as_str(),
+                    kind.as_str()
+                ),
+            ));
+        }
         let token = match first.kind {
             Kind::ApiKey => {
                 let key = secret(file, "key", first.key.as_ref())?;
@@ -346,6 +362,8 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+    const KIND: CredentialKind = CredentialKind::OauthAnthropic;
+    const KEY: CredentialKind = CredentialKind::ApiKey;
     /// A synthetic marker standing in for a token; it must never appear in an error.
     const MARK: &str = "test-token-7f3a";
 
@@ -410,12 +428,25 @@ mod tests {
     fn api_keys_and_fresh_tokens_load_as_they_are() {
         let (s, calls) = store(None);
         let f = file("key", r#"{"type":"api_key","key":"test-token-1"}"#, 0o600);
-        let c = s.load("login-1", &f, NOW, false).unwrap();
+        let c = s.load("login-1", &f, KEY, NOW, false).unwrap();
         assert_eq!((c.kind(), c.secret()), ("api_key", "test-token-1"));
         let f = file("fresh", &oauth("access-0", NOW + 600), 0o600);
-        let c = s.load("login-1", &f, NOW, false).unwrap();
+        let c = s.load("login-1", &f, KIND, NOW, false).unwrap();
         assert_eq!((c.kind(), c.secret()), ("oauth_anthropic", "access-0"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_file_of_another_kind_than_configured_is_refused() {
+        let (s, _) = store(None);
+        let f = file("kind", r#"{"type":"api_key","key":"test-token-1"}"#, 0o600);
+        let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
+        assert!(e.unusable, "{e}");
+        assert!(
+            e.message
+                .contains("has type `api_key`, the config says `oauth_anthropic`"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -423,7 +454,7 @@ mod tests {
         let (s, _) = store(None);
         for mode in [0o640, 0o604, 0o660, 0o644] {
             let f = file("mode", r#"{"type":"api_key","key":"test-token-1"}"#, mode);
-            let e = s.load("login-1", &f, NOW, false).unwrap_err();
+            let e = s.load("login-1", &f, KEY, NOW, false).unwrap_err();
             assert!(
                 e.unusable && e.message.contains("too open"),
                 "{mode:o}: {e}"
@@ -432,14 +463,17 @@ mod tests {
         let d = dir("link");
         let target = file("target", r#"{"type":"api_key","key":"k"}"#, 0o600);
         std::os::unix::fs::symlink(&target, d.join("link.json")).unwrap();
-        assert!(s.load("login-1", &d.join("link.json"), NOW, false).is_err());
+        assert!(
+            s.load("login-1", &d.join("link.json"), KEY, NOW, false)
+                .is_err()
+        );
     }
 
     #[test]
     fn an_expiring_token_is_refreshed_and_written_back_atomically() {
         let (s, calls) = store(None);
         let f = file("refresh", &oauth("access-0", NOW + 30), 0o600);
-        let c = s.load("login-1", &f, NOW, false).unwrap();
+        let c = s.load("login-1", &f, KIND, NOW, false).unwrap();
         assert_eq!(c.secret(), "access-1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let meta = std::fs::metadata(&f).unwrap();
@@ -454,7 +488,7 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["login-1.json"], "no temporary file is left");
-        let again = s.load("login-1", &f, NOW, false).unwrap();
+        let again = s.load("login-1", &f, KIND, NOW, false).unwrap();
         assert_eq!(again.secret(), "access-1");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -468,7 +502,7 @@ mod tests {
         let (s, calls) = store(None);
         let f = file("stale", &oauth("access-0", NOW + 600), 0o600);
         assert_eq!(
-            s.load("login-1", &f, NOW, true).unwrap().secret(),
+            s.load("login-1", &f, KIND, NOW, true).unwrap().secret(),
             "access-1"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -480,7 +514,7 @@ mod tests {
             let (s, _) = store(Some(rejected));
             let body = oauth("access-0", NOW);
             let f = file("fail", &body, 0o600);
-            let e = s.load("login-1", &f, NOW, false).unwrap_err();
+            let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
             assert_eq!(e.unusable, rejected);
             assert!(!e.message.contains(MARK), "{e}");
             assert_eq!(std::fs::read_to_string(&f).unwrap(), body);
@@ -500,7 +534,7 @@ mod tests {
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
             return;
         }
-        let e = s.load("login-1", &f, NOW, false).unwrap_err();
+        let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(e.message.contains("cannot write"), "{e}");
         assert!(!e.message.contains(MARK), "{e}");
@@ -516,13 +550,13 @@ mod tests {
             std::thread::spawn(move || {
                 let (s, _) = store(None);
                 for _ in 0..300 {
-                    let c = s.load("login-1", &f, NOW - 7200, false).unwrap();
+                    let c = s.load("login-1", &f, KIND, NOW - 7200, false).unwrap();
                     assert!(c.secret().starts_with("access-"));
                 }
             })
         };
         for _ in 0..100 {
-            s.load("login-1", &f, NOW, true).unwrap();
+            s.load("login-1", &f, KIND, NOW, true).unwrap();
         }
         reader.join().unwrap();
     }
@@ -556,13 +590,18 @@ mod tests {
                 "trailing data",
             ),
             (
+                format!(r#"{{"type":"api_key","access_token":"{MARK}"}}"#),
+                "no `key`",
+            ),
+            (
                 format!(r#"{{"type":"oauth_anthropic","access_token":"{MARK}","expires_at":1}}"#),
                 "no `refresh_token`",
             ),
         ];
         for (body, want) in cases {
             let f = file("leak", &body, 0o600);
-            let e = s.load("login-1", &f, NOW, false).unwrap_err();
+            let kind = if body.contains("api_key") { KEY } else { KIND };
+            let e = s.load("login-1", &f, kind, NOW, false).unwrap_err();
             assert!(e.message.starts_with(&f.display().to_string()), "{e}");
             assert!(e.message.contains(want), "{body}: {e}");
             assert!(!e.message.contains(MARK), "{body}: {e}");

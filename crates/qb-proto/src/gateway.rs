@@ -99,7 +99,8 @@ pub enum Block {
     Image {
         /// Media type.
         media_type: MediaType,
-        /// Absolute path of a file beneath one of the gateway's `media_dirs`.
+        /// Absolute path of a local file; part of the contract's shape, refused by `qb gateway`,
+        /// which reads no file a client names.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
         /// Standard base64 of the image bytes.
@@ -349,7 +350,8 @@ impl TurnRequest {
 
 /// One NDJSON line of the turn stream. A stream carries `route`, then any number of
 /// `text_delta`, `thinking`, `tool_call` and `usage`, and ends with exactly one `stop` or
-/// `error`; a stream without either was cut by a cancel or a transport failure.
+/// `error`; a turn that fails before any vendor answered is one `error` without `route`. A
+/// stream without a final event was cut by a transport failure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StreamEvent {
@@ -466,7 +468,7 @@ impl StopReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
-    /// Every login of the route is out of quota.
+    /// Every candidate of the route waits for a reset or back-off; `resets_at` says until when.
     QuotaExhausted,
     /// A login, or the caller, was rejected.
     Auth,
@@ -478,6 +480,10 @@ pub enum ErrorClass {
     BadRequest,
     /// The conversation does not fit the model.
     ContextTooLong,
+    /// The turn was cancelled by `POST /v1/model/cancel`.
+    Cancelled,
+    /// qbd has no candidate the route can ever run on (`dead`).
+    NoRoute,
 }
 
 impl ErrorClass {
@@ -490,6 +496,8 @@ impl ErrorClass {
             Self::Overloaded => "overloaded",
             Self::BadRequest => "bad_request",
             Self::ContextTooLong => "context_too_long",
+            Self::Cancelled => "cancelled",
+            Self::NoRoute => "no_route",
         }
     }
 
@@ -498,9 +506,10 @@ impl ErrorClass {
         match self {
             Self::BadRequest | Self::ContextTooLong => 400,
             Self::Auth => 401,
-            Self::QuotaExhausted => 429,
+            Self::Cancelled => 409,
+            Self::QuotaExhausted | Self::Overloaded => 429,
             Self::Unavailable => 502,
-            Self::Overloaded => 503,
+            Self::NoRoute => 503,
         }
     }
 }

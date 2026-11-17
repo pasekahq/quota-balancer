@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use qb::auth::Gate;
-use qb::gateway::core::Gateway;
+use qb::gateway::config::CredentialKind;
+use qb::gateway::core::{Cancel, Gateway};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
 use qb::gateway::front;
 use qb::gateway::upstream::{
@@ -34,7 +35,7 @@ use zeroize::Zeroizing;
 
 mod common;
 
-use common::{Daemon, line_with, own_uid, start_daemon, stderr_lines, temp_dir, wait_for};
+use common::{Daemon, line_with, start_daemon, stderr_lines, temp_dir, wait_for};
 
 const QBD: &str = r#"
 [journal]
@@ -146,10 +147,13 @@ impl Upstream for Shared {
             }
             Script::Hang(events) => {
                 emit(events, sink)?;
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !cancel.is_cancelled() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                // Blocks like a vendor read until the cancel hook unblocks it.
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                cancel.on_cancel(Box::new(move || {
+                    let _ = tx.send(());
+                }));
+                let woke = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+                assert!(woke, "the cancel hook did not run");
                 Err(Failure::new(FailureKind::Cancelled, "cancelled"))
             }
         }
@@ -215,21 +219,23 @@ fn start_qbd(dir: &Path) -> PathBuf {
     sock
 }
 
-/// The gateway config for `dir`, with `extra` appended.
-fn gateway_toml(dir: &Path, qbd: &Path, max_turns: u32, extra: &str) -> String {
+/// The gateway config for `dir` with credential kinds `kinds` of login-1 and login-2, and
+/// `extra` appended.
+fn gateway_toml(dir: &Path, qbd: &Path, max_turns: u32, kinds: [&str; 2], extra: &str) -> String {
     format!(
         r#"socket = "{dir}/gw.sock"
 qbd_socket = "{qbd}"
-media_dirs = ["{dir}/media"]
 max_turns = {max_turns}
-max_body_bytes = 65536
+max_request_bytes = 65536
 
 [[logins]]
 name = "login-1"
+kind = "{k1}"
 credentials = "{dir}/creds/login-1.json"
 
 [[logins]]
 name = "login-2"
+kind = "{k2}"
 credentials = "{dir}/creds/login-2.json"
 
 [[routes]]
@@ -244,7 +250,9 @@ vendor = "vendor-b"
 model = "model-b"
 {extra}"#,
         dir = dir.display(),
-        qbd = qbd.display()
+        qbd = qbd.display(),
+        k1 = kinds[0],
+        k2 = kinds[1],
     )
 }
 
@@ -252,7 +260,6 @@ model = "model-b"
 fn credentials(dir: &Path, files: &[(&str, String, u32)]) {
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
-    std::fs::create_dir_all(dir.join("media")).unwrap();
     for (login, contents, mode) in files {
         let f = creds.join(format!("{login}.json"));
         std::fs::write(&f, contents).unwrap();
@@ -260,18 +267,34 @@ fn credentials(dir: &Path, files: &[(&str, String, u32)]) {
     }
 }
 
-fn rig_with(max_turns: u32, extra: &str, files: &[(&str, String, u32)]) -> Rig {
+/// The kind a credential file's contents declare.
+fn kind_of(contents: &str) -> &'static str {
+    if contents.contains("oauth_anthropic") {
+        "oauth_anthropic"
+    } else {
+        "api_key"
+    }
+}
+
+fn rig_with(max_turns: u32, files: &[(&str, String, u32)]) -> Rig {
     let dir = temp_dir("gw");
     credentials(&dir, files);
     let qbd = start_qbd(&dir);
-    let text = gateway_toml(&dir, &qbd, max_turns, extra);
+    let kind = |i: usize| files.get(i).map_or("api_key", |f| kind_of(&f.1));
+    let text = gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], "");
     let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
     let gw = config.socket.clone();
     let fake = Arc::new(Fake::default());
     let refreshes = Arc::new(AtomicUsize::new(0));
     let gateway = Gateway::new(
         config,
-        vec![("vendor-a".into(), Box::new(Shared(Arc::clone(&fake))))],
+        vec![
+            (CredentialKind::ApiKey, Box::new(Shared(Arc::clone(&fake)))),
+            (
+                CredentialKind::OauthAnthropic,
+                Box::new(Shared(Arc::clone(&fake))),
+            ),
+        ],
         Box::new(Counting(Arc::clone(&refreshes))),
         None,
     );
@@ -289,7 +312,6 @@ fn rig_with(max_turns: u32, extra: &str, files: &[(&str, String, u32)]) -> Rig {
 fn rig() -> Rig {
     rig_with(
         4,
-        "",
         &[
             ("login-1", api_key("test-token-1"), 0o600),
             ("login-2", api_key("test-token-2"), 0o600),
@@ -605,7 +627,10 @@ fn an_exhausted_chain_answers_quota_exhausted_with_the_nearest_reset() {
     assert_eq!(kinds(&events), ["error QuotaExhausted"]);
     let e = last_error(&events);
     assert_eq!(e.resets_at, Some(early));
-    assert!(!e.retryable);
+    assert!(
+        e.retryable,
+        "a wait ends; quota_exhausted is retryable at resets_at"
+    );
     let tried: Vec<_> = e
         .tried
         .iter()
@@ -633,7 +658,7 @@ fn an_exhausted_chain_answers_quota_exhausted_with_the_nearest_reset() {
 }
 
 #[test]
-fn routes_show_where_a_turn_would_run_and_take_no_lease() {
+fn routes_show_the_state_of_their_logins_and_take_no_lease() {
     let r = rig();
     let (status, body) = call(&r.gw, "GET", paths::MODEL_ROUTES, "");
     assert_eq!(status, 200);
@@ -653,13 +678,13 @@ fn routes_show_where_a_turn_would_run_and_take_no_lease() {
     assert_eq!(
         shown,
         [
+            ("chat", RouteState::Ready, None, None),
             (
-                "chat",
-                RouteState::Ready,
-                Some("vendor-a"),
-                Some("model-large")
-            ),
-            ("spare", RouteState::Unavailable, None, None)
+                "spare",
+                RouteState::Unavailable,
+                Some("vendor-b"),
+                Some("model-b")
+            )
         ]
     );
     assert_eq!(state(&r.qbd).leases, Vec::new());
@@ -670,7 +695,6 @@ fn routes_show_where_a_turn_would_run_and_take_no_lease() {
 fn cancel_stops_an_in_flight_turn_and_frees_its_slot() {
     let r = rig_with(
         1,
-        "",
         &[
             ("login-1", api_key("test-token-1"), 0o600),
             ("login-2", api_key("test-token-2"), 0o600),
@@ -699,7 +723,7 @@ fn cancel_stops_an_in_flight_turn_and_frees_its_slot() {
     );
     assert_eq!(
         (status, busy.class, busy.retry_after),
-        (503, ErrorClass::Overloaded, Some(1))
+        (429, ErrorClass::Overloaded, Some(1))
     );
     let (status, dup) = rejection(
         &r.gw,
@@ -724,20 +748,26 @@ fn cancel_stops_an_in_flight_turn_and_frees_its_slot() {
     assert!(answer.cancelled);
     let (status, _, rest) = finish(s, seen);
     assert_eq!(status, 200);
+    let events = events(&rest);
     assert_eq!(
-        kinds(&events(&rest)),
-        ["route login-1", "text_delta"],
-        "a cut stream has no stop or error"
+        kinds(&events),
+        ["route login-1", "text_delta", "error Cancelled"]
     );
-    assert_eq!(state(&r.qbd).leases, Vec::new(), "the lease is released");
-    let (_, body) = call(
+    assert!(!last_error(&events).retryable);
+    let s = state(&r.qbd);
+    assert_eq!(s.leases, Vec::new(), "the lease is released");
+    assert_eq!(
+        status_of(&s, "login-1"),
+        LoginStatus::Unknown,
+        "a cancelled stream does not mark the login"
+    );
+    let (status, gone) = rejection(
         &r.gw,
         "POST",
         paths::MODEL_CANCEL,
         r#"{"request_id":"turn-1"}"#,
     );
-    let answer: CancelAnswer = serde_json::from_slice(&body).unwrap();
-    assert!(!answer.cancelled, "nothing runs any more");
+    assert_eq!((status, gone.class), (404, ErrorClass::BadRequest));
     let (_, _, events) = turn(&r.gw, &turn_body("turn-3"));
     assert_eq!(
         kinds(&events).last().unwrap(),
@@ -755,8 +785,8 @@ fn malformed_and_oversized_requests_are_rejected_before_any_work() {
     unknown["route"] = json!("nope");
     let mut extra = turn_body("t");
     extra["model"] = json!("model-large");
-    let mut outside = turn_body("t");
-    outside["messages"][0]["content"] = json!([
+    let mut by_path = turn_body("t");
+    by_path["messages"][0]["content"] = json!([
         {"type": "image", "media_type": "image/png", "path": format!("{}/creds/login-1.json", r.dir.display())}
     ]);
     let cases = [
@@ -785,9 +815,9 @@ fn malformed_and_oversized_requests_are_rejected_before_any_work() {
         (
             "POST",
             paths::MODEL_TURN,
-            outside.to_string(),
+            by_path.to_string(),
             400,
-            "outside the gateway's media_dirs",
+            "images must be sent inline",
         ),
         ("GET", paths::MODEL_TURN, String::new(), 405, "method"),
         (
@@ -813,23 +843,32 @@ fn malformed_and_oversized_requests_are_rejected_before_any_work() {
 }
 
 #[test]
-fn a_peer_that_is_not_an_allowed_client_is_refused() {
-    let foreign = own_uid().wrapping_add(1);
-    let r = rig_with(
-        4,
-        &format!("\n[[clients]]\nname = \"client-a\"\nuid = {foreign}\n"),
-        &[("login-1", api_key("test-token-1"), 0o600)],
-    );
-    let (status, e) = rejection(
-        &r.gw,
-        "POST",
-        paths::MODEL_TURN,
-        &turn_body("t").to_string(),
-    );
-    assert_eq!((status, e.class), (401, ErrorClass::Auth));
-    let (status, _) = rejection(&r.gw, "GET", paths::MODEL_ROUTES, "");
-    assert_eq!(status, 401);
-    assert_eq!(r.fake.calls(), Vec::new());
+fn health_answers_and_only_the_starting_caller_may_cancel() {
+    let r = rig();
+    let (status, body) = call(&r.gw, "GET", paths::HEALTH, "");
+    assert_eq!(status, 200);
+    let health: qb_proto::HealthResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health.api_version, "v1");
+
+    let config = qb::gateway::config::parse(
+        Path::new("gateway.toml"),
+        &gateway_toml(&r.dir, &r.qbd, 4, ["api_key", "api_key"], ""),
+    )
+    .unwrap();
+    let gateway = Gateway::new(config, Vec::new(), Box::new(Counting(Arc::default())), None);
+    let req: TurnRequest = serde_json::from_value(turn_body("turn-9")).unwrap();
+    let admitted = gateway.admit("client-a", &req).unwrap();
+    assert_eq!(gateway.cancel("client-b", "turn-9"), Cancel::Forbidden);
+    assert!(!admitted.cancel_token().is_cancelled());
+    assert_eq!(gateway.cancel("client-a", "turn-8"), Cancel::Unknown);
+    let waiter = std::thread::spawn(move || {
+        while !admitted.cancel_token().is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(admitted);
+    });
+    assert_eq!(gateway.cancel("client-a", "turn-9"), Cancel::Cancelled);
+    waiter.join().unwrap();
 }
 
 #[test]
@@ -840,7 +879,7 @@ fn a_rejected_token_is_refreshed_and_the_turn_retried() {
             unix_now() + 3600
         )
     };
-    let r = rig_with(4, "", &[("login-1", oauth("access-0"), 0o600)]);
+    let r = rig_with(4, &[("login-1", oauth("access-0"), 0o600)]);
     r.fake.script(
         "login-1",
         Script::Fail(Vec::new(), FailureKind::Auth, Vec::new()),
@@ -855,6 +894,7 @@ fn a_rejected_token_is_refreshed_and_the_turn_retried() {
     );
     let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
     assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+    assert_eq!(state(&r.qbd).leases, Vec::new(), "one lease, released");
     let secrets: Vec<String> = r.fake.calls().into_iter().map(|c| c.1).collect();
     assert_eq!(secrets, ["access-0", "access-1"]);
     assert_eq!(r.refreshes.load(Ordering::SeqCst), 1);
@@ -864,21 +904,55 @@ fn a_rejected_token_is_refreshed_and_the_turn_retried() {
 }
 
 #[test]
-fn an_unusable_credential_file_marks_its_login_and_the_turn_moves_on() {
+fn an_unusable_credential_file_is_never_used_and_its_login_dies() {
     let r = rig_with(
         4,
-        "",
         &[
             ("login-1", api_key("test-token-1"), 0o644),
             ("login-2", api_key("test-token-2"), 0o600),
         ],
     );
-    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
-    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    // qbd keeps a login pickable after one 401, and a failed login is not tried again in the
+    // same turn: the first turn ends with `auth`.
+    let (_, _, first) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&first), ["error Auth"]);
+    assert_eq!(last_error(&first).tried.len(), 1);
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthStale);
+    // The second 401 makes it auth_dead, and the turn moves on to login-2.
+    let (_, _, second) = turn(&r.gw, &turn_body("turn-2"));
+    assert_eq!(kinds(&second), ["route login-2", "text_delta", "stop End"]);
     let logins: Vec<String> = r.fake.calls().into_iter().map(|c| c.0).collect();
     assert_eq!(logins, ["login-2"], "the open file is never used");
     let s = state(&r.qbd);
     assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_vendor_failure_before_the_first_event_repicks_avoiding_the_vendor() {
+    let r = rig();
+    r.fake.script(
+        "login-1",
+        Script::Fail(
+            Vec::new(),
+            FailureKind::Overloaded {
+                retry_after: Some(30),
+            },
+            Vec::new(),
+        ),
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["error Overloaded"]);
+    let e = last_error(&events);
+    assert!(e.retryable);
+    assert_eq!(e.tried.len(), 1, "no other vendor serves the route: {e:?}");
+    assert_eq!(r.fake.calls().len(), 1, "login-2 is of the same vendor");
+    let s = state(&r.qbd);
+    assert_eq!(
+        status_of(&s, "login-1"),
+        LoginStatus::Unknown,
+        "error marks nothing"
+    );
     assert_eq!(s.leases, Vec::new());
 }
 
@@ -903,7 +977,8 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     let qbd = dir.join("qb.sock");
     let _qbd = start_daemon(Path::new(exe), &qbd_config, &qbd, Stdio::null());
     let config = dir.join("gateway.toml");
-    std::fs::write(&config, gateway_toml(&dir, &qbd, 2, "")).unwrap();
+    let kinds = ["api_key", "api_key"];
+    std::fs::write(&config, gateway_toml(&dir, &qbd, 2, kinds, "")).unwrap();
     let mut child = Command::new(exe)
         .args(["gateway", "--config"])
         .arg(&config)
@@ -914,7 +989,11 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     let _gateway = Daemon(child);
     let gw = dir.join("gw.sock");
     wait_for(&gw);
+    let mode = std::fs::metadata(&gw).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the socket is the owner's only by default");
 
+    // This build links no vendor adapter: a turn picks, finds none for the login's kind,
+    // releases the lease and ends with `unavailable`, before any credential is read.
     let (status, _, body) = finish(
         send(
             &gw,
@@ -927,20 +1006,24 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     assert_eq!(status, 200);
     let events = events(&body);
     let e = last_error(&events);
-    assert_eq!(e.class, ErrorClass::Auth, "{e:?}");
-    assert_eq!(
-        e.tried.len(),
-        4,
-        "two 401 reports per login make it auth_dead: {e:?}"
+    assert_eq!(e.class, ErrorClass::Unavailable, "{e:?}");
+    assert!(
+        e.message.as_deref().unwrap().contains("no adapter"),
+        "{e:?}"
     );
     assert!(!String::from_utf8_lossy(&body).contains(MARK));
+    let (status, body) = call(&gw, "GET", paths::MODEL_ROUTES, "");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let mut logged = Vec::new();
     while let Some(line) = line_with(&lines, "", Duration::from_millis(500)) {
         logged.push(line);
     }
-    assert!(logged.iter().any(|l| l.contains("too open")), "{logged:?}");
     assert!(
-        logged.iter().any(|l| l.contains("missing or invalid")),
+        logged.iter().any(|l| l.contains("listening on")),
+        "{logged:?}"
+    );
+    assert!(
+        logged.iter().any(|l| l.contains("no adapter")),
         "{logged:?}"
     );
     assert!(logged.iter().all(|l| !l.contains(MARK)), "{logged:?}");
@@ -950,5 +1033,4 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         serde_json::from_slice(&body).unwrap()
     };
     assert_eq!(s.leases, Vec::new());
-    assert_eq!(status_of(&s, "login-2"), LoginStatus::AuthDead);
 }

@@ -1,41 +1,47 @@
 //! The gateway's TOML config: its socket, qbd, callers, limits, credential files and route
 //! aliases. The format is in `docs/config.md`; [`load`] is the only way `qb gateway` obtains a
 //! [`GatewayConfig`].
+//!
+//! The file is read by walking toml's parsed tree rather than through serde: per-type serde code
+//! would not fit the binary budget. Errors still name the field path and the line.
 
 use std::path::{Path, PathBuf};
 
 use qb_core::MAX_LOGINS;
 use qb_proto::Pin;
-
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
-use crate::config::{
-    BEARER_HASH_EXPECTED, BearerHash, Client, Error, Fault, declare, toml_error, too_many,
-};
+use crate::config::{Error, Fault, declare, toml_error, too_many};
+
+/// Most turns one gateway runs at once.
+pub const MAX_TURNS: u32 = 16;
+/// Largest `max_request_bytes`.
+pub const MAX_REQUEST_BYTES: u32 = 32 << 20;
+/// Most route aliases.
+pub const MAX_ROUTES: usize = 64;
+/// Most attempts `max_attempts` may allow.
+pub const MAX_ATTEMPTS: u32 = 16;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]` and
-/// `[[routes]]` tables. It is read by walking the TOML tree rather than by serde, which keeps
-/// the binary small.
+/// `[[routes]]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// Absolute path of the gateway's unix socket.
     pub socket: PathBuf,
+    /// Mode of the socket file: 0o600 (the gateway's own user only) or 0o660 (its group too).
+    pub socket_mode: u32,
     /// qbd's socket.
     pub qbd_socket: PathBuf,
     /// File with the gateway's bearer token for qbd; without it qbd knows the gateway by uid.
     pub qbd_bearer_file: Option<PathBuf>,
-    /// Absolute directories whose files `image` blocks may name by `path`.
-    pub media_dirs: Vec<PathBuf>,
-    /// Turns running at once; a further turn is refused with `overloaded`.
+    /// Turns running at once, 1 to [`MAX_TURNS`].
     pub max_turns: u32,
-    /// Largest request body in bytes.
-    pub max_body_bytes: u32,
-    /// Per-caller refill rate in requests per second.
-    pub rate_per_s: f64,
-    /// Per-caller bucket size.
-    pub burst: u32,
-    /// Callers allowed on the socket; none means every peer the socket mode lets in.
+    /// Largest request body in bytes, at most [`MAX_REQUEST_BYTES`].
+    pub max_request_bytes: u32,
+    /// Picks per turn, 1 to [`MAX_ATTEMPTS`].
+    pub max_attempts: u32,
+    /// Callers besides the gateway's own uid.
     pub clients: Vec<GatewayClient>,
     /// Logins this gateway holds credentials for, 1 to [`MAX_LOGINS`].
     pub logins: Vec<GatewayLogin>,
@@ -43,25 +49,30 @@ pub struct GatewayConfig {
     pub routes: Vec<Route>,
 }
 
-/// A caller of the gateway, by peer uid, bearer token or both.
+/// A caller of the gateway by peer uid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayClient {
-    /// Name in logs and in the cancel registry.
+    /// Name in logs.
     pub name: String,
-    /// Local peer uid (`SO_PEERCRED`).
-    pub uid: Option<u32>,
-    /// SHA-256 of the caller's bearer token.
-    pub bearer_sha256: Option<BearerHash>,
+    /// Peer uid (`SO_PEERCRED`).
+    pub uid: u32,
 }
 
-impl GatewayClient {
-    /// The same caller as a daemon client, for [`crate::auth::Gate`].
-    pub fn as_client(&self) -> Client {
-        Client {
-            name: self.name.clone(),
-            uid: self.uid,
-            bearer_sha256: self.bearer_sha256,
-            role: None,
+/// The type of a credential file; it selects the vendor adapter and its auth mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// Anthropic subscription OAuth tokens.
+    OauthAnthropic,
+    /// A vendor API key.
+    ApiKey,
+}
+
+impl CredentialKind {
+    /// The name in the config and the credential file, e.g. `oauth_anthropic`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OauthAnthropic => "oauth_anthropic",
+            Self::ApiKey => "api_key",
         }
     }
 }
@@ -71,6 +82,8 @@ impl GatewayClient {
 pub struct GatewayLogin {
     /// Login name as declared in qbd's config.
     pub name: String,
+    /// Credential type.
+    pub kind: CredentialKind,
     /// Absolute path of the credential file, mode 0600.
     pub credentials: PathBuf,
 }
@@ -90,8 +103,6 @@ pub struct Route {
     pub model: Option<String>,
     /// Reasoning effort of the pin.
     pub effort: Option<String>,
-    /// One login of the pinned vendor.
-    pub login: Option<String>,
     /// Expected minutes of a turn, for the lease's cost estimate.
     pub expected_minutes: Option<u32>,
 }
@@ -103,13 +114,10 @@ impl Route {
             vendor: self.vendor.clone()?,
             model: self.model.clone()?,
             effort: self.effort.clone(),
-            login: self.login.clone(),
+            login: None,
         })
     }
 }
-
-/// Most route aliases.
-pub const MAX_ROUTES: usize = 64;
 
 /// Reads and validates the gateway config in `file`.
 ///
@@ -136,19 +144,18 @@ pub fn parse(file: &Path, text: &str) -> Result<GatewayConfig, Error> {
         field,
         reason,
     };
-    let config = walk_config(doc.get_ref()).map_err(|(field, reason, span)| {
-        let reason = match span {
-            Some(at) => format!("{reason} (line {})", line(text, at)),
+    let config = walk_config(doc.get_ref()).map_err(|(field, reason, at)| {
+        let reason = match at {
+            Some(at) => {
+                let line = text.get(..at).map_or(0, |s| s.matches('\n').count()) + 1;
+                format!("{reason} (line {line})")
+            }
             None => reason,
         };
         fail((field, reason))
     })?;
     config.validate().map_err(fail)?;
     Ok(config)
-}
-
-fn line(text: &str, at: usize) -> usize {
-    text.get(..at).map_or(0, |s| s.matches('\n').count()) + 1
 }
 
 /// A field error with the byte offset of the value, for the line number.
@@ -164,28 +171,37 @@ fn wrong(at: &str, v: &Value<'_>, expected: &str) -> WalkError {
     )
 }
 
-/// Calls `field` with each key of `table`, refusing keys outside `known`.
+/// Calls `field` with each key of `table`, refusing keys outside `known` and requiring the keys
+/// in `required`.
 fn fields<'v, 'i>(
     at: &str,
     table: &'v DeTable<'i>,
     known: &[&str],
+    required: &[&str],
     mut field: impl FnMut(&str, &str, &'v Value<'i>) -> Result<(), WalkError>,
 ) -> Result<(), WalkError> {
-    for (key, value) in table {
-        let key = key.get_ref().as_ref();
-        let path = if at.is_empty() {
+    let path = |key: &str| {
+        if at.is_empty() {
             key.to_owned()
         } else {
             format!("{at}.{key}")
-        };
+        }
+    };
+    for (key, value) in table {
+        let key = key.get_ref().as_ref();
         if !known.contains(&key) {
             return Err((
-                path,
+                path(key),
                 format!("unknown field, expected one of {}", known.join(", ")),
                 Some(value.span().start),
             ));
         }
-        field(key, &path, value)?;
+        field(key, &path(key), value)?;
+    }
+    for key in required {
+        if table.get(*key).is_none() {
+            return Err((path(key), "is missing".into(), None));
+        }
     }
     Ok(())
 }
@@ -214,131 +230,92 @@ fn integer<T: TryFrom<i64>>(at: &str, v: &Value<'_>) -> Result<T, WalkError> {
         })
 }
 
-fn float(at: &str, v: &Value<'_>) -> Result<f64, WalkError> {
-    match v.get_ref() {
-        DeValue::Float(f) => f.as_str().parse().map_err(|_| {
-            (
-                at.to_owned(),
-                "is not a number".into(),
-                Some(v.span().start),
-            )
-        }),
-        DeValue::Integer(_) => integer::<i32>(at, v).map(f64::from),
-        _ => Err(wrong(at, v, "a number")),
-    }
-}
-
-fn table<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<&'v DeTable<'i>, WalkError> {
-    v.get_ref()
-        .as_table()
-        .ok_or_else(|| wrong(at, v, "a table"))
-}
-
-/// Each element of the array `v` with its path `at[i]`.
-fn array<'v, 'i>(
-    at: &str,
-    v: &'v Value<'i>,
-) -> Result<impl Iterator<Item = (String, &'v Value<'i>)>, WalkError> {
+/// Each element of the array of tables `v` with its path `at[i]`.
+fn tables<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<Vec<(String, &'v DeTable<'i>)>, WalkError> {
     let items = v
         .get_ref()
         .as_array()
-        .ok_or_else(|| wrong(at, v, "an array"))?;
-    Ok(items
+        .ok_or_else(|| wrong(at, v, "an array of tables"))?;
+    items
         .iter()
         .enumerate()
-        .map(move |(i, item)| (format!("{at}[{i}]"), item)))
+        .map(|(i, item)| {
+            let at = format!("{at}[{i}]");
+            match item.get_ref().as_table() {
+                Some(t) => Ok((at, t)),
+                None => Err(wrong(&at, item, "a table")),
+            }
+        })
+        .collect()
 }
 
 /// The config's fields out of the parsed TOML tree.
 fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
     let mut c = GatewayConfig {
         socket: PathBuf::new(),
+        socket_mode: 0o600,
         qbd_socket: PathBuf::from(crate::DEFAULT_SOCKET),
         qbd_bearer_file: None,
-        media_dirs: Vec::new(),
         max_turns: 4,
-        max_body_bytes: 8 << 20,
-        rate_per_s: 5.0,
-        burst: 20,
+        max_request_bytes: 8 << 20,
+        max_attempts: 4,
         clients: Vec::new(),
         logins: Vec::new(),
         routes: Vec::new(),
     };
-    let mut seen = Vec::new();
     let known = [
         "socket",
+        "socket_mode",
         "qbd_socket",
         "qbd_bearer_file",
-        "media_dirs",
         "max_turns",
-        "max_body_bytes",
-        "rate_per_s",
-        "burst",
+        "max_request_bytes",
+        "max_attempts",
         "clients",
         "logins",
         "routes",
     ];
-    fields("", doc, &known, |key, at, v| {
-        seen.push(key.to_owned());
+    let required = ["socket", "logins", "routes"];
+    fields("", doc, &known, &required, |key, at, v| {
         match key {
             "socket" => c.socket = string(at, v)?.into(),
+            "socket_mode" => c.socket_mode = integer(at, v)?,
             "qbd_socket" => c.qbd_socket = string(at, v)?.into(),
             "qbd_bearer_file" => c.qbd_bearer_file = Some(string(at, v)?.into()),
-            "media_dirs" => {
-                for (at, d) in array(at, v)? {
-                    c.media_dirs.push(string(&at, d)?.into());
-                }
-            }
             "max_turns" => c.max_turns = integer(at, v)?,
-            "max_body_bytes" => c.max_body_bytes = integer(at, v)?,
-            "rate_per_s" => c.rate_per_s = float(at, v)?,
-            "burst" => c.burst = integer(at, v)?,
+            "max_request_bytes" => c.max_request_bytes = integer(at, v)?,
+            "max_attempts" => c.max_attempts = integer(at, v)?,
             "clients" => {
-                for (at, t) in array(at, v)? {
-                    c.clients.push(walk_client(&at, table(&at, t)?)?);
+                for (at, t) in tables(at, v)? {
+                    c.clients.push(walk_client(&at, t)?);
                 }
             }
             "logins" => {
-                for (at, t) in array(at, v)? {
-                    c.logins.push(walk_login(&at, table(&at, t)?)?);
+                for (at, t) in tables(at, v)? {
+                    c.logins.push(walk_login(&at, t)?);
                 }
             }
             _ => {
-                for (at, t) in array(at, v)? {
-                    c.routes.push(walk_route(&at, table(&at, t)?)?);
+                for (at, t) in tables(at, v)? {
+                    c.routes.push(walk_route(&at, t)?);
                 }
             }
         }
         Ok(())
     })?;
-    for required in ["socket", "logins", "routes"] {
-        if !seen.iter().any(|k| k == required) {
-            return Err((required.into(), "is missing".into(), None));
-        }
-    }
     Ok(c)
 }
 
 fn walk_client(at: &str, t: &DeTable<'_>) -> Result<GatewayClient, WalkError> {
     let mut c = GatewayClient {
         name: String::new(),
-        uid: None,
-        bearer_sha256: None,
+        uid: 0,
     };
-    fields(at, t, &["name", "uid", "bearer_sha256"], |key, at, v| {
+    let keys = ["name", "uid"];
+    fields(at, t, &keys, &keys, |key, at, v| {
         match key {
             "name" => c.name = string(at, v)?,
-            "uid" => c.uid = Some(integer(at, v)?),
-            _ => {
-                let hash = BearerHash::from_hex(&string(at, v)?).ok_or_else(|| {
-                    (
-                        at.to_owned(),
-                        BEARER_HASH_EXPECTED.into(),
-                        Some(v.span().start),
-                    )
-                })?;
-                c.bearer_sha256 = Some(hash);
-            }
+            _ => c.uid = integer(at, v)?,
         }
         Ok(())
     })?;
@@ -348,11 +325,23 @@ fn walk_client(at: &str, t: &DeTable<'_>) -> Result<GatewayClient, WalkError> {
 fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
     let mut l = GatewayLogin {
         name: String::new(),
+        kind: CredentialKind::ApiKey,
         credentials: PathBuf::new(),
     };
-    fields(at, t, &["name", "credentials"], |key, at, v| {
+    let keys = ["name", "kind", "credentials"];
+    fields(at, t, &keys, &keys, |key, at, v| {
         match key {
             "name" => l.name = string(at, v)?,
+            "kind" => {
+                l.kind = match string(at, v)?.as_str() {
+                    "oauth_anthropic" => CredentialKind::OauthAnthropic,
+                    "api_key" => CredentialKind::ApiKey,
+                    _ => {
+                        let reason = "expected `oauth_anthropic` or `api_key`".into();
+                        return Err((at.to_owned(), reason, Some(v.span().start)));
+                    }
+                };
+            }
             _ => l.credentials = string(at, v)?.into(),
         }
         Ok(())
@@ -368,7 +357,6 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         vendor: None,
         model: None,
         effort: None,
-        login: None,
         expected_minutes: None,
     };
     let known = [
@@ -378,10 +366,9 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         "vendor",
         "model",
         "effort",
-        "login",
         "expected_minutes",
     ];
-    fields(at, t, &known, |key, at, v| {
+    fields(at, t, &known, &["alias", "role"], |key, at, v| {
         match key {
             "alias" => r.alias = string(at, v)?,
             "role" => r.role = string(at, v)?,
@@ -389,7 +376,6 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
             "vendor" => r.vendor = Some(string(at, v)?),
             "model" => r.model = Some(string(at, v)?),
             "effort" => r.effort = Some(string(at, v)?),
-            "login" => r.login = Some(string(at, v)?),
             _ => r.expected_minutes = Some(integer(at, v)?),
         }
         Ok(())
@@ -408,42 +394,31 @@ fn absolute(field: &str, path: &Path) -> Result<(), Fault> {
 impl GatewayConfig {
     fn validate(&self) -> Result<(), Fault> {
         absolute("socket", &self.socket)?;
+        if ![0o600, 0o660].contains(&self.socket_mode) {
+            return Err(("socket_mode".into(), "must be 0o600 or 0o660".into()));
+        }
         absolute("qbd_socket", &self.qbd_socket)?;
-        for (i, dir) in self.media_dirs.iter().enumerate() {
-            absolute(&format!("media_dirs[{i}]"), dir)?;
+        if let Some(f) = &self.qbd_bearer_file {
+            absolute("qbd_bearer_file", f)?;
+        }
+        for (key, value, max) in [
+            ("max_turns", self.max_turns, MAX_TURNS),
+            (
+                "max_request_bytes",
+                self.max_request_bytes,
+                MAX_REQUEST_BYTES,
+            ),
+            ("max_attempts", self.max_attempts, MAX_ATTEMPTS),
+        ] {
+            if value == 0 || value > max {
+                return Err((key.into(), format!("must be 1 to {max}")));
+            }
         }
         declare("clients", self.clients.iter().map(|c| c.name.as_str()))?;
         for (i, c) in self.clients.iter().enumerate() {
-            if c.uid.is_none() && c.bearer_sha256.is_none() {
-                return Err((
-                    format!("clients[{i}]"),
-                    "needs `uid`, `bearer_sha256` or both".into(),
-                ));
-            }
-            let earlier = &self.clients[..i];
-            if c.uid.is_some() && earlier.iter().any(|o| o.uid == c.uid) {
+            if self.clients[..i].iter().any(|o| o.uid == c.uid) {
                 return Err((format!("clients[{i}].uid"), "duplicate uid".into()));
             }
-            if c.bearer_sha256.is_some()
-                && earlier.iter().any(|o| o.bearer_sha256 == c.bearer_sha256)
-            {
-                return Err((
-                    format!("clients[{i}].bearer_sha256"),
-                    "duplicate hash".into(),
-                ));
-            }
-        }
-        for (key, value) in [
-            ("max_turns", self.max_turns),
-            ("max_body_bytes", self.max_body_bytes),
-            ("burst", self.burst),
-        ] {
-            if value == 0 {
-                return Err((key.into(), "must be positive".into()));
-            }
-        }
-        if !(self.rate_per_s.is_finite() && self.rate_per_s > 0.0) {
-            return Err(("rate_per_s".into(), "must be positive".into()));
         }
         if self.logins.is_empty() {
             return Err(("logins".into(), "is empty".into()));
@@ -488,8 +463,8 @@ impl GatewayConfig {
                     ));
                 }
             }
-            if r.difficulty.is_some() && (r.effort.is_some() || r.login.is_some()) {
-                return Err((at, "`effort` and `login` belong to a pin".into()));
+            if r.difficulty.is_some() && r.effort.is_some() {
+                return Err((at, "`effort` belongs to a pin".into()));
             }
         }
         Ok(())
@@ -500,12 +475,9 @@ impl GatewayConfig {
         self.routes.iter().find(|r| r.alias == alias)
     }
 
-    /// The credential file of `login`.
-    pub fn credentials(&self, login: &str) -> Option<&Path> {
-        self.logins
-            .iter()
-            .find(|l| l.name == login)
-            .map(|l| l.credentials.as_path())
+    /// The credential entry of `login`.
+    pub fn login(&self, login: &str) -> Option<&GatewayLogin> {
+        self.logins.iter().find(|l| l.name == login)
     }
 }
 
@@ -517,6 +489,7 @@ mod tests {
 socket = "/run/qb-gateway/gateway.sock"
 [[logins]]
 name = "login-1"
+kind = "api_key"
 credentials = "/var/lib/qb-gateway/login-1.json"
 [[routes]]
 alias = "chat"
@@ -524,66 +497,112 @@ role = "gateway"
 difficulty = 1
 "#;
 
-    fn check(extra: &str) -> Result<GatewayConfig, String> {
-        parse(Path::new("gw.toml"), &format!("{BASE}{extra}")).map_err(|e| e.to_string())
+    fn check(top: &str, extra: &str) -> Result<GatewayConfig, String> {
+        parse(Path::new("gw.toml"), &format!("{top}\n{BASE}{extra}")).map_err(|e| e.to_string())
     }
 
     #[test]
     fn minimal_config_takes_defaults() {
-        let c = check("").unwrap();
+        let c = check("", "").unwrap();
         assert_eq!(c.qbd_socket, Path::new(crate::DEFAULT_SOCKET));
-        assert_eq!(c.max_turns, 4);
         assert_eq!(
-            c.credentials("login-1"),
-            Some(Path::new("/var/lib/qb-gateway/login-1.json"))
+            (
+                c.socket_mode,
+                c.max_turns,
+                c.max_request_bytes,
+                c.max_attempts
+            ),
+            (0o600, 4, 8 << 20, 4)
+        );
+        let login = c.login("login-1").unwrap();
+        assert_eq!(login.kind, CredentialKind::ApiKey);
+        assert_eq!(
+            login.credentials,
+            Path::new("/var/lib/qb-gateway/login-1.json")
         );
         assert_eq!(c.route("chat").and_then(|r| r.difficulty), Some(1));
+        let pinned = check(
+            "",
+            "[[routes]]\nalias = \"fast\"\nrole = \"r\"\nvendor = \"v\"\nmodel = \"m\"\neffort = \"low\"\n",
+        )
+        .unwrap();
+        let pin = pinned.route("fast").unwrap().pin().unwrap();
+        assert_eq!(
+            (pin.vendor.as_str(), pin.effort.as_deref()),
+            ("v", Some("low"))
+        );
     }
 
     #[test]
-    fn rule_violations_name_the_field() {
+    fn rule_violations_name_the_field_and_line() {
         let cases = [
             (
+                "",
                 "[[routes]]\nalias = \"chat\"\nrole = \"r\"\ndifficulty = 1\n",
-                "routes[1].alias: duplicate `chat`",
+                "gw.toml: routes[1].alias: duplicate `chat`",
             ),
             (
+                "",
                 "[[routes]]\nalias = \"Bad\"\nrole = \"r\"\ndifficulty = 1\n",
                 "routes[1].alias: must match",
             ),
             (
+                "",
                 "[[routes]]\nalias = \"two\"\nrole = \"r\"\ndifficulty = 1\nvendor = \"v\"\nmodel = \"m\"\n",
                 "routes[1]: needs either",
             ),
             (
-                "[[logins]]\nname = \"login-2\"\ncredentials = \"rel.json\"\n",
+                "",
+                "[[routes]]\nalias = \"x\"\nrole = \"r\"\nmodle = 1\n",
+                "routes[1].modle: unknown field, expected one of alias",
+            ),
+            (
+                "",
+                "[[routes]]\nalias = \"x\"\ndifficulty = 1\n",
+                "routes[1].role: is missing",
+            ),
+            (
+                "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\ncredentials = \"rel.json\"\n",
                 "logins[1].credentials: must be an absolute path",
             ),
-            ("[[clients]]\nname = \"c\"\n", "clients[0]: needs"),
             (
-                "[[routes]]\nalias = \"x\"\nrole = \"r\"\nmodle = 1\n",
-                "unknown field",
+                "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"oauth\"\ncredentials = \"/c.json\"\n",
+                "logins[1].kind: expected `oauth_anthropic` or `api_key` (line 14)",
             ),
-        ];
-        for (extra, want) in cases {
-            let err = check(extra).unwrap_err();
-            assert!(err.contains(want), "{extra}: {err}");
-        }
-        for (top, want) in [
             (
-                "media_dirs = [\"media\"]",
-                "media_dirs[0]: must be an absolute",
+                "",
+                "[[clients]]\nname = \"c\"\n",
+                "clients[0].uid: is missing",
             ),
-            ("max_turns = 0", "max_turns: must be positive"),
+            (
+                "",
+                "[[clients]]\nname = \"c\"\nuid = \"1000\"\n",
+                "clients[0].uid: expected an integer, found string",
+            ),
+            ("max_turns = 17", "", "max_turns: must be 1 to 16"),
+            ("max_attempts = 0", "", "max_attempts: must be 1 to 16"),
+            (
+                "socket_mode = 0o666",
+                "",
+                "socket_mode: must be 0o600 or 0o660",
+            ),
             (
                 "qbd_socket = \"qb.sock\"",
+                "",
                 "qbd_socket: must be an absolute",
             ),
-            ("rate_per_s = -1.0", "rate_per_s: must be positive"),
-        ] {
-            let text = format!("{top}\n{BASE}");
-            let err = parse(Path::new("gw.toml"), &text).unwrap_err().to_string();
-            assert!(err.contains(want), "{err}");
+            (
+                "max_request_bytes = -1",
+                "",
+                "max_request_bytes: is out of range (line 1)",
+            ),
+            ("bogus = 1", "", "bogus: unknown field"),
+        ];
+        for (top, extra, want) in cases {
+            let err = check(top, extra).unwrap_err();
+            assert!(err.contains(want), "{top}{extra}: {err}");
         }
     }
 }

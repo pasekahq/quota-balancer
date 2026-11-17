@@ -1,7 +1,8 @@
 //! Self-restriction of `qb agent` and `qb gateway` before their first connection: the process
 //! becomes non-dumpable, and landlock limits it to the credential directories (read-only for the
-//! agent, read-write for the gateway, which writes refreshed tokens back), the resolver files,
-//! the gateway's media directories (read-only) and TCP connections to port 443.
+//! agent; for the gateway also writing, creating and removing regular files, as a refreshed
+//! token is written back by rename), the resolver files and TCP connections to port 443, with no
+//! TCP bind.
 
 use std::path::{Path, PathBuf};
 
@@ -36,12 +37,13 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, false, &[])
+    confine(&files, false)
 }
 
-/// [`harden`] for `qb gateway`: read-write beneath each login's credential directory, so a
-/// refreshed token can be written back by rename, read-only beneath `media_dirs`. Call it
-/// before starting any thread.
+/// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
+/// truncate files, create regular files and remove files, so a refreshed token can be written
+/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. Call
+/// it before starting any thread.
 ///
 /// # Errors
 /// The dumpable flag cannot be cleared.
@@ -51,14 +53,10 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, true, &config.media_dirs)
+    confine(&files, true)
 }
 
-fn confine(
-    credential_files: &[&Path],
-    writable: bool,
-    media: &[PathBuf],
-) -> Result<Vec<String>, String> {
+fn confine(credential_files: &[&Path], writable: bool) -> Result<Vec<String>, String> {
     set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;
     let mut gaps = Vec::new();
@@ -73,14 +71,17 @@ fn confine(
     let read_dir = AccessFs::from_read(TARGET_ABI);
     let read_file = read_dir & AccessFs::from_file(TARGET_ABI);
     let credential_access = if writable {
-        AccessFs::from_all(TARGET_ABI)
+        read_dir
+            | AccessFs::WriteFile
+            | AccessFs::Truncate
+            | AccessFs::MakeReg
+            | AccessFs::RemoveFile
     } else {
         read_dir
     };
     let readable = dirs
         .iter()
         .map(|d| (d.as_path(), credential_access))
-        .chain(media.iter().map(|d| (d.as_path(), read_dir)))
         .chain(RESOLVER_FILES.map(|f| (Path::new(f), read_file)));
     let mut rules = Vec::new();
     for (path, access) in readable {

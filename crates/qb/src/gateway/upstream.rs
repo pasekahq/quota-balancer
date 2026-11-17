@@ -8,8 +8,8 @@
 //! `usage`) through the sink and returns how the call ended.
 
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use qb_proto::{StopReason, StreamEvent, TurnRequest, WindowReport};
 use zeroize::Zeroizing;
@@ -75,10 +75,23 @@ pub enum Flow {
     Stop,
 }
 
-/// Set by `POST /v1/model/cancel` or a dropped client; an adapter polls it between reads and
-/// gives up within one read timeout of the vendor connection.
-#[derive(Debug, Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+/// Set by `POST /v1/model/cancel` or a dropped client. An adapter polls it between reads and
+/// registers [`CancelToken::on_cancel`] to unblock a read in progress, for example by shutting
+/// down a clone of its vendor TCP stream.
+#[derive(Clone, Default)]
+pub struct CancelToken(Arc<CancelState>);
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl fmt::Debug for CancelToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CancelToken({})", self.is_cancelled())
+    }
+}
 
 impl CancelToken {
     /// A token that is not cancelled.
@@ -86,14 +99,39 @@ impl CancelToken {
         Self::default()
     }
 
-    /// Cancels every clone of this token.
+    /// Cancels every clone of this token and runs the registered hook, once.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        let hook = self.hook().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Whether the turn was cancelled.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Runs `hook` on cancel, replacing an earlier hook; at once if already cancelled. An
+    /// adapter registers one per attempt and calls [`CancelToken::clear`] when it ends.
+    pub fn on_cancel(&self, hook: Box<dyn FnOnce() + Send>) {
+        let mut slot = self.hook();
+        if self.is_cancelled() {
+            drop(slot);
+            hook();
+        } else {
+            *slot = Some(hook);
+        }
+    }
+
+    /// Drops the registered hook.
+    pub fn clear(&self) {
+        self.hook().take();
+    }
+
+    fn hook(&self) -> MutexGuard<'_, Option<Box<dyn FnOnce() + Send>>> {
+        self.0.hook.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -219,7 +257,18 @@ mod tests {
         let a = CancelToken::new();
         let b = a.clone();
         assert!(!b.is_cancelled());
+        let hits = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&hits);
+        b.on_cancel(Box::new(move || seen.store(true, Ordering::SeqCst)));
         a.cancel();
         assert!(b.is_cancelled());
+        assert!(hits.load(Ordering::SeqCst), "the hook ran");
+        let late = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&late);
+        a.on_cancel(Box::new(move || seen.store(true, Ordering::SeqCst)));
+        assert!(
+            late.load(Ordering::SeqCst),
+            "a hook after the cancel runs at once"
+        );
     }
 }

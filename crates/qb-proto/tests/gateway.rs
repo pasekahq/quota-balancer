@@ -102,6 +102,15 @@ fn errors_routes_cancel() {
         panic!("not an error event");
     };
     assert_eq!(error.retry_after, Some(30));
+    for (name, class) in [
+        ("gateway_error_cancelled.json", ErrorClass::Cancelled),
+        ("gateway_error_no_route.json", ErrorClass::NoRoute),
+    ] {
+        let StreamEvent::Error { error } = roundtrip(name) else {
+            panic!("not an error event");
+        };
+        assert_eq!(error.class, class);
+    }
     let body: GatewayError = roundtrip("gateway_error_body.json");
     assert_eq!(body.class, ErrorClass::BadRequest);
     let routes: RoutesAnswer = roundtrip("gateway_routes_answer.json");
