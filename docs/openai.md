@@ -271,3 +271,10 @@ error answer. After it the error is in the stream: on the Chat front one
 `data: {"error": {…}}` event (the shape OpenAI SDKs raise) and no `[DONE]`; on the Responses
 front an `error` event with `code` and `message`, then `response.failed` with the items so far
 and `error{code, message}`.
+
+## Fixtures
+
+The streams, answers and SDK requests in `crates/qb-openai/tests/fixtures/` are synthetic: they
+are written by hand in the shape the OpenAI API, the ChatGPT backend and the OpenAI SDKs use, with
+neutral ids and values, and none was captured from a vendor. Recorded streams and requests, with
+every identifier anonymised, are added with the live smoke of the wired gateway.

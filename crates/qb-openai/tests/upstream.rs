@@ -513,7 +513,7 @@ const CASES: [Case; 17] = [
 ];
 
 #[test]
-fn recorded_error_answers() {
+fn error_answers_in_the_vendor_shape() {
     for c in CASES {
         let a = Answer::load(c.fixture);
         let f = classify_response(a.status, &a.pairs(), &a.body, NOW);

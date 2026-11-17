@@ -26,7 +26,7 @@ pub fn object(v: Value) -> Object {
     }
 }
 
-/// A recorded vendor answer: status, headers and body bytes.
+/// A vendor answer in the recorded shape: status, headers and body bytes.
 pub struct Answer {
     pub status: u16,
     pub headers: Vec<(String, String)>,
