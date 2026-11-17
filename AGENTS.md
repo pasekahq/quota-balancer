@@ -5,8 +5,10 @@ Read this before changing anything. `README.md` is for humans; this file is for 
 ## What this is
 
 `qb` is a pre-flight quota scheduler for coding-agent subscriptions: one static Rust binary with
-three roles (`qbd` daemon, `qb agent`, `qb` CLI) and a JSON `/v1` API over HTTP/1.1 on a unix
-socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan: `docs/roadmap.md`.
+the roles `qbd` daemon, `qb agent`, `qb` CLI and the optional `qb gateway` (model traffic for its
+credential owner, decided in `docs/adr/0001-model-gateway.md`, not built yet) and a JSON `/v1`
+API over HTTP/1.1 on a unix socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan:
+`docs/roadmap.md`. Decisions: `docs/adr/`.
 
 ## Layout
 
@@ -60,15 +62,20 @@ Release builds are CPU-heavy (fat LTO). Run one cargo build at a time on shared 
 2. **Nothing environment-specific in code or docs**: no host names, IPs, user names, home paths
    or names of the orchestrators that use `qb`. Everything deployment-specific goes through
    config; examples live in `deploy/examples/` with neutral names.
-3. **No telemetry, no phone-home, no update checks.** The only outbound connections allowed are
-   the agent's vendor probes, and those are off by default.
+3. **No telemetry, no phone-home, no update checks.** Two components may connect outbound, both
+   only over TCP 443 to vendor endpoints: the agent's vendor probes, off by default, and
+   `qb gateway`'s model requests and OAuth token refreshes for the credentials in its config.
 4. **Stay synchronous and small.** No tokio/hyper/axum/reqwest/chrono/openssl (enforced by
    `deny.toml`). A new dependency needs a reason in the PR description; keep direct
    dependencies ≤ 12 and the tree ≲ 50 crates (`cargo tree`).
 5. **Budgets are part of the contract**: binary ≤ 2.5 MiB, daemon RSS ≤ 4 MiB after 10⁴ picks,
    `qbd.service` exposure ≤ 1.5. Do not raise a limit to make CI green; fix the cause or ask.
-6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only
-   `qb agent` reads credential files, read-only, for the duration of one request, then zeroizes.
+6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only two
+   components touch credential files, both as the credential owner, non-dumpable, under
+   landlock and with `zeroize` after use: `qb agent` reads them read-only for the duration of
+   one request; `qb gateway` reads them for each upstream request and is the only component
+   that writes them, and only to store refreshed OAuth tokens (0600, temporary file renamed in
+   the same directory). Neither puts a secret into a log, an error, a response or a report.
 7. **`unsafe`** is forbidden in `qb-core` and `qb-proto` and denied in `qb`; the single
    exception (`listen.rs`, fd ownership from systemd) carries a `SAFETY:` comment. New
    exceptions need the same and a test.

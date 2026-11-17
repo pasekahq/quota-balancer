@@ -6,12 +6,18 @@ An orchestrator runs coding agents on several subscriptions (vendors × logins).
 rolling quota windows (for example 5 hours and 7 days). Picking by a fixed order wastes quota
 that resets unused and runs into exhausted logins at the worst moment. `qb` answers one
 question before every run — *where should this task run now?* — and keeps short leases so
-concurrent workers do not oversubscribe the same window.
+concurrent workers do not oversubscribe the same window. Clients that should not hold vendor
+credentials themselves can send model requests through the optional gateway, which asks `qbd`
+the same question before each request.
 
 ## Non-goals
 
-- Proxying model traffic or failing over mid-request. Clients talk to vendors directly.
-- Storing, refreshing or sharing credentials. Pooling accounts between people.
+- Model traffic or credentials in `qbd`. Only the optional `qb gateway` carries model traffic
+  and stores and refreshes tokens, for its own credential owner; other clients talk to vendors
+  directly.
+- Failing over after an answer has started streaming. The gateway moves to another login only
+  before the client has seen any event ([ADR 0001](adr/0001-model-gateway.md#rotation-boundary)).
+- Sharing credentials or pooling accounts between people.
 - Telemetry of any kind.
 
 ## Where quota numbers come from (cheapest first)
@@ -33,24 +39,39 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
  clients (orchestrators, qb CLI)          qbd  (DynamicUser, PrivateNetwork=yes)
   local uid ──unix socket──────────────▶   policy, leases, journal
   remote ──ssh -L forwarded socket──────▶   no vendor secrets, no outbound sockets
-            + bearer token                   ▲ "probe login X"
- qb agent (credential owner, user unit) ─────┘ reply: window numbers only
+            + bearer token                   ▲ ▲ "probe login X"
+ qb agent (credential owner, user unit) ─────┘ │ reply: window numbers only
   landlock: read-only credential dirs, TCP 443 only; non-dumpable; zeroize
+                                               │ pick / report, as a client
+ qb gateway (credential owner, user unit) ─────┘
+  own unix socket (+ optional loopback port), model traffic to vendors over HTTPS
+  landlock: read-write credential dirs, TCP 443 only, bind only the loopback port;
+  non-dumpable; zeroize
 ```
 
 - **`qbd`** owns all state in one thread. It receives its listening socket from systemd, so it
   can run with `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`. It cannot open an
   outbound connection even if compromised. Alerts go out through a configured hook, not from
   the daemon.
-- **`qb agent`** is the only component that ever touches a credential: it reads the vendor CLI's
-  own credential file right before one GET, keeps the token for at most a second, then
-  zeroizes it. It never writes or refreshes credentials. Before its first connection to `qbd`
-  it makes itself non-dumpable and restricts itself with landlock to reading the credential
-  directories, `/etc/resolv.conf` and `/etc/hosts`, and to TCP connections to port 443; a
-  kernel that cannot enforce part of this gets one warning in the log. DNS over TCP (port 53)
-  is not allowed, so a truncated UDP answer fails the probe as `error`. On 401 it reports
-  `auth_stale`; the vendor CLI refreshes its own token on next use.
-- **Clients** send no secrets: only outcome classes and window numbers.
+- **`qb agent`** touches credentials only to probe: it reads the vendor CLI's own credential
+  file right before one GET, keeps the token for at most a second, then zeroizes it. It never
+  writes or refreshes credentials. Before its first connection to `qbd` it makes itself
+  non-dumpable and restricts itself with landlock to reading the credential directories,
+  `/etc/resolv.conf` and `/etc/hosts`, and to TCP connections to port 443; a kernel that cannot
+  enforce part of this gets one warning in the log. DNS over TCP (port 53) is not allowed, so a
+  truncated UDP answer fails the probe as `error`. On 401 it reports `auth_stale`; the vendor
+  CLI refreshes its own token on next use.
+- `qb gateway` (optional) carries model traffic for its own credential owner and is the
+  only component that writes credentials. It serves its own unix socket, identifies peers by
+  `SO_PEERCRED`, and for each request picks a login from `qbd` as an ordinary client, calls the
+  vendor with that login's token or API key, rotates to another login before the first event
+  when one fails, and reports the outcome and the windows it saw. It refreshes OAuth tokens on
+  demand and replaces the credential file atomically (0600, rename in the same directory).
+  Before serving it makes itself non-dumpable and restricts itself with landlock to its
+  credential directories (read-write), the resolver files, TCP connections to port 443 and a
+  bind on the optional loopback port; gaps on older kernels are logged as for the agent.
+  Decisions and limits: [ADR 0001](adr/0001-model-gateway.md).
+- **Clients** of `qbd` send no secrets: only outcome classes and window numbers.
 
 ## Transport
 
@@ -149,15 +170,17 @@ refreshes the login for later picks.
 |---|---|
 | daemon RSS idle / after 10⁴ picks | ≲ 2 MiB / ≤ 4 MiB (`MemoryMax=16M`) |
 | agent RSS idle / during probe | ≲ 2 MiB / ≲ 6 MiB |
-| binary | static musl, ≤ 2.5 MiB with TLS |
+| gateway RSS idle / per turn in flight | ≤ 4 MiB / ≲ 1 MiB plus twice the request body |
+| binary | static musl, ≤ 2.5 MiB with TLS and the gateway |
 | dependencies | ≤ 12 direct, ≲ 50 total |
-| CPU | 0 wake-ups/s idle; pick ≤ 50 µs server-side, p99 ≤ 1 ms over UDS from connect to response |
-| disk | ≤ ~150 B per pick, or 0 with `journal = off` |
-| network | 0 idle; ≤ 1 small HTTPS GET per login per TTL, only on demand |
+| CPU | 0 wake-ups/s idle (daemon, agent and gateway); pick ≤ 50 µs server-side, p99 ≤ 1 ms over UDS from connect to response; gateway p99 ≤ 5 ms from a request to its upstream request |
+| disk | ≤ ~150 B per pick, or 0 with `journal = off`; the gateway writes only refreshed credential files |
+| network | 0 idle; agent ≤ 1 small HTTPS GET per login per TTL, only on demand; gateway one HTTPS request per attempt and one per token refresh |
 
 CI enforces the binary, daemon RSS, latency, wake-up and `journal = off` budgets in the
-`budgets` job. `ci/budgets.sh` checks the size and static linking of the musl release binary.
-The acceptance lane, `crates/qb/tests/acceptance.rs`, runs that binary as the daemon:
+`budgets` job; the gateway's RSS, latency and wake-up targets join it with the gateway itself.
+`ci/budgets.sh` checks the size and static linking of the musl release binary. The acceptance
+lane, `crates/qb/tests/acceptance.rs`, runs that binary as the daemon:
 
 - the three policy scenarios of the roadmap, with reports and picks over the socket;
 - 10⁴ picks, each released by a report, one connection per request, journal on: it prints the
@@ -181,4 +204,5 @@ QB_ACCEPTANCE_BIN="$PWD/target/x86_64-unknown-linux-musl/release/qb" \
 At ~1 request per second, the language barely matters for throughput. Rust gives one static
 binary, convenient landlock/seccomp, no GC, and memory safety next to credential handling. An
 async stack would add ~100 crates and megabytes of binary for nothing at this load; if
-thousands of clients ever appear, `mio` fits under the same core.
+thousands of clients ever appear, `mio` fits under the same core. The gateway's long streams run
+one blocking thread per turn, at most 16 at once, under the same rule.
