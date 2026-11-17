@@ -127,6 +127,10 @@ users allowed to talk to the daemon, then `systemctl enable --now qbd.socket`. T
 `~/.config/qb/agent.toml` of its user (start from
 [`deploy/examples/agent.toml`](deploy/examples/agent.toml)); probes stay off until
 `[probe] enabled = true` in the daemon's config.
+The gateway runs as `qb-gateway.service`, a user unit of the credential owner reading
+`~/.config/qb/gateway.toml` (start from [`deploy/examples/gateway.toml`](deploy/examples/gateway.toml));
+[docs/runbooks/hermes-secretary-cutover.md](docs/runbooks/hermes-secretary-cutover.md) installs it
+next to a Hermes agent and switches that agent's Anthropic provider to it.
 
 ## Terms of service
 
