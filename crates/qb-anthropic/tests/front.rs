@@ -318,6 +318,17 @@ fn errors_map_to_messages_answers() {
             (status, kind),
             "{class:?}"
         );
+        assert_eq!(r.should_retry, None, "{class:?}");
+    }
+    // A retry can help neither a cancelled turn nor a route without any usable login.
+    for (class, status) in [(ErrorClass::Cancelled, 409), (ErrorClass::NoRoute, 503)] {
+        let r = error_response(&GatewayError::new(class, false, ""), NOW);
+        assert_eq!(
+            (r.status, r.body.error.kind.as_str(), r.should_retry),
+            (status, "api_error", Some(false)),
+            "{class:?}"
+        );
+        assert!(!r.body.error.message.is_empty(), "{class:?}");
     }
     let r = error_response(
         &GatewayError::new(ErrorClass::ContextTooLong, false, "x"),

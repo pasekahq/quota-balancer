@@ -664,6 +664,8 @@ pub fn error_body(e: &GatewayError) -> ErrorBody {
         ErrorClass::Overloaded => ("overloaded_error", "overloaded"),
         ErrorClass::BadRequest => ("invalid_request_error", "invalid request"),
         ErrorClass::ContextTooLong => ("invalid_request_error", "prompt is too long"),
+        ErrorClass::Cancelled => ("api_error", "the turn was cancelled"),
+        ErrorClass::NoRoute => ("api_error", "no login of the route can serve this request"),
     };
     let detail = e.message.as_deref().filter(|m| !m.is_empty());
     let message = match (e.class, detail) {
@@ -682,7 +684,8 @@ pub const NO_RETRY_AFTER_S: u64 = 300;
 /// The Anthropic error answer of a canonical error at `now`: 429 with `retry-after` until
 /// `resets_at` for `quota_exhausted` (and `x-should-retry: false` beyond [`NO_RETRY_AFTER_S`]),
 /// 529 for `overloaded`, 400 for `bad_request` and `context_too_long`, 502 for `unavailable`
-/// and for `auth`, which is the vendor rejecting the gateway's credential, not the client's.
+/// and for `auth`, which is the vendor rejecting the gateway's credential, not the client's;
+/// `cancelled` (409) and `no_route` (503) carry `x-should-retry: false`, since a retry cannot help.
 pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
     let status = match e.class {
         ErrorClass::Overloaded => 529,
@@ -696,9 +699,13 @@ pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
             .or(e.retry_after),
         _ => e.retry_after,
     };
-    let should_retry = (e.class == ErrorClass::QuotaExhausted
-        && retry_after.is_some_and(|s| s > NO_RETRY_AFTER_S))
-    .then_some(false);
+    let should_retry = match e.class {
+        ErrorClass::Cancelled | ErrorClass::NoRoute => Some(false),
+        ErrorClass::QuotaExhausted => retry_after
+            .is_some_and(|s| s > NO_RETRY_AFTER_S)
+            .then_some(false),
+        _ => None,
+    };
     ErrorResponse {
         status,
         retry_after,

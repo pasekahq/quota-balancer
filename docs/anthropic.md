@@ -190,6 +190,11 @@ later turns, as when the upstream request drops it). The default is `Keep`.
 | `bad_request` | 400 | `invalid_request_error` | — |
 | `context_too_long` | 400 | `invalid_request_error`, message starting `prompt is too long` | — |
 | `unavailable` | 502 | `api_error` | — |
+| `cancelled` | 409 | `api_error` | — |
+| `no_route` | 503 | `api_error` | — |
+
+`cancelled` and `no_route` carry `x-should-retry: false`: retrying a cancelled turn or a route
+without any usable login cannot help.
 
 A `quota_exhausted` answer whose `retry-after` is more than 300 s also carries
 `x-should-retry: false`, so SDK clients stop their automatic retries until the reset.
