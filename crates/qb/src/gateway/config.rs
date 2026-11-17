@@ -23,9 +23,11 @@ pub const MAX_REQUEST_BYTES: u32 = 32 << 20;
 pub const MAX_ROUTES: usize = 64;
 /// Most attempts `max_attempts` may allow.
 pub const MAX_ATTEMPTS: u32 = 16;
+/// Most entries of `messages.models`.
+pub const MAX_MODELS: usize = 256;
 
-/// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]` and
-/// `[[routes]]` tables.
+/// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
+/// `[[routes]]` and `[messages]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// Absolute path of the gateway's unix socket.
@@ -48,6 +50,18 @@ pub struct GatewayConfig {
     pub logins: Vec<GatewayLogin>,
     /// Route aliases.
     pub routes: Vec<Route>,
+    /// The `/v1/messages` front; without it the front answers 404.
+    pub messages: Option<MessagesFront>,
+}
+
+/// The `/v1/messages` front's settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagesFront {
+    /// `qbd` vendor whose thinking blocks are Anthropic blocks: they pass to clients as such, and
+    /// clients' thinking blocks come back as this vendor's.
+    pub vendor: String,
+    /// Client `model` names and the route alias each runs on.
+    pub models: Vec<(String, String)>,
 }
 
 /// A caller of the gateway by peer uid.
@@ -290,6 +304,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         clients: Vec::new(),
         logins: Vec::new(),
         routes: Vec::new(),
+        messages: None,
     };
     let known = [
         "socket",
@@ -302,6 +317,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         "clients",
         "logins",
         "routes",
+        "messages",
     ];
     let required = ["socket", "logins", "routes"];
     fields("", doc, &known, &required, |key, at, v| {
@@ -323,15 +339,43 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
                     c.logins.push(walk_login(&at, t)?);
                 }
             }
-            _ => {
+            "routes" => {
                 for (at, t) in tables(at, v)? {
                     c.routes.push(walk_route(&at, t)?);
+                }
+            }
+            _ => c.messages = Some(walk_messages(at, table(at, v)?)?),
+        }
+        Ok(())
+    })?;
+    Ok(c)
+}
+
+fn table<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<&'v DeTable<'i>, WalkError> {
+    v.get_ref()
+        .as_table()
+        .ok_or_else(|| wrong(at, v, "a table"))
+}
+
+fn walk_messages(at: &str, t: &DeTable<'_>) -> Result<MessagesFront, WalkError> {
+    let mut m = MessagesFront {
+        vendor: String::new(),
+        models: Vec::new(),
+    };
+    fields(at, t, &["vendor", "models"], &["vendor"], |key, at, v| {
+        match key {
+            "vendor" => m.vendor = string(at, v)?,
+            _ => {
+                for (model, alias) in table(at, v)? {
+                    let model = model.get_ref().as_ref();
+                    let alias = string(&format!("{at}.\"{model}\""), alias)?;
+                    m.models.push((model.to_owned(), alias));
                 }
             }
         }
         Ok(())
     })?;
-    Ok(c)
+    Ok(m)
 }
 
 fn walk_client(at: &str, t: &DeTable<'_>) -> Result<GatewayClient, WalkError> {
@@ -542,7 +586,37 @@ impl GatewayConfig {
         for (i, login) in self.logins.iter().enumerate() {
             absolute(&format!("logins[{i}].credentials"), &login.credentials)?;
         }
-        self.validate_routes()
+        self.validate_routes()?;
+        self.validate_messages()
+    }
+
+    fn validate_messages(&self) -> Result<(), Fault> {
+        let Some(m) = &self.messages else {
+            return Ok(());
+        };
+        if m.vendor.trim().is_empty() {
+            return Err(("messages.vendor".into(), "is empty".into()));
+        }
+        if m.models.len() > MAX_MODELS {
+            return Err(too_many(
+                "messages.models".into(),
+                m.models.len(),
+                MAX_MODELS,
+            ));
+        }
+        for (model, alias) in &m.models {
+            let at = format!("messages.models.\"{model}\"");
+            if model.is_empty() {
+                return Err((at, "an empty model name".into()));
+            }
+            if self.route(model).is_some() {
+                return Err((at, "is a route alias, which needs no entry".into()));
+            }
+            if self.route(alias).is_none() {
+                return Err((at, format!("unknown route alias `{alias}`")));
+            }
+        }
+        Ok(())
     }
 
     fn validate_routes(&self) -> Result<(), Fault> {
@@ -585,6 +659,16 @@ impl GatewayConfig {
     /// The route named `alias`.
     pub fn route(&self, alias: &str) -> Option<&Route> {
         self.routes.iter().find(|r| r.alias == alias)
+    }
+
+    /// The route a `/v1/messages` request for `model` runs on: the alias `messages.models` maps
+    /// it to, or the alias `model` itself.
+    pub fn route_of_model(&self, model: &str) -> Option<&Route> {
+        let models = self.messages.as_ref().map_or(&[][..], |m| &m.models);
+        match models.iter().find(|(name, _)| name == model) {
+            Some((_, alias)) => self.route(alias),
+            None => self.route(model),
+        }
     }
 
     /// The credential entry of `login`.
@@ -767,6 +851,49 @@ difficulty = 1
         for (top, extra, want) in cases {
             let err = check(top, extra).unwrap_err();
             assert!(err.contains(want), "{top}{extra}: {err}");
+        }
+    }
+
+    #[test]
+    fn messages_models_map_client_model_names_to_route_aliases() {
+        let c = check(
+            "",
+            "[messages]\nvendor = \"vendor-a\"\nmodels = { \"model-2025-01-01\" = \"chat\" }\n",
+        )
+        .unwrap();
+        let alias = |model: &str| c.route_of_model(model).map(|r| r.alias.as_str());
+        assert_eq!(alias("model-2025-01-01"), Some("chat"));
+        assert_eq!(alias("chat"), Some("chat"), "an alias names itself");
+        assert_eq!(alias("model-unknown"), None);
+        assert_eq!(c.messages.unwrap().vendor, "vendor-a");
+        assert_eq!(
+            check("", "").unwrap().route_of_model("chat").unwrap().alias,
+            "chat"
+        );
+
+        let cases = [
+            ("[messages]\nmodels = {}\n", "messages.vendor: is missing"),
+            (
+                "[messages]\nvendor = \"v\"\nmodels = { m = \"nope\" }\n",
+                "messages.models.\"m\": unknown route alias `nope`",
+            ),
+            (
+                "[messages]\nvendor = \"v\"\nmodels = { chat = \"chat\" }\n",
+                "messages.models.\"chat\": is a route alias",
+            ),
+            (
+                "[messages]\nvendor = \"v\"\nmodels = { m = 1 }\n",
+                "messages.models.\"m\": expected a string, found integer (line 15)",
+            ),
+            (
+                "[messages]\nvendor = \"v\"\nmodels = [\"m\"]\n",
+                "messages.models: expected a table, found array",
+            ),
+            ("[messages]\nvendor = \" \"\n", "messages.vendor: is empty"),
+        ];
+        for (extra, want) in cases {
+            let err = check("", extra).unwrap_err();
+            assert!(err.contains(want), "{extra}: {err}");
         }
     }
 

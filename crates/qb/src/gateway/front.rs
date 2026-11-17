@@ -1,8 +1,9 @@
-//! The C4 front: `/v1/model/turn`, `/v1/model/routes`, `/v1/model/cancel` and `/v1/health` over
-//! the gateway's unix socket. One thread per connection, at most `max_turns` +
-//! [`EXTRA_CONNECTIONS`] at once; every rejection is a non-200 [`GatewayError`], every admitted
-//! turn a `200` with a chunked NDJSON stream whose head goes out with its first event. The main
-//! thread accepts and cancels a turn whose client hangs up.
+//! The gateway's unix socket: the C4 front, `/v1/model/turn`, `/v1/model/routes`,
+//! `/v1/model/cancel` and `/v1/health`, and the Messages front's `/v1/messages`
+//! ([`super::messages`]). One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`]
+//! at once. On the C4 front every rejection is a non-200 [`GatewayError`], every admitted turn a
+//! `200` with a chunked NDJSON stream whose head goes out with its first event. The main thread
+//! accepts and cancels a turn whose client hangs up.
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -22,6 +23,7 @@ use rustix::io::Errno;
 use serde::Serialize;
 
 use super::core::{Cancel, Gateway};
+use super::messages;
 use super::upstream::{CancelToken, Flow};
 use crate::http::{self, Method, ReadError};
 use crate::log;
@@ -53,7 +55,7 @@ struct Watched {
 
 /// The client connections of running turns, which the main thread polls for a hang-up so a turn
 /// blocked on a silent vendor ends with its client.
-struct Watch {
+pub(super) struct Watch {
     turns: Mutex<Vec<Watched>>,
     /// An eventfd that wakes the main thread when the set changes.
     wake: OwnedFd,
@@ -61,7 +63,7 @@ struct Watch {
 }
 
 /// Removes its turn from the [`Watch`] when dropped.
-struct Watching<'w> {
+pub(super) struct Watching<'w> {
     watch: &'w Watch,
     id: u64,
 }
@@ -87,7 +89,7 @@ impl Watch {
     }
 
     /// Watches `stream` until the guard drops; a hang-up cancels `cancel`.
-    fn add(&self, stream: &UnixStream, cancel: CancelToken) -> io::Result<Watching<'_>> {
+    pub(super) fn add(&self, stream: &UnixStream, cancel: CancelToken) -> io::Result<Watching<'_>> {
         let stream = Arc::new(stream.try_clone()?);
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.turns().push(Watched { id, stream, cancel });
@@ -271,6 +273,13 @@ fn handle(
     };
     match (req.method, req.path.as_str()) {
         (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, watch, &caller, req.body),
+        (Method::Post, paths::MESSAGES) => {
+            messages::turn(stream, gateway, watch, &caller, req.body);
+        }
+        (_, paths::MESSAGES) => {
+            let e = GatewayError::new(ErrorClass::BadRequest, false, "method not allowed");
+            messages::reject(&mut stream, Some(405), &e);
+        }
         (Method::Get, paths::MODEL_ROUTES) => reply(&mut stream, 200, &gateway.routes()),
         (Method::Post, paths::MODEL_CANCEL) => {
             let c = match serde_json::from_slice::<CancelRequest>(&req.body) {
@@ -316,12 +325,15 @@ fn handle(
     }
 }
 
-/// Reads one request under [`READ_DEADLINE`]: a turn body of at most `max_turn` bytes, any
-/// other of at most [`http::MAX_BODY`]. A request that cannot be read is answered here.
+/// Reads one request under [`READ_DEADLINE`]: a turn or Messages body of at most `max_turn`
+/// bytes, any other of at most [`http::MAX_BODY`]. A request that cannot be read is answered
+/// here, in the Messages error format when its path is `/v1/messages`.
 fn read(stream: &mut UnixStream, max_turn: usize) -> Option<http::Request> {
     let limit = Cell::new(http::MAX_BODY);
+    let to_messages = Cell::new(false);
     let max_body = |method, path: &str| {
-        if method == Method::Post && path == paths::MODEL_TURN {
+        to_messages.set(path == paths::MESSAGES);
+        if method == Method::Post && [paths::MODEL_TURN, paths::MESSAGES].contains(&path) {
             limit.set(max_turn);
         }
         limit.get()
@@ -342,7 +354,12 @@ fn read(stream: &mut UnixStream, max_turn: usize) -> Option<http::Request> {
         }
         Err(ReadError::LengthRequired) => (411, "Content-Length required".into()),
     };
-    reject(stream, status, ErrorClass::BadRequest, &message);
+    if to_messages.get() {
+        let e = GatewayError::new(ErrorClass::BadRequest, false, message);
+        messages::reject(stream, Some(status), &e);
+    } else {
+        reject(stream, status, ErrorClass::BadRequest, &message);
+    }
     None
 }
 

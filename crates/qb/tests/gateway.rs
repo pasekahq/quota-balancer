@@ -1653,8 +1653,13 @@ fn recorded(name: &str, sse: Option<&str>) -> Answer {
     Answer::Full(status, headers, body)
 }
 
-/// A rig whose gateway runs the Anthropic adapter against a scripted vendor; `logins` as in
-/// [`gateway_toml`], the credential files `files`.
+/// The `[messages]` table of the Messages front tests: client model `model-2025-01-01` runs on
+/// route `chat`.
+const MESSAGES_FRONT: &str =
+    "[messages]\nvendor = \"vendor-a\"\nmodels = { \"model-2025-01-01\" = \"chat\" }\n";
+
+/// A rig whose gateway runs the Anthropic adapter against a scripted vendor and serves the
+/// Messages front; `logins` as in [`gateway_toml`], the credential files `files`.
 fn vendor_rig(
     files: &[(&str, String, u32)],
     logins: impl Fn(&Vendor) -> [String; 2],
@@ -1664,7 +1669,7 @@ fn vendor_rig(
     credentials(&dir, files);
     let qbd = start_qbd(&dir, QBD);
     let keys = logins(&vendor);
-    let text = gateway_toml(&dir, &qbd, 4, [&keys[0], &keys[1]], "");
+    let text = gateway_toml(&dir, &qbd, 4, [&keys[0], &keys[1]], MESSAGES_FRONT);
     let refreshes = Arc::new(AtomicUsize::new(0));
     let gw = serve_gateway(
         &text,
@@ -2084,6 +2089,10 @@ fn an_expired_token_is_refreshed_before_the_call_and_written_back() {
     let asked = tokens.received();
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].path, "/v1/oauth/token");
+    assert_eq!(
+        asked[0].header("user-agent"),
+        Some(identity::OAUTH_TOKEN_USER_AGENT)
+    );
     let form = asked[0].body.as_str().unwrap();
     assert!(
         form.starts_with(&format!(
@@ -2197,4 +2206,384 @@ fn concurrent_turns_on_one_expiring_login_make_one_token_request() {
     for s in sent.iter() {
         assert_eq!(s.header("authorization"), Some(bearer(NEW_ACCESS).as_str()));
     }
+}
+
+/// The headers the official Anthropic Python SDK sends besides `Host`, `Content-Length` and
+/// `anthropic-beta`, with a synthetic key the gateway ignores.
+const SDK_HEADERS: &str = "Accept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\n\
+x-stainless-timeout: 600\r\nAccept: application/json\r\nContent-Type: application/json\r\n\
+User-Agent: Anthropic/Python 0.87.0\r\nX-Stainless-Lang: python\r\n\
+X-Stainless-Package-Version: 0.87.0\r\nX-Stainless-OS: Linux\r\nX-Stainless-Arch: x64\r\n\
+X-Stainless-Runtime: CPython\r\nX-Stainless-Runtime-Version: 3.11.16\r\n\
+X-Api-Key: test-client-key\r\nX-Stainless-Async: false\r\nanthropic-version: 2023-06-01\r\n\
+x-stainless-retry-count: 0\r\nx-stainless-read-timeout: 600\r\n";
+
+/// Sends `body` to `/v1/messages` with the SDK's headers and `anthropic-beta: beta` when set.
+fn sdk_send(sock: &Path, body: &Value, beta: Option<&str>) -> UnixStream {
+    let mut s = UnixStream::connect(sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let beta = beta.map_or(String::new(), |b| format!("anthropic-beta: {b}\r\n"));
+    let body = body.to_string();
+    write!(
+        s,
+        "POST {} HTTP/1.1\r\nHost: localhost\r\n{SDK_HEADERS}{beta}Content-Length: {}\r\n\r\n{body}",
+        paths::MESSAGES,
+        body.len()
+    )
+    .unwrap();
+    s
+}
+
+/// Status, head and body of one `/v1/messages` call.
+fn sdk_call(sock: &Path, body: &Value, beta: Option<&str>) -> (u16, String, Vec<u8>) {
+    finish(sdk_send(sock, body, beta), Vec::new())
+}
+
+/// A first request as the SDK's `messages.create` builds it: cached system prompt and user
+/// block, a tool, thinking and `metadata.user_id`.
+fn sdk_body(model: &str, stream: bool) -> Value {
+    json!({
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}
+        ]}],
+        "model": model,
+        "metadata": {"user_id": "session-1"},
+        "stream": stream,
+        "system": [{"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}}],
+        "thinking": {"type": "enabled", "budget_tokens": 512},
+        "tools": [{"name": "read", "description": "Read a file.", "input_schema": {
+            "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]
+        }}],
+    })
+}
+
+/// The SSE events of `body`.
+fn frames(body: &[u8]) -> Vec<qb_anthropic::sse::Frame> {
+    let mut out = Vec::new();
+    qb_anthropic::sse::Parser::default()
+        .feed(body, &mut out)
+        .unwrap();
+    out
+}
+
+fn names(frames: &[qb_anthropic::sse::Frame]) -> Vec<&str> {
+    frames.iter().map(|f| f.event.as_str()).collect()
+}
+
+/// The canonical events and stop reason a Messages stream carries, read as the adapter reads
+/// the vendor's.
+fn content_of(sse: &[u8]) -> (Vec<StreamEvent>, StopReason) {
+    let mut reader =
+        qb_anthropic::stream::Reader::new("vendor-a", qb_anthropic::limits::RateLimits::default());
+    let mut events = Vec::new();
+    reader.feed(sse, &mut events).unwrap();
+    (events, reader.finish().unwrap())
+}
+
+#[test]
+fn messages_streams_the_vendor_content_to_an_sdk_client() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    for _ in 0..2 {
+        vendor.answer(recorded("200_allowed", Some("upstream_thinking.sse")));
+    }
+    let beta = "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
+    let body = sdk_body("model-2025-01-01", true);
+    let (status, head, plain) = sdk_call(&r.gw, &body, None);
+    let (status_beta, _, with_beta) = sdk_call(&r.gw, &body, Some(beta));
+    assert_eq!((status, status_beta), (200, 200));
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+
+    let got = frames(&with_beta);
+    assert_eq!(
+        names(&got),
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    let start: Value = serde_json::from_str(&got[0].data).unwrap();
+    assert_eq!(start["message"]["model"], "model-2025-01-01");
+    assert_eq!(
+        content_of(&with_beta),
+        content_of(&vendor_fixture("upstream_thinking.sse"))
+    );
+    let tail = |sse: &[u8]| frames(sse).into_iter().skip(1).collect::<Vec<_>>();
+    assert_eq!(
+        tail(&plain),
+        tail(&with_beta),
+        "only the message id differs"
+    );
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[0].body, sent[1].body,
+        "anthropic-beta leaves the turn as it is"
+    );
+    let names_of = |r: &Received| r.headers.iter().map(|h| h.0.clone()).collect::<Vec<_>>();
+    assert_eq!(names_of(&sent[0]), names_of(&sent[1]));
+    assert_eq!(sent[1].header("anthropic-beta"), None);
+    assert_eq!(sent[1].body["model"], "model-large");
+    assert_eq!(sent[1].body["system"][0]["text"], "Be brief.");
+    assert!(
+        sent[1].body.to_string().contains("cache_control"),
+        "{}",
+        sent[1].body
+    );
+}
+
+#[test]
+fn messages_answers_stream_false_with_one_assembled_body() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("200_allowed", Some("upstream_thinking.sse")));
+    let (status, head, body) = sdk_call(&r.gw, &sdk_body("model-2025-01-01", false), None);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(head.contains("Content-Type: application/json"), "{head}");
+    let mut message: Value = serde_json::from_slice(&body).unwrap();
+    assert!(message["id"].as_str().unwrap().starts_with("msg_"));
+    message["id"] = Value::Null;
+    assert_eq!(
+        message,
+        json!({
+            "id": null,
+            "type": "message",
+            "role": "assistant",
+            "model": "model-2025-01-01",
+            "content": [
+                {"type": "thinking", "thinking": "The user wants a greeting.",
+                 "signature": "c2lnbmF0dXJlLXRlc3QtMQ=="},
+                {"type": "redacted_thinking", "data": "cmVkYWN0ZWQtdGVzdC0x"},
+                {"type": "text", "text": "Hi!"},
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 25, "cache_creation_input_tokens": 100,
+                      "cache_read_input_tokens": 2000, "output_tokens": 30},
+        })
+    );
+    assert_eq!(vendor.received()[0].body["stream"], true);
+}
+
+#[test]
+fn messages_carries_a_tool_round_trip_with_signed_thinking_to_the_vendor() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("200_allowed", Some("upstream_tool_use.sse")));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+
+    let mut first = sdk_body("model-2025-01-01", false);
+    let (status, _, answer) = sdk_call(&r.gw, &first, None);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let answer: Value = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer["stop_reason"], "tool_use");
+    let content = answer["content"].as_array().unwrap();
+    assert_eq!(
+        content[1],
+        json!({"type": "tool_use", "id": "toolu_test_1", "name": "read",
+               "input": {"path": "notes.txt", "lines": [1, 2]}})
+    );
+
+    let thinking = json!({"type": "thinking", "thinking": "Read it first.",
+                          "signature": "c2lnbmF0dXJlLXRlc3QtMQ=="});
+    let mut assistant = vec![thinking.clone()];
+    assistant.extend(content.iter().cloned());
+    let history = first["messages"].as_array_mut().unwrap();
+    history.push(json!({"role": "assistant", "content": assistant}));
+    history.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_test_1", "content": "line one",
+         "cache_control": {"type": "ephemeral"}},
+        {"type": "tool_result", "tool_use_id": "toolu_test_2",
+         "content": [{"type": "text", "text": "a.txt"}], "is_error": true},
+    ]}));
+    first["stream"] = json!(true);
+    let (status, _, sse) = sdk_call(&r.gw, &first, Some("interleaved-thinking-2025-05-14"));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    assert_eq!(
+        content_of(&sse),
+        content_of(&vendor_fixture("upstream_text.sse"))
+    );
+
+    let sent = vendor.received();
+    let messages = sent[1].body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(
+        messages[1]["content"][0], thinking,
+        "signed thinking reaches the vendor"
+    );
+    assert_eq!(messages[1]["content"][2]["id"], "toolu_test_1");
+    assert_eq!(
+        messages[1]["content"][2]["input"],
+        json!({"path": "notes.txt", "lines": [1, 2]})
+    );
+    let results = messages[2]["content"].as_array().unwrap();
+    assert_eq!(
+        (&results[0]["tool_use_id"], &results[0]["content"]),
+        (&json!("toolu_test_1"), &json!("line one"))
+    );
+    assert_eq!(
+        (&results[1]["content"], &results[1]["is_error"]),
+        (&json!("a.txt"), &json!(true))
+    );
+    assert!(
+        sent[1].body.to_string().contains("cache_control"),
+        "{}",
+        sent[1].body
+    );
+}
+
+#[test]
+fn a_usage_limit_rotation_is_invisible_to_a_messages_client() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("429_usage_limit", None));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let (status, _, sse) = sdk_call(&r.gw, &sdk_body("chat", true), None);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    assert_eq!(names(&frames(&sse))[0], "message_start");
+    assert!(!names(&frames(&sse)).contains(&"error"));
+    assert_eq!(
+        content_of(&sse),
+        content_of(&vendor_fixture("upstream_text.sse"))
+    );
+    let sent = vendor.received();
+    let keys: Vec<_> = sent.iter().map(|s| s.header("x-api-key")).collect();
+    assert_eq!(keys, [Some("test-token-1"), Some("test-token-2")]);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+    assert_eq!(s.leases, Vec::new());
+}
+
+/// The `retry-after` and `x-should-retry` headers of an answer head.
+fn retry_headers(head: &str) -> (Option<u64>, Option<&str>) {
+    let value = |name: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+    };
+    (
+        value("retry-after:").map(|v| v.parse().unwrap()),
+        value("x-should-retry:"),
+    )
+}
+
+#[test]
+fn an_exhausted_chain_answers_429_with_retry_after_until_the_reset() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    for _ in 0..2 {
+        vendor.answer(recorded("429_usage_limit", None));
+    }
+    for stream in [true, false] {
+        let before = unix_now();
+        let (status, head, body) = sdk_call(&r.gw, &sdk_body("model-2025-01-01", stream), None);
+        assert_eq!(status, 429, "{}", String::from_utf8_lossy(&body));
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        let (retry_after, should_retry) = retry_headers(&head);
+        let retry_after = retry_after.unwrap();
+        let reset = 1_800_018_000;
+        assert!(
+            (reset - unix_now()..=reset - before).contains(&retry_after),
+            "{head}"
+        );
+        assert_eq!(should_retry, Some("false"), "the reset is hours away");
+    }
+    assert_eq!(
+        vendor.received().len(),
+        2,
+        "the second turn needs no attempt"
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn messages_errors_use_the_messages_format_before_and_after_the_first_event() {
+    let r = rig_as(4, &key_files(), MESSAGES_FRONT, own_uid());
+    let resets = unix_now() + 3600;
+    r.fake.script(
+        "login-1",
+        Script::Fail(
+            vec![text("partial")],
+            FailureKind::Overloaded { retry_after: None },
+            window(0.5, resets),
+        ),
+    );
+    let (status, _, sse) = sdk_call(&r.gw, &sdk_body("chat", true), None);
+    assert_eq!(status, 200);
+    let got = frames(&sse);
+    assert_eq!(
+        names(&got)[..3],
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta"
+        ]
+    );
+    assert_eq!(names(&got).last(), Some(&"error"));
+    let error: Value = serde_json::from_str(&got.last().unwrap().data).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "overloaded_error");
+
+    let (status, _, body) = sdk_call(&r.gw, &sdk_body("model-unknown", true), None);
+    assert_eq!(status, 400);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("model-unknown"),
+        "{body}"
+    );
+
+    let (status, body) = call(&r.gw, "GET", paths::MESSAGES, "");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((status, &body["type"]), (405, &json!("error")));
+    let oversized = "x".repeat(131_073);
+    let (status, body) = call(&r.gw, "POST", paths::MESSAGES, &oversized);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        (status, &body["error"]["type"]),
+        (413, &json!("invalid_request_error"))
+    );
+
+    let (status, body) = call(
+        &rig().gw,
+        "POST",
+        paths::MESSAGES,
+        &sdk_body("chat", true).to_string(),
+    );
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[test]
+fn a_messages_client_that_closes_its_connection_shuts_the_vendor_stream_down() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(Answer::Hold(stream_start()));
+    let mut client = sdk_send(&r.gw, &sdk_body("model-2025-01-01", true), None);
+    until_text(&mut client);
+    let dropped = std::time::Instant::now();
+    drop(client);
+    let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(closed.duration_since(dropped) < Duration::from_secs(1));
+    let mut leases = 1;
+    for _ in 0..50 {
+        leases = state(&r.qbd).leases.len();
+        if leases == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(leases, 0, "the lease is released");
 }
