@@ -20,7 +20,7 @@ use std::time::Duration;
 use qb::auth::Gate;
 use qb::gateway::anthropic::Anthropic;
 use qb::gateway::chat_upstream::ChatCompletions;
-use qb::gateway::config::Api;
+use qb::gateway::config::{Api, GatewayLogin};
 use qb::gateway::core::{Cancel, Gateway, Upstreams};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
 use qb::gateway::front;
@@ -36,9 +36,9 @@ use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
-    Block, CancelAnswer, ErrorClass, GatewayError, LoginStatus, RouteState, RouteStatus,
-    RoutesAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
-    WindowReport, paths,
+    Block, CancelAnswer, ErrorClass, GatewayError, LoginStatus, ReloadAnswer, RouteState,
+    RouteStatus, RoutesAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall,
+    TurnRequest, Usage, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -88,6 +88,8 @@ enum Script {
     Fail(Vec<StreamEvent>, FailureKind, Vec<WindowReport>),
     /// Emit the events, then wait for the cancel.
     Hang(Vec<StreamEvent>),
+    /// Emit the events, then finish with `end` once the sender sends or hangs up.
+    Held(Vec<StreamEvent>, std::sync::mpsc::Receiver<()>),
     /// Emit a text event every 20 ms until the sink stops it; at most 10 s.
     Drip,
     /// Fail as a refused request with a message that quotes the credential.
@@ -180,6 +182,14 @@ impl Upstream for Shared {
                 }
                 panic!("the sink never stopped the stream");
             }
+            Script::Held(events, release) => {
+                emit(events, sink)?;
+                let _ = release.recv_timeout(Duration::from_secs(10));
+                Ok(Finished {
+                    stop: StopReason::End,
+                    windows: Vec::new(),
+                })
+            }
             Script::Hang(events) => {
                 emit(events, sink)?;
                 // Blocks like a vendor read until the cancel hook unblocks it.
@@ -200,7 +210,7 @@ impl Upstream for Shared {
 struct Counting(Arc<AtomicUsize>);
 
 impl Refresher for Counting {
-    fn refresh(&self, _: &str, refresh_token: &str) -> Result<Refreshed, RefreshError> {
+    fn refresh(&self, _: &GatewayLogin, refresh_token: &str) -> Result<Refreshed, RefreshError> {
         let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(rejected) = match refresh_token {
             "refresh-down" => Some(false),
@@ -376,8 +386,8 @@ fn rig_on(
     }
 }
 
-/// Serves a gateway of config `text` with `upstreams` as `gateway_uid`, and its Messages front
-/// on `loopback` when set; its socket.
+/// Serves a gateway of config `text`, written to `gateway.toml` beside its socket, with
+/// `upstreams` as `gateway_uid`, and its Messages front on `loopback` when set; its socket.
 fn serve_gateway(
     text: &str,
     upstreams: Upstreams,
@@ -385,7 +395,10 @@ fn serve_gateway(
     gateway_uid: u32,
     loopback: Option<TcpListener>,
 ) -> PathBuf {
-    let config = qb::gateway::config::parse(Path::new("gateway.toml"), text).unwrap();
+    let parsed = qb::gateway::config::parse(Path::new("gateway.toml"), text).unwrap();
+    let file = parsed.socket.with_file_name("gateway.toml");
+    std::fs::write(&file, text).unwrap();
+    let config = qb::gateway::config::load(&file).unwrap();
     let gw = config.socket.clone();
     let gateway = Gateway::new(config, upstreams, refresher, None);
     let listener = UnixListener::bind(&gw).unwrap();
@@ -393,6 +406,7 @@ fn serve_gateway(
         front::serve(
             &listener,
             loopback.as_ref(),
+            None,
             &Arc::new(gateway),
             gateway_uid,
         )
@@ -1681,6 +1695,185 @@ fn routes_show_a_chain_on_its_first_ready_step_or_its_nearest_reset() {
     assert_eq!(r.fake.calls(), Vec::new());
 }
 
+/// The config file of the gateway on socket `gw`.
+fn config_file(gw: &Path) -> PathBuf {
+    gw.with_file_name("gateway.toml")
+}
+
+/// Rewrites the config file of the gateway on `gw` with `edit`, which must change it, and asks
+/// the gateway to reload: the answer's status and body.
+fn reload_with(gw: &Path, edit: impl FnOnce(&str) -> String) -> (u16, Vec<u8>) {
+    let file = config_file(gw);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let edited = edit(&text);
+    assert_ne!(edited, text, "the edit changes the file");
+    std::fs::write(&file, edited).unwrap();
+    call(gw, "POST", paths::MODEL_RELOAD, "")
+}
+
+fn aliases(gw: &Path) -> Vec<String> {
+    routes_of(gw).into_iter().map(|r| r.alias).collect()
+}
+
+#[test]
+fn a_turn_in_flight_keeps_its_chain_across_a_reload_and_the_next_takes_the_new_one() {
+    let r = chain_rig();
+    let (release, held) = std::sync::mpsc::channel();
+    r.fake
+        .script("login-1", Script::Held(vec![text("old")], held));
+    let mut s = send(
+        &r.gw,
+        "POST",
+        paths::MODEL_TURN,
+        &turn_body("turn-1").to_string(),
+    );
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !String::from_utf8_lossy(&seen).contains("text_delta") {
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "stream ended early");
+        seen.extend_from_slice(&chunk[..n]);
+    }
+    let first_step = "  { vendor = \"vendor-a\", model = \"model-a\" },\n";
+    let (status, body) = reload_with(&r.gw, |t| t.replace(first_step, ""));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let answer: ReloadAnswer = serde_json::from_slice(&body).unwrap();
+    assert_eq!((answer.routes, answer.logins), (1, 3));
+
+    release.send(()).unwrap();
+    let (status, _, rest) = finish(s, seen);
+    assert_eq!(status, 200);
+    let events = events(&rest);
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+    assert_eq!(route_of(&events), ("vendor-a".into(), "model-a".into()));
+
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-2"));
+    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    assert_eq!(route_of(&events), ("vendor-b".into(), "model-b".into()));
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn routes_and_admissions_follow_the_aliases_a_reload_adds_and_removes() {
+    let r = rig();
+    assert_eq!(aliases(&r.gw), ["chat", "spare"]);
+    let mut answer = (0, Vec::new());
+    let logged = stderr_until("gateway: reloaded", || {
+        answer = reload_with(&r.gw, |t| {
+            t.replace("alias = \"chat\"", "alias = \"added\"")
+        });
+    });
+    assert_eq!(answer.0, 200, "{}", String::from_utf8_lossy(&answer.1));
+    let reloaded = format!(
+        "gateway: reloaded {}: 2 routes, 2 logins",
+        config_file(&r.gw).display()
+    );
+    assert!(logged.contains(&reloaded), "{logged}");
+    assert_eq!(aliases(&r.gw), ["added", "spare"]);
+
+    let mut body = turn_body("turn-1");
+    body["route"] = json!("added");
+    let (_, _, events) = turn(&r.gw, &body);
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+    body["route"] = json!("chat");
+    body["request_id"] = json!("turn-2");
+    let (status, e) = rejection(&r.gw, "POST", paths::MODEL_TURN, &body.to_string());
+    assert_eq!((status, e.class), (400, ErrorClass::BadRequest));
+    assert_eq!(
+        e.message.as_deref(),
+        Some("unknown route alias `chat`"),
+        "{e:?}"
+    );
+}
+
+/// Asks the gateway on `gw` to reload after `edit`, expects a refusal whose message holds
+/// `says`, logged in one line, and puts the file back.
+fn refused_reload(gw: &Path, edit: impl FnOnce(&str) -> String, says: &str) {
+    let file = config_file(gw);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let mut answer = (0, Vec::new());
+    let logged = stderr_until("reload refused", || answer = reload_with(gw, edit));
+    std::fs::write(&file, before).unwrap();
+    let e: GatewayError = serde_json::from_slice(&answer.1).unwrap();
+    assert_eq!((answer.0, e.class), (400, ErrorClass::BadRequest), "{e:?}");
+    let message = e.message.unwrap();
+    let refusal = format!("reload refused: {}: {says}", file.display());
+    assert!(message.starts_with(&refusal), "{message}");
+    let lines: Vec<&str> = logged
+        .lines()
+        .filter(|l| l.contains("reload refused"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{logged}");
+    assert!(
+        lines[0].contains(&format!("gateway: {message}")),
+        "{logged}"
+    );
+}
+
+#[test]
+fn a_broken_config_is_refused_and_the_running_one_keeps_serving() {
+    let r = rig();
+    refused_reload(
+        &r.gw,
+        |t| format!("{t}[[routes]\n"),
+        "unclosed array table, expected `]` (line 29)",
+    );
+    refused_reload(
+        &r.gw,
+        |t| t.replace("alias = \"spare\"", "alias = \"chat\""),
+        "routes[1].alias: duplicate `chat` (line ",
+    );
+    assert_eq!(aliases(&r.gw), ["chat", "spare"]);
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+}
+
+#[test]
+fn a_change_that_needs_a_restart_is_refused_naming_the_field() {
+    let r = rig();
+    let socket = r.gw.display().to_string();
+    refused_reload(
+        &r.gw,
+        |t| t.replace(&socket, &format!("{socket}.new")),
+        "socket: changed; it takes effect only on a restart",
+    );
+    refused_reload(
+        &r.gw,
+        |t| format!("socket_mode = 0o660\n{t}"),
+        "socket_mode: changed",
+    );
+    refused_reload(
+        &r.gw,
+        |t| t.replace("creds/login-2.json", "elsewhere/login-2.json"),
+        "logins[1].credentials: lies outside the credential directories the sandbox opened; \
+         it takes effect only on a restart",
+    );
+    let login_3 = format!(
+        "\n[[logins]]\nname = \"login-3\"\n{ANTHROPIC_KEY}\ncredentials = \"{}/creds/login-3.json\"\n",
+        r.dir.display()
+    );
+    let (status, body) = reload_with(&r.gw, |t| format!("{t}{login_3}"));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let answer: ReloadAnswer = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        answer.logins, 3,
+        "a new file in an opened directory needs no restart"
+    );
+}
+
+#[test]
+fn only_the_gateway_s_own_uid_may_reload_it() {
+    let files = [("login-1", api_key("test-token-1"), 0o600)];
+    let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
+    let r = rig_as(4, &files, &extra, own_uid() + 1);
+    let (status, body) = reload_with(&r.gw, |t| {
+        t.replace("alias = \"spare\"", "alias = \"added\"")
+    });
+    let e: GatewayError = serde_json::from_slice(&body).unwrap();
+    assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
+    assert_eq!(aliases(&r.gw), ["chat", "spare"]);
+}
+
 /// Runs `f` with this process's stderr in a file and returns what was written there.
 fn stderr_of(f: impl FnOnce()) -> String {
     stderr_until("", f)
@@ -2283,11 +2476,10 @@ fn oauth_rig(login_1: String, qbd_config: &str) -> (Rig, Vendor, Vendor) {
         tokens.base_url
     );
     let text = gateway_toml(&dir, &qbd, 4, [&oauth, &vendor.login(ANTHROPIC_KEY)], "");
-    let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
     let gw = serve_gateway(
         &text,
         vec![(Api::Anthropic, Box::new(Anthropic::new()))],
-        Box::new(OauthRefresher::new(&config)),
+        Box::new(OauthRefresher::new()),
         own_uid(),
         None,
     );
@@ -4294,11 +4486,10 @@ fn chatgpt_rig(login_1: String) -> (Rig, Vendor, Vendor) {
     );
     let key = vendor.login(OPENAI_KEY);
     let text = gateway_toml(&dir, &qbd, 4, [&chatgpt, &key], "");
-    let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
     let gw = serve_gateway(
         &text,
         vec![(Api::Openai, Box::new(Openai::new()))],
-        Box::new(OauthRefresher::new(&config)),
+        Box::new(OauthRefresher::new()),
         own_uid(),
         None,
     );

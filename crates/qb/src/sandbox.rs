@@ -1,8 +1,9 @@
 //! Self-restriction of `qb agent` and `qb gateway` before their first connection: the process
 //! becomes non-dumpable, and landlock limits it to the credential directories (read-only for the
 //! agent; for the gateway also writing, creating and removing regular files, as a refreshed
-//! token is written back by rename), the resolver files and TCP connections to port 443. The only
-//! TCP bind allowed is the gateway's on the port of its loopback Messages listener.
+//! token is written back by rename), the resolver files and TCP connections to port 443. The
+//! gateway may also read the files of its config's directory, for a reload. The only TCP bind
+//! allowed is the gateway's on the port of its loopback Messages listener.
 
 use std::path::{Path, PathBuf};
 
@@ -37,14 +38,15 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, false, None)
+    confine(&files, false, None, None)
 }
 
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
 /// truncate files, create regular files and remove files, so a refreshed token can be written
-/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. TCP
-/// bind only on the port of `fronts.listen`, whose listener must exist before. Call it before
-/// starting any thread.
+/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. Read
+/// files beneath the directory of `config.file`, so a reload sees the file an editor replaced.
+/// TCP bind only on the port of `fronts.listen`, whose listener must exist before. Call it
+/// before starting any thread.
 ///
 /// # Errors
 /// The dumpable flag cannot be cleared.
@@ -59,12 +61,13 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
         .as_ref()
         .and_then(|f| f.listen)
         .map(|a| a.port());
-    confine(&files, true, bind)
+    confine(&files, true, Some(&config.file), bind)
 }
 
 fn confine(
     credential_files: &[&Path],
     writable: bool,
+    config_file: Option<&Path>,
     bind: Option<u16>,
 ) -> Result<Vec<String>, String> {
     set_dumpable_behavior(DumpableBehavior::NotDumpable)
@@ -72,7 +75,7 @@ fn confine(
     let mut gaps = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for file in credential_files {
-        match credential_dir(file) {
+        match file_dir(file) {
             Ok(dir) if !dirs.contains(&dir) => dirs.push(dir),
             Ok(_) => {}
             Err(e) => gaps.push(format!("{} stays unreadable: {e}", file.display())),
@@ -89,9 +92,17 @@ fn confine(
     } else {
         read_dir
     };
+    let config_dir = match config_file.map(file_dir).transpose() {
+        Ok(dir) => dir,
+        Err(e) => {
+            gaps.push(format!("the config stays unreadable for a reload: {e}"));
+            None
+        }
+    };
     let readable = dirs
         .iter()
         .map(|d| (d.as_path(), credential_access))
+        .chain(config_dir.as_deref().map(|d| (d, read_file)))
         .chain(RESOLVER_FILES.map(|f| (Path::new(f), read_file)));
     let mut rules = Vec::new();
     for (path, access) in readable {
@@ -118,11 +129,15 @@ fn confine(
     Ok(gaps)
 }
 
-/// The absolute directory of the credential file `file`, resolved against the working directory.
+/// The absolute directory of the credential or config file `file`, resolved against the working
+/// directory; the sandbox opens that directory to the file.
 ///
-/// The directory, not the file, is readable because vendor CLIs replace the file by rename when
-/// they refresh the token, and a rule on the file would keep pointing at the old inode.
-fn credential_dir(file: &Path) -> std::io::Result<PathBuf> {
+/// The directory, not the file, is readable because vendor CLIs and editors replace a file by
+/// rename, and a rule on the file would keep pointing at the old inode.
+///
+/// # Errors
+/// The working directory is unknown, or `file` has no parent.
+pub fn file_dir(file: &Path) -> std::io::Result<PathBuf> {
     let file = std::path::absolute(file)?;
     file.parent().map(Path::to_path_buf).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "has no parent directory")

@@ -20,6 +20,7 @@ qb-anthropic.workspace = true
 qb-openai.workspace = true
 httparse.workspace = true
 landlock.workspace = true
+libc.workspace = true
 lexopt.workspace = true
 rustix.workspace = true
 serde.workspace = true

@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used)]
 
 use qb_proto::{
-    Block, CancelAnswer, CancelRequest, ErrorClass, GatewayError, Message, Role, RouteState,
-    RoutesAnswer, StopReason, StreamEvent, TurnRequest,
+    Block, CancelAnswer, CancelRequest, ErrorClass, GatewayError, Message, ReloadAnswer, Role,
+    RouteState, RoutesAnswer, StopReason, StreamEvent, TurnRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -128,6 +128,8 @@ fn errors_routes_cancel() {
     assert_eq!(cancel.request_id, "turn-0001");
     let answer: CancelAnswer = roundtrip("gateway_cancel_answer.json");
     assert!(answer.cancelled);
+    let reloaded: ReloadAnswer = roundtrip("gateway_reload_answer.json");
+    assert_eq!((reloaded.routes, reloaded.logins), (3, 2));
 }
 
 /// A turn request around one block, for the block fixtures.

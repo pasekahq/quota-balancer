@@ -9,7 +9,7 @@ use qb_openai::request::identity as openai;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::config::{CredentialKind, GatewayConfig};
+use super::config::{CredentialKind, GatewayLogin};
 use super::creds::{RefreshError, Refreshed, Refresher, Secret};
 use super::vendor::{self, CONNECT_TIMEOUT};
 use crate::server::unix_now;
@@ -53,50 +53,43 @@ impl Issuer {
     }
 }
 
-/// One OAuth login, its issuer and its token endpoints in the order they are tried.
+/// The issuer of an OAuth login and its token endpoints in the order they are tried.
 struct Grant {
-    login: String,
     issuer: Issuer,
     urls: Vec<String>,
 }
 
-/// Refreshes the tokens of the `oauth_anthropic` and `chatgpt_oauth` logins of one gateway
-/// config.
+impl Grant {
+    /// The grant of `login`: its `token_url`, else the vendor's endpoints; `None` for an API key.
+    fn of(login: &GatewayLogin) -> Option<Self> {
+        let (issuer, default): (_, &[&str]) = match login.kind {
+            CredentialKind::OauthAnthropic => (Issuer::Anthropic, &anthropic::OAUTH_TOKEN_URLS),
+            CredentialKind::ChatgptOauth => (Issuer::Openai, &[openai::OAUTH_TOKEN_URL]),
+            CredentialKind::ApiKey => return None,
+        };
+        let urls = match &login.token_url {
+            Some(url) => vec![url.clone()],
+            None => default.iter().map(|u| (*u).to_owned()).collect(),
+        };
+        Some(Self { issuer, urls })
+    }
+}
+
+/// Refreshes the tokens of `oauth_anthropic` and `chatgpt_oauth` logins at the endpoints their
+/// entries name.
 pub struct OauthRefresher {
     config: ureq::config::Config,
-    grants: Vec<Grant>,
+}
+
+impl Default for OauthRefresher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OauthRefresher {
-    /// A refresher of `config`'s OAuth logins with [`CONNECT_TIMEOUT`] and [`REFRESH_TIMEOUT`],
-    /// no proxy and no redirects.
-    pub fn new(config: &GatewayConfig) -> Self {
-        let grants = config
-            .logins
-            .iter()
-            .filter_map(|l| {
-                let (issuer, default): (_, &[&str]) = match l.kind {
-                    CredentialKind::OauthAnthropic => {
-                        (Issuer::Anthropic, &anthropic::OAUTH_TOKEN_URLS)
-                    }
-                    CredentialKind::ChatgptOauth => (Issuer::Openai, &[openai::OAUTH_TOKEN_URL]),
-                    CredentialKind::ApiKey => return None,
-                };
-                let urls = match &l.token_url {
-                    Some(url) => vec![url.clone()],
-                    None => default.iter().map(|u| (*u).to_owned()).collect(),
-                };
-                Some(Grant {
-                    login: l.name.clone(),
-                    issuer,
-                    urls,
-                })
-            })
-            .collect();
-        Self::with_grants(grants)
-    }
-
-    fn with_grants(grants: Vec<Grant>) -> Self {
+    /// A refresher with [`CONNECT_TIMEOUT`] and [`REFRESH_TIMEOUT`], no proxy and no redirects.
+    pub fn new() -> Self {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
@@ -104,7 +97,24 @@ impl OauthRefresher {
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(REFRESH_TIMEOUT))
             .build();
-        Self { config, grants }
+        Self { config }
+    }
+
+    /// The refresh grant of `refresh_token` at each endpoint of `grant` until one answers.
+    fn exchange(&self, grant: &Grant, refresh_token: &str) -> Result<Refreshed, RefreshError> {
+        let body = form(refresh_token, grant.issuer.client_id());
+        let mut failures = Vec::new();
+        for url in &grant.urls {
+            match self.post(grant.issuer, url, body.as_bytes()) {
+                Ok(fresh) => return Ok(fresh),
+                Err(Failed::Next(why)) => failures.push(why),
+                Err(Failed::Last(e)) => return Err(e),
+            }
+        }
+        Err(RefreshError {
+            rejected: false,
+            message: failures.join("; "),
+        })
     }
 
     /// One token request of `issuer` to `url` with the form `body`.
@@ -250,26 +260,18 @@ fn base64url(s: &str) -> Option<Vec<u8>> {
 }
 
 impl Refresher for OauthRefresher {
-    fn refresh(&self, login: &str, refresh_token: &str) -> Result<Refreshed, RefreshError> {
-        let Some(grant) = self.grants.iter().find(|g| g.login == login) else {
+    fn refresh(
+        &self,
+        login: &GatewayLogin,
+        refresh_token: &str,
+    ) -> Result<Refreshed, RefreshError> {
+        let Some(grant) = Grant::of(login) else {
             return Err(RefreshError {
                 rejected: false,
-                message: format!("`{login}` is not an OAuth login"),
+                message: format!("`{}` is not an OAuth login", login.name),
             });
         };
-        let body = form(refresh_token, grant.issuer.client_id());
-        let mut failures = Vec::new();
-        for url in &grant.urls {
-            match self.post(grant.issuer, url, body.as_bytes()) {
-                Ok(fresh) => return Ok(fresh),
-                Err(Failed::Next(why)) => failures.push(why),
-                Err(Failed::Last(e)) => return Err(e),
-            }
-        }
-        Err(RefreshError {
-            rejected: false,
-            message: failures.join("; "),
-        })
+        self.exchange(&grant, refresh_token)
     }
 }
 
@@ -348,16 +350,21 @@ mod tests {
         (url, received)
     }
 
-    fn refresher_of(issuer: Issuer, urls: &[&str]) -> OauthRefresher {
-        let urls = urls.iter().map(|u| (*u).to_owned()).collect();
-        OauthRefresher::with_grants(vec![Grant {
-            login: "login-1".into(),
-            issuer,
-            urls,
-        }])
+    /// A refresher whose one login exchanges its token at `urls`.
+    struct Granted(OauthRefresher, Grant);
+
+    impl Granted {
+        fn refresh(&self, _login: &str, token: &str) -> Result<Refreshed, RefreshError> {
+            self.0.exchange(&self.1, token)
+        }
     }
 
-    fn refresher(urls: &[&str]) -> OauthRefresher {
+    fn refresher_of(issuer: Issuer, urls: &[&str]) -> Granted {
+        let urls = urls.iter().map(|u| (*u).to_owned()).collect();
+        Granted(OauthRefresher::new(), Grant { issuer, urls })
+    }
+
+    fn refresher(urls: &[&str]) -> Granted {
         refresher_of(Issuer::Anthropic, urls)
     }
 
@@ -490,8 +497,18 @@ mod tests {
     }
 
     #[test]
-    fn only_configured_oauth_logins_refresh() {
-        let e = refresher(&[]).refresh("login-2", MARK).err().unwrap();
+    fn only_oauth_logins_refresh() {
+        let login = GatewayLogin {
+            name: "login-2".into(),
+            kind: CredentialKind::ApiKey,
+            api: crate::gateway::config::Api::Anthropic,
+            base_url: None,
+            referer: None,
+            title: None,
+            token_url: None,
+            credentials: "/creds/login-2.json".into(),
+        };
+        let e = OauthRefresher::new().refresh(&login, MARK).err().unwrap();
         assert!(!e.rejected);
         assert!(e.message.contains("`login-2` is not an OAuth login"));
     }

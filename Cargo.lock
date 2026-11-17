@@ -196,6 +196,7 @@ dependencies = [
  "httparse",
  "landlock",
  "lexopt",
+ "libc",
  "qb-anthropic",
  "qb-core",
  "qb-openai",

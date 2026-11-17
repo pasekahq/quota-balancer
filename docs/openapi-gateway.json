@@ -116,6 +116,34 @@
         }
       }
     },
+    "/v1/model/reload": {
+      "post": {
+        "operationId": "reload",
+        "summary": "Read the gateway's config file again; only the gateway's own uid, 403 for any other caller. A config that parses and validates as at startup and changes no restart-only field serves every later turn; turns already admitted finish on theirs. A refusal is 400 `bad_request` whose message names the file and the field or line, and the running config stays. The body is ignored.",
+        "responses": {
+          "200": {
+            "description": "The new config serves.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -907,6 +935,26 @@
         },
         "required": [
           "cancelled"
+        ]
+      },
+      "ReloadAnswer": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/reload`: the config now serving later turns.",
+        "properties": {
+          "routes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Route aliases of the new config."
+          },
+          "logins": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Logins of the new config."
+          }
+        },
+        "required": [
+          "routes",
+          "logins"
         ]
       },
       "Health": {

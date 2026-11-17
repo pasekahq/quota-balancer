@@ -618,6 +618,15 @@ pub struct CancelAnswer {
     pub cancelled: bool,
 }
 
+/// `POST /v1/model/reload` response: the config now serving later turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadAnswer {
+    /// Route aliases of the new config.
+    pub routes: usize,
+    /// Logins of the new config.
+    pub logins: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,12 +1,13 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
-//! `/v1/model/routes`, `/v1/model/cancel` and `/v1/health`, and the HTTP fronts: `/v1/messages`
-//! ([`super::messages`]), `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the
-//! optional loopback TCP listener serves only the HTTP fronts, to clients with the client token.
+//! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload` and `/v1/health`, and the HTTP
+//! fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
+//! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
+//! clients with the client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once. On the C4
 //! front every rejection is a non-200 [`GatewayError`], every admitted turn a `200` with a chunked
 //! NDJSON stream whose head goes out with its first event; an HTTP front answers its errors in
-//! its own format. The main thread accepts, cancels a turn whose client hangs up and pings silent
-//! SSE answers.
+//! its own format. The main thread accepts, cancels a turn whose client hangs up, pings silent
+//! SSE answers and reloads the config on SIGHUP.
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -31,6 +32,7 @@ use super::core::{Cancel, Gateway};
 use super::upstream::{CancelToken, Flow};
 use super::{messages, openai};
 use crate::auth::token_matches;
+use crate::hangup::Hangup;
 use crate::http::{self, Head, Method, ReadError};
 use crate::log;
 use crate::server::{IO_TIMEOUT, discard, drain_pending};
@@ -158,10 +160,11 @@ impl Drop for Watching<'_> {
     }
 }
 
-/// Which listeners have a connection waiting.
+/// Which listeners have a connection waiting, and whether SIGHUP asked for a reload.
 struct Ready {
     unix: bool,
     tcp: bool,
+    reload: bool,
 }
 
 impl Watch {
@@ -209,17 +212,25 @@ impl Watch {
         let _ = rustix::io::write(&self.wake, &1u64.to_ne_bytes());
     }
 
-    /// Sleeps until `listener` or `loopback` has a connection, cancelling the turns whose clients
-    /// hang up and pinging the silent SSE answers meanwhile. Without a stream to ping it
-    /// sleeps without a timeout.
-    fn wait(&self, listener: &UnixListener, loopback: Option<&TcpListener>) -> Ready {
+    /// Sleeps until `listener` or `loopback` has a connection or `sighup` a signal, cancelling
+    /// the turns whose clients hang up and pinging the silent SSE answers meanwhile. Without a
+    /// stream to ping it sleeps without a timeout.
+    fn wait(
+        &self,
+        listener: &UnixListener,
+        loopback: Option<&TcpListener>,
+        sighup: Option<&Hangup>,
+    ) -> Ready {
         loop {
             let watched = self.turns().clone();
-            let mut fds = Vec::with_capacity(3 + watched.len());
+            let mut fds = Vec::with_capacity(4 + watched.len());
             fds.push(PollFd::new(&self.wake, PollFlags::IN));
             fds.push(PollFd::new(listener, PollFlags::IN));
             if let Some(l) = loopback {
                 fds.push(PollFd::new(l, PollFlags::IN));
+            }
+            if let Some(h) = sighup {
+                fds.push(PollFd::new(h, PollFlags::IN));
             }
             let first = fds.len();
             fds.extend(
@@ -257,11 +268,14 @@ impl Watch {
                     keepalive.tick(&w.stream, now);
                 }
             }
+            let signalled = usize::from(loopback.is_some()) + 2;
             let ready = Ready {
                 unix: fds[1].revents().contains(PollFlags::IN),
                 tcp: loopback.is_some() && fds[2].revents().contains(PollFlags::IN),
+                reload: sighup
+                    .is_some_and(|h| fds[signalled].revents().contains(PollFlags::IN) && h.take()),
             };
-            if ready.unix || ready.tcp {
+            if ready.unix || ready.tcp || ready.reload {
                 return ready;
             }
         }
@@ -270,23 +284,27 @@ impl Watch {
 
 /// Serves `gateway` on `listener` to peers of uid `own_uid`, the gateway's own, and the
 /// configured clients, and its HTTP fronts on `loopback` to peers with the client token of
-/// `[fronts]`. The main thread accepts and watches the clients of running turns; each
-/// connection runs on its own thread.
+/// `[fronts]`. The main thread accepts, watches the clients of running turns and reloads the
+/// config when `hangup` reads a signal; each connection runs on its own thread.
 ///
 /// # Errors
 /// The eventfd of the watch cannot be created.
 pub fn serve(
     listener: &UnixListener,
     loopback: Option<&TcpListener>,
+    hangup: Option<&Hangup>,
     gateway: &Arc<Gateway>,
     own_uid: u32,
 ) -> io::Result<Infallible> {
-    let cap = gateway.config().max_turns as usize + EXTRA_CONNECTIONS;
     let started = Instant::now();
     let live = Arc::new(AtomicUsize::new(0));
     let watch = Arc::new(Watch::new()?);
     loop {
-        let ready = watch.wait(listener, loopback);
+        let ready = watch.wait(listener, loopback, hangup);
+        if ready.reload {
+            // The outcome is logged; nobody waits for an answer.
+            let _ = gateway.reload();
+        }
         let mut accepted = Vec::with_capacity(2);
         if ready.unix {
             accepted.push(listener.accept().map(|(s, _)| Conn::Unix(s)));
@@ -304,6 +322,7 @@ pub fn serve(
                     continue;
                 }
             };
+            let cap = gateway.config().max_turns as usize + EXTRA_CONNECTIONS;
             if live.load(Ordering::SeqCst) >= cap {
                 let _ = conn.set_write_timeout(Some(IO_TIMEOUT));
                 let mut e = GatewayError::new(ErrorClass::Overloaded, true, "too many connections");
@@ -353,8 +372,9 @@ fn caller(gateway: &Gateway, uid: Option<u32>, own_uid: u32) -> Option<String> {
     if uid == own_uid {
         return Some(format!("uid:{uid}"));
     }
-    let clients = &gateway.config().clients;
-    clients
+    let config = gateway.config();
+    config
+        .clients
         .iter()
         .find(|c| c.uid == uid)
         .map(|c| c.name.clone())
@@ -422,6 +442,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             Dialect::of(path).reject(&mut stream, 405, &e);
         }
         (Method::Get, paths::MODEL_ROUTES) => reply(&mut stream, 200, &gateway.routes()),
+        (Method::Post, paths::MODEL_RELOAD) => reload(&mut stream, gateway, uid == Some(own_uid)),
         (Method::Post, paths::MODEL_CANCEL) => {
             let c = match serde_json::from_slice::<CancelRequest>(&req.body) {
                 Ok(c) => c,
@@ -454,7 +475,14 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             };
             reply(&mut stream, 200, &health);
         }
-        (_, paths::MODEL_TURN | paths::MODEL_ROUTES | paths::MODEL_CANCEL | paths::HEALTH) => {
+        (
+            _,
+            paths::MODEL_TURN
+            | paths::MODEL_ROUTES
+            | paths::MODEL_CANCEL
+            | paths::MODEL_RELOAD
+            | paths::HEALTH,
+        ) => {
             reject(
                 &mut stream,
                 405,
@@ -463,6 +491,21 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             );
         }
         _ => reject(&mut stream, 404, ErrorClass::BadRequest, "no such endpoint"),
+    }
+}
+
+/// Answers `POST /v1/model/reload`, which only the gateway's `own` uid may send.
+fn reload(stream: &mut Conn, gateway: &Gateway, own: bool) {
+    if !own {
+        let message = "only the gateway's own uid may reload it";
+        return reject(stream, 403, ErrorClass::Auth, message);
+    }
+    match gateway.reload() {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(e) => {
+            let message = format!("reload refused: {e}");
+            reject(stream, 400, ErrorClass::BadRequest, &message);
+        }
     }
 }
 
