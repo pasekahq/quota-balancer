@@ -228,7 +228,11 @@ Top-level keys come before the tables:
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn`, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Picks per turn, default 4. |
 
-`[[clients]]`, optional: callers besides the gateway's own uid.
+`[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
+the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
+directory it may traverse. The shipped unit's `RuntimeDirectoryMode=0700` keeps everyone else
+out of the runtime directory; with clients, set `RuntimeDirectoryMode=0750` and a shared group,
+or put the socket in a directory outside it.
 
 | Key | Type | Meaning |
 |---|---|---|

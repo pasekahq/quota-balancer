@@ -3,7 +3,8 @@
 # ~/.config/systemd/user/ of that user. The process makes itself non-dumpable and applies landlock
 # itself (credential directories, resolver files, TCP 443), so the unit's system call filter
 # allows the landlock calls on top of @system-service. The socket goes into RuntimeDirectory,
-# for example socket = "/run/user/<uid>/qb-gateway/gateway.sock" in the config.
+# for example socket = "/run/user/<uid>/qb-gateway/gateway.sock" in the config. Mode 0700 admits
+# only this user; for [[clients]] of other uids use 0750 with a shared group and socket_mode 0o660.
 [Unit]
 Description=quota-balancer model gateway
 Documentation=https://github.com/vladmesh/quota-balancer
