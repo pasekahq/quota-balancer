@@ -1,6 +1,8 @@
-//! Self-restriction of `qb agent` before its first connection to the daemon: the process becomes
-//! non-dumpable, and landlock limits it to reading the credential directories and the resolver
-//! files and to TCP connections to port 443.
+//! Self-restriction of `qb agent` and `qb gateway` before their first connection: the process
+//! becomes non-dumpable, and landlock limits it to the credential directories (read-only for the
+//! agent; for the gateway also writing, creating and removing regular files, as a refreshed
+//! token is written back by rename), the resolver files and TCP connections to port 443, with no
+//! TCP bind.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +13,7 @@ use landlock::{
 use rustix::process::{DumpableBehavior, set_dumpable_behavior};
 
 use crate::config::AgentConfig;
+use crate::gateway::config::GatewayConfig;
 
 /// Files the musl resolver reads for each lookup.
 pub const RESOLVER_FILES: [&str; 2] = ["/etc/resolv.conf", "/etc/hosts"];
@@ -29,25 +32,56 @@ const TARGET_ABI: ABI = ABI::V4;
 /// # Errors
 /// The dumpable flag cannot be cleared.
 pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
+    let files: Vec<&Path> = config
+        .logins
+        .iter()
+        .map(|l| l.credentials.as_path())
+        .collect();
+    confine(&files, false)
+}
+
+/// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
+/// truncate files, create regular files and remove files, so a refreshed token can be written
+/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. Call
+/// it before starting any thread.
+///
+/// # Errors
+/// The dumpable flag cannot be cleared.
+pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
+    let files: Vec<&Path> = config
+        .logins
+        .iter()
+        .map(|l| l.credentials.as_path())
+        .collect();
+    confine(&files, true)
+}
+
+fn confine(credential_files: &[&Path], writable: bool) -> Result<Vec<String>, String> {
     set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;
     let mut gaps = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for login in &config.logins {
-        match credential_dir(&login.credentials) {
+    for file in credential_files {
+        match credential_dir(file) {
             Ok(dir) if !dirs.contains(&dir) => dirs.push(dir),
             Ok(_) => {}
-            Err(e) => gaps.push(format!(
-                "{} stays unreadable: {e}",
-                login.credentials.display()
-            )),
+            Err(e) => gaps.push(format!("{} stays unreadable: {e}", file.display())),
         }
     }
     let read_dir = AccessFs::from_read(TARGET_ABI);
     let read_file = read_dir & AccessFs::from_file(TARGET_ABI);
+    let credential_access = if writable {
+        read_dir
+            | AccessFs::WriteFile
+            | AccessFs::Truncate
+            | AccessFs::MakeReg
+            | AccessFs::RemoveFile
+    } else {
+        read_dir
+    };
     let readable = dirs
         .iter()
-        .map(|d| (d.as_path(), read_dir))
+        .map(|d| (d.as_path(), credential_access))
         .chain(RESOLVER_FILES.map(|f| (Path::new(f), read_file)));
     let mut rules = Vec::new();
     for (path, access) in readable {

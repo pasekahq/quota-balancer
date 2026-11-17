@@ -63,6 +63,14 @@ pub fn from_systemd() -> io::Result<Option<UnixListener>> {
 /// # Errors
 /// Bind/permission errors, or a live daemon on the path.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
+    bind_with_mode(path, 0o660)
+}
+
+/// [`bind`] with the socket file's `mode`.
+///
+/// # Errors
+/// As [`bind`].
+pub fn bind_with_mode(path: &Path, mode: u32) -> io::Result<UnixListener> {
     if path.exists() {
         match UnixStream::connect(path) {
             Ok(_) => {
@@ -78,6 +86,6 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         }
     }
     let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(listener)
 }

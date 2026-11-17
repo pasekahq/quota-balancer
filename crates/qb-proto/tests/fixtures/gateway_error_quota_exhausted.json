@@ -1,0 +1,12 @@
+{
+  "type": "error",
+  "error": {
+    "class": "quota_exhausted",
+    "retryable": true,
+    "resets_at": 1800018000,
+    "tried": [
+      {"vendor": "vendor-a", "model": "model-large", "login_label": "login-1", "class": "quota_exhausted"},
+      {"vendor": "vendor-a", "model": "model-large", "login_label": "login-2", "class": "quota_exhausted"}
+    ]
+  }
+}

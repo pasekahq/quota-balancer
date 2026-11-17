@@ -1,0 +1,15 @@
+//! `qb gateway`: the model gateway. It runs as the owner of vendor credentials, serves the C4
+//! contract (`/v1/model/*`, see `docs/api.md`) on its own unix socket, asks qbd where to run each
+//! turn and reports back what happened. qbd itself stays without secrets and network.
+//!
+//! - [`config`]: the gateway's TOML config;
+//! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
+//! - [`upstream`]: the seam vendor adapters implement;
+//! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
+//! - [`front`]: the C4 front over the unix socket.
+
+pub mod config;
+pub mod core;
+pub mod creds;
+pub mod front;
+pub mod upstream;

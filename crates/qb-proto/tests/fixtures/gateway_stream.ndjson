@@ -1,0 +1,6 @@
+{"type":"route","route":{"vendor":"vendor-a","model":"model-large","login_label":"login-1","lease":"l-1"}}
+{"type":"thinking","thinking":{"vendor":"vendor-a","opaque":"c3ludGhldGljLW9wYXF1ZQ=="}}
+{"type":"text_delta","text":"Hello"}
+{"type":"tool_call","tool_call":{"id":"call_02","name":"read","input":{"path":"notes.md"}}}
+{"type":"usage","usage":{"input":120,"output":48,"cache_read":2048,"cache_write":0}}
+{"type":"stop","reason":"tool_use"}

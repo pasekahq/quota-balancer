@@ -275,7 +275,7 @@ const DRAIN_CAP: usize = 1024 * 1024;
 
 /// Reads and drops up to `len` declared body bytes within one I/O timeout, so a client still
 /// writing an oversized body finishes its write and reads the 413 instead of `EPIPE`.
-fn discard(stream: &mut UnixStream, len: usize) {
+pub(crate) fn discard(stream: &mut UnixStream, len: usize) {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut left = len.min(DRAIN_CAP);
     let mut scratch = [0u8; 4096];
@@ -296,7 +296,7 @@ fn discard(stream: &mut UnixStream, len: usize) {
 ///
 /// Closing a unix stream socket with unread input makes the peer's next read fail with
 /// `ECONNRESET`, so a client that sent an oversized or rejected body would lose our error reply.
-fn drain_pending(stream: &mut UnixStream) {
+pub(crate) fn drain_pending(stream: &mut UnixStream) {
     if stream.set_nonblocking(true).is_err() {
         return;
     }

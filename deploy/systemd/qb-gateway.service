@@ -1,0 +1,44 @@
+# quota-balancer model gateway (template, user unit). Runs as the owner of the credentials in its
+# config, serves /v1/model/* on its own socket and asks qbd where each turn runs. Install into
+# ~/.config/systemd/user/ of that user. The process makes itself non-dumpable and applies landlock
+# itself (credential directories, resolver files, TCP 443), so the unit's system call filter
+# allows the landlock calls on top of @system-service. The socket goes into RuntimeDirectory,
+# for example socket = "/run/user/<uid>/qb-gateway/gateway.sock" in the config. Mode 0700 admits
+# only this user; for [[clients]] of other uids use 0750 with a shared group and socket_mode 0o660.
+[Unit]
+Description=quota-balancer model gateway
+Documentation=https://github.com/vladmesh/quota-balancer
+
+[Service]
+Type=simple
+WorkingDirectory=~
+RuntimeDirectory=qb-gateway
+RuntimeDirectoryMode=0700
+ExecStart=%h/.local/bin/qb gateway --config %h/.config/qb/gateway.toml
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+# Namespace-based sandboxing in user units needs unprivileged user namespaces, which some
+# distributions restrict. Enable where available:
+#ProtectSystem=strict
+#ProtectHome=read-only
+#PrivateTmp=yes
+UMask=0077
+# max_turns x (2 x max_request_bytes + 1 MiB) + 4 MiB, rounded up, for the defaults.
+MemoryMax=96M
+# The main thread, max_turns turn threads and 2 for routes, cancel and health; raise with max_turns.
+TasksMax=8
+
+[Install]
+WantedBy=default.target

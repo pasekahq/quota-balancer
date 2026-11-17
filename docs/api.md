@@ -2,8 +2,8 @@
 
 JSON over HTTP/1.1 on a unix socket (or a forwarded one). One request per connection;
 `Content-Length` is required for `POST`; bodies ≤ 64 KiB, headers ≤ 8 KiB. Times are Unix
-seconds, utilisation is `0.0..=1.0`, enums are `snake_case`. Requests reject unknown fields.
-Types are defined in `crates/qb-proto`; example payloads are in `crates/qb-proto/tests/fixtures/`.
+seconds, utilisation is `0.0..=1.0`, enums are `snake_case`. Requests reject unknown fields;
+responses may gain optional fields, which clients ignore. Types are defined in `crates/qb-proto`; example payloads are in `crates/qb-proto/tests/fixtures/`.
 
 | Endpoint | Request | Response |
 |---|---|---|
@@ -204,3 +204,156 @@ deadlines of the daemon's loop, which sleeps without a timeout when nothing is p
 The response is `{"accepted": true, "login_status": ...}` as for a report. A `probe_id` that is
 unknown, already answered or timed out is 404 `not_found`; a probe handed to another client is
 403 `forbidden`; a `utilization` outside `0.0..=1.0` is 400. None of them changes anything.
+
+## Model gateway `/v1/model/*`
+
+`qb gateway` serves this part of the contract on its own unix socket, not on `qbd`'s. Decisions
+and limits: [ADR 0001](adr/0001-model-gateway.md); machine-readable form:
+[`openapi-gateway.json`](openapi-gateway.json); config: [config.md](config.md#gateway-config).
+Types are in `crates/qb-proto/src/gateway.rs`, examples in
+`crates/qb-proto/tests/fixtures/gateway_*`.
+
+| Endpoint | Request | Response |
+|---|---|---|
+| `POST /v1/model/turn` | `TurnRequest` | 200 chunked NDJSON of `StreamEvent`; a rejection is an `Error` with 400, 401, 411, 413 or 429 |
+| `GET /v1/model/routes` | — | 200 `RoutesAnswer` |
+| `POST /v1/model/cancel` | `CancelRequest` | 200 `CancelAnswer`, 403 another caller's turn, 404 no such running turn |
+| `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
+
+Framing is `qbd`'s: HTTP/1.1, one request per connection, head ≤ 8 KiB, `Content-Length`
+required, chunked request bodies refused. The body of `POST /v1/model/turn` may be up to the
+config's `max_request_bytes` (default 8 MiB), every other body up to 64 KiB; a request whose
+head and body have not arrived within 10 s is dropped without an answer. Requests reject
+unknown fields. Every non-200 answer of the gateway has the
+body `Error` below, whose `class` is authoritative and whose status is informative.
+
+**Callers.** The peer's uid from `SO_PEERCRED` must be the gateway's own uid or the `uid` of a
+`[[clients]]` entry of the gateway config; any other peer gets 401 `auth` before its request
+is read. The socket file is
+0600, or 0660 with `socket_mode = 0o660`.
+
+### `POST /v1/model/turn`
+
+```json
+{"route": "chat", "system": "You are terse.",
+ "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}],
+ "max_tokens": 1024, "effort": "medium", "session_key": "session-1", "cache": "auto",
+ "request_id": "turn-0001"}
+```
+
+Required: `route` (an alias of the gateway config, `^[a-z][a-z0-9_-]{0,63}$`), `messages` (at
+least one, each with at least one block), `max_tokens` (≥ 1) and `request_id`
+(`^[A-Za-z0-9_-]{1,64}$`, unique among running turns). Optional: `system`, `tools`
+(`{name, description, input_schema}`, names unique), `effort` (`low|medium|high|max`),
+`session_key` (1 to 128 bytes), `cache` (`auto`).
+
+A message has `role` (`user|assistant`) and `content`, a list of blocks, each one flat object
+with `type`:
+
+| `type` | Fields |
+|---|---|
+| `text` | `text` |
+| `image` | `media_type` (`image/png|jpeg|gif|webp`) and `base64`; `path` is part of the shape but refused: the gateway reads no file a client names |
+| `tool_use` | `id`, `name`, `input` (object) |
+| `tool_result` | `id`, `content`, optional `is_error` |
+| `thinking` | `vendor`, `opaque`, echoed back as received |
+
+A block may carry only its own fields. The gateway drops `thinking` blocks whose `vendor` is not
+the vendor it picks for an attempt, and passes tool-call ids through unchanged.
+
+Before the turn starts the request is checked; a failure is answered at once: 400
+`bad_request` (invalid JSON, unknown field, broken rule, unknown route alias, an image by
+`path`, a `request_id` already running), 413 over `max_request_bytes`, 429 `overloaded` with
+`retry_after: 1` when `max_turns` turns run already.
+
+An admitted turn is answered `200` with `Transfer-Encoding: chunked` and
+`Content-Type: application/x-ndjson`, one event per line. The response head goes out together
+with the first event:
+
+```json
+{"type":"route","route":{"vendor":"vendor-a","model":"model-large","login_label":"login-1","lease":"l-17"}}
+{"type":"thinking","thinking":{"vendor":"vendor-a","opaque":"..."}}
+{"type":"text_delta","text":"Hello"}
+{"type":"tool_call","tool_call":{"id":"call_02","name":"read","input":{"path":"notes.md"}}}
+{"type":"usage","usage":{"input":120,"output":48,"cache_read":2048,"cache_write":0}}
+{"type":"stop","reason":"tool_use"}
+```
+
+`route` comes with the first content event of the attempt that answers; `usage` replaces any
+earlier one; `stop.reason` is `end`, `tool_use`, `max_tokens` or `refusal`. A stream ends with
+exactly one `stop` or `error`; one that ends without either was cut by a transport failure.
+
+#### Attempts and rotation
+
+Each attempt is one `POST /v1/pick` to `qbd` with the route's target (`role` and `difficulty`,
+or `role` and a `pin` of `vendor`, `model` and `effort`), `run_id` = `session_key` or else
+`request_id`, `resume_of` = `session_key` when given, `expected_minutes` of the route, and
+`avoid_vendor` after a vendor failure. A `wait` caused by `resume_of` is asked again once
+without it. `qbd` accepts `resume_of` but does not use it yet, so `session_key` only names the
+run: turns of one session are not kept on one login for the prompt cache. The picked login's credential entry gives the credential kind, which selects the
+vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
+`release: true`, the windows the vendor showed, and the outcome:
+
+| Attempt ended with | `qbd` outcome | before any event reached the client |
+|---|---|---|
+| a stream, finished or not | `ok` | — |
+| usage limit | `usage_limit` | next pick; the login is not tried again in this turn |
+| 429 without usage limit | `http_429` | as above |
+| 401 | `http_401` | an OAuth login first refreshes its token and retries once on the same lease; then as above, and the login is dead (below) |
+| model unavailable to the login | `model_unavailable` | as above |
+| unreadable or invalid credential file, or a refresh token the vendor refused | `http_401` | as above, and the login is dead (below) |
+| overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn |
+| invalid request, context too long | `error` | the turn ends |
+
+Once an event has reached the client the gateway never retries: a failure ends the stream
+with an `error` event. A turn is bounded by `max_attempts` picks (default 4). A 401 that the
+one refresh did not cure, or an unusable credential file, does not pass by itself: after the
+lease report the gateway also sends `POST /v1/report {"login", "outcome": "http_401"}`, which
+makes the login `auth_dead` in `qbd`, so the next pick of the same turn skips it. When a pick
+still returns a login that already failed in the turn, the lease is released with `error` and
+the turn ends with the last failure's class.
+
+#### Errors
+
+```json
+{"type":"error","error":{"class":"quota_exhausted","retryable":true,"resets_at":1800018000,
+ "tried":[{"vendor":"vendor-a","model":"model-large","login_label":"login-1","class":"quota_exhausted"}]}}
+```
+
+`Error` has `class`, `retryable` and optionally `retry_after` (seconds), `resets_at` (Unix
+time), `tried` (the attempts of the turn in order, each with `vendor`, `model`, `login_label`
+and `class`) and `message` (never a credential).
+
+| `class` | When | `retryable` |
+|---|---|---|
+| `quota_exhausted` | `qbd` answered `wait`: every candidate waits for a reset or back-off; `resets_at` is the `wait`'s `retry_after`, the nearest time one becomes usable | true |
+| `no_route` | `qbd` answered `dead` | false |
+| `auth` | the last login's credential was rejected or unusable; or, as a 401 answer, the caller is not allowed | false |
+| `overloaded` | the vendor asked to back off (`retry_after`), a 429 of the last login, or the gateway's caps | true |
+| `unavailable` | the vendor failed, `qbd` is unreachable, a token refresh could not reach the vendor, or the picked login has no credential entry or adapter | true, false for a configuration error |
+| `bad_request` | the vendor or the gateway refused the request | false |
+| `context_too_long` | the conversation does not fit the model | false |
+| `cancelled` | `POST /v1/model/cancel` stopped the turn | false |
+
+### `GET /v1/model/routes`
+
+```json
+{"routes": [{"alias": "chat", "state": "ready"},
+            {"alias": "fast", "state": "exhausted", "vendor": "vendor-b", "model": "model-b",
+             "resets_at": 1800018000}]}
+```
+
+Aliases sorted, each with the state of the logins it can run on in `qbd`'s `GET /v1/state`: the
+gateway's logins of the pinned vendor, or every login of the gateway for a ladder route.
+`ready` when one is `ok`, `unknown` or `auth_stale`; else `exhausted` when one is `exhausted`
+or `rate_limited`, with `resets_at` the earliest `dead_until`; else `unavailable` (all
+`auth_dead`, none, or `qbd` unreachable). `vendor` and `model` are a pinned route's. It takes no
+lease.
+
+### `POST /v1/model/cancel`
+
+`{"request_id": "turn-0001"}` stops that running turn of this caller: the adapter's read is
+interrupted, the lease is released, the stream ends with an `error` of class `cancelled`, and
+the answer `{"cancelled": true}` comes once the turn has ended (at most 5 s). 404 when no turn
+with that id runs, 403 when another caller started it. A client that closes its stream cancels
+its turn the same way, without an event.
