@@ -289,7 +289,8 @@ Each attempt is one `POST /v1/pick` to `qbd` with the route's target (`role` and
 or `role` and a `pin` of `vendor`, `model` and `effort`), `run_id` = `session_key` or else
 `request_id`, `resume_of` = `session_key` when given, `expected_minutes` of the route, and
 `avoid_vendor` after a vendor failure. A `wait` caused by `resume_of` is asked again once
-without it. The picked login's credential entry gives the credential kind, which selects the
+without it. `qbd` accepts `resume_of` but does not use it yet, so `session_key` only names the
+run: turns of one session are not kept on one login for the prompt cache. The picked login's credential entry gives the credential kind, which selects the
 vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
 `release: true`, the windows the vendor showed, and the outcome:
 
