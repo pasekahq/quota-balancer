@@ -301,7 +301,7 @@ vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
 | 429 without usage limit | `http_429` | as above |
 | 401 | `http_401` | an OAuth login first refreshes its token and retries once on the same lease; then as above, and the login is dead (below) |
 | model unavailable to the login | `model_unavailable` | as above |
-| unreadable or invalid credential file | `http_401` | as above, and the login is dead (below) |
+| unreadable or invalid credential file, or a refresh token the vendor refused | `http_401` | as above, and the login is dead (below) |
 | overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn |
 | invalid request, context too long | `error` | the turn ends |
 
@@ -330,7 +330,7 @@ and `class`) and `message` (never a credential).
 | `no_route` | `qbd` answered `dead` | false |
 | `auth` | the last login's credential was rejected or unusable; or, as a 401 answer, the caller is not allowed | false |
 | `overloaded` | the vendor asked to back off (`retry_after`), a 429 of the last login, or the gateway's caps | true |
-| `unavailable` | the vendor failed, `qbd` is unreachable, a token refresh failed, or the picked login has no credential entry or adapter | true, false for a configuration error |
+| `unavailable` | the vendor failed, `qbd` is unreachable, a token refresh could not reach the vendor, or the picked login has no credential entry or adapter | true, false for a configuration error |
 | `bad_request` | the vendor or the gateway refused the request | false |
 | `context_too_long` | the conversation does not fit the model | false |
 | `cancelled` | `POST /v1/model/cancel` stopped the turn | false |
