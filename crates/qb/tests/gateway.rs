@@ -963,6 +963,39 @@ fn health_answers_and_only_the_starting_caller_may_cancel() {
 }
 
 #[test]
+fn a_turn_that_sent_its_last_event_can_no_longer_be_cancelled() {
+    let r = rig();
+    let config = qb::gateway::config::parse(
+        Path::new("gateway.toml"),
+        &gateway_toml(&r.dir, &r.qbd, 1, ["api_key", "api_key"], ""),
+    )
+    .unwrap();
+    let fake = Arc::new(Fake::default());
+    let upstream: Box<dyn Upstream> = Box::new(Shared(Arc::clone(&fake)));
+    let gateway = Gateway::new(
+        config,
+        vec![(CredentialKind::ApiKey, upstream)],
+        Box::new(Counting(Arc::default())),
+        None,
+    );
+    let req: TurnRequest = serde_json::from_value(turn_body("turn-1")).unwrap();
+    let admitted = gateway.admit("client-a", &req).unwrap();
+    let (mut cancel, mut slot_free) = (None, None);
+    gateway.run(&admitted, &req, &mut |event| {
+        if matches!(event, StreamEvent::Stop { .. }) {
+            // The client is still being written to; the turn itself is over.
+            cancel = Some(gateway.cancel("client-a", "turn-1"));
+            let next: TurnRequest = serde_json::from_value(turn_body("turn-2")).unwrap();
+            slot_free = Some(gateway.admit("client-a", &next).is_ok());
+        }
+        Flow::Continue
+    });
+    assert_eq!(cancel, Some(Cancel::Unknown));
+    assert_eq!(slot_free, Some(true), "max_turns is 1 and the slot is free");
+    assert!(!admitted.cancel_token().is_cancelled());
+}
+
+#[test]
 fn a_rejected_token_is_refreshed_and_the_turn_retried() {
     let oauth = |access: &str| {
         format!(

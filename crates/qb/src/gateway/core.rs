@@ -4,6 +4,7 @@
 //! boundary"); after that, or when qbd has nothing left, the turn ends with `error`.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,8 @@ pub enum Cancel {
 }
 
 struct Entry {
+    /// Unique per admission, so a finished turn never removes a later one with its `request_id`.
+    id: u64,
     client: String,
     request_id: String,
     cancel: CancelToken,
@@ -46,6 +49,7 @@ struct Entry {
 
 struct Running {
     turns: Mutex<Vec<Entry>>,
+    admitted: AtomicU64,
     ended: Condvar,
 }
 
@@ -56,6 +60,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A turn that passed admission: it counts against `max_turns` and can be cancelled until it is
 /// dropped.
 pub struct Admitted {
+    id: u64,
     client: String,
     request_id: String,
     route: Route,
@@ -77,12 +82,20 @@ impl Admitted {
     }
 }
 
-impl Drop for Admitted {
-    fn drop(&mut self) {
+impl Admitted {
+    /// Takes the turn out of the registry: it no longer counts against `max_turns` and a cancel
+    /// answers `Unknown`. Called before the terminal event, whose write may block.
+    fn finish(&self) {
         let mut turns = lock(&self.running.turns);
-        turns.retain(|e| e.request_id != self.request_id);
+        turns.retain(|e| e.id != self.id);
         drop(turns);
         self.running.ended.notify_all();
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -262,6 +275,7 @@ impl Gateway {
             qbd_bearer,
             running: Arc::new(Running {
                 turns: Mutex::new(Vec::new()),
+                admitted: AtomicU64::new(0),
                 ended: Condvar::new(),
             }),
         }
@@ -306,12 +320,15 @@ impl Gateway {
             return Err(e);
         }
         let cancel = CancelToken::new();
+        let id = self.running.admitted.fetch_add(1, Ordering::Relaxed);
         turns.push(Entry {
+            id,
             client: client.to_owned(),
             request_id: req.request_id.clone(),
             cancel: cancel.clone(),
         });
         Ok(Admitted {
+            id,
             client: client.to_owned(),
             request_id: req.request_id.clone(),
             route: route.clone(),
@@ -359,6 +376,12 @@ impl Gateway {
         req: &TurnRequest,
         emit: &mut dyn FnMut(StreamEvent) -> Flow,
     ) {
+        let emit = &mut |event: StreamEvent| {
+            if matches!(event, StreamEvent::Stop { .. } | StreamEvent::Error { .. }) {
+                turn.finish();
+            }
+            emit(event)
+        };
         let mut progress = Progress {
             tried: Vec::new(),
             failed: Vec::new(),
