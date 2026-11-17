@@ -79,6 +79,8 @@ enum Script {
     Hang(Vec<StreamEvent>),
     /// Emit a text event every 20 ms until the sink stops it; at most 10 s.
     Drip,
+    /// Fail as a refused request with a message that quotes the credential.
+    Leak,
 }
 
 /// A scripted adapter: one queue of scripts per login, and a record of every call.
@@ -147,6 +149,10 @@ impl Upstream for Shared {
                     message: format!("scripted {kind:?}"),
                 })
             }
+            Script::Leak => Err(Failure::new(
+                FailureKind::BadRequest,
+                format!("vendor refused key {}", credential.secret()),
+            )),
             Script::Drip => {
                 for _ in 0..500 {
                     if sink(text("drop")) == Flow::Stop {
@@ -1317,6 +1323,36 @@ fn a_vendor_failure_before_the_first_event_repicks_avoiding_the_vendor() {
         "error marks nothing"
     );
     assert_eq!(s.leases, Vec::new());
+}
+
+/// Runs `f` with this process's stderr in a file and returns what was written there.
+fn stderr_of(f: impl FnOnce()) -> String {
+    use std::os::fd::AsFd;
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap();
+    let path = temp_dir("stderr").join("stderr.log");
+    let file = std::fs::File::create(&path).unwrap();
+    let saved = rustix::io::dup(std::io::stderr().as_fd()).unwrap();
+    rustix::stdio::dup2_stderr(&file).unwrap();
+    f();
+    rustix::stdio::dup2_stderr(&saved).unwrap();
+    std::fs::read_to_string(&path).unwrap()
+}
+
+#[test]
+fn a_credential_an_adapter_quotes_reaches_neither_the_log_nor_the_client() {
+    const MARK: &str = "test-token-5b2d";
+    let r = rig_with(4, &[("login-1", api_key(MARK), 0o600)]);
+    r.fake.script("login-1", Script::Leak);
+    let mut events = Vec::new();
+    let logged = stderr_of(|| events = turn(&r.gw, &turn_body("turn-1")).2);
+    assert_eq!(kinds(&events), ["error BadRequest"]);
+    let message = last_error(&events).message.clone().unwrap();
+    assert!(message.contains("vendor refused key"), "{message}");
+    assert!(!message.contains(MARK), "{message}");
+    assert!(logged.contains("vendor refused key"), "{logged}");
+    assert!(!logged.contains(MARK), "{logged}");
+    assert_eq!(r.fake.calls()[0].1, MARK, "the adapter got the credential");
 }
 
 #[test]

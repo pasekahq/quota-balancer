@@ -552,6 +552,14 @@ impl Gateway {
                 &mut |e| relay.pass(e, at.vendor, &turn.cancel),
                 &turn.cancel,
             );
+            // The adapter must never quote the credential; if it does, the copy stops here.
+            let result = result.map_err(|mut f| {
+                let secret = credential.secret();
+                if f.message.contains(secret) {
+                    f.message = f.message.replace(secret, "[redacted]");
+                }
+                f
+            });
             drop(credential);
             turn.cancel.clear();
             let refresh = matches!(&result, Err(f) if f.kind == FailureKind::Auth)

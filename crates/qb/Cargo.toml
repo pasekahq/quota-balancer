@@ -27,5 +27,9 @@ toml.workspace = true
 ureq.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+# Tests redirect their own stderr to check what the gateway logs.
+rustix = { workspace = true, features = ["stdio"] }
+
 [lints]
 workspace = true

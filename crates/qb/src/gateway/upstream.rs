@@ -186,7 +186,8 @@ pub struct Failure {
     pub kind: FailureKind,
     /// Quota windows the vendor reported with the failure, for qbd's `report`.
     pub windows: Vec<WindowReport>,
-    /// Detail for the log and the client's `error.message`; never a credential or a header value.
+    /// Detail for the log and the client's `error.message`; never a credential or a header
+    /// value. The core still replaces the attempt's credential by `[redacted]` if it appears.
     pub message: String,
 }
 
