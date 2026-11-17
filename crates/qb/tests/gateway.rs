@@ -77,6 +77,8 @@ enum Script {
     Fail(Vec<StreamEvent>, FailureKind, Vec<WindowReport>),
     /// Emit the events, then wait for the cancel.
     Hang(Vec<StreamEvent>),
+    /// Emit a text event every 20 ms until the sink stops it; at most 10 s.
+    Drip,
 }
 
 /// A scripted adapter: one queue of scripts per login, and a record of every call.
@@ -145,6 +147,15 @@ impl Upstream for Shared {
                     message: format!("scripted {kind:?}"),
                 })
             }
+            Script::Drip => {
+                for _ in 0..500 {
+                    if sink(text("drop")) == Flow::Stop {
+                        return Err(Failure::new(FailureKind::Cancelled, "stopped"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                panic!("the sink never stopped the stream");
+            }
             Script::Hang(events) => {
                 emit(events, sink)?;
                 // Blocks like a vendor read until the cancel hook unblocks it.
@@ -160,12 +171,23 @@ impl Upstream for Shared {
     }
 }
 
-/// Hands out `access-N` and counts its calls.
+/// Hands out `access-N` and counts its calls. The refresh token `refresh-down` fails as an
+/// unreachable endpoint, `refresh-revoked` as a refused token.
 struct Counting(Arc<AtomicUsize>);
 
 impl Refresher for Counting {
-    fn refresh(&self, _: &str, _: &str) -> Result<Refreshed, RefreshError> {
+    fn refresh(&self, _: &str, refresh_token: &str) -> Result<Refreshed, RefreshError> {
         let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(rejected) = match refresh_token {
+            "refresh-down" => Some(false),
+            "refresh-revoked" => Some(true),
+            _ => None,
+        } {
+            return Err(RefreshError {
+                rejected,
+                message: "scripted refresh failure".into(),
+            });
+        }
         Ok(Refreshed {
             access_token: Zeroizing::new(format!("access-{n}")),
             refresh_token: None,
@@ -284,13 +306,19 @@ fn own_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// A rig whose gateway config ends with `extra` and whose gateway runs as `gateway_uid`.
+/// A rig whose gateway runs as `gateway_uid`, with `extra` in its config: appended when it is
+/// a table, else put first as top-level keys.
 fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_uid: u32) -> Rig {
     let dir = temp_dir("gw");
     credentials(&dir, files);
     let qbd = start_qbd(&dir);
     let kind = |i: usize| files.get(i).map_or("api_key", |f| kind_of(&f.1));
-    let text = gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], extra);
+    let text = if extra.trim_start().starts_with('[') {
+        gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], extra)
+    } else {
+        let toml = gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], "");
+        format!("{extra}\n{toml}")
+    };
     let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
     let gw = config.socket.clone();
     let fake = Arc::new(Fake::default());
@@ -357,6 +385,16 @@ fn dechunk(mut raw: &[u8]) -> Vec<u8> {
         assert_eq!(&raw[size..size + 2], b"\r\n");
         raw = &raw[size + 2..];
     }
+}
+
+/// Status and plain body of the complete answer `raw`.
+fn finish_raw(raw: &[u8]) -> (u16, Vec<u8>) {
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8(raw[..at].to_vec()).unwrap();
+    (
+        head.split(' ').nth(1).unwrap().parse().unwrap(),
+        raw[at + 4..].to_vec(),
+    )
 }
 
 /// Status, head and (dechunked) body of a complete answer.
@@ -993,6 +1031,172 @@ fn a_turn_that_sent_its_last_event_can_no_longer_be_cancelled() {
     assert_eq!(cancel, Some(Cancel::Unknown));
     assert_eq!(slot_free, Some(true), "max_turns is 1 and the slot is free");
     assert!(!admitted.cancel_token().is_cancelled());
+}
+
+#[test]
+fn connections_beyond_the_cap_get_429_from_the_main_thread() {
+    let r = rig_with(
+        1,
+        &[
+            ("login-1", api_key("test-token-1"), 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    // max_turns 1 plus the two extra connections; these send nothing and hold their threads.
+    let cap = 1 + front::EXTRA_CONNECTIONS;
+    let idle: Vec<UnixStream> = (0..cap)
+        .map(|_| UnixStream::connect(&r.gw).unwrap())
+        .collect();
+    // The main thread answers without waiting for the request, so a write or, rarely, the
+    // read may fail; such a try is repeated.
+    let health = || {
+        for _ in 0..50 {
+            let mut s = UnixStream::connect(&r.gw).unwrap();
+            let _ = s.write_all(b"GET /v1/health HTTP/1.1\r\nHost: qb\r\n\r\n");
+            let mut raw = Vec::new();
+            if s.read_to_end(&mut raw).is_ok() && !raw.is_empty() {
+                return finish_raw(&raw);
+            }
+        }
+        panic!("no answer");
+    };
+    let (status, body) = health();
+    let e: GatewayError = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        (status, e.class, e.retryable),
+        (429, ErrorClass::Overloaded, true)
+    );
+    assert_eq!(e.message.as_deref(), Some("too many connections"));
+    drop(idle);
+    let mut status = 0;
+    for _ in 0..100 {
+        status = health().0;
+        if status == 200 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(status, 200, "closed connections free their slots");
+}
+
+#[test]
+fn a_turn_ends_after_max_attempts_picks() {
+    let files = [
+        ("login-1", api_key("test-token-1"), 0o600),
+        ("login-2", api_key("test-token-2"), 0o600),
+    ];
+    let r = rig_as(4, &files, "max_attempts = 1", own_uid());
+    r.fake.script(
+        "login-1",
+        Script::Fail(
+            Vec::new(),
+            FailureKind::RateLimited { retry_after: None },
+            Vec::new(),
+        ),
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["error Overloaded"]);
+    let e = last_error(&events);
+    assert!(e.retryable);
+    assert!(
+        e.message
+            .as_deref()
+            .unwrap()
+            .contains("gave up after 1 attempts"),
+        "{e:?}"
+    );
+    assert_eq!(e.tried.len(), 1);
+    assert_eq!(r.fake.calls().len(), 1, "login-2 is not tried");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::RateLimited);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_client_that_closes_its_connection_cancels_its_turn() {
+    let r = rig();
+    r.fake.script("login-1", Script::Drip);
+    let mut s = send(
+        &r.gw,
+        "POST",
+        paths::MODEL_TURN,
+        &turn_body("turn-1").to_string(),
+    );
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !String::from_utf8_lossy(&seen).contains("text_delta") {
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "stream ended early");
+        seen.extend_from_slice(&chunk[..n]);
+    }
+    assert!(state(&r.qbd).leases.len() == 1, "the turn holds its lease");
+    drop(s);
+    let mut leases = 1;
+    for _ in 0..250 {
+        leases = state(&r.qbd).leases.len();
+        if leases == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(leases, 0, "the lease is released");
+    assert_eq!(
+        status_of(&state(&r.qbd), "login-1"),
+        LoginStatus::Unknown,
+        "a stream that started marks nothing on its login"
+    );
+    let (_, _, next) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(
+        kinds(&next).last().unwrap(),
+        "stop End",
+        "the request_id is free"
+    );
+}
+
+/// An OAuth credential file whose token expires now, with `refresh` as its refresh token.
+fn expiring_oauth(refresh: &str) -> String {
+    format!(
+        r#"{{"type":"oauth_anthropic","access_token":"access-0","refresh_token":"{refresh}","expires_at":{}}}"#,
+        unix_now()
+    )
+}
+
+#[test]
+fn a_refresh_that_cannot_reach_the_vendor_ends_the_turn_retryable() {
+    let r = rig_with(
+        4,
+        &[
+            ("login-1", expiring_oauth("refresh-down"), 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["error Unavailable"]);
+    assert!(last_error(&events).retryable);
+    assert_eq!(r.fake.calls(), Vec::new(), "the expired token is not sent");
+    let s = state(&r.qbd);
+    assert_eq!(
+        status_of(&s, "login-1"),
+        LoginStatus::Unknown,
+        "reported as error"
+    );
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_refused_refresh_token_kills_the_login_and_the_turn_moves_on() {
+    let r = rig_with(
+        4,
+        &[
+            ("login-1", expiring_oauth("refresh-revoked"), 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
 }
 
 #[test]
