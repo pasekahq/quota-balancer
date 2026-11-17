@@ -193,10 +193,10 @@ fn stop_reason(reason: &str) -> Option<StopReason> {
     }
 }
 
-/// A tool call whose pieces are still arriving.
+/// A tool call whose pieces are still arriving; `index` is `None` for a vendor that omits it.
 #[derive(Debug)]
 struct Pending {
-    index: u32,
+    index: Option<u32>,
     id: String,
     name: String,
     args: String,
@@ -207,7 +207,9 @@ struct Pending {
 struct Turn {
     calls: Vec<Pending>,
     held: usize,
+    refused: bool,
     stop: Option<StopReason>,
+    usage: Option<Usage>,
     cost: Option<f64>,
 }
 
@@ -224,7 +226,7 @@ impl Turn {
             self.choice(choice, out)?;
         }
         if let Some(u) = chunk.usage {
-            out.push(StreamEvent::Usage { usage: usage(&u) });
+            self.usage = Some(usage(&u));
             if u.cost.is_some() {
                 self.cost = u.cost;
             }
@@ -234,11 +236,16 @@ impl Turn {
 
     fn choice(&mut self, c: ChunkChoice, out: &mut Vec<StreamEvent>) -> Result<(), Failure> {
         let text = c.delta.content.filter(|t| !t.is_empty());
+        let refusal = c.delta.refusal.filter(|t| !t.is_empty());
         let pieces = c.delta.tool_calls.unwrap_or_default();
-        if self.stop.is_some() && (text.is_some() || !pieces.is_empty()) {
+        if self.stop.is_some() && (text.is_some() || refusal.is_some() || !pieces.is_empty()) {
             return Err(malformed("content after the finish reason"));
         }
         if let Some(text) = text {
+            out.push(StreamEvent::TextDelta { text });
+        }
+        if let Some(text) = refusal {
+            self.refused = true;
             out.push(StreamEvent::TextDelta { text });
         }
         for piece in pieces {
@@ -250,11 +257,21 @@ impl Turn {
         }
     }
 
-    /// Adds one tool-call piece: id and name from the first piece of its `index` that has them,
-    /// arguments appended.
+    /// Adds one tool-call piece: id and name from the first piece of its call that has them,
+    /// arguments appended. A piece names its call by `index`; without one, a piece with a new id
+    /// starts a call and any other piece continues the last call.
     fn piece(&mut self, piece: ChunkToolCall) -> Result<(), Failure> {
         let function = piece.function.unwrap_or_default();
-        let at = match self.calls.iter().position(|p| p.index == piece.index) {
+        let found = match piece.index {
+            Some(_) => self.calls.iter().position(|p| p.index == piece.index),
+            None => self.calls.len().checked_sub(1).filter(|&last| {
+                piece
+                    .id
+                    .as_ref()
+                    .is_none_or(|id| *id == self.calls[last].id)
+            }),
+        };
+        let at = match found {
             Some(at) => at,
             None if self.calls.len() >= MAX_OPEN_ITEMS => {
                 return Err(malformed("too many tool calls"));
@@ -289,7 +306,8 @@ impl Turn {
         Ok(())
     }
 
-    /// Emits the tool calls in `index` order and records the stop reason.
+    /// Emits the tool calls in `index` order, calls without one last in arrival order, and records
+    /// the stop reason; a turn with refusal text stops with `refusal`.
     fn end(&mut self, reason: &str, out: &mut Vec<StreamEvent>) -> Result<(), Failure> {
         let Some(mut stop) = stop_reason(reason) else {
             return Err(Failure::new(
@@ -297,7 +315,7 @@ impl Turn {
                 "vendor stream ended with finish_reason `error`",
             ));
         };
-        self.calls.sort_by_key(|p| p.index);
+        self.calls.sort_by_key(|p| p.index.unwrap_or(u32::MAX));
         let made = !self.calls.is_empty();
         for p in self.calls.drain(..) {
             if p.id.is_empty() || p.name.is_empty() {
@@ -318,8 +336,21 @@ impl Turn {
         if made && stop == StopReason::End {
             stop = StopReason::ToolUse;
         }
+        if self.refused {
+            stop = StopReason::Refusal;
+        }
         self.stop = Some(stop);
         Ok(())
+    }
+
+    /// The stop reason once the stream ended, after the one `usage` event of the last usage
+    /// chunk.
+    fn close(&mut self, out: &mut Vec<StreamEvent>, missing: &str) -> Result<StopReason, Failure> {
+        let stop = self.stop.ok_or_else(|| malformed(missing))?;
+        if let Some(usage) = self.usage.take() {
+            out.push(StreamEvent::Usage { usage });
+        }
+        Ok(stop)
     }
 }
 
@@ -339,7 +370,8 @@ impl Reader {
         Self::default()
     }
 
-    /// Feeds response bytes, appending canonical events to `out`; `data: [DONE]` finishes.
+    /// Feeds response bytes, appending canonical events to `out`; `data: [DONE]` finishes and
+    /// appends the `usage` event.
     ///
     /// # Errors
     /// The stream's `error` chunk, classified, or [`FailureKind::Unavailable`] for an oversized
@@ -358,10 +390,7 @@ impl Reader {
             }
             if frame.data == "[DONE]" {
                 self.done = true;
-                let stop = self
-                    .turn
-                    .stop
-                    .ok_or_else(|| malformed("[DONE] before a finish reason"))?;
+                let stop = self.turn.close(out, "[DONE] before a finish reason")?;
                 progress = Progress::Finished(stop);
             } else {
                 self.turn.chunk(&frame.data, out)?;
@@ -370,14 +399,12 @@ impl Reader {
         Ok(progress)
     }
 
-    /// How the stream ended once the vendor closed it.
+    /// How the stream ended once the vendor closed it, appending the `usage` event to `out`.
     ///
     /// # Errors
     /// [`FailureKind::Unavailable`] when no finish reason arrived.
-    pub fn finish(&self) -> Result<StopReason, Failure> {
-        self.turn
-            .stop
-            .ok_or_else(|| malformed("stream ended before a finish reason"))
+    pub fn finish(&mut self, out: &mut Vec<StreamEvent>) -> Result<StopReason, Failure> {
+        self.turn.close(out, "stream ended before a finish reason")
     }
 
     /// The cost in USD the usage chunk reported (OpenRouter's `usage.cost`), if any.

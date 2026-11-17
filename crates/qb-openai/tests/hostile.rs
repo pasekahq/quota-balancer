@@ -31,6 +31,8 @@ const STREAMS: &[(&str, Runner)] = &[
     ("chat_upstream_openrouter.sse", run_chat_chunked),
     ("chat_upstream_error.sse", run_chat_chunked),
     ("chat_upstream_cut.sse", run_chat_chunked),
+    ("chat_upstream_no_index.sse", run_chat_chunked),
+    ("chat_upstream_refusal.sse", run_chat_chunked),
     ("client_chat_stream.sse", run_chat_chunked),
 ];
 

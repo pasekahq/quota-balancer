@@ -342,7 +342,7 @@ impl SseEncoder {
                 ChunkDelta {
                     role: Some("assistant".into()),
                     content: Some(String::new()),
-                    tool_calls: None,
+                    ..ChunkDelta::default()
                 },
                 None,
             ));
@@ -375,7 +375,7 @@ impl SseEncoder {
                 out.extend(self.chunk(
                     ChunkDelta {
                         tool_calls: Some(vec![ChunkToolCall {
-                            index,
+                            index: Some(index),
                             id: Some(tool_call.id.clone()),
                             kind: Some("function".into()),
                             function: Some(ChunkFunction {

@@ -532,6 +532,8 @@ impl Gateway {
                 effort: pick.effort.as_deref(),
                 login: &login,
                 base_url: entry.base_url.as_deref(),
+                referer: entry.referer.as_deref(),
+                title: entry.title.as_deref(),
             };
             let mut relay = Relay {
                 route: Some(StreamEvent::Route {

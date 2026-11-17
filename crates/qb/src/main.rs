@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use qb::auth::Gate;
 use qb::config::Config;
 use qb::gateway::anthropic::Anthropic;
+use qb::gateway::chat_upstream::ChatCompletions;
 use qb::gateway::config::Api;
 use qb::gateway::core::{Gateway, Upstreams};
 use qb::gateway::front;
@@ -432,8 +433,8 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Runs the model gateway of the config in `file` with the adapters of the `anthropic` and
-/// `openai` API families.
+/// Runs the model gateway of the config in `file` with the adapters of the `anthropic`, `openai`
+/// and `chat_completions` API families.
 fn gateway(file: &Path) -> Result<ExitCode, String> {
     let config = qb::gateway::config::load(file).map_err(|e| e.to_string())?;
     let qbd_bearer = bearer(config.qbd_bearer_file.clone())?.map(zeroize::Zeroizing::new);
@@ -467,6 +468,7 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
     let upstreams: Upstreams = vec![
         (Api::Anthropic, Box::new(Anthropic::new())),
         (Api::Openai, Box::new(Openai::new())),
+        (Api::ChatCompletions, Box::new(ChatCompletions::new())),
     ];
     let refresher = Box::new(AnthropicOauth::new(&config));
     let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer);

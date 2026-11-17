@@ -78,14 +78,14 @@ pub struct Run {
 /// A stream reader of either upstream API.
 pub trait Feed {
     fn feed(&mut self, chunk: &[u8], out: &mut Vec<StreamEvent>) -> Result<Progress, Failure>;
-    fn finish(&self) -> Result<StopReason, Failure>;
+    fn finish(&mut self, out: &mut Vec<StreamEvent>) -> Result<StopReason, Failure>;
 }
 
 impl Feed for Reader {
     fn feed(&mut self, chunk: &[u8], out: &mut Vec<StreamEvent>) -> Result<Progress, Failure> {
         Reader::feed(self, chunk, out)
     }
-    fn finish(&self) -> Result<StopReason, Failure> {
+    fn finish(&mut self, _out: &mut Vec<StreamEvent>) -> Result<StopReason, Failure> {
         Reader::finish(self)
     }
 }
@@ -94,8 +94,8 @@ impl Feed for chat_upstream::Reader {
     fn feed(&mut self, chunk: &[u8], out: &mut Vec<StreamEvent>) -> Result<Progress, Failure> {
         chat_upstream::Reader::feed(self, chunk, out)
     }
-    fn finish(&self) -> Result<StopReason, Failure> {
-        chat_upstream::Reader::finish(self)
+    fn finish(&mut self, out: &mut Vec<StreamEvent>) -> Result<StopReason, Failure> {
+        chat_upstream::Reader::finish(self, out)
     }
 }
 
@@ -125,10 +125,8 @@ pub fn drive(reader: &mut impl Feed, bytes: &[u8], sizes: &[usize]) -> Run {
             }
         }
     }
-    Run {
-        end: reader.finish(),
-        events,
-    }
+    let end = reader.finish(&mut events);
+    Run { events, end }
 }
 
 /// A Responses stream through [`Reader`].

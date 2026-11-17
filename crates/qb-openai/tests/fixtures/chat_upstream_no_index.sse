@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-test-2","object":"chat.completion.chunk","created":1800000000,"model":"model-c","choices":[{"index":0,"delta":{"role":"assistant","content":"Both."},"finish_reason":null}],"usage":{"prompt_tokens":90,"completion_tokens":1,"total_tokens":91}}
+
+data: {"id":"chatcmpl-test-2","object":"chat.completion.chunk","created":1800000000,"model":"model-c","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_n1","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test-2","object":"chat.completion.chunk","created":1800000000,"model":"model-c","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"notes.txt\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test-2","object":"chat.completion.chunk","created":1800000000,"model":"model-c","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_n2","type":"function","function":{"name":"list_dir","arguments":"{\"dir\":\"src\"}"}}]},"finish_reason":null}],"usage":{"prompt_tokens":90,"completion_tokens":20,"total_tokens":110}}
+
+data: {"id":"chatcmpl-test-2","object":"chat.completion.chunk","created":1800000000,"model":"model-c","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":90,"completion_tokens":31,"total_tokens":121}}
+
+data: [DONE]
+

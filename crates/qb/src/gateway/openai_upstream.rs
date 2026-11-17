@@ -38,7 +38,7 @@ impl Default for Openai {
 
 /// The seam's failure of a classified vendor failure; the limiting window of a usage limit is
 /// already at 1.0.
-fn failure(f: limits::Failure) -> Failure {
+pub(super) fn failure(f: limits::Failure) -> Failure {
     use limits::FailureKind as K;
     let kind = match f.kind {
         K::UsageLimit { resets_at } => FailureKind::UsageLimit { resets_at },

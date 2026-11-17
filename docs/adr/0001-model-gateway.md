@@ -203,7 +203,8 @@ The upstream adapters, one per API family of a login:
   logins it adds the identity the subscription endpoint expects from the vendor's CLI (system
   prompt prefix, beta headers, user agent);
 - the OpenAI Responses adapter, for `chatgpt_oauth` logins and OpenAI API keys; for ChatGPT
-  logins it sends the account id and the identity headers of the vendor's CLI.
+  logins it sends the account id and the identity headers of the vendor's CLI;
+- the Chat Completions adapter, for API keys of OpenRouter and other OpenAI-compatible vendors.
 
 Clients never see or send the vendor identity. The fronts:
 

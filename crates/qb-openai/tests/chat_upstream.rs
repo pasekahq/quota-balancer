@@ -411,6 +411,109 @@ fn empty_arguments_are_an_empty_object_and_calls_on_stop_are_tool_use() {
     assert_eq!(got.end, Ok(StopReason::ToolUse));
 }
 
+fn usage_chunk(prompt: u64, completion: u64) -> String {
+    let c = json!({"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+        "choices": [], "usage": {"prompt_tokens": prompt, "completion_tokens": completion}});
+    format!("data: {c}\n\n")
+}
+
+#[test]
+fn refusal_text_is_text_and_stops_the_turn_with_refusal() {
+    let bytes = stream(
+        &[
+            chunk(&json!({"refusal": "I can't "}), None),
+            chunk(&json!({"refusal": "help with that."}), None),
+            chunk(&json!({}), Some("stop")),
+        ],
+        true,
+    );
+    let got = run_chat(&bytes);
+    assert_eq!(got.events, vec![text("I can't "), text("help with that.")]);
+    assert_eq!(got.end, Ok(StopReason::Refusal));
+
+    let got = run_chat(&fixture("chat_upstream_refusal.sse"));
+    assert_eq!(
+        got.events,
+        vec![text("I can't help "), text("with that."), usage(12, 6, 0)]
+    );
+    assert_eq!(got.end, Ok(StopReason::Refusal));
+}
+
+#[test]
+fn tool_call_pieces_without_index_continue_the_last_call_or_start_one_by_id() {
+    let piece = |id: Option<&str>, name: Option<&str>, args: &str| {
+        chunk(
+            &json!({"tool_calls": [{"id": id, "type": "function",
+                "function": {"name": name, "arguments": args}}]}),
+            None,
+        )
+    };
+    let bytes = stream(
+        &[
+            piece(Some("c1"), Some("read_file"), "{\"path\""),
+            piece(None, None, ": \"notes.txt\"}"),
+            piece(Some("c2"), Some("list_dir"), "{\"dir\": "),
+            piece(Some("c2"), None, "\"src\"}"),
+            piece(Some("c3"), Some("now"), ""),
+            chunk(&json!({}), Some("tool_calls")),
+        ],
+        true,
+    );
+    let got = run_chat(&bytes);
+    assert_eq!(
+        got.events,
+        vec![
+            call("c1", "read_file", json!({"path": "notes.txt"})),
+            call("c2", "list_dir", json!({"dir": "src"})),
+            call("c3", "now", json!({})),
+        ]
+    );
+    assert_eq!(got.end, Ok(StopReason::ToolUse));
+
+    let got = run_chat(&fixture("chat_upstream_no_index.sse"));
+    assert_eq!(
+        got.events,
+        vec![
+            text("Both."),
+            call("call_n1", "read_file", json!({"path": "notes.txt"})),
+            call("call_n2", "list_dir", json!({"dir": "src"})),
+            usage(90, 31, 0),
+        ]
+    );
+    assert_eq!(got.end, Ok(StopReason::ToolUse));
+}
+
+#[test]
+fn only_the_last_usage_is_emitted_once_at_the_end_of_the_stream() {
+    let chunks = [
+        usage_chunk(10, 0),
+        chunk(&json!({"content": "Hi"}), None),
+        usage_chunk(20, 3),
+        chunk(&json!({}), Some("stop")),
+        usage_chunk(30, 7),
+    ];
+    for done in [true, false] {
+        let got = run_chat(&stream(&chunks, done));
+        assert_eq!(
+            got.events,
+            vec![text("Hi"), usage(30, 7, 0)],
+            "[DONE] {done}"
+        );
+        assert_eq!(got.end, Ok(StopReason::End), "[DONE] {done}");
+    }
+
+    let mut reader = Reader::new();
+    let mut events = Vec::new();
+    let progress = reader.feed(&stream(&chunks[..4], false), &mut events);
+    assert_eq!(progress, Ok(Progress::Continue));
+    assert_eq!(events, vec![text("Hi")], "usage waits for the end");
+
+    let cut = stream(&chunks[..3], false);
+    let got = run_chat(&cut);
+    assert_eq!(got.events, vec![text("Hi")], "a failed stream has no usage");
+    assert!(got.end.is_err());
+}
+
 #[test]
 fn error_answers_classify_by_status() {
     let cases = [
