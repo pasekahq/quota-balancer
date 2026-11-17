@@ -584,10 +584,8 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
         Ok(())
     })?;
     l.api = family(at, l.kind, api)?;
-    if let (CredentialKind::ApiKey | CredentialKind::ChatgptOauth, Some(span)) =
-        (l.kind, token_url_at)
-    {
-        let reason = "belongs to an `oauth_anthropic` login".into();
+    if let (CredentialKind::ApiKey, Some(span)) = (l.kind, token_url_at) {
+        let reason = "belongs to an `oauth_anthropic` or `chatgpt_oauth` login".into();
         return Err((format!("{at}.token_url"), reason, Some(span)));
     }
     if l.api == Api::ChatCompletions {
@@ -1294,19 +1292,22 @@ difficulty = 1
             )
         };
         let oauth = "kind = \"oauth_anthropic\"";
-        let c = check("", &login(oauth, "http://127.0.0.1:443/v1/oauth/token/")).unwrap();
-        assert_eq!(
-            c.login("login-2").unwrap().token_url.as_deref(),
-            Some("http://127.0.0.1:443/v1/oauth/token")
-        );
-        assert_eq!(c.login("login-1").unwrap().token_url, None);
+        let chatgpt = "kind = \"chatgpt_oauth\"";
+        for kind in [oauth, chatgpt] {
+            let c = check("", &login(kind, "http://127.0.0.1:443/v1/oauth/token/")).unwrap();
+            assert_eq!(
+                c.login("login-2").unwrap().token_url.as_deref(),
+                Some("http://127.0.0.1:443/v1/oauth/token")
+            );
+            assert_eq!(c.login("login-1").unwrap().token_url, None);
+        }
         let cases = [
             (
                 login(oauth, "https://example.com:8443/t"),
                 "logins[1].token_url: an `https` URL uses port 443",
             ),
             (
-                login(oauth, "http://example.com/t"),
+                login(chatgpt, "http://example.com/t"),
                 "logins[1].token_url: plain `http` is accepted only for a loopback host",
             ),
             (
@@ -1314,11 +1315,7 @@ difficulty = 1
                     "kind = \"api_key\"\napi = \"anthropic\"",
                     "https://example.com/t",
                 ),
-                "logins[1].token_url: belongs to an `oauth_anthropic` login (line 17)",
-            ),
-            (
-                login("kind = \"chatgpt_oauth\"", "https://example.com/t"),
-                "logins[1].token_url: belongs to an `oauth_anthropic` login (line 16)",
+                "logins[1].token_url: belongs to an `oauth_anthropic` or `chatgpt_oauth` login (line 17)",
             ),
         ];
         for (extra, want) in cases {

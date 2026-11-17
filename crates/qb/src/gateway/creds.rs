@@ -1,13 +1,13 @@
 //! The gateway's credential files: one JSON file per login, mode 0600, owned by the gateway's
-//! user, read for one attempt and zeroized. An expired `oauth_anthropic` token is refreshed
-//! through a [`Refresher`] and written back atomically; a `chatgpt_oauth` token is used as it is
-//! and its `refresh_token` and `expires_at`, if present, are not read. No error message ever
-//! quotes a file's contents.
+//! user, read for one attempt and zeroized. An expiring or vendor-rejected OAuth token
+//! (`oauth_anthropic`, `chatgpt_oauth`) is refreshed through a [`Refresher`] and written back
+//! atomically; a `chatgpt_oauth` file without `refresh_token` is used as it is. No error message
+//! ever quotes a file's contents.
 //!
 //! ```json
 //! {"type": "oauth_anthropic", "access_token": "...", "refresh_token": "...", "expires_at": 1800000000}
 //! {"type": "api_key", "key": "..."}
-//! {"type": "chatgpt_oauth", "access_token": "...", "account_id": "...", "refresh_token": "..."}
+//! {"type": "chatgpt_oauth", "access_token": "...", "account_id": "...", "refresh_token": "...", "expires_at": 1800000000}
 //! ```
 
 use std::fmt;
@@ -110,14 +110,17 @@ struct Written<'a> {
     kind: Kind,
     access_token: &'a str,
     refresh_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<&'a str>,
     expires_at: u64,
 }
 
-/// Loads credentials and refreshes expired OAuth tokens, one refresh per login at a time.
+/// Loads credentials and refreshes expired OAuth tokens, one refresh per credential file at a
+/// time.
 pub struct CredentialStore {
     refresher: Box<dyn Refresher>,
-    /// The refresh lock of each login that refreshed so far.
-    refreshing: Mutex<Vec<(String, Arc<Mutex<()>>)>>,
+    /// The refresh lock of each credential file that refreshed so far.
+    refreshing: Mutex<Vec<(PathBuf, Arc<Mutex<()>>)>>,
 }
 
 impl CredentialStore {
@@ -129,22 +132,23 @@ impl CredentialStore {
         }
     }
 
-    fn refresh_lock(&self, login: &str) -> Arc<Mutex<()>> {
+    fn refresh_lock(&self, file: &Path) -> Arc<Mutex<()>> {
         let mut locks = self
             .refreshing
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, l)) = locks.iter().find(|(name, _)| name == login) {
+        if let Some((_, l)) = locks.iter().find(|(path, _)| path == file) {
             return Arc::clone(l);
         }
         let l = Arc::new(Mutex::new(()));
-        locks.push((login.to_owned(), Arc::clone(&l)));
+        locks.push((file.to_owned(), Arc::clone(&l)));
         l
     }
 
-    /// The credential of `login` in `file`, which must hold `kind`, at `now`. An `oauth_anthropic`
-    /// token expiring within [`REFRESH_MARGIN_S`], or any such token when `stale` (the vendor just
-    /// rejected it), is refreshed first unless another attempt already replaced it.
+    /// The credential of `login` in `file`, which must hold `kind`, at `now`. An OAuth token
+    /// expiring within [`REFRESH_MARGIN_S`], or any such token when `stale` (the vendor just
+    /// rejected it), is refreshed first unless another attempt already replaced it; an expiring
+    /// `chatgpt_oauth` token without `refresh_token` is used as it is.
     ///
     /// # Errors
     /// The file is unreadable, too open, malformed, or the refresh failed.
@@ -172,41 +176,30 @@ impl CredentialStore {
                 ),
             ));
         }
-        let token = match first.kind {
-            Kind::ApiKey => {
-                let key = secret(file, "key", first.key.as_ref())?;
-                return Ok(Credential::ApiKey { key });
-            }
-            Kind::ChatgptOauth => {
-                let access_token = secret(file, "access_token", first.access_token.as_ref())?;
-                let account_id = secret(file, "account_id", first.account_id.as_ref())?;
-                return Ok(Credential::ChatgptOauth {
-                    access_token,
-                    account_id,
-                });
-            }
-            Kind::OauthAnthropic => secret(file, "access_token", first.access_token.as_ref())?,
-        };
+        if first.kind == Kind::ApiKey {
+            let key = secret(file, "key", first.key.as_ref())?;
+            return Ok(Credential::ApiKey { key });
+        }
+        let token = secret(file, "access_token", first.access_token.as_ref())?;
+        let account_id = account(file, &first)?;
         let expiring = first
             .expires_at
             .is_some_and(|at| at <= now.saturating_add(REFRESH_MARGIN_S));
-        if !stale && !expiring {
-            return Ok(Credential::OauthAnthropic {
-                access_token: token,
-            });
+        let as_is = first.kind == Kind::ChatgptOauth && first.refresh_token.is_none();
+        if !stale && (!expiring || as_is) {
+            return Ok(oauth(token, account_id));
         }
-        let lock = self.refresh_lock(login);
+        let lock = self.refresh_lock(file);
         let _one = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let again = read(file)?;
         let current = secret(file, "access_token", again.access_token.as_ref())?;
+        let account_id = account(file, &again)?;
         let replaced = *current != *token
             && again
                 .expires_at
                 .is_none_or(|at| at > now.saturating_add(REFRESH_MARGIN_S));
         if replaced {
-            return Ok(Credential::OauthAnthropic {
-                access_token: current,
-            });
+            return Ok(oauth(current, account_id));
         }
         let refresh_token = secret(file, "refresh_token", again.refresh_token.as_ref())?;
         let fresh = self
@@ -220,12 +213,15 @@ impl CredentialStore {
         let kept = fresh.refresh_token.as_ref().unwrap_or(&refresh_token);
         visible(file, "refresh_token", kept)?;
         let mut body = Zeroizing::new(Vec::with_capacity(
-            128 + fresh.access_token.len() + kept.len(),
+            160 + fresh.access_token.len()
+                + kept.len()
+                + account_id.as_ref().map_or(0, |a| a.len()),
         ));
         let written = Written {
-            kind: Kind::OauthAnthropic,
+            kind: first.kind,
             access_token: &fresh.access_token,
             refresh_token: kept,
+            account_id: account_id.as_deref().map(String::as_str),
             expires_at: fresh.expires_at,
         };
         serde_json::to_writer(&mut *body, &written).map_err(|e| CredError {
@@ -236,9 +232,26 @@ impl CredentialStore {
             unusable: false,
             message: format!("{}: cannot write the refreshed token: {e}", file.display()),
         })?;
-        Ok(Credential::OauthAnthropic {
-            access_token: fresh.access_token,
-        })
+        Ok(oauth(fresh.access_token, account_id))
+    }
+}
+
+/// The account id of a `chatgpt_oauth` file, `None` for another kind.
+fn account(file: &Path, stored: &Stored) -> Result<Option<Zeroizing<String>>, CredError> {
+    match stored.kind {
+        Kind::ChatgptOauth => secret(file, "account_id", stored.account_id.as_ref()).map(Some),
+        Kind::OauthAnthropic | Kind::ApiKey => Ok(None),
+    }
+}
+
+/// The OAuth credential of `access_token`: a ChatGPT login's when it has an `account_id`.
+fn oauth(access_token: Zeroizing<String>, account_id: Option<Zeroizing<String>>) -> Credential {
+    match account_id {
+        Some(account_id) => Credential::ChatgptOauth {
+            access_token,
+            account_id,
+        },
+        None => Credential::OauthAnthropic { access_token },
     }
 }
 
@@ -450,24 +463,67 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    const CHATGPT: CredentialKind = CredentialKind::ChatgptOauth;
+
+    fn chatgpt(refresh: Option<&str>, expires_at: u64) -> String {
+        let refresh = refresh.map_or(String::new(), |r| format!(r#","refresh_token":"{r}""#));
+        format!(
+            r#"{{"type":"chatgpt_oauth","access_token":"access-0","account_id":"account-1"{refresh},"expires_at":{expires_at}}}"#
+        )
+    }
+
     #[test]
-    fn a_chatgpt_login_loads_its_token_and_account_as_they_are() {
-        const CHATGPT: CredentialKind = CredentialKind::ChatgptOauth;
-        let (s, calls) = store(None);
-        let body = format!(
-            r#"{{"type":"chatgpt_oauth","access_token":"access-0","account_id":"account-1","refresh_token":"refresh-{MARK}","expires_at":{}}}"#,
-            NOW - 600
-        );
-        let f = file("chatgpt", &body, 0o600);
-        for stale in [false, true] {
+    fn a_chatgpt_token_is_refreshed_when_expiring_or_stale_and_keeps_its_account() {
+        for (expires_at, stale) in [(NOW + 30, false), (NOW + 600, true)] {
+            let (s, calls) = store(None);
+            let f = file(
+                "chatgpt",
+                &chatgpt(Some(&format!("refresh-{MARK}")), expires_at),
+                0o600,
+            );
             let c = s.load("login-1", &f, CHATGPT, NOW, stale).unwrap();
+            assert_eq!(
+                (c.kind(), c.secret(), c.account_id()),
+                ("chatgpt_oauth", "access-1", Some("account-1"))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::metadata(&f).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::read_to_string(&f).unwrap(),
+                format!(
+                    r#"{{"type":"chatgpt_oauth","access_token":"access-1","refresh_token":"refresh-{MARK}-1","account_id":"account-1","expires_at":{}}}"#,
+                    NOW + 3600
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_chatgpt_token_or_one_without_refresh_token_is_used_as_it_is() {
+        let (s, calls) = store(None);
+        for body in [
+            chatgpt(Some("refresh-0"), NOW + 600),
+            chatgpt(None, NOW - 600),
+        ] {
+            let f = file("chatgpt-as-is", &body, 0o600);
+            let c = s.load("login-1", &f, CHATGPT, NOW, false).unwrap();
             assert_eq!(
                 (c.kind(), c.secret(), c.account_id()),
                 ("chatgpt_oauth", "access-0", Some("account-1"))
             );
+            assert_eq!(std::fs::read_to_string(&f).unwrap(), body);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no refresh of its own");
-        assert_eq!(std::fs::read_to_string(&f).unwrap(), body);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let f = file("chatgpt-stale", &chatgpt(None, NOW + 600), 0o600);
+        let e = s.load("login-1", &f, CHATGPT, NOW, true).unwrap_err();
+        assert!(e.unusable, "{e}");
+        assert!(e.message.starts_with(&f.display().to_string()), "{e}");
+        assert!(e.message.contains("no `refresh_token`"), "{e}");
+    }
+
+    #[test]
+    fn a_chatgpt_file_is_checked_before_use() {
+        let (s, _) = store(None);
         for (body, want) in [
             (
                 format!(r#"{{"type":"chatgpt_oauth","access_token":"{MARK}"}}"#),
@@ -491,6 +547,7 @@ mod tests {
             assert!(e.unusable && e.message.contains(want), "{body}: {e}");
             assert!(!e.message.contains(MARK), "{body}: {e}");
         }
+        let f = file("chatgpt-kind", &chatgpt(None, NOW), 0o600);
         let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
         assert!(
             e.message
@@ -673,6 +730,22 @@ mod tests {
         assert_eq!(got.as_deref(), Ok("access-login-2"));
         other.join().unwrap();
         assert_eq!(stuck.join().unwrap().secret(), "access-login-1");
+    }
+
+    #[test]
+    fn two_logins_of_one_file_refresh_it_once() {
+        let (s, calls) = store(None);
+        let s = Arc::new(s);
+        let f = file("shared", &chatgpt(Some("refresh-0"), NOW + 30), 0o600);
+        let load = |login: &'static str| {
+            let (s, f) = (Arc::clone(&s), f.clone());
+            std::thread::spawn(move || s.load(login, &f, CHATGPT, NOW, false).unwrap())
+        };
+        let (one, two) = (load("login-1"), load("login-2"));
+        for t in [one, two] {
+            assert_eq!(t.join().unwrap().secret(), "access-1");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

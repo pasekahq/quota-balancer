@@ -12,7 +12,7 @@
 //! - [`anthropic`]: the adapter of the `anthropic` API family;
 //! - [`openai_upstream`]: the adapter of the `openai` API family;
 //! - [`chat_upstream`]: the adapter of the `chat_completions` API family;
-//! - [`oauth`]: the token refresher of `oauth_anthropic` logins;
+//! - [`oauth`]: the token refresher of `oauth_anthropic` and `chatgpt_oauth` logins;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`front`]: the listeners and the C4 front;
 //! - [`answer`]: how the HTTP fronts answer a turn, SSE or one body;

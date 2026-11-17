@@ -568,7 +568,10 @@ impl Gateway {
             let refresh = matches!(&result, Err(f) if f.kind == FailureKind::Auth)
                 && !relay.emitted
                 && !refreshed
-                && entry.kind == CredentialKind::OauthAnthropic
+                && matches!(
+                    entry.kind,
+                    CredentialKind::OauthAnthropic | CredentialKind::ChatgptOauth
+                )
                 && !turn.cancel.is_cancelled();
             if refresh {
                 refreshed = true;

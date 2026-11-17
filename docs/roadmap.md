@@ -80,8 +80,7 @@ The optional `qb gateway` role as decided in [ADR 0001](adr/0001-model-gateway.m
    that does not cut streams in flight.
 6. Spend cap per API key, from the cost of reported usage.
 7. Login import and login: `qb login import` from existing credential files by path,
-   without printing values; `qb login` with PKCE for Anthropic and OpenAI; refresh of ChatGPT
-   tokens.
+   without printing values; `qb login` with PKCE for Anthropic and OpenAI.
 8. CI and budgets green, `docs/config.md` with neutral examples.
 
 ## S2 — several hosts

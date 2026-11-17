@@ -13,7 +13,7 @@ use qb::gateway::chat_upstream::ChatCompletions;
 use qb::gateway::config::Api;
 use qb::gateway::core::{Gateway, Upstreams};
 use qb::gateway::front;
-use qb::gateway::oauth::AnthropicOauth;
+use qb::gateway::oauth::OauthRefresher;
 use qb::gateway::openai_upstream::Openai;
 use qb::hooks::Runner;
 use qb::journal::{self, Journal};
@@ -470,7 +470,7 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         (Api::Openai, Box::new(Openai::new())),
         (Api::ChatCompletions, Box::new(ChatCompletions::new())),
     ];
-    let refresher = Box::new(AnthropicOauth::new(&config));
+    let refresher = Box::new(OauthRefresher::new(&config));
     let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer);
     let Err(e) = front::serve(
         &listener,

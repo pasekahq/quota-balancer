@@ -250,7 +250,7 @@ or put the socket in a directory outside it.
 | `base_url` | string | Base URL of the vendor API, default the family's public endpoint: `https://api.anthropic.com` for `anthropic`, below which the gateway calls `/v1/messages`; for `openai` the URL below which it calls `/responses`, `https://api.openai.com/v1` for a key and `https://chatgpt.com/backend-api/codex` for a ChatGPT login. Required for `chat_completions`: the URL below which the gateway calls `/chat/completions`, e.g. `https://openrouter.ai/api/v1`. `https://` on port 443, or `http://` with a loopback host (`localhost`, `127.0.0.0/8`, `::1`); an optional path, no user, query or fragment. |
 | `referer` | string | Only for a `chat_completions` login: sent as `http-referer`, OpenRouter's app attribution. Non-empty printable ASCII. |
 | `title` | string | Only for a `chat_completions` login: sent as `x-title`, OpenRouter's app name. Non-empty printable ASCII. |
-| `token_url` | string | Only for an `oauth_anthropic` login: the full URL of the OAuth token endpoint its refreshes go to, instead of the vendor's endpoints ([anthropic.md](anthropic.md#oauth-token-refresh)). Same rules as `base_url`. |
+| `token_url` | string | Only for an `oauth_anthropic` or `chatgpt_oauth` login: the full URL of the OAuth token endpoint its refreshes go to, instead of the vendor's endpoints ([anthropic.md](anthropic.md#oauth-token-refresh), [openai.md](openai.md#serving-the-upstream)). Same rules as `base_url`. |
 | `credentials` | string | Absolute path of the credential file. |
 
 The sandbox lets the gateway connect to TCP port 443 only, on every host: a loopback `http`
@@ -267,16 +267,18 @@ mode 0600; anything else is refused:
 
 ```json
 {"type": "oauth_anthropic", "access_token": "...", "refresh_token": "...", "expires_at": 1800000000}
-{"type": "chatgpt_oauth", "access_token": "...", "account_id": "..."}
+{"type": "chatgpt_oauth", "access_token": "...", "account_id": "...", "refresh_token": "...", "expires_at": 1800000000}
 {"type": "api_key", "key": "..."}
 ```
 
-An `oauth_anthropic` token expiring within 60 s, or rejected by the vendor, is refreshed and the
-file replaced atomically (temporary 0600 file in the same directory, fsync, rename, fsync of the
-directory). A `chatgpt_oauth` file holds the access token of a ChatGPT subscription login and
-its account id ([openai.md](openai.md#serving-the-upstream)); it may also hold `refresh_token`
-and `expires_at`, which the gateway does not read. The gateway does not refresh it: an expired or
-rejected token is an `auth` failure: the attempt is reported to `qbd` as `http_401` and the
+An OAuth token (`oauth_anthropic`, `chatgpt_oauth`) expiring within 60 s, or rejected by the
+vendor, is refreshed and the file replaced atomically (temporary 0600 file in the same
+directory, fsync, rename, fsync of the directory); one refresh per file runs at a time, and a
+token another attempt already replaced is not refreshed again. A `chatgpt_oauth` file holds the
+access token of a ChatGPT subscription login and its account id
+([openai.md](openai.md#serving-the-upstream)), which a refresh keeps; `refresh_token` and
+`expires_at` are optional. Without `refresh_token` the token is used as it is, and a token the
+vendor rejects makes the login unusable: the attempt is reported to `qbd` as `http_401` and the
 turn moves to the next login. Any other field is refused. The gateway may create, write and remove files in the credential files'
 directories and nowhere else.
 

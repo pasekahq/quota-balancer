@@ -1,10 +1,11 @@
-//! The [`Refresher`] of `oauth_anthropic` logins: the OAuth refresh grant, form-encoded, over
-//! ureq with rustls to the login's `token_url` or the vendor's token endpoints in order. The
-//! protocol is in `docs/anthropic.md`, "OAuth token refresh".
+//! The [`Refresher`] of OAuth logins: the refresh grant, form-encoded, over ureq with rustls to
+//! the login's `token_url`, else the vendor's token endpoints in order. The protocols are in
+//! `docs/anthropic.md`, "OAuth token refresh", and `docs/openai.md`, "Serving the upstream".
 
 use std::time::Duration;
 
-use qb_anthropic::request::identity;
+use qb_anthropic::request::identity as anthropic;
+use qb_openai::request::identity as openai;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -19,33 +20,83 @@ pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest token answer read.
 const MAX_ANSWER: u64 = 64 << 10;
 
-/// Refreshes the tokens of the `oauth_anthropic` logins of one gateway config.
-pub struct AnthropicOauth {
-    config: ureq::config::Config,
-    /// Each OAuth login and its token endpoints in the order they are tried.
-    endpoints: Vec<(String, Vec<String>)>,
+/// OAuth error codes that mean the refresh token is spent: the login needs a new sign-in.
+const SPENT: [&str; 4] = [
+    "invalid_grant",
+    "refresh_token_expired",
+    "refresh_token_reused",
+    "refresh_token_invalidated",
+];
+
+/// The vendor whose token endpoint refreshes a login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Issuer {
+    /// An `oauth_anthropic` login: the answer must carry `expires_in`.
+    Anthropic,
+    /// A `chatgpt_oauth` login: without `expires_in`, the `exp` of the returned JWTs.
+    Openai,
 }
 
-impl AnthropicOauth {
+impl Issuer {
+    fn client_id(self) -> &'static str {
+        match self {
+            Self::Anthropic => anthropic::OAUTH_CLIENT_ID,
+            Self::Openai => openai::OAUTH_CLIENT_ID,
+        }
+    }
+
+    fn user_agent(self) -> &'static str {
+        match self {
+            Self::Anthropic => anthropic::OAUTH_TOKEN_USER_AGENT,
+            Self::Openai => openai::CHATGPT_USER_AGENT,
+        }
+    }
+}
+
+/// One OAuth login, its issuer and its token endpoints in the order they are tried.
+struct Grant {
+    login: String,
+    issuer: Issuer,
+    urls: Vec<String>,
+}
+
+/// Refreshes the tokens of the `oauth_anthropic` and `chatgpt_oauth` logins of one gateway
+/// config.
+pub struct OauthRefresher {
+    config: ureq::config::Config,
+    grants: Vec<Grant>,
+}
+
+impl OauthRefresher {
     /// A refresher of `config`'s OAuth logins with [`CONNECT_TIMEOUT`] and [`REFRESH_TIMEOUT`],
     /// no proxy and no redirects.
     pub fn new(config: &GatewayConfig) -> Self {
-        let endpoints = config
+        let grants = config
             .logins
             .iter()
-            .filter(|l| l.kind == CredentialKind::OauthAnthropic)
-            .map(|l| {
+            .filter_map(|l| {
+                let (issuer, default): (_, &[&str]) = match l.kind {
+                    CredentialKind::OauthAnthropic => {
+                        (Issuer::Anthropic, &anthropic::OAUTH_TOKEN_URLS)
+                    }
+                    CredentialKind::ChatgptOauth => (Issuer::Openai, &[openai::OAUTH_TOKEN_URL]),
+                    CredentialKind::ApiKey => return None,
+                };
                 let urls = match &l.token_url {
                     Some(url) => vec![url.clone()],
-                    None => identity::OAUTH_TOKEN_URLS.map(str::to_owned).to_vec(),
+                    None => default.iter().map(|u| (*u).to_owned()).collect(),
                 };
-                (l.name.clone(), urls)
+                Some(Grant {
+                    login: l.name.clone(),
+                    issuer,
+                    urls,
+                })
             })
             .collect();
-        Self::with_endpoints(endpoints)
+        Self::with_grants(grants)
     }
 
-    fn with_endpoints(endpoints: Vec<(String, Vec<String>)>) -> Self {
+    fn with_grants(grants: Vec<Grant>) -> Self {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
@@ -53,17 +104,17 @@ impl AnthropicOauth {
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(REFRESH_TIMEOUT))
             .build();
-        Self { config, endpoints }
+        Self { config, grants }
     }
 
-    /// One token request to `url` with the form `body`.
-    fn post(&self, url: &str, body: &[u8]) -> Result<Refreshed, Failed> {
+    /// One token request of `issuer` to `url` with the form `body`.
+    fn post(&self, issuer: Issuer, url: &str, body: &[u8]) -> Result<Refreshed, Failed> {
         let agent = vendor::agent(&self.config);
         let mut response = agent
             .post(url)
             .header("content-type", "application/x-www-form-urlencoded")
             .header("accept", "application/json")
-            .header("user-agent", identity::OAUTH_TOKEN_USER_AGENT)
+            .header("user-agent", issuer.user_agent())
             .send(body)
             .map_err(|e| Failed::Next(format!("{url}: request failed: {e}")))?;
         let status = response.status().as_u16();
@@ -84,13 +135,10 @@ impl AnthropicOauth {
             })
         };
         if !(200..300).contains(&status) {
-            let code = serde_json::from_slice::<Refusal>(&bytes)
-                .ok()
-                .and_then(|r| r.error)
-                .filter(|c| {
-                    c.len() <= 64 && c.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
-                });
-            let rejected = matches!(status, 400 | 401) || code.as_deref() == Some("invalid_grant");
+            let code = refusal_code(&bytes);
+            let rejected = status != 429
+                && (matches!(status, 400 | 401)
+                    || code.as_deref().is_some_and(|c| SPENT.contains(&c)));
             let what = match code {
                 Some(code) => format!("HTTP {status} {code}"),
                 None => format!("HTTP {status}"),
@@ -108,13 +156,22 @@ impl AnthropicOauth {
         let Some(access_token) = answer.access_token else {
             return Err(last(false, "answer has no `access_token`"));
         };
-        let Some(expires_in) = answer.expires_in else {
-            return Err(last(false, "answer has no `expires_in`"));
+        let expires_at = match (answer.expires_in, issuer) {
+            (Some(expires_in), _) => unix_now().saturating_add(expires_in),
+            (None, Issuer::Anthropic) => return Err(last(false, "answer has no `expires_in`")),
+            (None, Issuer::Openai) => {
+                let id_token = answer.id_token.as_ref().and_then(|t| jwt_exp(&t.0));
+                let Some(exp) = id_token.or_else(|| jwt_exp(&access_token.0)) else {
+                    let what = "answer has no `expires_in` and no token with an `exp` claim";
+                    return Err(last(false, what));
+                };
+                exp
+            }
         };
         Ok(Refreshed {
             access_token: access_token.0,
             refresh_token: answer.refresh_token.map(|s| s.0),
-            expires_at: unix_now().saturating_add(expires_in),
+            expires_at,
         })
     }
 }
@@ -130,27 +187,80 @@ enum Failed {
 struct Answer {
     access_token: Option<Secret>,
     refresh_token: Option<Secret>,
+    id_token: Option<Secret>,
     expires_in: Option<u64>,
 }
 
-/// The OAuth error code of a refusal.
+/// A refusal: the OAuth `{"error": "code"}` or OpenAI's `{"error": {"code": "code"}}`.
 #[derive(Deserialize)]
 struct Refusal {
-    error: Option<String>,
+    error: Option<RefusalError>,
 }
 
-impl Refresher for AnthropicOauth {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RefusalError {
+    Code(String),
+    Object { code: Option<String> },
+}
+
+/// The error code of a refusal body, when it is lowercase letters and `_`, at most 64 bytes.
+fn refusal_code(body: &[u8]) -> Option<String> {
+    let code = match serde_json::from_slice::<Refusal>(body).ok()?.error? {
+        RefusalError::Code(code) => code,
+        RefusalError::Object { code } => code?,
+    };
+    let plain = code.len() <= 64 && code.bytes().all(|b| b == b'_' || b.is_ascii_lowercase());
+    plain.then_some(code)
+}
+
+/// The `exp` claim of a JWT's payload, read as base64url JSON without a signature check.
+fn jwt_exp(token: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Claims {
+        exp: Option<u64>,
+    }
+    let payload = Zeroizing::new(base64url(token.split('.').nth(1)?)?);
+    serde_json::from_slice::<Claims>(&payload).ok()?.exp
+}
+
+/// `s` decoded from base64url, padded or not.
+fn base64url(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for b in s.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits).to_le_bytes()[0]);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+impl Refresher for OauthRefresher {
     fn refresh(&self, login: &str, refresh_token: &str) -> Result<Refreshed, RefreshError> {
-        let Some((_, urls)) = self.endpoints.iter().find(|(name, _)| name == login) else {
+        let Some(grant) = self.grants.iter().find(|g| g.login == login) else {
             return Err(RefreshError {
                 rejected: false,
-                message: format!("`{login}` is not an `oauth_anthropic` login"),
+                message: format!("`{login}` is not an OAuth login"),
             });
         };
-        let body = form(refresh_token);
+        let body = form(refresh_token, grant.issuer.client_id());
         let mut failures = Vec::new();
-        for url in urls {
-            match self.post(url, body.as_bytes()) {
+        for url in &grant.urls {
+            match self.post(grant.issuer, url, body.as_bytes()) {
                 Ok(fresh) => return Ok(fresh),
                 Err(Failed::Next(why)) => failures.push(why),
                 Err(Failed::Last(e)) => return Err(e),
@@ -163,15 +273,15 @@ impl Refresher for AnthropicOauth {
     }
 }
 
-/// The form body of the refresh grant for `refresh_token`.
-fn form(refresh_token: &str) -> Zeroizing<String> {
+/// The form body of the refresh grant for `refresh_token` and `client_id`.
+fn form(refresh_token: &str, client_id: &str) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(
-        96 + 3 * refresh_token.len() + identity::OAUTH_CLIENT_ID.len(),
+        96 + 3 * refresh_token.len() + client_id.len(),
     ));
     out.push_str("grant_type=refresh_token&refresh_token=");
     encode(refresh_token, &mut out);
     out.push_str("&client_id=");
-    encode(identity::OAUTH_CLIENT_ID, &mut out);
+    encode(client_id, &mut out);
     out
 }
 
@@ -238,9 +348,17 @@ mod tests {
         (url, received)
     }
 
-    fn refresher(urls: &[&str]) -> AnthropicOauth {
+    fn refresher_of(issuer: Issuer, urls: &[&str]) -> OauthRefresher {
         let urls = urls.iter().map(|u| (*u).to_owned()).collect();
-        AnthropicOauth::with_endpoints(vec![("login-1".into(), urls)])
+        OauthRefresher::with_grants(vec![Grant {
+            login: "login-1".into(),
+            issuer,
+            urls,
+        }])
+    }
+
+    fn refresher(urls: &[&str]) -> OauthRefresher {
+        refresher_of(Issuer::Anthropic, urls)
     }
 
     fn granted(refresh: Option<&str>) -> (u16, String) {
@@ -276,7 +394,7 @@ mod tests {
             received.lock().unwrap()[0],
             format!(
                 "grant_type=refresh_token&refresh_token=test-refresh%2B%2F%3D&client_id={}",
-                identity::OAUTH_CLIENT_ID
+                anthropic::OAUTH_CLIENT_ID
             )
         );
         let kept = r.refresh("login-1", "test-refresh").unwrap();
@@ -375,9 +493,104 @@ mod tests {
     fn only_configured_oauth_logins_refresh() {
         let e = refresher(&[]).refresh("login-2", MARK).err().unwrap();
         assert!(!e.rejected);
-        assert!(
-            e.message
-                .contains("`login-2` is not an `oauth_anthropic` login")
+        assert!(e.message.contains("`login-2` is not an OAuth login"));
+    }
+
+    /// A JWT with the payload `claims` and no valid signature.
+    fn jwt(claims: &serde_json::Value) -> String {
+        const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut payload = String::new();
+        for chunk in claims.to_string().as_bytes().chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..=chunk.len() {
+                payload.push(char::from(ABC[(n >> (18 - 6 * i) & 63) as usize]));
+            }
+        }
+        format!("e30.{payload}.c2lnbmF0dXJl")
+    }
+
+    fn codex_grant(fields: &serde_json::Value) -> (u16, String) {
+        (200, fields.to_string())
+    }
+
+    #[test]
+    fn a_chatgpt_grant_sends_the_codex_client_id_and_dates_the_token_by_its_jwts() {
+        let access = jwt(&serde_json::json!({"exp": 1_900_000_200, "sub": MARK}));
+        let id_token = jwt(&serde_json::json!({"exp": 1_900_000_100, "email": MARK}));
+        let (url, received) = endpoint(vec![
+            codex_grant(&serde_json::json!({
+                "access_token": access, "id_token": id_token, "expires_in": 3600,
+                "refresh_token": format!("refresh-{MARK}-2"),
+            })),
+            codex_grant(&serde_json::json!({"access_token": access, "id_token": id_token})),
+            codex_grant(&serde_json::json!({"access_token": access})),
+            codex_grant(&serde_json::json!({"access_token": MARK, "id_token": "a.%%.b"})),
+        ]);
+        let r = refresher_of(Issuer::Openai, &[&url]);
+        let before = unix_now();
+        let first = r.refresh("login-1", "test-refresh+1").unwrap();
+        assert!((before + 3600..=unix_now() + 3600).contains(&first.expires_at));
+        assert_eq!(*first.access_token, access);
+        assert_eq!(
+            first.refresh_token.as_deref().map(String::as_str),
+            Some(format!("refresh-{MARK}-2").as_str())
         );
+        let by_id = r.refresh("login-1", "test-refresh").unwrap();
+        assert_eq!(by_id.expires_at, 1_900_000_100);
+        assert!(
+            by_id.refresh_token.is_none(),
+            "no rotation keeps the old one"
+        );
+        let by_access = r.refresh("login-1", "test-refresh").unwrap();
+        assert_eq!(by_access.expires_at, 1_900_000_200);
+        let e = r.refresh("login-1", "test-refresh").err().unwrap();
+        assert!(!e.rejected, "{e:?}");
+        assert!(e.message.contains("no `expires_in`"), "{e:?}");
+        assert!(!e.message.contains(MARK), "{e:?}");
+        assert_eq!(
+            received.lock().unwrap()[0],
+            format!(
+                "grant_type=refresh_token&refresh_token=test-refresh%2B1&client_id={}",
+                openai::OAUTH_CLIENT_ID
+            )
+        );
+    }
+
+    #[test]
+    fn a_chatgpt_refusal_is_rejected_on_400_401_or_a_spent_code_only() {
+        let echo = format!(r#"{{"error":{{"code":"x","message":"{MARK}"}}}}"#);
+        let cases = [
+            (400, r#"{"error":"invalid_grant"}"#.to_owned(), true),
+            (401, "{}".to_owned(), true),
+            (
+                403,
+                format!(r#"{{"error":{{"code":"refresh_token_reused","message":"{MARK}"}}}}"#),
+                true,
+            ),
+            (403, echo, false),
+            (
+                429,
+                format!(r#"{{"error":{{"code":"refresh_token_expired","detail":"{MARK}"}}}}"#),
+                false,
+            ),
+            (
+                503,
+                format!(r#"{{"error":"invalid_grant","detail":"{MARK}"}}"#),
+                false,
+            ),
+        ];
+        for (status, body, rejected) in cases {
+            let (url, _) = endpoint(vec![(status, body.clone())]);
+            let e = refresher_of(Issuer::Openai, &[&url])
+                .refresh("login-1", MARK)
+                .err()
+                .unwrap();
+            assert_eq!(e.rejected, rejected, "{status} {body}: {e:?}");
+            assert!(e.message.contains(&format!("HTTP {status}")), "{e:?}");
+            assert!(!e.message.contains(MARK), "{e:?}");
+        }
     }
 }

@@ -1,6 +1,7 @@
-//! Contract tests of the model gateway: `/v1/model/*` over a real unix socket, with a real qbd
-//! in-process and a scripted fake vendor adapter, or the Anthropic adapter against a scripted
-//! vendor endpoint on loopback TCP.
+//! Contract tests of the model gateway: `/v1/model/*` and the HTTP fronts over a real unix
+//! socket, with a real qbd in-process and a scripted fake vendor adapter, or the Anthropic,
+//! OpenAI Responses and Chat Completions adapters against a scripted vendor endpoint and a
+//! scripted OAuth token endpoint on loopback TCP.
 
 #![allow(clippy::unwrap_used)]
 
@@ -23,7 +24,7 @@ use qb::gateway::config::Api;
 use qb::gateway::core::{Cancel, Gateway, Upstreams};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
 use qb::gateway::front;
-use qb::gateway::oauth::AnthropicOauth;
+use qb::gateway::oauth::OauthRefresher;
 use qb::gateway::openai_upstream::Openai;
 use qb::gateway::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Sink, Upstream,
@@ -1986,7 +1987,7 @@ fn oauth_rig(login_1: String, qbd_config: &str) -> (Rig, Vendor, Vendor) {
     let gw = serve_gateway(
         &text,
         vec![(Api::Anthropic, Box::new(Anthropic::new()))],
-        Box::new(AnthropicOauth::new(&config)),
+        Box::new(OauthRefresher::new(&config)),
         own_uid(),
         None,
     );
@@ -2003,6 +2004,12 @@ fn oauth_rig(login_1: String, qbd_config: &str) -> (Rig, Vendor, Vendor) {
 /// Runs `turn` with stderr captured; its events, after checking that neither the log nor the
 /// client's answer holds a token.
 fn turn_without_leaks(r: &Rig, request_id: &str) -> Vec<StreamEvent> {
+    turn_hiding(r, request_id, &TOKENS)
+}
+
+/// Runs `turn` with stderr captured; its events, after checking that neither the log nor the
+/// client's answer holds one of `secrets`.
+fn turn_hiding(r: &Rig, request_id: &str, secrets: &[&str]) -> Vec<StreamEvent> {
     let mut answer = Vec::new();
     let logged = stderr_of(|| {
         let s = send(
@@ -2014,7 +2021,7 @@ fn turn_without_leaks(r: &Rig, request_id: &str) -> Vec<StreamEvent> {
         answer = finish(s, Vec::new()).2;
     });
     let answer = String::from_utf8(answer).unwrap();
-    for token in TOKENS {
+    for token in secrets {
         assert!(!logged.contains(token), "{token} logged: {logged}");
         assert!(!answer.contains(token), "{token} sent: {answer}");
     }
@@ -3469,7 +3476,7 @@ const OPENAI_KEY: &str = "kind = \"api_key\"\napi = \"openai\"";
 /// The keys of a ChatGPT subscription login.
 const CHATGPT: &str = "kind = \"chatgpt_oauth\"";
 
-/// A ChatGPT credential file with a refresh token the gateway does not use.
+/// A ChatGPT credential file without an expiry: the gateway refreshes it only after a 401.
 fn chatgpt(access_token: &str, account_id: &str) -> String {
     format!(
         r#"{{"type":"chatgpt_oauth","access_token":"{access_token}","account_id":"{account_id}","refresh_token":"refresh-0"}}"#
@@ -3861,14 +3868,26 @@ fn a_usage_limit_on_a_chatgpt_login_moves_the_turn_to_the_next_openai_login() {
     );
     vendor.answer(openai_recorded("429_usage_limit", None));
     vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
-    let mut events = Vec::new();
-    let logged = stderr_of(|| events = turn(&r.gw, &turn_body("turn-1")).2);
+    let mut answer = Vec::new();
+    let logged = stderr_of(|| {
+        let s = send(
+            &r.gw,
+            "POST",
+            paths::MODEL_TURN,
+            &turn_body("turn-1").to_string(),
+        );
+        answer = finish(s, Vec::new()).2;
+    });
+    let answer = String::from_utf8(answer).unwrap();
+    let events = events(answer.as_bytes());
 
     assert_eq!(kinds(&events)[0], "route login-2");
     assert_eq!(kinds(&events).last().unwrap(), "stop End");
     assert_eq!(text_of(&events), "Hello, w\u{f6}rld!");
     let s = state(&r.qbd);
-    assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+    let exhausted = s.logins.iter().find(|l| l.login == "login-1").unwrap();
+    assert_eq!(exhausted.status, LoginStatus::Exhausted);
+    assert_eq!(exhausted.dead_until, Some(1_800_018_000), "until the reset");
     assert_eq!(s.leases, Vec::new());
 
     let sent = vendor.received();
@@ -3885,8 +3904,202 @@ fn a_usage_limit_on_a_chatgpt_login_moves_the_turn_to_the_next_openai_login() {
     );
     assert!(logged.contains("login-1: usage_limit"), "{logged}");
     for secret in [ACCESS, ACCOUNT, KEY] {
-        assert!(!logged.contains(secret), "{secret}: {logged}");
+        assert!(!logged.contains(secret), "{secret} logged: {logged}");
+        assert!(!answer.contains(secret), "{secret} sent: {answer}");
     }
+}
+
+const ACCOUNT: &str = "test-account-41d7";
+/// A JWT whose payload holds [`ACCOUNT`] and an `exp`, as the ChatGPT token endpoint returns.
+const ID_TOKEN: &str = "e30.eyJleHAiOjE5MDAwMDAwMDAsImFjY291bnQiOiJ0ZXN0LWFjY291bnQtNDFkNyJ9.c2ln";
+const CHATGPT_SECRETS: [&str; 6] = [
+    OLD_ACCESS,
+    OLD_REFRESH,
+    NEW_ACCESS,
+    NEW_REFRESH,
+    ACCOUNT,
+    ID_TOKEN,
+];
+
+/// login-1's ChatGPT credential file with the old tokens, expiring at `expires_at`.
+fn old_chatgpt(expires_at: u64) -> String {
+    format!(
+        r#"{{"type":"chatgpt_oauth","access_token":"{OLD_ACCESS}","account_id":"{ACCOUNT}","refresh_token":"{OLD_REFRESH}","expires_at":{expires_at}}}"#
+    )
+}
+
+/// A ChatGPT token answer that rotates the refresh token and dates the access token by the
+/// `id_token`.
+fn codex_grant() -> Answer {
+    let body = json!({
+        "access_token": NEW_ACCESS,
+        "refresh_token": NEW_REFRESH,
+        "id_token": ID_TOKEN,
+    });
+    let headers = vec![("content-type".into(), "application/json".into())];
+    Answer::Full(200, headers, serde_json::to_vec(&body).unwrap())
+}
+
+/// A gateway with the OpenAI adapter and the shipped OAuth refresher: login-1 a ChatGPT login
+/// with `login_1` as its file, refreshing at a scripted token endpoint, login-2 an OpenAI key
+/// login, both of `vendor-o` on one scripted vendor.
+fn chatgpt_rig(login_1: String) -> (Rig, Vendor, Vendor) {
+    let vendor = Vendor::start();
+    let tokens = Vendor::start();
+    let dir = temp_dir("gwc");
+    credentials(
+        &dir,
+        &[
+            ("login-1", login_1, 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    let qbd = start_qbd(&dir, &openai_qbd("vendor-o"));
+    let chatgpt = format!(
+        "{}\ntoken_url = \"{}/oauth/token\"",
+        vendor.login(CHATGPT),
+        tokens.base_url
+    );
+    let key = vendor.login(OPENAI_KEY);
+    let text = gateway_toml(&dir, &qbd, 4, [&chatgpt, &key], "");
+    let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Openai, Box::new(Openai::new()))],
+        Box::new(OauthRefresher::new(&config)),
+        own_uid(),
+        None,
+    );
+    let rig = Rig {
+        dir,
+        qbd,
+        gw,
+        fake: Arc::default(),
+        refreshes: Arc::default(),
+    };
+    (rig, vendor, tokens)
+}
+
+/// The `authorization` header of every request the vendor received.
+fn bearers(vendor: &Vendor) -> Vec<Option<String>> {
+    let sent = vendor.received();
+    sent.iter()
+        .map(|s| s.header("authorization").map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn an_expired_chatgpt_token_is_refreshed_before_the_call_and_written_back() {
+    let (r, vendor, tokens) = chatgpt_rig(old_chatgpt(unix_now()));
+    tokens.answer(codex_grant());
+    vendor.answer(openai_recorded("200_chatgpt", Some("upstream_text.sse")));
+    let events = turn_hiding(&r, "turn-1", &CHATGPT_SECRETS);
+    assert_eq!(kinds(&events)[0], "route login-1");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+
+    let asked = tokens.received();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].path, "/oauth/token");
+    assert_eq!(
+        asked[0].body.as_str().unwrap(),
+        format!(
+            "grant_type=refresh_token&refresh_token={OLD_REFRESH}&client_id={}",
+            openai_identity::OAUTH_CLIENT_ID
+        )
+    );
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].header("authorization"),
+        Some(bearer(NEW_ACCESS).as_str())
+    );
+    assert_eq!(
+        sent[0].header(openai_identity::ACCOUNT_HEADER),
+        Some(ACCOUNT)
+    );
+
+    let (file, mode) = stored(&r);
+    assert_eq!(mode, 0o600);
+    assert_eq!(
+        file,
+        json!({
+            "type": "chatgpt_oauth",
+            "access_token": NEW_ACCESS,
+            "refresh_token": NEW_REFRESH,
+            "account_id": ACCOUNT,
+            "expires_at": 1_900_000_000,
+        })
+    );
+}
+
+#[test]
+fn a_401_on_a_chatgpt_login_refreshes_once_and_the_same_turn_succeeds() {
+    let (r, vendor, tokens) = chatgpt_rig(old_chatgpt(unix_now() + 3600));
+    tokens.answer(codex_grant());
+    vendor.answer(openai_recorded("401", None));
+    vendor.answer(openai_recorded("200_chatgpt", Some("upstream_text.sse")));
+    let events = turn_hiding(&r, "turn-1", &CHATGPT_SECRETS);
+    assert_eq!(kinds(&events)[0], "route login-1");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    assert_eq!(tokens.received().len(), 1);
+    assert_eq!(
+        bearers(&vendor),
+        [Some(bearer(OLD_ACCESS)), Some(bearer(NEW_ACCESS))]
+    );
+    assert_eq!(stored(&r).0["access_token"], NEW_ACCESS);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Ok);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_second_401_on_a_chatgpt_login_moves_the_turn_to_the_next_login() {
+    let (r, vendor, tokens) = chatgpt_rig(old_chatgpt(unix_now() + 3600));
+    tokens.answer(codex_grant());
+    vendor.answer(openai_recorded("401", None));
+    vendor.answer(openai_recorded("401", None));
+    vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
+    let events = turn_hiding(&r, "turn-1", &CHATGPT_SECRETS);
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    assert_eq!(tokens.received().len(), 1, "one refresh per turn");
+    assert_eq!(
+        bearers(&vendor),
+        [
+            Some(bearer(OLD_ACCESS)),
+            Some(bearer(NEW_ACCESS)),
+            Some(bearer("test-token-2"))
+        ]
+    );
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn the_codex_windows_of_a_chatgpt_answer_reach_qbd_as_sent() {
+    let (r, vendor, _tokens) = chatgpt_rig(old_chatgpt(unix_now() + 3600));
+    vendor.answer(openai_recorded("200_chatgpt", Some("upstream_text.sse")));
+    let before = unix_now();
+    let events = turn_hiding(&r, "turn-1", &CHATGPT_SECRETS);
+    let after = unix_now();
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    let s = state(&r.qbd);
+    let login = s.logins.iter().find(|l| l.login == "login-1").unwrap();
+    assert_eq!(login.status, LoginStatus::Ok);
+    let window = |name: &str| {
+        let w = login.windows.iter().find(|w| w.name == name).unwrap();
+        (w.used, w.resets_at.unwrap())
+    };
+    let (used, resets_at) = window("five_hour");
+    assert!((used - 0.425).abs() < 1e-9, "{login:?}");
+    assert_eq!(resets_at, 1_800_010_000);
+    let (used, resets_at) = window("seven_day");
+    assert!((used - 0.07).abs() < 1e-9, "{login:?}");
+    assert!(
+        (before + 86_400..=after + 86_400).contains(&resets_at),
+        "{login:?}"
+    );
 }
 
 /// The canonical events and stop reason an OpenAI vendor stream carries, read as the adapter

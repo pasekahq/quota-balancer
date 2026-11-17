@@ -26,6 +26,10 @@ pub mod identity {
     pub const ORIGINATOR: &str = "codex_cli_rs";
     /// `user-agent` of the subscription mode: the Codex CLI's.
     pub const CHATGPT_USER_AGENT: &str = "codex_cli_rs/0.63.0";
+    /// OAuth token endpoint of a ChatGPT subscription login's refreshes.
+    pub const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+    /// The Codex CLI's public OAuth client id, sent with every token refresh.
+    pub const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
     /// Header that names the ChatGPT account of the subscription mode.
     pub const ACCOUNT_HEADER: &str = "chatgpt-account-id";
     /// Header that carries the session of the subscription mode.
