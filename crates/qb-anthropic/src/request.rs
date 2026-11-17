@@ -19,7 +19,7 @@ pub mod identity {
     /// client the subscription endpoint expects.
     pub const OAUTH_BETAS: &[&str] = &["oauth-2025-04-20", "claude-code-20250219"];
     /// `user-agent` of the OAuth mode: the vendor CLI's own.
-    pub const OAUTH_USER_AGENT: &str = "claude-cli/2.1.0 (external, cli)";
+    pub const OAUTH_USER_AGENT: &str = "claude-cli/2.1.319 (external, cli)";
     /// `x-app` of the OAuth mode.
     pub const OAUTH_X_APP: &str = "cli";
     /// First system block of every OAuth request, ahead of the client's system prompt.
