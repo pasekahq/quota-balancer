@@ -217,7 +217,7 @@ it: [ADR 0001](adr/0001-model-gateway.md); its API: [api.md](api.md#model-gatewa
 Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml).
 
 Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`,
-`[fronts]`):
+`[openai_models]`, `[fronts]`):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -295,6 +295,19 @@ directories and nowhere else.
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
+
+`[openai_models]`, optional: settings of models of the `openai` API family, keyed by model id as
+`qbd` picks it, at most 256. An entry applies to every route and login of `api = "openai"` that
+runs the model, pinned or picked from a ladder; a model without one keeps the defaults.
+
+```toml
+[openai_models."model-plain"]
+reasoning = false
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `reasoning` | boolean | Required. `false`: the model's Responses requests carry no `reasoning`, no effort (of the request or the pick) and no `include`, for a model that refuses the parameter ([openai.md](openai.md#serving-the-upstream)). `true` is the default. |
 
 `[fronts]`, optional: the HTTP fronts, `POST /v1/messages`
 ([anthropic.md](anthropic.md#the-v1messages-front)), `POST /v1/chat/completions` and

@@ -26,7 +26,7 @@ pub const MAX_REQUEST_BYTES: u32 = 32 << 20;
 pub const MAX_ROUTES: usize = 64;
 /// Most attempts `max_attempts` may allow.
 pub const MAX_ATTEMPTS: u32 = 16;
-/// Most entries of `fronts.models`.
+/// Most entries of `fronts.models`, and of `openai_models`.
 pub const MAX_MODELS: usize = 256;
 /// Default of `fronts.ping_interval_s`.
 pub const PING_INTERVAL_S: u32 = 10;
@@ -34,7 +34,7 @@ pub const PING_INTERVAL_S: u32 = 10;
 pub const MAX_PING_INTERVAL_S: u32 = 30;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
-/// `[[routes]]` and `[fronts]` tables.
+/// `[[routes]]`, `[openai_models]` and `[fronts]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// Absolute path of the gateway's unix socket.
@@ -57,8 +57,19 @@ pub struct GatewayConfig {
     pub logins: Vec<GatewayLogin>,
     /// Route aliases.
     pub routes: Vec<Route>,
+    /// Settings of models of the `openai` API family, at most [`MAX_MODELS`].
+    pub openai_models: Vec<OpenaiModel>,
     /// The HTTP fronts; without it their endpoints answer 404.
     pub fronts: Option<Fronts>,
+}
+
+/// The settings of one model id on every route and login of the `openai` API family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenaiModel {
+    /// Model id as qbd picks it.
+    pub model: String,
+    /// Whether its Responses requests carry `reasoning` and `include`.
+    pub reasoning: bool,
 }
 
 /// The settings the HTTP fronts share and the fronts this gateway serves; at least one is set.
@@ -297,6 +308,12 @@ fn string(at: &str, v: &Value<'_>) -> Result<String, WalkError> {
         .ok_or_else(|| wrong(at, v, "a string"))
 }
 
+fn boolean(at: &str, v: &Value<'_>) -> Result<bool, WalkError> {
+    v.get_ref()
+        .as_bool()
+        .ok_or_else(|| wrong(at, v, "a boolean"))
+}
+
 fn integer<T: TryFrom<i64>>(at: &str, v: &Value<'_>) -> Result<T, WalkError> {
     let n = v
         .get_ref()
@@ -346,6 +363,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         clients: Vec::new(),
         logins: Vec::new(),
         routes: Vec::new(),
+        openai_models: Vec::new(),
         fronts: None,
     };
     let known = [
@@ -359,6 +377,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         "clients",
         "logins",
         "routes",
+        "openai_models",
         "fronts",
     ];
     let required = ["socket", "logins", "routes"];
@@ -386,11 +405,31 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
                     c.routes.push(walk_route(&at, t)?);
                 }
             }
+            "openai_models" => c.openai_models = walk_openai_models(at, table(at, v)?)?,
             _ => c.fronts = Some(walk_fronts(at, table(at, v)?)?),
         }
         Ok(())
     })?;
     Ok(c)
+}
+
+fn walk_openai_models(at: &str, t: &DeTable<'_>) -> Result<Vec<OpenaiModel>, WalkError> {
+    let mut models = Vec::new();
+    for (model, settings) in t {
+        let model = model.get_ref().as_ref();
+        let at = format!("{at}.\"{model}\"");
+        let mut m = OpenaiModel {
+            model: model.to_owned(),
+            reasoning: true,
+        };
+        let keys = ["reasoning"];
+        fields(&at, table(&at, settings)?, &keys, &keys, |_, at, v| {
+            m.reasoning = boolean(at, v)?;
+            Ok(())
+        })?;
+        models.push(m);
+    }
+    Ok(models)
 }
 
 fn table<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<&'v DeTable<'i>, WalkError> {
@@ -743,6 +782,13 @@ impl GatewayConfig {
             absolute(&format!("logins[{i}].credentials"), &login.credentials)?;
         }
         self.validate_routes()?;
+        if self.openai_models.len() > MAX_MODELS {
+            let n = self.openai_models.len();
+            return Err(too_many("openai_models".into(), n, MAX_MODELS));
+        }
+        if self.openai_models.iter().any(|m| m.model.is_empty()) {
+            return Err(("openai_models".into(), "an empty model id".into()));
+        }
         self.validate_fronts()
     }
 
@@ -841,6 +887,15 @@ impl GatewayConfig {
             Some((_, alias)) => self.route(alias),
             None => self.route(model),
         }
+    }
+
+    /// Whether Responses requests for `model` carry reasoning: yes unless `openai_models` turns
+    /// it off.
+    pub fn reasoning(&self, model: &str) -> bool {
+        self.openai_models
+            .iter()
+            .find(|m| m.model == model)
+            .is_none_or(|m| m.reasoning)
     }
 
     /// The credential entry of `login`.
@@ -1281,6 +1336,50 @@ difficulty = 1
             let err = check("", &front(&keys)).unwrap_err();
             assert!(err.contains(want), "{keys}: {err}");
             assert!(!err.contains("qb-plaintext-token"), "{err}");
+        }
+    }
+
+    #[test]
+    fn openai_models_turn_reasoning_off_per_model_id() {
+        let c = check(
+            "",
+            "[openai_models.\"model-plain\"]\nreasoning = false\n\
+             [openai_models.\"model-r\"]\nreasoning = true\n",
+        )
+        .unwrap();
+        assert!(!c.reasoning("model-plain"));
+        assert!(c.reasoning("model-r"));
+        assert!(
+            c.reasoning("model-other"),
+            "a model without an entry reasons"
+        );
+        assert!(check("", "").unwrap().reasoning("model-plain"));
+
+        let cases = [
+            (
+                "[openai_models.\"m\"]\nreasonin = false\n",
+                "openai_models.\"m\".reasonin: unknown field, expected one of reasoning (line 14)",
+            ),
+            (
+                "[openai_models.\"m\"]\nreasoning = \"no\"\n",
+                "openai_models.\"m\".reasoning: expected a boolean, found string (line 14)",
+            ),
+            (
+                "[openai_models.\"m\"]\n",
+                "openai_models.\"m\".reasoning: is missing",
+            ),
+            (
+                "[openai_models]\nm = false\n",
+                "openai_models.\"m\": expected a table, found boolean (line 14)",
+            ),
+            (
+                "[openai_models.\"\"]\nreasoning = false\n",
+                "openai_models: an empty model id",
+            ),
+        ];
+        for (extra, want) in cases {
+            let err = check("", extra).unwrap_err();
+            assert!(err.contains(want), "{extra}: {err}");
         }
     }
 

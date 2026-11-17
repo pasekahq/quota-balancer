@@ -25,7 +25,7 @@ kind = "api_key"
 api = "anthropic"
 credentials = "/var/lib/qb-gateway/credentials/key-1.json"
 
-# A ChatGPT subscription login: access token and account id, not refreshed by the gateway.
+# A ChatGPT subscription login: access token, account id and refresh token.
 [[logins]]
 name = "login-3"
 kind = "chatgpt_oauth"
@@ -61,6 +61,11 @@ alias = "compact"
 role = "gateway"
 vendor = "vendor-a"
 model = "model-small"
+
+# A model of the openai API family that refuses the reasoning parameter: its Responses requests
+# carry no reasoning, effort or include, on every route and login that runs it.
+[openai_models."model-plain"]
+reasoning = false
 
 # The HTTP fronts for SDK clients: the model names clients send mapped to route aliases (a model
 # equal to an alias needs no entry), the same on every front.

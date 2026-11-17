@@ -3658,6 +3658,38 @@ fn reasoning_of_an_openai_login_goes_back_to_it_in_the_next_turn() {
 }
 
 #[test]
+fn a_model_configured_without_reasoning_gets_no_reasoning_effort_or_include() {
+    let plain = "[[routes]]\nalias = \"plain\"\nrole = \"gateway\"\nvendor = \"vendor-o\"\n\
+                 model = \"model-plain\"\neffort = \"low\"\n\n\
+                 [openai_models.\"model-plain\"]\nreasoning = false\n\n";
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &key_files(),
+        |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
+        &format!("{plain}{}", fronts("")),
+        None,
+    );
+    for (n, alias) in ["plain", "chat"].into_iter().enumerate() {
+        vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
+        let mut body = turn_body(&format!("turn-{n}"));
+        body["route"] = json!(alias);
+        body["effort"] = json!("high");
+        let (_, _, events) = turn(&r.gw, &body);
+        assert_eq!(kinds(&events).last().unwrap(), "stop End", "{alias}");
+    }
+
+    let sent = vendor.received();
+    let bodies: Vec<&Value> = sent.iter().map(|r| &r.body).collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["model"], "model-plain");
+    assert_eq!(bodies[0].get("reasoning"), None, "{}", bodies[0]);
+    assert_eq!(bodies[0].get("include"), None, "{}", bodies[0]);
+    assert_eq!(bodies[1]["model"], "model-o");
+    assert_eq!(bodies[1]["reasoning"]["effort"], "high");
+    assert_eq!(bodies[1]["include"], json!(["reasoning.encrypted_content"]));
+}
+
+#[test]
 fn messages_on_a_chatgpt_login_sends_its_account_and_never_shows_reasoning_as_thinking() {
     const ACCESS: &str = "test-access-6d1f";
     const ACCOUNT: &str = "test-account-3a9c";
@@ -4816,6 +4848,7 @@ fn the_chat_completions_adapter_refuses_a_credential_of_another_kind_without_quo
         vendor: "vendor-o",
         model: "model-o",
         effort: None,
+        reasoning: true,
         login: "login-1",
         base_url: Some("http://127.0.0.1:9"),
         referer: None,
