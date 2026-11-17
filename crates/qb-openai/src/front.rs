@@ -253,10 +253,14 @@ pub fn error_body(e: &GatewayError) -> ErrorBody {
 /// A quota reset further away than this tells SDK clients not to retry.
 pub const NO_RETRY_AFTER_S: u64 = 300;
 
+/// The `retry-after` of a `quota_exhausted` error that names neither a reset nor a delay.
+pub const QUOTA_RETRY_AFTER_S: u64 = 60;
+
 /// The OpenAI error answer of a canonical error at `now`:
 ///
-/// - `quota_exhausted`: 429 `insufficient_quota` with `retry-after` until `resets_at`, and
-///   `x-should-retry: false` beyond [`NO_RETRY_AFTER_S`];
+/// - `quota_exhausted`: 429 `insufficient_quota` with `retry-after` until `resets_at`, else
+///   `retry_after`, else [`QUOTA_RETRY_AFTER_S`], and `x-should-retry: false` beyond
+///   [`NO_RETRY_AFTER_S`];
 /// - `overloaded`, `unavailable` and `no_route`: 503; `auth`, which is the vendor rejecting the
 ///   gateway's credential and not the client's, 502;
 /// - `bad_request`, `context_too_long` (`context_length_exceeded`): 400; `cancelled`: 409;
@@ -273,7 +277,8 @@ pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
         ErrorClass::QuotaExhausted => e
             .resets_at
             .map(|r| r.saturating_sub(now).max(1))
-            .or(e.retry_after),
+            .or(e.retry_after)
+            .or(Some(QUOTA_RETRY_AFTER_S)),
         _ => e.retry_after,
     };
     let should_retry = match e.class {

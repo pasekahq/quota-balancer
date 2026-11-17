@@ -344,3 +344,12 @@ fn errors_that_a_retry_cannot_fix_stop_sdk_retries() {
         );
     }
 }
+
+#[test]
+fn a_quota_error_without_a_known_reset_still_says_when_to_retry() {
+    let e = GatewayError::new(ErrorClass::QuotaExhausted, true, "all logins wait");
+    let r = error_response(&e, NOW);
+    assert_eq!(r.status, 429);
+    assert_eq!(r.retry_after, Some(qb_openai::front::QUOTA_RETRY_AFTER_S));
+    assert_eq!(r.should_retry, None, "a short default lets the SDK retry");
+}

@@ -239,7 +239,7 @@ and the body `{"error": {"message", "type", "param", "code"}}`:
 
 | Class | Status | `type` | `code` | Headers |
 |---|---|---|---|---|
-| `quota_exhausted` | 429 | `insufficient_quota` | `insufficient_quota` | `retry-after`: seconds to `resets_at` (at least 1), else `retry_after`; `x-should-retry: false` when that is over 300 s |
+| `quota_exhausted` | 429 | `insufficient_quota` | `insufficient_quota` | `retry-after`: seconds to `resets_at` (at least 1), else `retry_after`, else 60; `x-should-retry: false` when that is over 300 s |
 | `overloaded` | 503 | `server_error` | `server_is_overloaded` | `retry-after` when known |
 | `unavailable` | 503 | `server_error` | `upstream_unavailable` | `retry-after` when known |
 | `no_route` | 503 | `server_error` | `no_route` | `x-should-retry: false` |
