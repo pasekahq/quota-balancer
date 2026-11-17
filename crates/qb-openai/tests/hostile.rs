@@ -4,38 +4,48 @@
 mod common;
 
 use common::{
-    Answer, NOW, Rng, VENDOR, accumulate_chat, check_responses, fixture, object, run, run_chunked,
+    Answer, NOW, Rng, Run, VENDOR, accumulate_chat, check_responses, fixture, object, run,
+    run_chat, run_chat_chunked, run_chunked,
 };
-use qb_openai::limits::{FailureKind, RateLimits, classify_response, rate_limits};
+use qb_openai::limits::{
+    FailureKind, RateLimits, classify_chat_response, classify_response, rate_limits,
+};
 use qb_openai::stream::{MAX_BLOCK_BYTES, Reader};
 use qb_openai::{chat, responses};
 use qb_proto::{StopReason, StreamEvent, Thinking, ToolCall, Usage};
 use serde_json::json;
 
-const STREAMS: &[&str] = &[
-    "upstream_text.sse",
-    "upstream_text_crlf.sse",
-    "upstream_tool_calls.sse",
-    "upstream_reasoning.sse",
-    "upstream_incomplete.sse",
-    "upstream_failed.sse",
-    "upstream_error_event.sse",
-    "upstream_cut.sse",
-    "client_responses_stream.sse",
+type Runner = fn(&[u8], &[usize]) -> Run;
+
+const STREAMS: &[(&str, Runner)] = &[
+    ("upstream_text.sse", run_chunked),
+    ("upstream_text_crlf.sse", run_chunked),
+    ("upstream_tool_calls.sse", run_chunked),
+    ("upstream_reasoning.sse", run_chunked),
+    ("upstream_incomplete.sse", run_chunked),
+    ("upstream_failed.sse", run_chunked),
+    ("upstream_error_event.sse", run_chunked),
+    ("upstream_cut.sse", run_chunked),
+    ("client_responses_stream.sse", run_chunked),
+    ("chat_upstream_openai.sse", run_chat_chunked),
+    ("chat_upstream_openrouter.sse", run_chat_chunked),
+    ("chat_upstream_error.sse", run_chat_chunked),
+    ("chat_upstream_cut.sse", run_chat_chunked),
+    ("client_chat_stream.sse", run_chat_chunked),
 ];
 
 #[test]
 fn every_chunking_gives_the_same_events() {
     let mut rng = Rng(0x00c0_ffee);
-    for name in STREAMS {
+    for (name, runner) in STREAMS {
         let bytes = fixture(name);
-        let whole = run(&bytes);
+        let whole = runner(&bytes, &[bytes.len().max(1)]);
         for split in 1..=3 {
-            assert_eq!(run_chunked(&bytes, &[split]), whole, "{name} by {split}");
+            assert_eq!(runner(&bytes, &[split]), whole, "{name} by {split}");
         }
         for _ in 0..200 {
             let sizes: Vec<usize> = (0..8).map(|_| 1 + rng.below(64)).collect();
-            assert_eq!(run_chunked(&bytes, &sizes), whole, "{name} {sizes:?}");
+            assert_eq!(runner(&bytes, &sizes), whole, "{name} {sizes:?}");
         }
     }
 }
@@ -61,7 +71,7 @@ fn mutate(rng: &mut Rng, input: &mut Vec<u8>) {
 #[test]
 fn mutated_streams_never_panic() {
     let mut rng = Rng(0xbad5_eed5);
-    for name in STREAMS {
+    for (name, runner) in STREAMS {
         let original = fixture(name);
         for _ in 0..500 {
             let mut bytes = original.clone();
@@ -69,7 +79,7 @@ fn mutated_streams_never_panic() {
                 mutate(&mut rng, &mut bytes);
             }
             let sizes = [1 + rng.below(40), 1 + rng.below(400)];
-            let _ = run_chunked(&bytes, &sizes);
+            let _ = runner(&bytes, &sizes);
         }
     }
 }
@@ -85,9 +95,11 @@ fn random_bytes_never_panic() {
         let n = rng.below(512);
         let bytes: Vec<u8> = (0..n).map(|_| rng.next().to_le_bytes()[0]).collect();
         let _ = run(&bytes);
+        let _ = run_chat(&bytes);
         let _ = chat::decode_request(&bytes, "m", &route, 16);
         let _ = responses::decode_request(&bytes, "m", VENDOR, &route, 16);
         let _ = classify_response(429, &[], &bytes, NOW);
+        let _ = classify_chat_response(400, &[], &bytes, NOW);
     }
 }
 
@@ -220,6 +232,7 @@ fn mutated_requests_and_headers_never_panic() {
             let mut body = answer.body.clone();
             mutate(&mut rng, &mut body);
             let _ = classify_response(answer.status, &pairs, &body, u64::MAX);
+            let _ = classify_chat_response(answer.status, &pairs, &body, u64::MAX);
         }
     }
 }
@@ -290,4 +303,27 @@ fn any_event_sequence_encodes_to_valid_streams() {
             assert!(accumulate_chat(&cb).done);
         }
     }
+}
+
+#[test]
+fn unbounded_chat_tool_calls_fail_as_malformed() {
+    let piece = "x".repeat(200 << 10);
+    let mut bytes = Vec::new();
+    for i in 0..4 {
+        let c = json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": i % 2,
+            "id": format!("c{i}"), "function": {"name": "f", "arguments": piece}}]}}]});
+        bytes.extend(format!("data: {c}\n\n").into_bytes());
+    }
+    let f = run_chat(&bytes).end.expect_err("bounded");
+    assert_eq!(f.kind, FailureKind::Unavailable);
+    assert!(f.message.contains("size bound"), "{}", f.message);
+
+    let mut many = Vec::new();
+    for i in 0..100 {
+        let c = json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": i,
+            "id": format!("c{i}"), "function": {"name": "f"}}]}}]});
+        many.extend(format!("data: {c}\n\n").into_bytes());
+    }
+    let f = run_chat(&many).end.expect_err("bounded");
+    assert!(f.message.contains("too many tool calls"), "{}", f.message);
 }

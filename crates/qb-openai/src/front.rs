@@ -186,6 +186,7 @@ pub fn chat_usage(u: Usage) -> ChatUsage {
             cached_tokens: u.cache_read,
         }),
         completion_tokens_details: Some(CompletionTokensDetails::default()),
+        cost: None,
     }
 }
 

@@ -264,7 +264,7 @@ pub struct Choice {
 }
 
 /// Token counts of a Chat Completions answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ChatUsage {
     /// Input tokens, cached ones included.
     #[serde(default)]
@@ -281,6 +281,9 @@ pub struct ChatUsage {
     /// Reasoning tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// What the answer cost in USD, as OpenRouter reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
 
 /// `prompt_tokens_details` and `input_tokens_details`.
@@ -299,8 +302,10 @@ pub struct CompletionTokensDetails {
     pub reasoning_tokens: u64,
 }
 
-/// One `chat.completion.chunk` of a Chat Completions stream.
+/// One `chat.completion.chunk` of a Chat Completions stream; absent fields of an upstream chunk
+/// read as empty.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChatChunk {
     /// Same in every chunk of a stream.
     pub id: String,
@@ -319,6 +324,7 @@ pub struct ChatChunk {
 
 /// The choice of a [`ChatChunk`].
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChunkChoice {
     /// Always 0.
     pub index: u32,

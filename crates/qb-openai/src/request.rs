@@ -35,6 +35,12 @@ pub mod identity {
     /// `include` value that returns reasoning as encrypted content, which `store: false` needs to
     /// pass reasoning on to the next turn.
     pub const INCLUDE_REASONING: &str = "reasoning.encrypted_content";
+    /// Header that names the calling application's URL to a Chat Completions vendor (OpenRouter's
+    /// `HTTP-Referer`).
+    pub const REFERER_HEADER: &str = "http-referer";
+    /// Header that names the calling application to a Chat Completions vendor (OpenRouter's
+    /// `X-Title`).
+    pub const TITLE_HEADER: &str = "x-title";
 }
 
 /// How the gateway authenticates to the vendor.

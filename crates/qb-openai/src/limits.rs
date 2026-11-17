@@ -236,17 +236,21 @@ pub fn rate_limits(headers: &[(&str, &str)], now: u64) -> RateLimits {
         });
     }
     windows.sort_by(|a, b| a.name.cmp(&b.name));
-    let retry_after = header(headers, "retry-after")
+    RateLimits {
+        windows,
+        retry_after: retry_after(headers),
+    }
+}
+
+/// `retry-after` in whole seconds, else `retry-after-ms` rounded up.
+fn retry_after(headers: &[(&str, &str)]) -> Option<u64> {
+    header(headers, "retry-after")
         .and_then(|v| v.parse().ok())
         .or_else(|| {
             header(headers, "retry-after-ms")
                 .and_then(number)
                 .and_then(|ms| ceil_secs(ms / 1000.0))
-        });
-    RateLimits {
-        windows,
-        retry_after,
-    }
+        })
 }
 
 /// How a vendor call failed, vendor-neutral; mirrors the gateway core's failure kinds.
@@ -401,10 +405,30 @@ fn detail_of(body: &[u8], now: u64) -> Detail {
             ..Detail::default()
         };
     };
-    let obj = match v.get("error") {
+    let obj = error_object(&v);
+    let resets_at = obj
+        .get("resets_at")
+        .and_then(|r| unix_time(&text(Some(r))))
+        .or_else(|| {
+            let after = number(&text(obj.get("resets_in_seconds")))?;
+            now.checked_add(ceil_secs(after)?)
+        });
+    Detail {
+        resets_at,
+        ..detail_of_value(&v)
+    }
+}
+
+fn error_object(v: &Value) -> &Value {
+    match v.get("error") {
         Some(e @ Value::Object(_)) => e,
-        _ => &v,
-    };
+        _ => v,
+    }
+}
+
+/// [`detail_of`] of a decoded body, without a reset.
+fn detail_of_value(v: &Value) -> Detail {
+    let obj = error_object(v);
     let mut message = text(obj.get("message"));
     if message.is_empty() {
         message = match (v.get("error"), v.get("detail")) {
@@ -416,19 +440,12 @@ fn detail_of(body: &[u8], now: u64) -> Detail {
             _ => String::new(),
         };
     }
-    let resets_at = obj
-        .get("resets_at")
-        .and_then(|r| unix_time(&text(Some(r))))
-        .or_else(|| {
-            let after = number(&text(obj.get("resets_in_seconds")))?;
-            now.checked_add(ceil_secs(after)?)
-        });
     Detail {
         json: true,
         kind: text(obj.get("type")),
         code: text(obj.get("code")),
         message,
-        resets_at,
+        resets_at: None,
     }
 }
 
@@ -508,19 +525,88 @@ pub fn classify_response(status: u16, headers: &[(&str, &str)], body: &[u8], now
     let kind = by_detail(Some(status), &detail, &limits);
     let mut windows = limits.windows;
     mark_limiting(kind, &mut windows);
-    let message = if detail.message.trim().is_empty() {
-        format!("vendor answered HTTP {status}")
-    } else {
-        format!(
-            "vendor answered HTTP {status}: {}",
-            shorten(&detail.message)
-        )
-    };
     Failure {
         kind,
         windows,
-        message,
+        message: answered(status, &detail.message),
     }
+}
+
+fn answered(status: u16, message: &str) -> String {
+    if message.trim().is_empty() {
+        format!("vendor answered HTTP {status}")
+    } else {
+        format!("vendor answered HTTP {status}: {}", shorten(message))
+    }
+}
+
+/// A model id the vendor does not know, in an OpenAI-compatible vendor's words.
+const CHAT_MODEL_PHRASES: &[&str] = &["not a valid model"];
+
+/// The failure kind of a Chat Completions vendor's `status`; the error object refines only a
+/// 400, 413 or 422 with a JSON body.
+fn chat_kind(status: u16, d: &Detail, retry_after: Option<u64>) -> FailureKind {
+    let has = |names: &[&str]| names.contains(&d.code.as_str()) || names.contains(&d.kind.as_str());
+    match status {
+        401 | 403 => FailureKind::Auth,
+        402 => FailureKind::UsageLimit { resets_at: None },
+        429 => FailureKind::RateLimited { retry_after },
+        404 => FailureKind::ModelUnavailable,
+        400 | 413 | 422 if d.json => {
+            if has(&["context_length_exceeded"]) || says(&d.message, CONTEXT_PHRASES) {
+                FailureKind::ContextTooLong
+            } else if has(&["model_not_found"])
+                || says(&d.message, MODEL_PHRASES)
+                || says(&d.message, CHAT_MODEL_PHRASES)
+            {
+                FailureKind::ModelUnavailable
+            } else {
+                FailureKind::BadRequest
+            }
+        }
+        400 | 413 | 422 => FailureKind::BadRequest,
+        503 => FailureKind::Overloaded { retry_after },
+        _ => FailureKind::Unavailable,
+    }
+}
+
+/// Classifies a non-200 answer of a Chat Completions vendor (OpenRouter, an OpenAI-compatible API
+/// key) by its status; `retry-after` sets the wait of a 429 or 503. The failure carries no windows.
+pub fn classify_chat_response(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    now: u64,
+) -> Failure {
+    let detail = detail_of(body, now);
+    Failure::new(
+        chat_kind(status, &detail, retry_after(headers)),
+        answered(status, &detail.message),
+    )
+}
+
+/// Classifies the `error` object of a Chat Completions stream chunk: a numeric `code` from 400 to
+/// 599 is the status the vendor would have answered and classifies as [`classify_chat_response`];
+/// any other error as [`classify_stream_error`] without windows.
+pub fn classify_chat_stream_error(error: &Value) -> Failure {
+    let status = error
+        .get("code")
+        .and_then(Value::as_u64)
+        .and_then(|c| u16::try_from(c).ok())
+        .filter(|c| (400..600).contains(c));
+    let detail = detail_of_value(&serde_json::json!({ "error": error }));
+    if let Some(status) = status {
+        return Failure::new(
+            chat_kind(status, &detail, None),
+            format!("vendor stream error {status}: {}", shorten(&detail.message)),
+        );
+    }
+    let code = if detail.code.is_empty() {
+        &detail.kind
+    } else {
+        &detail.code
+    };
+    classify_stream_error(code, &detail.message, &RateLimits::default())
 }
 
 /// Puts the limiting window of a usage limit at 1.0 with its reset, since qbd learns the reset

@@ -1,0 +1,6 @@
+: synthetic stream in the recorded shape of the OpenAI Chat Completions API, cut by the vendor
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"role":"assistant","content":"Cut "},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"content":"here"},"logprobs":null,"finish_reason":null}],"usage":null}
+

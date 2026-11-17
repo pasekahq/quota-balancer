@@ -3,6 +3,7 @@
 
 #![allow(dead_code, unreachable_pub, clippy::missing_panics_doc)]
 
+use qb_openai::chat_upstream;
 use qb_openai::limits::{Failure, RateLimits};
 use qb_openai::stream::{Progress, Reader};
 use qb_proto::{Object, RouteInfo, StopReason, StreamEvent, Thinking, ToolCall, Usage};
@@ -67,15 +68,39 @@ impl Answer {
     }
 }
 
-/// Everything a reader made of a stream fed in the given chunk sizes (cycled).
+/// Everything a reader made of a stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub events: Vec<StreamEvent>,
     pub end: Result<StopReason, Failure>,
 }
 
-pub fn run_chunked(bytes: &[u8], sizes: &[usize]) -> Run {
-    let mut reader = Reader::new(VENDOR, RateLimits::default());
+/// A stream reader of either upstream API.
+pub trait Feed {
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<StreamEvent>) -> Result<Progress, Failure>;
+    fn finish(&self) -> Result<StopReason, Failure>;
+}
+
+impl Feed for Reader {
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<StreamEvent>) -> Result<Progress, Failure> {
+        Reader::feed(self, chunk, out)
+    }
+    fn finish(&self) -> Result<StopReason, Failure> {
+        Reader::finish(self)
+    }
+}
+
+impl Feed for chat_upstream::Reader {
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<StreamEvent>) -> Result<Progress, Failure> {
+        chat_upstream::Reader::feed(self, chunk, out)
+    }
+    fn finish(&self) -> Result<StopReason, Failure> {
+        chat_upstream::Reader::finish(self)
+    }
+}
+
+/// Feeds `bytes` to `reader` in the given chunk sizes (cycled) until it finishes or fails.
+pub fn drive(reader: &mut impl Feed, bytes: &[u8], sizes: &[usize]) -> Run {
     let mut events = Vec::new();
     let mut rest = bytes;
     let mut i = 0;
@@ -106,8 +131,26 @@ pub fn run_chunked(bytes: &[u8], sizes: &[usize]) -> Run {
     }
 }
 
+/// A Responses stream through [`Reader`].
+pub fn run_chunked(bytes: &[u8], sizes: &[usize]) -> Run {
+    drive(
+        &mut Reader::new(VENDOR, RateLimits::default()),
+        bytes,
+        sizes,
+    )
+}
+
 pub fn run(bytes: &[u8]) -> Run {
     run_chunked(bytes, &[bytes.len().max(1)])
+}
+
+/// A Chat Completions stream through [`chat_upstream::Reader`].
+pub fn run_chat_chunked(bytes: &[u8], sizes: &[usize]) -> Run {
+    drive(&mut chat_upstream::Reader::new(), bytes, sizes)
+}
+
+pub fn run_chat(bytes: &[u8]) -> Run {
+    run_chat_chunked(bytes, &[bytes.len().max(1)])
 }
 
 /// Splits an SSE byte stream into `(event, data)` pairs; tests use it as an independent reader.

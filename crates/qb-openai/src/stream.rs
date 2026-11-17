@@ -24,7 +24,7 @@ pub fn event_bound(request_bytes: usize) -> usize {
 }
 
 /// Bound of the items open at once.
-const MAX_OPEN_ITEMS: usize = 64;
+pub(crate) const MAX_OPEN_ITEMS: usize = 64;
 
 /// Where a stream is after an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +47,27 @@ pub fn incomplete_reason(reason: &str) -> StopReason {
 /// counts inside `input_tokens`.
 pub fn usage(u: &ResponsesUsage) -> Usage {
     let cached = u.input_tokens_details.map_or(0, |d| d.cached_tokens);
+    counts(u.input_tokens, cached, u.output_tokens)
+}
+
+/// Canonical counts of an OpenAI answer's input (cached included), cached and output tokens.
+pub(crate) fn counts(input: u64, cached: u64, output: u64) -> Usage {
     Usage {
-        input: u.input_tokens.saturating_sub(cached),
-        output: u.output_tokens,
+        input: input.saturating_sub(cached),
+        output,
         cache_read: cached,
         cache_write: 0,
+    }
+}
+
+/// The input of a function call's arguments string: empty is `{}`; `None` unless a JSON object.
+pub(crate) fn call_input(args: &str) -> Option<Object> {
+    if args.trim().is_empty() {
+        return Some(Object::new());
+    }
+    match serde_json::from_str::<Value>(args) {
+        Ok(Value::Object(m)) => Some(m),
+        _ => None,
     }
 }
 
@@ -82,7 +98,7 @@ pub struct Translator {
     finished: Option<StopReason>,
 }
 
-fn malformed(what: &str) -> Failure {
+pub(crate) fn malformed(what: &str) -> Failure {
     Failure::new(
         FailureKind::Unavailable,
         format!("malformed vendor stream: {what}"),
@@ -291,14 +307,8 @@ impl Translator {
                 if id.is_empty() || name.is_empty() {
                     return Err(malformed("function call without call_id or name"));
                 }
-                let input = if args.trim().is_empty() {
-                    Object::new()
-                } else {
-                    match serde_json::from_str::<Value>(&args) {
-                        Ok(Value::Object(m)) => m,
-                        _ => return Err(malformed("function arguments are not a JSON object")),
-                    }
-                };
+                let input = call_input(&args)
+                    .ok_or_else(|| malformed("function arguments are not a JSON object"))?;
                 self.tool_calls = true;
                 out.push(StreamEvent::ToolCall {
                     tool_call: ToolCall { id, name, input },
