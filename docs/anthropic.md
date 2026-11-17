@@ -120,7 +120,10 @@ is `seven_day` and `7d_<model>` is `seven_day_<model>` (604800 s); other claims 
 unreadable utilisation or reset drops that window only.
 
 `limits::classify_response(status, headers, body)` and, for an `error` event,
-`limits::classify_stream_error(detail, limits)`:
+`limits::classify_stream_error(detail, limits)` give a `limits::FailureKind`. It mirrors the
+gateway seam's `FailureKind` by variant and `as_str` name, without `Cancelled`, which only the
+adapter sees; the crate stays pure, so the binary converts by name rather than this crate
+depending on it. The client class and outcome are the gateway core's mapping:
 
 | Answer | Failure kind | Client class | `qbd` outcome |
 |---|---|---|---|

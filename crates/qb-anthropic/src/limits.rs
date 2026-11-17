@@ -164,7 +164,9 @@ pub fn rate_limits(headers: &[(&str, &str)]) -> RateLimits {
     }
 }
 
-/// How a vendor call failed, vendor-neutral; mirrors the gateway core's failure kinds.
+/// How a vendor call failed, vendor-neutral. Mirrors the gateway seam's `FailureKind` (same
+/// variants and names, minus `Cancelled`, which only the adapter sees): this crate stays pure and
+/// the binary that owns the seam depends on it, not the other way round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// The login's usage limit is reached.
@@ -195,6 +197,20 @@ pub enum FailureKind {
 }
 
 impl FailureKind {
+    /// The seam's name of this kind, e.g. `usage_limit`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UsageLimit { .. } => "usage_limit",
+            Self::Auth => "auth",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::Overloaded { .. } => "overloaded",
+            Self::Unavailable => "unavailable",
+            Self::BadRequest => "bad_request",
+            Self::ContextTooLong => "context_too_long",
+        }
+    }
+
     /// The canonical error class a client sees when this failure ends a turn.
     pub fn error_class(self) -> ErrorClass {
         match self {

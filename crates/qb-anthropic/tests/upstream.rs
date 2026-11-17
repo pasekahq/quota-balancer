@@ -362,6 +362,68 @@ fn unified_headers_become_windows() {
     );
 }
 
+/// The mapping the gateway core applies to its seam's `FailureKind`, by the seam's names: the
+/// binary converts this crate's mirror by name, so the names and both columns must agree.
+#[test]
+fn failure_kinds_map_as_the_gateway_core_does() {
+    let cases = [
+        (
+            FailureKind::UsageLimit { resets_at: None },
+            "usage_limit",
+            ErrorClass::QuotaExhausted,
+            Outcome::UsageLimit,
+        ),
+        (
+            FailureKind::Auth,
+            "auth",
+            ErrorClass::Auth,
+            Outcome::Http401,
+        ),
+        (
+            FailureKind::RateLimited { retry_after: None },
+            "rate_limited",
+            ErrorClass::Overloaded,
+            Outcome::Http429,
+        ),
+        (
+            FailureKind::ModelUnavailable,
+            "model_unavailable",
+            ErrorClass::Unavailable,
+            Outcome::ModelUnavailable,
+        ),
+        (
+            FailureKind::Overloaded { retry_after: None },
+            "overloaded",
+            ErrorClass::Overloaded,
+            Outcome::Error,
+        ),
+        (
+            FailureKind::Unavailable,
+            "unavailable",
+            ErrorClass::Unavailable,
+            Outcome::Error,
+        ),
+        (
+            FailureKind::BadRequest,
+            "bad_request",
+            ErrorClass::BadRequest,
+            Outcome::Error,
+        ),
+        (
+            FailureKind::ContextTooLong,
+            "context_too_long",
+            ErrorClass::ContextTooLong,
+            Outcome::Error,
+        ),
+    ];
+    for (kind, name, class, outcome) in cases {
+        assert_eq!(
+            (kind.as_str(), kind.error_class(), kind.outcome()),
+            (name, class, outcome)
+        );
+    }
+}
+
 #[test]
 fn vendor_answers_classify() {
     let cases: &[(&str, FailureKind, ErrorClass, Outcome)] = &[
