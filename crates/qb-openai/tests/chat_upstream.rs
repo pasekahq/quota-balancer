@@ -1,0 +1,481 @@
+//! The Chat Completions upstream direction: a canonical turn becomes a Chat Completions body and
+//! headers; recorded-shape Chat Completions streams become canonical events; vendor answers
+//! become failures.
+
+mod common;
+
+use common::{Answer, NOW, OTHER, VENDOR, drive, fixture, object, run_chat};
+use qb_openai::chat_upstream::{InvalidHeader, Reader, build, headers, secret_header};
+use qb_openai::limits::{FailureKind, classify_chat_response};
+use qb_openai::request::BuildError;
+use qb_openai::stream::Progress;
+use qb_proto::{
+    Block, Effort, MediaType, Message, Role, StopReason, StreamEvent, Tool, ToolCall, TurnRequest,
+    Usage,
+};
+use serde_json::{Value, json};
+
+fn text(t: &str) -> StreamEvent {
+    StreamEvent::TextDelta { text: t.into() }
+}
+
+fn call(id: &str, name: &str, input: Value) -> StreamEvent {
+    StreamEvent::ToolCall {
+        tool_call: ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input: object(input),
+        },
+    }
+}
+
+fn usage(input: u64, output: u64, cache_read: u64) -> StreamEvent {
+    StreamEvent::Usage {
+        usage: Usage {
+            input,
+            output,
+            cache_read,
+            cache_write: 0,
+        },
+    }
+}
+
+fn turn() -> TurnRequest {
+    TurnRequest {
+        route: "chat".into(),
+        system: Some("Be brief.".into()),
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: vec![
+                    Block::Text {
+                        text: "Look".into(),
+                    },
+                    Block::Image {
+                        media_type: MediaType::Png,
+                        path: None,
+                        base64: Some("iVBORw0K".into()),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    Block::Thinking {
+                        vendor: OTHER.into(),
+                        opaque: r#"{"type":"thinking","thinking":"x","signature":"sig"}"#.into(),
+                    },
+                    Block::Thinking {
+                        vendor: VENDOR.into(),
+                        opaque: r#"{"type":"reasoning","summary":[],"encrypted_content":"ZW5j"}"#
+                            .into(),
+                    },
+                    Block::Text {
+                        text: "On it.".into(),
+                    },
+                    Block::Text {
+                        text: String::new(),
+                    },
+                    Block::ToolUse {
+                        id: "toolu_01".into(),
+                        name: "read_file".into(),
+                        input: object(json!({"path": "a"})),
+                    },
+                    Block::ToolUse {
+                        id: "toolu_02".into(),
+                        name: "list_dir".into(),
+                        input: object(json!({})),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    Block::ToolResult {
+                        id: "toolu_01".into(),
+                        content: "contents".into(),
+                        is_error: Some(true),
+                    },
+                    Block::ToolResult {
+                        id: "toolu_02".into(),
+                        content: "a.txt".into(),
+                        is_error: None,
+                    },
+                    Block::Text {
+                        text: "Go on".into(),
+                    },
+                ],
+            },
+        ],
+        tools: vec![Tool {
+            name: "read_file".into(),
+            description: "Read a file.".into(),
+            input_schema: object(json!({"type": "object"})),
+        }],
+        max_tokens: 4096,
+        effort: Some(Effort::Max),
+        session_key: Some("conv-1".into()),
+        cache: None,
+        request_id: "turn-1".into(),
+    }
+}
+
+#[test]
+fn request_body() {
+    let body = build(&turn(), "vendor-x/model-r").expect("builds");
+    let got = serde_json::to_value(&body).expect("json");
+    let want = json!({
+        "model": "vendor-x/model-r",
+        "messages": [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K"}}
+            ]},
+            {"role": "assistant", "content": "On it.", "tool_calls": [
+                {"id": "toolu_01", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}},
+                {"id": "toolu_02", "type": "function",
+                 "function": {"name": "list_dir", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "content": "contents", "tool_call_id": "toolu_01"},
+            {"role": "tool", "content": "a.txt", "tool_call_id": "toolu_02"},
+            {"role": "user", "content": [{"type": "text", "text": "Go on"}]}
+        ],
+        "tools": [{"type": "function", "function": {"name": "read_file",
+                   "description": "Read a file.", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+        "max_tokens": 4096,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+    assert_eq!(got, want);
+}
+
+#[test]
+fn an_assistant_turn_of_tool_calls_only_has_null_content_and_no_system_without_one() {
+    let mut req = turn();
+    req.system = None;
+    req.tools.clear();
+    req.messages[1]
+        .content
+        .retain(|b| matches!(b, Block::ToolUse { .. }));
+    let got = serde_json::to_value(build(&req, "m").expect("builds")).expect("json");
+    assert_eq!(got["messages"][0]["role"], json!("user"));
+    assert_eq!(got["messages"][1]["role"], json!("assistant"));
+    assert_eq!(got["messages"][1]["content"], Value::Null);
+    assert!(got.get("tools").is_none() && got.get("tool_choice").is_none());
+}
+
+#[test]
+fn an_image_path_is_refused() {
+    let mut req = turn();
+    req.messages[0].content[1] = Block::Image {
+        media_type: MediaType::Png,
+        path: Some("/srv/a.png".into()),
+        base64: None,
+    };
+    assert_eq!(
+        build(&req, "m"),
+        Err(BuildError::ImagePath("/srv/a.png".into()))
+    );
+}
+
+#[test]
+fn header_set_secret_and_path() {
+    let plain = vec![
+        ("content-type", "application/json".to_owned()),
+        ("accept", "text/event-stream".to_owned()),
+        ("user-agent", "qb-gateway".to_owned()),
+    ];
+    assert_eq!(headers(None, None), Ok(plain.clone()));
+    let mut attributed = plain;
+    attributed.push(("http-referer", "https://example.com/app".to_owned()));
+    attributed.push(("x-title", "Example App".to_owned()));
+    assert_eq!(
+        headers(Some("https://example.com/app"), Some("Example App")),
+        Ok(attributed)
+    );
+    assert_eq!(
+        headers(Some("https://example.com\r\nx-injected: 1"), None),
+        Err(InvalidHeader("http-referer"))
+    );
+    assert_eq!(headers(None, Some("")), Err(InvalidHeader("x-title")));
+    assert_eq!(secret_header(), ("authorization", "Bearer "));
+}
+
+#[test]
+fn openai_stream_with_two_split_tool_calls() {
+    let want = vec![
+        text("Reading "),
+        text("both."),
+        call("call_a1", "read_file", json!({"path": "notes.txt"})),
+        call("call_b2", "list_dir", json!({"dir": "src"})),
+        usage(300, 40, 2000),
+    ];
+    let lf = fixture("chat_upstream_openai.sse");
+    let crlf = String::from_utf8(lf.clone())
+        .expect("utf-8")
+        .replace('\n', "\r\n")
+        .into_bytes();
+    for bytes in [lf, crlf] {
+        let got = run_chat(&bytes);
+        assert_eq!(got.events, want);
+        assert_eq!(got.end, Ok(StopReason::ToolUse));
+    }
+}
+
+#[test]
+fn openrouter_stream_with_comments_reasoning_and_cost() {
+    let bytes = fixture("chat_upstream_openrouter.sse");
+    let mut reader = Reader::new();
+    let got = drive(&mut reader, &bytes, &[7, 1, 33]);
+    assert_eq!(
+        got.events,
+        vec![
+            text("Reading both."),
+            call("call_or_1", "read_file", json!({"path": "notes.txt"})),
+            call("call_or_2", "list_dir", json!({"dir": "src"})),
+            usage(116, 60, 64),
+        ]
+    );
+    assert_eq!(got.end, Ok(StopReason::ToolUse));
+    assert_eq!(reader.cost(), Some(0.000_42));
+}
+
+fn chunk(delta: &Value, finish: Option<&str>) -> String {
+    let c = json!({"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+    format!("data: {c}\n\n")
+}
+
+fn stream(chunks: &[String], done: bool) -> Vec<u8> {
+    let mut s = chunks.concat();
+    if done {
+        s.push_str("data: [DONE]\n\n");
+    }
+    s.into_bytes()
+}
+
+#[test]
+fn finish_reasons_map_to_stop_reasons() {
+    for (reason, want) in [
+        ("stop", StopReason::End),
+        ("tool_calls", StopReason::ToolUse),
+        ("length", StopReason::MaxTokens),
+        ("content_filter", StopReason::Refusal),
+    ] {
+        let bytes = stream(
+            &[
+                chunk(&json!({"content": "Hi"}), None),
+                chunk(&json!({}), Some(reason)),
+            ],
+            true,
+        );
+        let got = run_chat(&bytes);
+        assert_eq!(got.events, vec![text("Hi")], "{reason}");
+        assert_eq!(got.end, Ok(want), "{reason}");
+    }
+    let mut reader = Reader::new();
+    let bytes = stream(&[chunk(&json!({"content": "Hi"}), Some("stop"))], true);
+    assert_eq!(
+        reader.feed(&bytes, &mut Vec::new()),
+        Ok(Progress::Finished(StopReason::End))
+    );
+    assert_eq!(reader.cost(), None);
+}
+
+#[test]
+fn a_finish_reason_without_done_ends_the_stream_when_the_vendor_closes_it() {
+    let bytes = stream(&[chunk(&json!({"content": "Hi"}), Some("stop"))], false);
+    assert_eq!(run_chat(&bytes).end, Ok(StopReason::End));
+}
+
+#[test]
+fn a_cut_stream_is_unavailable_and_keeps_what_was_delivered() {
+    let got = run_chat(&fixture("chat_upstream_cut.sse"));
+    assert_eq!(got.events, vec![text("Cut "), text("here")]);
+    let f = got.end.expect_err("cut");
+    assert_eq!(f.kind, FailureKind::Unavailable);
+    assert!(
+        f.message.contains("before a finish reason"),
+        "{}",
+        f.message
+    );
+
+    let early_done = stream(&[chunk(&json!({"content": "Hi"}), None)], true);
+    let f = run_chat(&early_done)
+        .end
+        .expect_err("[DONE] without a reason");
+    assert_eq!(f.kind, FailureKind::Unavailable);
+}
+
+#[test]
+fn an_in_stream_error_after_content_is_classified() {
+    let got = run_chat(&fixture("chat_upstream_error.sse"));
+    assert_eq!(got.events, vec![text("Partial")]);
+    let f = got.end.expect_err("error chunk");
+    assert_eq!(f.kind, FailureKind::Unavailable);
+    assert!(f.message.contains("Provider disconnected"), "{}", f.message);
+    assert!(!f.message.chars().any(char::is_control), "{}", f.message);
+
+    for (code, want) in [
+        (json!(429), FailureKind::RateLimited { retry_after: None }),
+        (json!(402), FailureKind::UsageLimit { resets_at: None }),
+        (json!(503), FailureKind::Overloaded { retry_after: None }),
+        (
+            json!("rate_limit_exceeded"),
+            FailureKind::RateLimited { retry_after: None },
+        ),
+    ] {
+        let e = json!({"error": {"code": code, "message": "stopped"}});
+        let bytes = format!("{}data: {e}\n\n", chunk(&json!({"content": "a"}), None));
+        let f = run_chat(bytes.as_bytes()).end.expect_err("error chunk");
+        assert_eq!(f.kind, want, "{code}");
+    }
+
+    let reason = stream(&[chunk(&json!({"content": "a"}), Some("error"))], true);
+    let f = run_chat(&reason).end.expect_err("finish_reason error");
+    assert_eq!(f.kind, FailureKind::Unavailable);
+}
+
+#[test]
+fn malformed_tool_calls_and_order_fail_as_unavailable() {
+    let piece = |index: u32, id: Option<&str>, name: Option<&str>, args: &str| {
+        chunk(
+            &json!({"tool_calls": [{"index": index, "id": id, "type": "function",
+                "function": {"name": name, "arguments": args}}]}),
+            None,
+        )
+    };
+    let end = chunk(&json!({}), Some("tool_calls"));
+    for (what, bytes) in [
+        (
+            "unparsable arguments",
+            stream(
+                &[piece(0, Some("c1"), Some("f"), "{\"a\": "), end.clone()],
+                true,
+            ),
+        ),
+        (
+            "arguments not an object",
+            stream(&[piece(0, Some("c1"), Some("f"), "[1]"), end.clone()], true),
+        ),
+        (
+            "no id",
+            stream(&[piece(0, None, Some("f"), "{}"), end.clone()], true),
+        ),
+        (
+            "content after the finish reason",
+            stream(
+                &[end.clone(), chunk(&json!({"content": "late"}), None)],
+                true,
+            ),
+        ),
+        (
+            "data after [DONE]",
+            [
+                stream(std::slice::from_ref(&end), true),
+                stream(std::slice::from_ref(&end), false),
+            ]
+            .concat(),
+        ),
+        ("not JSON", b"data: {\"choices\": [\n\n".to_vec()),
+        ("not a chunk", b"data: {\"choices\": \"none\"}\n\n".to_vec()),
+    ] {
+        let f = run_chat(&bytes).end.expect_err(what);
+        assert_eq!(f.kind, FailureKind::Unavailable, "{what}");
+        assert!(
+            f.message.starts_with("malformed vendor stream"),
+            "{what}: {}",
+            f.message
+        );
+    }
+}
+
+#[test]
+fn empty_arguments_are_an_empty_object_and_calls_on_stop_are_tool_use() {
+    let bytes = stream(
+        &[
+            chunk(
+                &json!({"tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                    "function": {"name": "now", "arguments": ""}}]}),
+                None,
+            ),
+            chunk(&json!({}), Some("stop")),
+        ],
+        true,
+    );
+    let got = run_chat(&bytes);
+    assert_eq!(got.events, vec![call("c1", "now", json!({}))]);
+    assert_eq!(got.end, Ok(StopReason::ToolUse));
+}
+
+#[test]
+fn error_answers_classify_by_status() {
+    let cases = [
+        ("answer_401.json", FailureKind::Auth),
+        ("answer_403.json", FailureKind::Auth),
+        ("answer_403_html.json", FailureKind::Auth),
+        (
+            "chat_answer_402_credits.json",
+            FailureKind::UsageLimit { resets_at: None },
+        ),
+        (
+            "chat_answer_429_retry.json",
+            FailureKind::RateLimited {
+                retry_after: Some(12),
+            },
+        ),
+        ("answer_404_model.json", FailureKind::ModelUnavailable),
+        ("chat_answer_400_model.json", FailureKind::ModelUnavailable),
+        ("chat_answer_400_context.json", FailureKind::ContextTooLong),
+        ("answer_400_context.json", FailureKind::ContextTooLong),
+        ("answer_400_invalid.json", FailureKind::BadRequest),
+        ("chat_answer_422_invalid.json", FailureKind::BadRequest),
+        (
+            "answer_503_overloaded.json",
+            FailureKind::Overloaded {
+                retry_after: Some(7),
+            },
+        ),
+        ("answer_500_html.json", FailureKind::Unavailable),
+        ("chat_answer_502_empty.json", FailureKind::Unavailable),
+    ];
+    for (name, want) in cases {
+        let a = Answer::load(name);
+        let f = classify_chat_response(a.status, &a.pairs(), &a.body, NOW);
+        assert_eq!(f.kind, want, "{name}");
+        assert!(f.windows.is_empty(), "{name}");
+        assert!(
+            f.message
+                .starts_with(&format!("vendor answered HTTP {}", a.status)),
+            "{name}: {}",
+            f.message
+        );
+        assert!(!f.message.chars().any(char::is_control), "{name}");
+    }
+    assert_eq!(
+        classify_chat_response(429, &[], b"", NOW).kind,
+        FailureKind::RateLimited { retry_after: None }
+    );
+    assert_eq!(
+        classify_chat_response(413, &[], b"<html>context length</html>", NOW).kind,
+        FailureKind::BadRequest,
+        "an HTML body classifies by status alone"
+    );
+}
+
+#[test]
+fn a_failure_message_is_shortened_and_never_quotes_a_header_value() {
+    let a = Answer::load("answer_401.json");
+    let mut pairs = a.pairs();
+    pairs.push(("authorization", "Bearer test-token-1"));
+    let f = classify_chat_response(a.status, &pairs, &a.body, NOW);
+    assert!(!f.message.contains("test-token-1"), "{}", f.message);
+
+    let long = json!({"error": {"code": 400, "message": "é\n".repeat(400)}}).to_string();
+    let f = classify_chat_response(400, &[], long.as_bytes(), NOW);
+    assert!(f.message.chars().count() < 340, "{}", f.message);
+    assert!(!f.message.chars().any(char::is_control));
+}

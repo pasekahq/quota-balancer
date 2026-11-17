@@ -1,0 +1,15 @@
+{
+  "status": 402,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "error": {
+      "code": 402,
+      "message": "Insufficient credits. This account never purchased credits; add credits and try again."
+    }
+  }
+}

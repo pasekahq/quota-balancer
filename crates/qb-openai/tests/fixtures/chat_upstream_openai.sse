@@ -1,0 +1,26 @@
+: synthetic stream in the recorded shape of the OpenAI Chat Completions API
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"role":"assistant","content":"","refusal":null},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"content":"Reading "},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"content":"both."},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a1","type":"function","function":{"name":"read_file","arguments":""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\": \"notes.txt\"}"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b2","type":"function","function":{"name":"list_dir","arguments":""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"dir\""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":": \"src\"}"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"chatcmpl-test1","object":"chat.completion.chunk","created":1800000000,"model":"model-o","system_fingerprint":"fp_test","choices":[],"usage":{"prompt_tokens":2300,"completion_tokens":40,"total_tokens":2340,"prompt_tokens_details":{"cached_tokens":2000,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}
+
+data: [DONE]
+

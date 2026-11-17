@@ -4,7 +4,8 @@
 [api.md](api.md)) and the two OpenAI APIs, in both directions:
 
 - **upstream**: the gateway calls an OpenAI-family vendor through the Responses API, with an API
-  key or a ChatGPT subscription login. A `TurnRequest` becomes a Responses request body and
+  key or a ChatGPT subscription login, or an OpenAI-compatible vendor (OpenRouter and others)
+  through the Chat Completions API with an API key. A `TurnRequest` becomes a request body and
   header set; the SSE answer becomes canonical content events; rate-limit headers and errors
   become quota windows and a vendor-neutral failure for `qbd`'s report;
 - **client side**: the gateway's `/v1/chat/completions` and `/v1/responses` fronts. A request
@@ -27,9 +28,10 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | Thinking into a Chat Completions client | Chat Completions has no reasoning field: thinking is not shown and does not come back in the next turn. A Claude route that needs its thinking blocks in a tool loop gets them only through the Messages or Responses front. |
 | Thinking into a Responses client | Kept. Thinking of the route's own OpenAI-family vendor is its reasoning item; thinking of another vendor is a `reasoning` item whose `encrypted_content` wraps it (below) and comes back byte for byte. Its `summary` is empty. |
 | Anthropic thinking to an OpenAI upstream, or reasoning to an Anthropic upstream | Dropped by the upstream adapter: a vendor cannot read another vendor's thinking. |
-| `cache_control` breakpoints of a Messages client on an OpenAI upstream | Not sent: OpenAI caches prompts on its own; `session_key` becomes `prompt_cache_key`. |
+| Thinking to a Chat Completions upstream, reasoning from it | Dropped, of every vendor: a Chat Completions request has no field to carry it, and the answer's reasoning deltas are not read. |
+| `cache_control` breakpoints of a Messages client on an OpenAI upstream | Not sent: OpenAI caches prompts on its own; on the Responses upstream `session_key` becomes `prompt_cache_key`. |
 | Any OpenAI front | `cache` is always `auto`, since OpenAI clients expect caching without asking; on an Anthropic API key that means cache writes at their price. |
-| `tool_result.is_error` to an OpenAI upstream | Dropped: `function_call_output` has no error flag. |
+| `tool_result.is_error` to an OpenAI upstream | Dropped: `function_call_output` and the Chat Completions `tool` message have no error flag. |
 | Usage | OpenAI reports no cache writes: `cache_write` reads as 0 upstream, and fronts fold it into `prompt_tokens`/`input_tokens`. The canonical usage has no reasoning count, so fronts write `reasoning_tokens: 0`. |
 | `reasoning.summary`, `include`, `store` of a Responses client | Ignored: the upstream adapter always asks for summaries and encrypted reasoning and never stores. |
 | `n` > 1, logprobs, audio, structured output (`response_format`, `text.format`), non-function tools, image URLs, files | Refused with a clear `400`. |
@@ -147,6 +149,82 @@ the latest reset of a subscription window at 100 %. `retry_after` is the header,
 duration after `try again in` in the message (`1.8s`, `6m0s`, `5 minutes`). The failure carries the windows of the headers and
 the vendor's message, cut to 300 characters with control characters as spaces; it never carries a
 header value.
+
+## Chat Completions upstream
+
+`chat_upstream` is the upstream half for Chat Completions vendors: OpenRouter and other
+OpenAI-compatible API keys. It reads no rate-limit headers; the vendor-reported cost is a side
+value of the reader.
+
+### Chat Completions request
+
+`chat_upstream::build(req, model)` returns the body; `chat_upstream::PATH` (`/chat/completions`)
+is the path below the vendor's base URL.
+
+| Canonical | Chat Completions |
+|---|---|
+| `system` | the first message, `{role: system, content}`; absent when empty |
+| `user` message | one `tool` message per `tool_result{id,content}` (`tool_call_id: id`, `content`), then one `user` message of `text` and `image_url` parts (a base64 `data:` URL) |
+| `assistant` message | one `assistant` message: its text joined as `content` (`null` without text), `tool_calls[]{id, type: function, function{name, arguments: input as JSON}}` with the canonical id unchanged |
+| `thinking` of any vendor; empty text; images of an assistant message | dropped |
+| `image` with `path` | `BuildError` |
+| `tools[]` | `tools[]{type: function, function{name, description, parameters}}`, `tool_choice: auto` |
+| `max_tokens` | `max_tokens` |
+| (always) | `stream: true`, `stream_options.include_usage: true` |
+
+`effort` and `session_key` are not sent.
+
+| Header | Value |
+|---|---|
+| `authorization` | `Bearer <key>`: `chat_upstream::secret_header()` names the header and prefix, the caller appends the key |
+| `content-type`, `accept`, `user-agent` | `application/json`, `text/event-stream`, `qb-gateway` |
+| `http-referer`, `x-title` | the caller's values, when given (OpenRouter's app attribution); a value that is empty or not printable ASCII is an `InvalidHeader` error |
+
+`chat_upstream::headers(referer, title)` returns every header except the secret.
+
+### Chat Completions answer
+
+`chat_upstream::Reader` takes response bytes in chunks of any size through the same SSE parser,
+with the 1 MiB event bound; comments such as `: OPENROUTER PROCESSING` are skipped. Only choice
+0 is read.
+
+| Chunk | Canonical event |
+|---|---|
+| `delta.content` | `text_delta` per non-empty piece |
+| `delta.tool_calls[]` | accumulated by `index`: `id` and `function.name` from the first piece that has them, `function.arguments` concatenated |
+| `finish_reason` | every accumulated call as one `tool_call{id, name, input}` in `index` order (empty arguments are `{}`); the stop reason `stop` → `end`, `tool_calls` → `tool_use`, `length` → `max_tokens`, `content_filter` → `refusal`, any other → `end`; `end` with tool calls is `tool_use` |
+| `usage` | one `usage`: `input` = `prompt_tokens` − `cached_tokens`, `cache_read` = `cached_tokens`, `output` = `completion_tokens`, `cache_write` = 0; `usage.cost` (USD) is `Reader::cost()` |
+| `delta.reasoning`, `delta.reasoning_details`, other fields | nothing |
+| `data: [DONE]` | `Progress::Finished` with the stop reason |
+| `{"error": {...}}` | a classified `Failure` (below) |
+
+A stream the vendor closes after a finish reason but without `[DONE]` ends with that reason.
+`[DONE]` or the end of the stream before a finish reason, a `finish_reason` of `error`, a chunk
+that does not decode, content after the finish reason, data after `[DONE]`, a tool call without
+id or name, arguments that are not a JSON object, more than 64 tool calls or more than 768 KiB of
+them, and an oversized event are `unavailable` failures. Events already returned stay delivered.
+
+### Chat Completions failures
+
+`limits::classify_chat_response(status, headers, body, now)` classifies by status; only a 400,
+413 or 422 with a JSON error body is refined by its `code`, `type` and message. The failure
+carries no windows; its message is cut and cleaned as in the Responses failures and never
+carries a header value.
+
+| Answer | Failure kind |
+|---|---|
+| 401, 403 | `auth` |
+| 402 | `usage_limit` without reset |
+| 429 | `rate_limited{retry_after}`, from `retry-after` or `retry-after-ms` |
+| 404; a 400, 413 or 422 whose code is `model_not_found` or whose message names an unknown model (`model not found`, `does not exist`, `is not a valid model`, …) | `model_unavailable` |
+| a 400, 413 or 422 whose code is `context_length_exceeded` or whose message says `context length`, `maximum context`, `context window`, … | `context_too_long` |
+| other 400, 413, 422 | `bad_request` |
+| 503 | `overloaded{retry_after}` |
+| other 5xx, any other status | `unavailable` |
+
+An in-stream error chunk goes through `limits::classify_chat_stream_error`: a numeric `code` from
+400 to 599 (OpenRouter's) classifies as that status; another code (`server_error`,
+`rate_limit_exceeded`) classifies as a Responses stream error.
 
 ## Serving the upstream
 

@@ -1,0 +1,6 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-test-1","provider":"vendor-x","model":"vendor-x/model-r","object":"chat.completion.chunk","created":1800000000,"choices":[{"index":0,"delta":{"role":"assistant","content":"Partial"},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-test-1","provider":"vendor-x","model":"vendor-x/model-r","object":"chat.completion.chunk","created":1800000000,"error":{"code":"server_error","message":"Provider disconnected\nunexpectedly"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error","native_finish_reason":"error"}]}
+

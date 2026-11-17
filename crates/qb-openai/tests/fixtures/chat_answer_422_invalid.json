@@ -1,0 +1,15 @@
+{
+  "status": 422,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "error": {
+      "code": 422,
+      "message": "messages[2].tool_call_id: field required"
+    }
+  }
+}

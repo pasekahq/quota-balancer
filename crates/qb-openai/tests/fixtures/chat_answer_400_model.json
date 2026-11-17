@@ -1,0 +1,15 @@
+{
+  "status": 400,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "error": {
+      "code": 400,
+      "message": "vendor-x/model-z is not a valid model ID"
+    }
+  }
+}
