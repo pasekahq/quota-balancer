@@ -1,0 +1,38 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "text/event-stream"
+    ],
+    [
+      "x-codex-primary-used-percent",
+      "42.5"
+    ],
+    [
+      "x-codex-primary-window-minutes",
+      "300"
+    ],
+    [
+      "x-codex-primary-reset-at",
+      "1800010000"
+    ],
+    [
+      "x-codex-secondary-used-percent",
+      "7"
+    ],
+    [
+      "x-codex-secondary-window-minutes",
+      "10080"
+    ],
+    [
+      "x-codex-secondary-reset-after-seconds",
+      "86400"
+    ],
+    [
+      "x-codex-credits-has-credits",
+      "false"
+    ]
+  ],
+  "body": null
+}

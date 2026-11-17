@@ -1,0 +1,11 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_7","object":"response","created_at":1800000000,"status":"in_progress","model":"model-o","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_test_7","type":"message","status":"in_progress","content":[],"role":"assistant"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_test_7","output_index":0,"content_index":0,"delta":"Cut here"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_te

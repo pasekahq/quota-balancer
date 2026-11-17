@@ -1,0 +1,21 @@
+{
+  "status": 503,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "retry-after",
+      "7"
+    ]
+  ],
+  "body": {
+    "error": {
+      "message": "The server is overloaded. Please try again later.",
+      "type": "server_error",
+      "param": null,
+      "code": "server_is_overloaded"
+    }
+  }
+}

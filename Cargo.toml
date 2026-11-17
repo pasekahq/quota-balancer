@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qb-core", "crates/qb-proto", "crates/qb-vendors", "crates/qb-anthropic", "crates/qb"]
+members = ["crates/qb-core", "crates/qb-proto", "crates/qb-vendors", "crates/qb-anthropic", "crates/qb-openai", "crates/qb"]
 
 [workspace.package]
 version = "0.0.1"
