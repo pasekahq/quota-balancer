@@ -167,7 +167,8 @@ pub struct Tool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRequestError(pub String);
 
-fn is_alias(s: &str) -> bool {
+/// Whether `s` is a valid route alias: `^[a-z][a-z0-9_-]{0,63}$`.
+pub fn is_alias(s: &str) -> bool {
     let mut bytes = s.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_lowercase())
         && s.len() <= MAX_NAME

@@ -462,7 +462,10 @@ pub fn parse_agent(file: &Path, text: &str) -> Result<AgentConfig, Error> {
 }
 
 /// `text` as TOML of type `T`, errors on one line with the field path and no quoted values.
-fn deserialize<T: serde::de::DeserializeOwned>(file: &Path, text: &str) -> Result<T, Error> {
+pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(
+    file: &Path,
+    text: &str,
+) -> Result<T, Error> {
     let error = |field: String, reason: String| Error {
         file: file.to_owned(),
         field,
@@ -532,7 +535,7 @@ fn after_debug_string(s: &str) -> &str {
 }
 
 /// A validation failure: field path and reason.
-type Fault = (String, String);
+pub(crate) type Fault = (String, String);
 
 impl Config {
     /// The policy part of the config as the core's spec, in config order.
@@ -778,7 +781,7 @@ impl Role {
 }
 
 /// Checks that the names of list `list` are non-empty and unique and returns them.
-fn declare<'a>(
+pub(crate) fn declare<'a>(
     list: &str,
     names: impl Iterator<Item = &'a str>,
 ) -> Result<HashSet<&'a str>, Fault> {
@@ -803,6 +806,6 @@ fn known(declared: &HashSet<&str>, field: String, kind: &str, name: &str) -> Res
     }
 }
 
-fn too_many(field: String, n: usize, max: usize) -> Fault {
+pub(crate) fn too_many(field: String, n: usize, max: usize) -> Fault {
     (field, format!("{n} entries, at most {max} allowed"))
 }
