@@ -171,7 +171,7 @@ refreshes the login for later picks.
 | daemon RSS idle / after 10⁴ picks | ≲ 2 MiB / ≤ 4 MiB (`MemoryMax=16M`) |
 | agent RSS idle / during probe | ≲ 2 MiB / ≲ 6 MiB |
 | gateway RSS idle / per turn in flight | ≤ 4 MiB / ≲ 1 MiB plus twice the request body |
-| binary | static musl, ≤ 2.5 MiB with TLS and the gateway |
+| binary | static musl, ≤ 4 MiB with TLS and the gateway (raised from 2.5 MiB on 2026-11-17 by owner decision to fit both gateway fronts) |
 | dependencies | ≤ 12 direct, ≲ 50 total |
 | CPU | 0 wake-ups/s idle (daemon, agent and gateway); pick ≤ 50 µs server-side, p99 ≤ 1 ms over UDS from connect to response; gateway p99 ≤ 5 ms from a request to its upstream request |
 | disk | ≤ ~150 B per pick, or 0 with `journal = off`; the gateway writes only refreshed credential files |

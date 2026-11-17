@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Static release binary: size <= QB_MAX_BINARY_BYTES (default 2.5 MiB) and static linking.
+# Static release binary: size <= QB_MAX_BINARY_BYTES (default 4 MiB) and static linking.
 # The daemon's budgets are measured by the acceptance lane (see docs/design.md, "Budgets").
 # Usage: ci/budgets.sh [path/to/qb]   (default: target/x86_64-unknown-linux-musl/release/qb)
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/qb}"
-max_bytes="${QB_MAX_BINARY_BYTES:-2621440}"
+max_bytes="${QB_MAX_BINARY_BYTES:-4194304}"
+# 4 MiB since 2026-11-17 (owner decision): room to wire the qb-anthropic and qb-openai
+# gateway fronts; it was 2.5 MiB (2621440) before.
 fail=0
 
 size=$(stat -c %s "$bin")

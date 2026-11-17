@@ -217,7 +217,7 @@ needs its own reason and measured cost under AGENTS.md rule 4.
 
 | Resource | Target |
 |---|---|
-| binary | the same static binary within the existing ≤ 2.5 MiB; the gateway links no TLS or HTTP crate the agent does not already link |
+| binary | the same static binary within the existing ≤ 4 MiB (2.5 MiB until 2026-11-17); the gateway links no TLS or HTTP crate the agent does not already link |
 | gateway RSS | idle ≤ 4 MiB; per turn in flight ≲ 1 MiB plus twice its request body |
 | unit memory | `MemoryMax` ≥ `max_turns` × (2 × `max_request_bytes` + 1 MiB) + 4 MiB, 96 MiB for the defaults |
 | CPU | 0 wake-ups/s idle: no timers, refresh only on demand; p99 ≤ 5 ms from a turn's request to its upstream request, without refresh and TLS handshake |

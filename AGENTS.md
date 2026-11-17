@@ -71,7 +71,7 @@ Release builds are CPU-heavy (fat LTO). Run one cargo build at a time on shared 
 4. **Stay synchronous and small.** No tokio/hyper/axum/reqwest/chrono/openssl (enforced by
    `deny.toml`). A new dependency needs a reason in the PR description; keep direct
    dependencies ≤ 12 and the tree ≲ 50 crates (`cargo tree`).
-5. **Budgets are part of the contract**: binary ≤ 2.5 MiB, daemon RSS ≤ 4 MiB after 10⁴ picks,
+5. **Budgets are part of the contract**: binary ≤ 4 MiB, daemon RSS ≤ 4 MiB after 10⁴ picks,
    `qbd.service` exposure ≤ 1.5. Do not raise a limit to make CI green; fix the cause or ask.
 6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only two
    components touch credential files, both as the credential owner, non-dumpable, under

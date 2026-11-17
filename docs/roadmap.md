@@ -40,7 +40,7 @@ Order matters; each item lands as its own PR with tests.
 7. **Service hardening check**: `systemd-analyze security` in CI for all units; `on_dead` /
    `on_recover` hooks (exec).
 8. **Acceptance**: the three scenarios above end-to-end through the daemon; RSS ≤ 4 MiB after
-   10⁴ picks; binary ≤ 2.5 MiB; pick p99 ≤ 1 ms over UDS; 0 wake-ups/s idle; `write_bytes = 0`
+   10⁴ picks; binary ≤ 4 MiB; pick p99 ≤ 1 ms over UDS; 0 wake-ups/s idle; `write_bytes = 0`
    with `journal=off`; no network interfaces but `lo` under `PrivateNetwork`.
 
 Also in S1: `clients/python/qb_client.py` — a single-file stdlib client (~60 lines) for
