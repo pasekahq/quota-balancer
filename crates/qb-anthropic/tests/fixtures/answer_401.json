@@ -1,0 +1,11 @@
+{
+  "status": 401,
+  "headers": [],
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "authentication_error",
+      "message": "OAuth token has expired."
+    }
+  }
+}

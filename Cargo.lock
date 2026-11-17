@@ -209,6 +209,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qb-anthropic"
+version = "0.0.1"
+dependencies = [
+ "qb-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qb-core"
 version = "0.0.1"
 
