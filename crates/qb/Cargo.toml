@@ -17,6 +17,7 @@ qb-core.workspace = true
 qb-proto.workspace = true
 qb-vendors.workspace = true
 qb-anthropic.workspace = true
+qb-openai.workspace = true
 httparse.workspace = true
 landlock.workspace = true
 lexopt.workspace = true

@@ -15,6 +15,7 @@ qb-core = { path = "crates/qb-core" }
 qb-proto = { path = "crates/qb-proto" }
 qb-vendors = { path = "crates/qb-vendors" }
 qb-anthropic = { path = "crates/qb-anthropic" }
+qb-openai = { path = "crates/qb-openai" }
 httparse = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"
 rustix = { version = "1", default-features = false, features = ["std", "net", "event", "process"] }

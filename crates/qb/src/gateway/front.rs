@@ -1,11 +1,12 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
-//! `/v1/model/routes`, `/v1/model/cancel` and `/v1/health`, and the Messages front's
-//! `/v1/messages` ([`super::messages`]); the optional loopback TCP listener serves only
-//! `/v1/messages`, to clients with the client token. One thread per connection, at most
-//! `max_turns` + [`EXTRA_CONNECTIONS`] at once. On the C4 front every rejection is a non-200
-//! [`GatewayError`], every admitted turn a `200` with a chunked NDJSON stream whose head goes out
-//! with its first event. The main thread accepts, cancels a turn whose client hangs up and pings
-//! silent Messages streams.
+//! `/v1/model/routes`, `/v1/model/cancel` and `/v1/health`, and the HTTP fronts: `/v1/messages`
+//! ([`super::messages`]), `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the
+//! optional loopback TCP listener serves only the HTTP fronts, to clients with the client token.
+//! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once. On the C4
+//! front every rejection is a non-200 [`GatewayError`], every admitted turn a `200` with a chunked
+//! NDJSON stream whose head goes out with its first event; an HTTP front answers its errors in
+//! its own format. The main thread accepts, cancels a turn whose client hangs up and pings silent
+//! SSE answers.
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -25,9 +26,10 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use serde::Serialize;
 
+use super::answer::Keepalive;
 use super::core::{Cancel, Gateway};
-use super::messages::{self, Keepalive};
 use super::upstream::{CancelToken, Flow};
+use super::{messages, openai};
 use crate::auth::token_matches;
 use crate::http::{self, Head, Method, ReadError};
 use crate::log;
@@ -125,8 +127,8 @@ impl io::Write for Conn {
     }
 }
 
-/// A client connection of a running turn, the turn's cancel token and, for a Messages stream,
-/// its keepalive.
+/// A client connection of a running turn, the turn's cancel token and, for an HTTP front, its
+/// keepalive.
 #[derive(Clone)]
 struct Watched {
     id: u64,
@@ -136,7 +138,7 @@ struct Watched {
 }
 
 /// The client connections of running turns, which the main thread polls for a hang-up so a turn
-/// blocked on a silent vendor ends with its client, and pings when a Messages stream is silent.
+/// blocked on a silent vendor ends with its client, and pings when an SSE answer is silent.
 pub(super) struct Watch {
     turns: Mutex<Vec<Watched>>,
     /// An eventfd that wakes the main thread when the set changes.
@@ -208,7 +210,7 @@ impl Watch {
     }
 
     /// Sleeps until `listener` or `loopback` has a connection, cancelling the turns whose clients
-    /// hang up and pinging the silent Messages streams meanwhile. Without a stream to ping it
+    /// hang up and pinging the silent SSE answers meanwhile. Without a stream to ping it
     /// sleeps without a timeout.
     fn wait(&self, listener: &UnixListener, loopback: Option<&TcpListener>) -> Ready {
         loop {
@@ -267,8 +269,8 @@ impl Watch {
 }
 
 /// Serves `gateway` on `listener` to peers of uid `own_uid`, the gateway's own, and the
-/// configured clients, and its Messages front on `loopback` to peers with the client token of
-/// `[messages]`. The main thread accepts and watches the clients of running turns; each
+/// configured clients, and its HTTP fronts on `loopback` to peers with the client token of
+/// `[fronts]`. The main thread accepts and watches the clients of running turns; each
 /// connection runs on its own thread.
 ///
 /// # Errors
@@ -396,10 +398,11 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
     };
     let max_turn = gateway.config().max_request_bytes as usize;
     let limit = Cell::new(http::MAX_BODY);
-    let to_messages = Cell::new(false);
+    let dialect = Cell::new(Dialect::C4);
     let max_body = |head: &Head<'_>| {
-        to_messages.set(head.path == paths::MESSAGES);
-        if head.method == Method::Post && [paths::MODEL_TURN, paths::MESSAGES].contains(&head.path)
+        dialect.set(Dialect::of(head.path));
+        if head.method == Method::Post
+            && (head.path == paths::MODEL_TURN || HTTP_FRONTS.contains(&head.path))
         {
             limit.set(max_turn);
         }
@@ -407,16 +410,16 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
     };
     let req = match read(&stream, &max_body) {
         Ok(r) => r,
-        Err(e) => return unreadable(&mut stream, &e, limit.get(), to_messages.get()),
+        Err(e) => return unreadable(&mut stream, &e, limit.get(), dialect.get()),
     };
     match (req.method, req.path.as_str()) {
         (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, watch, &caller, req.body),
-        (Method::Post, paths::MESSAGES) => {
-            messages::turn(stream, gateway, watch, &caller, req.body);
+        (Method::Post, path) if HTTP_FRONTS.contains(&path) => {
+            front_turn(stream, gateway, watch, &caller, req);
         }
-        (_, paths::MESSAGES) => {
+        (_, path) if HTTP_FRONTS.contains(&path) => {
             let e = GatewayError::new(ErrorClass::BadRequest, false, "method not allowed");
-            messages::reject(&mut stream, Some(405), &e);
+            Dialect::of(path).reject(&mut stream, 405, &e);
         }
         (Method::Get, paths::MODEL_ROUTES) => reply(&mut stream, 200, &gateway.routes()),
         (Method::Post, paths::MODEL_CANCEL) => {
@@ -463,50 +466,112 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
     }
 }
 
+/// The endpoints of the HTTP fronts, `POST` only.
+const HTTP_FRONTS: [&str; 3] = [paths::MESSAGES, paths::CHAT_COMPLETIONS, paths::RESPONSES];
+
+/// Runs the HTTP front `req.path` names, one of [`HTTP_FRONTS`].
+fn front_turn(stream: Conn, gateway: &Gateway, watch: &Watch, caller: &str, req: http::Request) {
+    match req.path.as_str() {
+        paths::CHAT_COMPLETIONS => openai::chat_turn(stream, gateway, watch, caller, req.body),
+        paths::RESPONSES => openai::responses_turn(stream, gateway, watch, caller, req.body),
+        _ => messages::turn(stream, gateway, watch, caller, req.body),
+    }
+}
+
+/// The error format of an endpoint.
+#[derive(Clone, Copy)]
+enum Dialect {
+    /// [`GatewayError`] of the C4 front and the other gateway endpoints.
+    C4,
+    /// The Messages error format.
+    Messages,
+    /// The OpenAI error format.
+    Openai,
+}
+
+impl Dialect {
+    fn of(path: &str) -> Self {
+        match path {
+            paths::MESSAGES => Self::Messages,
+            paths::CHAT_COMPLETIONS | paths::RESPONSES => Self::Openai,
+            _ => Self::C4,
+        }
+    }
+
+    /// Answers `e` in this format with `status`.
+    fn reject(self, stream: &mut Conn, status: u16, e: &GatewayError) {
+        match self {
+            Self::C4 => reply(stream, status, e),
+            Self::Messages => messages::reject(stream, Some(status), e),
+            Self::Openai => openai::reject(stream, Some(status), e),
+        }
+    }
+}
+
 /// Why the loopback listener refused a request head.
 #[derive(Clone, Copy)]
 enum Refusal {
     /// No client token, or a wrong one.
     Token,
-    /// Not `POST /v1/messages`.
+    /// Not `POST` to one of [`HTTP_FRONTS`].
     Path,
 }
 
-/// Serves one connection of the loopback listener: `POST /v1/messages` with the client token in
-/// `x-api-key` or `Authorization: Bearer`, checked before the body is read; every answer is in the
-/// Messages format.
+/// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] with the
+/// client token in `x-api-key` or `Authorization: Bearer`, checked before the body is read. Every
+/// answer is in the OpenAI format for the OpenAI endpoints, else in the Messages format.
 fn loopback(mut stream: Conn, gateway: &Gateway, watch: &Watch) {
     let config = gateway.config();
-    let token = config.messages.as_ref().and_then(|m| m.token_sha256);
+    let token = config.fronts.as_ref().and_then(|f| f.token_sha256);
     let max_turn = config.max_request_bytes as usize;
     let refusal = Cell::new(None);
+    let dialect = Cell::new(Dialect::Messages);
     let check = |head: &Head<'_>| {
+        if let Dialect::Openai = Dialect::of(head.path) {
+            dialect.set(Dialect::Openai);
+        }
         let mut presented = [head.api_key, head.bearer].into_iter().flatten();
         if !token.is_some_and(|hash| presented.any(|t| token_matches(t, &hash))) {
             refusal.set(Some(Refusal::Token));
             return None;
         }
-        if (head.method, head.path) != (Method::Post, paths::MESSAGES) {
+        if head.method != Method::Post || !HTTP_FRONTS.contains(&head.path) {
             refusal.set(Some(Refusal::Path));
             return None;
         }
         Some(max_turn)
     };
-    match (read(&stream, &check), refusal.get()) {
-        (Ok(req), _) => messages::turn(stream, gateway, watch, TOKEN_CALLER, req.body),
-        (Err(ReadError::Refused { .. }), Some(Refusal::Token)) => messages::refuse(
+    let refused = match (read(&stream, &check), refusal.get()) {
+        (Ok(req), _) => return front_turn(stream, gateway, watch, TOKEN_CALLER, req),
+        (Err(ReadError::Refused { .. }), Some(refusal)) => refusal,
+        (Err(e), _) => return unreadable(&mut stream, &e, max_turn, dialect.get()),
+    };
+    let served = "this listener serves only `POST /v1/messages`, `POST /v1/chat/completions` \
+                  and `POST /v1/responses`";
+    match (refused, dialect.get()) {
+        (Refusal::Token, Dialect::Openai) => openai::refuse(
+            &mut stream,
+            401,
+            "invalid_request_error",
+            "invalid_api_key",
+            "invalid API key: not this gateway's client token",
+        ),
+        (Refusal::Token, _) => messages::refuse(
             &mut stream,
             401,
             "authentication_error",
             "invalid x-api-key: not this gateway's client token",
         ),
-        (Err(ReadError::Refused { .. }), _) => messages::refuse(
-            &mut stream,
-            404,
-            "not_found_error",
-            "this listener serves only `POST /v1/messages`",
-        ),
-        (Err(e), _) => unreadable(&mut stream, &e, max_turn, true),
+        (Refusal::Path, Dialect::Openai) => {
+            openai::refuse(
+                &mut stream,
+                404,
+                "invalid_request_error",
+                "unknown_url",
+                served,
+            );
+        }
+        (Refusal::Path, _) => messages::refuse(&mut stream, 404, "not_found_error", served),
     }
 }
 
@@ -523,9 +588,9 @@ fn read(
     http::read_request_limited(&mut reader, &mut buf, max_body)
 }
 
-/// Answers a request that could not be read, its body limit `limit`, in the Messages error
-/// format when `to_messages`; a closed connection or a refused head gets no answer here.
-fn unreadable(stream: &mut Conn, e: &ReadError, limit: usize, to_messages: bool) {
+/// Answers a request that could not be read, its body limit `limit`, in the error format
+/// `dialect`; a closed connection or a refused head gets no answer here.
+fn unreadable(stream: &mut Conn, e: &ReadError, limit: usize, dialect: Dialect) {
     let (status, message) = match *e {
         ReadError::Closed | ReadError::Io(_) | ReadError::Refused { .. } => return,
         ReadError::Malformed => (400, "malformed HTTP request".into()),
@@ -536,12 +601,8 @@ fn unreadable(stream: &mut Conn, e: &ReadError, limit: usize, to_messages: bool)
         }
         ReadError::LengthRequired => (411, "Content-Length required".into()),
     };
-    if to_messages {
-        let e = GatewayError::new(ErrorClass::BadRequest, false, message);
-        messages::reject(stream, Some(status), &e);
-    } else {
-        reject(stream, status, ErrorClass::BadRequest, &message);
-    }
+    let e = GatewayError::new(ErrorClass::BadRequest, false, message);
+    dialect.reject(stream, status, &e);
 }
 
 fn turn(mut stream: Conn, gateway: &Gateway, watch: &Watch, caller: &str, body: Vec<u8>) {

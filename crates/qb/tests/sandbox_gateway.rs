@@ -40,7 +40,7 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
     std::fs::write(&outside, "outside").unwrap();
     let qbd = dir.join("qb.sock");
     let _qbd = UnixListener::bind(&qbd).unwrap();
-    // The Messages front's listener, bound before the sandbox; a client waits in its backlog.
+    // The HTTP fronts' listener, bound before the sandbox; a client waits in its backlog.
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = tcp.local_addr().unwrap().port();
     let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -50,7 +50,8 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
             "socket = \"{}\"\nqbd_socket = \"{}\"\n\
              [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\napi = \"anthropic\"\ncredentials = \"{}\"\n\
              [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n\
-             [messages]\nvendor = \"vendor-a\"\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\n",
+             [fronts]\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\n\
+             [fronts.messages]\nvendor = \"vendor-a\"\n",
             dir.join("gw.sock").display(),
             qbd.display(),
             credential.display(),

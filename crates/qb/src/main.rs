@@ -35,10 +35,11 @@ COMMANDS:
                                         else /etc/qb/qbd.toml
     agent --config PATH                 run the credential-owner agent: wait for the daemon's
                                         probe jobs and answer them
-    gateway --config PATH               run the model gateway: serve /v1/model/* and
-                                        /v1/messages on the socket named in its config,
-                                        /v1/messages also on its loopback port, picking and
-                                        reporting via qbd
+    gateway --config PATH               run the model gateway: serve /v1/model/* and the
+                                        HTTP fronts (/v1/messages, /v1/chat/completions,
+                                        /v1/responses) on the socket named in its config,
+                                        the HTTP fronts also on its loopback port, picking
+                                        and reporting via qbd
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -447,10 +448,10 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         ));
         l
     };
-    let loopback = match config.messages.as_ref().and_then(|m| m.listen) {
+    let loopback = match config.fronts.as_ref().and_then(|f| f.listen) {
         Some(addr) => {
             let l = std::net::TcpListener::bind(addr).map_err(|e| format!("{addr}: {e}"))?;
-            log::info(&format!("qb gateway: serving /v1/messages on {addr}"));
+            log::info(&format!("qb gateway: serving the HTTP fronts on {addr}"));
             Some(l)
         }
         None => None,

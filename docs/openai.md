@@ -148,6 +148,46 @@ duration after `try again in` in the message (`1.8s`, `6m0s`, `5 minutes`). The 
 the vendor's message, cut to 300 characters with control characters as spaces; it never carries a
 header value.
 
+## Serving the fronts
+
+`qb gateway` serves `POST /v1/chat/completions` and `POST /v1/responses` on its unix socket to
+the peers of its C4 front, when its config has a `[fronts.openai]` table
+([config.md](config.md#gateway-config)), in `crates/qb/src/gateway/openai.rs`; the answer is
+written by `crates/qb/src/gateway/answer.rs`, shared with the Messages front. With
+`fronts.listen` it serves them, and `/v1/messages`, on that loopback TCP address too, to
+requests whose head carries the local client token in `Authorization: Bearer` (what OpenAI SDKs
+send) or `x-api-key`; the token's SHA-256 is compared in constant time with
+`fronts.token_sha256` before the body is read. On these two paths a missing or wrong token is
+401 `invalid_request_error` with code `invalid_api_key`, and another method 404
+`invalid_request_error` with code `unknown_url`. An OpenAI SDK switches to the gateway with the
+base URL `http://127.0.0.1:<port>/v1` and the client token as its API key.
+
+`model` is a client model name of `fronts.models` or a route alias; any other model is a 400.
+`native_vendor` of the Responses front is `fronts.openai.vendor`, and `default_max_tokens` of
+both fronts is `fronts.openai.max_tokens`. Thinking of another vendor is kept
+(`ForeignThinking::Keep`). The decoded turn runs through the same core as a C4 turn, with the
+same pick, report and rotation: a login that hits its limit before the first event is replaced
+within the turn, unseen by the client. The answer is:
+
+- `stream: true`: `200` with `content-type: text/event-stream`, one chunk per canonical event
+  from the front's `SseEncoder`; once the first event went out, a stream silent for
+  `fronts.ping_interval_s` gets the comment `: keep-alive`, which SDKs skip, so client read
+  timeouts outlast a slow vendor; an error after the first event is in the stream (below);
+- `stream: false`: one `Assembler` body as `application/json` once the turn ended;
+- an error before the first event, an error of a non-streaming turn and a rejected request:
+  `front::error_response` as status, `retry-after`, `x-should-retry` and OpenAI error body, so
+  `quota_exhausted` is a 429 with `retry-after`; a request the gateway cannot read is
+  `invalid_request_error` with 400, 411 or 413, another method than `POST` on the unix socket
+  405, and without `[fronts.openai]` both endpoints answer 404.
+
+Ids: a Chat Completions answer is `chatcmpl-<hex seconds>_<n>`, a Responses answer
+`resp_<hex seconds>_<n>`, unique within the gateway process; the turn's `request_id` is the
+same string. Other request headers (`OpenAI-Organization`, `OpenAI-Project`, the SDK's own) are
+ignored. A client closing its connection cancels the turn and shuts the upstream connection
+down. A loopback connection beyond the gateway's connection cap gets 429 with `retry-after: 1`
+in the Messages error format, as the main thread answers it before the request is read; OpenAI
+SDKs retry it like any 429.
+
 ## The `/v1/chat/completions` front
 
 `chat::decode_request(body, request_id, route_of, default_max_tokens)`:

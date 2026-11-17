@@ -184,12 +184,14 @@ vendor = "<gateway-vendor>"
 model = "<model-b>"
 expected_minutes = 2
 
-[messages]
-vendor = "<gateway-vendor>"
+[fronts]
 models = { "<model-a>" = "model-a", "<model-b>" = "model-b" }
 listen = "127.0.0.1:<port>"
 token_sha256 = "<the hash printed above>"
 ping_interval_s = 10
+
+[fronts.messages]
+vendor = "<gateway-vendor>"
 ```
 
 `max_turns = 2` stays below the shipped unit's `TasksMax=8`: the gateway runs its main thread,
@@ -198,8 +200,8 @@ thread per turn. At `max_turns = 4` concurrent resolves exceed the limit and the
 thread cannot start fails. Raise `max_turns` only together with `TasksMax`. A request beyond the
 cap gets a 429 with `retry-after: 1`, which Hermes retries.
 
-Every route pins `<gateway-vendor>`, the vendor of `[messages]`, so Hermes' history holds only
-Anthropic blocks and stays valid after a rollback to direct Anthropic.
+Every route pins `<gateway-vendor>`, the vendor of `[fronts.messages]`, so Hermes' history holds
+only Anthropic blocks and stays valid after a rollback to direct Anthropic.
 
 ### Gateway unit
 

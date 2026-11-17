@@ -39,14 +39,24 @@ role = "gateway"
 vendor = "vendor-a"
 model = "model-small"
 
-# POST /v1/messages for Anthropic SDK clients: the qbd vendor of the logins above, and the model
-# names clients send mapped to route aliases; a model equal to an alias needs no entry.
-[messages]
-vendor = "vendor-a"
+# The HTTP fronts for SDK clients: the model names clients send mapped to route aliases (a model
+# equal to an alias needs no entry), the same on every front.
+[fronts]
 models = { "model-large-2025-01-01" = "chat", "model-small-2025-01-01" = "compact" }
-# Also on loopback TCP, for clients with base URL http://127.0.0.1:8080 and the local client
-# token as their API key; the SHA-256 of the token (docs/config.md shows how to make one).
+# Also on loopback TCP, for clients with base URL http://127.0.0.1:8080 (OpenAI SDKs:
+# http://127.0.0.1:8080/v1) and the local client token as their API key; the SHA-256 of the
+# token (docs/config.md shows how to make one).
 listen = "127.0.0.1:8080"
 token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-# Seconds of silence in a started stream before an SSE ping, at most 30.
+# Seconds of silence in a started stream before an SSE keep-alive, at most 30.
 ping_interval_s = 10
+
+# POST /v1/messages for Anthropic SDK clients: the qbd vendor of the Anthropic logins above.
+[fronts.messages]
+vendor = "vendor-a"
+
+# POST /v1/chat/completions and /v1/responses for OpenAI SDK clients: the qbd vendor whose
+# reasoning is OpenAI's, and the output bound of a request that names none.
+[fronts.openai]
+vendor = "vendor-b"
+max_tokens = 8192
