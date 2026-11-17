@@ -294,3 +294,23 @@ fn a_short_wait_in_the_stream_is_a_rate_limit() {
         assert_eq!(response["error"]["code"], code, "{resets_in}");
     }
 }
+
+#[test]
+fn a_tool_choice_the_turn_cannot_honour_is_refused() {
+    let tools = json!([{"type": "function", "name": "f", "parameters": {}}]);
+    let body = json!({"model": "gpt-chat", "input": "Hi", "tools": tools, "tool_choice": "auto"});
+    assert!(decode(&body).is_ok());
+    for choice in [
+        json!("none"),
+        json!("required"),
+        json!({"type": "function", "name": "f"}),
+    ] {
+        let body =
+            json!({"model": "gpt-chat", "input": "Hi", "tools": tools, "tool_choice": choice});
+        let e = decode(&body).expect_err(&choice.to_string());
+        assert!(
+            e.message.unwrap_or_default().contains("`tool_choice`"),
+            "{choice}"
+        );
+    }
+}

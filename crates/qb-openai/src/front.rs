@@ -35,6 +35,24 @@ pub enum ForeignThinking {
     Drop,
 }
 
+/// Checks that `tool_choice` leaves the choice to the model, as the canonical turn has no field
+/// for it: absent, `null` or `auto`, or `none` when the request has no tools.
+///
+/// # Errors
+/// A `bad_request` error for `none` with tools, `required` and a named tool.
+pub(crate) fn check_tool_choice(
+    choice: Option<&serde_json::Value>,
+    has_tools: bool,
+) -> Result<(), GatewayError> {
+    match choice.and_then(|c| if c.is_null() { None } else { Some(c.as_str()) }) {
+        None | Some(Some("auto")) => Ok(()),
+        Some(Some("none")) if !has_tools => Ok(()),
+        Some(_) => Err(bad(
+            "`tool_choice` other than `auto` is not supported by this gateway",
+        )),
+    }
+}
+
 /// Prefix of an `encrypted_content` that carries another vendor's thinking, so a Responses
 /// client passes it back like any reasoning item.
 pub const FOREIGN_THINKING: &str = "qb-thinking:";

@@ -12,8 +12,8 @@ use qb_proto::{
 use serde_json::{Value, json};
 
 use crate::front::{
-    FrontRequest, bad, chat_usage, effort, error_body, finish_reason, image, join_system,
-    push_message, session_key,
+    FrontRequest, bad, chat_usage, check_tool_choice, effort, error_body, finish_reason, image,
+    join_system, push_message, session_key,
 };
 use crate::sse;
 use crate::wire::{
@@ -35,12 +35,13 @@ pub(crate) fn empty_schema() -> qb_proto::Object {
 /// when the request names no bound. `system` and `developer` messages join into the system
 /// prompt; each `tool` message becomes a tool result merged with its neighbours into one user
 /// message. `cache` is always `auto`, as OpenAI caches prompts without being asked. Sampling
-/// parameters, `stop`, `tool_choice` and `parallel_tool_calls` are ignored.
+/// parameters, `stop` and `parallel_tool_calls` are ignored.
 ///
 /// # Errors
 /// A `bad_request` error for a body that is not a Chat Completions request, an unknown model,
-/// a feature the canonical form cannot carry (`n` > 1, logprobs, audio, structured output,
-/// non-function tools, image URLs that are not base64 `data:` URLs, audio and file parts), a
+/// a feature the canonical form cannot carry (`n` > 1, a `tool_choice` other than `auto`,
+/// logprobs, audio, structured output, non-function tools, image URLs that are not base64
+/// `data:` URLs, audio and file parts), a
 /// tool message that answers no earlier tool call, or a turn that fails
 /// [`TurnRequest::validate`].
 pub fn decode_request(
@@ -177,6 +178,10 @@ fn reject_unsupported(req: &ChatRequest) -> Result<(), GatewayError> {
     if req.n.is_some_and(|n| n != 1) {
         return unsupported("`n` other than 1");
     }
+    check_tool_choice(
+        req.tool_choice.as_ref(),
+        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
+    )?;
     if req.logprobs == Some(true) || req.top_logprobs.is_some_and(|n| n > 0) {
         return unsupported("`logprobs`");
     }

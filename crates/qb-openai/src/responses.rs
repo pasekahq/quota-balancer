@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::chat::{arguments, empty_schema};
 use crate::front::{
-    FOREIGN_THINKING, ForeignThinking, FrontRequest, bad, effort, error_kind, image, join_system,
-    push_message, responses_usage, session_key,
+    FOREIGN_THINKING, ForeignThinking, FrontRequest, bad, check_tool_choice, effort, error_kind,
+    image, join_system, push_message, responses_usage, session_key,
 };
 use crate::request::{output_text, reasoning_from_opaque, reasoning_to_opaque};
 use crate::sse;
@@ -38,14 +38,15 @@ struct Foreign {
 /// `function_call_output` items the user message after. A reasoning item with encrypted content
 /// becomes canonical thinking of `native_vendor`, except one this front wrapped for another
 /// vendor; one without is dropped. `cache` is always `auto`. `store`, `include`,
-/// `reasoning.summary`, sampling parameters, `tool_choice` and `parallel_tool_calls` are ignored.
+/// `reasoning.summary`, sampling parameters and `parallel_tool_calls` are ignored; a `tool_choice`
+/// other than `auto` is refused.
 ///
 /// # Errors
 /// A `bad_request` error for a body that is not a Responses request, an unknown model, state the
 /// gateway does not keep (`previous_response_id`, `conversation`, `item_reference`,
-/// `background`), structured output, non-function tools, items or parts the canonical form
-/// cannot carry, a tool output that answers no earlier call, or a turn that fails
-/// [`TurnRequest::validate`].
+/// `background`), structured output, a `tool_choice` other than `auto`, non-function tools,
+/// items or parts the canonical form cannot carry, a tool output that answers no earlier call,
+/// or a turn that fails [`TurnRequest::validate`].
 pub fn decode_request(
     body: &[u8],
     request_id: &str,
@@ -219,6 +220,10 @@ fn reject_unsupported(req: &CreateResponse) -> Result<(), GatewayError> {
              conversation in `input`",
         ));
     }
+    check_tool_choice(
+        req.tool_choice.as_ref(),
+        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
+    )?;
     if req.background == Some(true) {
         return Err(bad("`background` is not supported by this gateway"));
     }

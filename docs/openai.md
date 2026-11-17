@@ -33,7 +33,9 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | Usage | OpenAI reports no cache writes: `cache_write` reads as 0 upstream, and fronts fold it into `prompt_tokens`/`input_tokens`. The canonical usage has no reasoning count, so fronts write `reasoning_tokens: 0`. |
 | `reasoning.summary`, `include`, `store` of a Responses client | Ignored: the upstream adapter always asks for summaries and encrypted reasoning and never stores. |
 | `n` > 1, logprobs, audio, structured output (`response_format`, `text.format`), non-function tools, image URLs, files | Refused with a clear `400`. |
-| `tool_choice`, `parallel_tool_calls`, sampling parameters, `stop` | Ignored, as on the Messages front. |
+| `tool_choice` other than `auto` (`none` with tools, `required`, a named tool) | Refused with a clear `400`: the canonical turn always leaves the choice to the model, so honouring it is impossible and ignoring it would run tools the client forbade. `none` without tools is accepted. |
+| `reasoning_effort` / `reasoning.effort` `none` | Read as `low`: the canonical effort has no "off", so the model still reasons a little. |
+| `parallel_tool_calls`, sampling parameters, `stop` | Ignored, as on the Messages front. |
 
 ## Upstream request
 
@@ -162,6 +164,7 @@ header value.
 - `tools[]` of type `function` become tools; without `parameters` the schema is an empty object;
 - `max_completion_tokens`, else `max_tokens`, else `default_max_tokens`;
 - `reasoning_effort`: `none` and `minimal` read as `low`, `xhigh` as `max`;
+- `tool_choice` may be absent, `null` or `auto` (or `none` without tools), else it is refused;
 - `prompt_cache_key`, else `user`, is the `session_key`; longer than 128 bytes it becomes `qb-sk:`
   and 32 hex digits derived from all of it;
 - `stream` and `stream_options.include_usage` are passed on in `FrontRequest`.
@@ -197,8 +200,9 @@ tool call with its `index` from 0, its id, name and whole arguments, a last chun
   dropped;
 - `max_output_tokens`, else `default_max_tokens`; `reasoning.effort` as on the Chat front;
   `prompt_cache_key`, else `user`, as the session key;
-- `store`, `include`, `reasoning.summary`, `tool_choice`, `parallel_tool_calls` and sampling
-  parameters are ignored.
+- `tool_choice` as on the Chat front;
+- `store`, `include`, `reasoning.summary`, `parallel_tool_calls` and sampling parameters are
+  ignored.
 
 Refused with `bad_request`: `previous_response_id` and `conversation` (the gateway is stateless:
 the message says to send the whole conversation in `input`), `item_reference` items,

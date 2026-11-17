@@ -406,3 +406,36 @@ fn a_short_wait_is_a_rate_limit_and_a_far_reset_is_out_of_quota() {
         assert_eq!(v["error"]["code"], code);
     }
 }
+
+#[test]
+fn a_tool_choice_the_turn_cannot_honour_is_refused() {
+    let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]);
+    for choice in [json!("auto"), Value::Null] {
+        let mut body = minimal();
+        body["tools"] = tools.clone();
+        body["tool_choice"] = choice.clone();
+        assert!(decode(&body).is_ok(), "{choice}");
+    }
+    let mut body = minimal();
+    body["tool_choice"] = json!("none");
+    assert!(
+        decode(&body).is_ok(),
+        "`none` without tools changes nothing"
+    );
+
+    for choice in [
+        json!("none"),
+        json!("required"),
+        json!({"type": "function", "function": {"name": "f"}}),
+    ] {
+        let mut body = minimal();
+        body["tools"] = tools.clone();
+        body["tool_choice"] = choice.clone();
+        let e = decode(&body).expect_err(&choice.to_string());
+        assert_eq!(e.class, ErrorClass::BadRequest);
+        assert!(
+            e.message.unwrap_or_default().contains("`tool_choice`"),
+            "{choice}"
+        );
+    }
+}
