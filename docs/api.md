@@ -294,9 +294,10 @@ exactly one `stop` or `error`; one that ends without either was cut by a transpo
 #### Attempts and rotation
 
 Each attempt is one `POST /v1/pick` to `qbd` with the route's target (`role` and `difficulty`,
-or `role` and a `pin` of `vendor`, `model` and `effort`), `run_id` = `session_key` or else
+or `role` and a `pin` of `vendor`, `model` and `effort`, on a chain route the current step's
+pin), `run_id` = `session_key` or else
 `request_id`, `resume_of` = `session_key` when given, `expected_minutes` of the route, and
-`avoid_vendor` after a vendor failure. A `wait` caused by `resume_of` is asked again once
+`avoid_vendor` after a vendor failure on a ladder or pin route. A `wait` caused by `resume_of` is asked again once
 without it. `qbd` accepts `resume_of` but does not use it yet, so `session_key` only names the
 run: turns of one session are not kept on one login for the prompt cache. The picked login's credential entry gives the credential kind, which selects the
 vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
@@ -310,16 +311,25 @@ vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
 | 401 | `http_401` | an OAuth login first refreshes its token and retries once on the same lease; then as above, and the login is dead (below) |
 | model unavailable to the login | `model_unavailable` | as above |
 | unreadable or invalid credential file, or a refresh token the vendor refused | `http_401` | as above, and the login is dead (below) |
-| overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn |
+| overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn. On a chain route: the next step |
 | invalid request, context too long | `error` | the turn ends |
 
 Once an event has reached the client the gateway never retries: a failure ends the stream
-with an `error` event. A turn is bounded by `max_attempts` picks (default 4). A 401 that the
+with an `error` event. A turn is bounded by `max_attempts` attempts (default 4), picks whose
+login is tried. A 401 that the
 one refresh did not cure, or an unusable credential file, does not pass by itself: after the
 lease report the gateway also sends `POST /v1/report {"login", "outcome": "http_401"}`, which
 makes the login `auth_dead` in `qbd`, so the next pick of the same turn skips it. When a pick
 still returns a login that already failed in the turn, the lease is released with `error` and
 the turn ends with the last failure's class.
+
+A chain route walks its steps in order, starting with the first. Until an event has reached
+the client, the turn moves to the next step without an adapter call when `qbd` answers the
+step's pick with `wait` or `dead`, or with a login that already failed in the turn, and after
+a vendor failure of the step; after a login failure it picks the same step again, so another
+login of that vendor may run. When no step is left the turn ends with `error`: `tried` lists
+every attempt, and the class is `quota_exhausted` with the nearest `resets_at` of the steps
+when every step was spent (a usage limit) or waiting, else the class of the last step's end.
 
 #### Errors
 
@@ -334,7 +344,7 @@ and `class`) and `message` (never a credential).
 
 | `class` | When | `retryable` |
 |---|---|---|
-| `quota_exhausted` | `qbd` answered `wait`: every candidate waits for a reset or back-off; `resets_at` is the `wait`'s `retry_after`, the nearest time one becomes usable | true |
+| `quota_exhausted` | `qbd` answered `wait`: every candidate waits for a reset or back-off; `resets_at` is the `wait`'s `retry_after`, the nearest time one becomes usable. On a chain route: every step was spent or waiting, `resets_at` the nearest of them | true |
 | `no_route` | `qbd` answered `dead` | false |
 | `auth` | the last login's credential was rejected or unusable; or, as a 401 answer, the caller is not allowed | false |
 | `overloaded` | the vendor asked to back off (`retry_after`), a 429 of the last login, or the gateway's caps | true |
@@ -355,8 +365,10 @@ Aliases sorted, each with the state of the logins it can run on in `qbd`'s `GET 
 gateway's logins of the pinned vendor, or every login of the gateway for a ladder route.
 `ready` when one is `ok`, `unknown` or `auth_stale`; else `exhausted` when one is `exhausted`
 or `rate_limited`, with `resets_at` the earliest `dead_until`; else `unavailable` (all
-`auth_dead`, none, or `qbd` unreachable). `vendor` and `model` are a pinned route's. It takes no
-lease.
+`auth_dead`, none, or `qbd` unreachable). `vendor` and `model` are a pinned route's. A chain
+route is `ready` with the `vendor` and `model` of its first step whose vendor has a `ready`
+login; else `exhausted` with the earliest `resets_at` over its steps when one waits, else
+`unavailable`, without `vendor` and `model`. It takes no lease.
 
 ### `POST /v1/model/cancel`
 

@@ -48,12 +48,25 @@ referer = "https://app.example.com"
 title = "example-app"
 credentials = "/var/lib/qb-gateway/credentials/key-3.json"
 
-# Ladder step 1 of qbd's role "gateway": subscription logins first, the key as the last tier.
+# A chain of pins tried in order: the subscription logins of vendor-a, then the OpenAI API key
+# (qbd vendor "vendor-c", login key-2), then the OpenRouter-style vendor (qbd vendor
+# "vendor-d", login key-3). A turn moves to the next step only before the client has seen an
+# event.
 [[routes]]
 alias = "chat"
 role = "gateway"
-difficulty = 1
+chain = [
+  { vendor = "vendor-a", model = "model-large" },
+  { vendor = "vendor-c", model = "model-large", effort = "medium" },
+  { vendor = "vendor-d", model = "vendor-x/model-large" },
+]
 expected_minutes = 2
+
+# Ladder step 1 of qbd's role "gateway": subscription logins first, the key as the last tier.
+[[routes]]
+alias = "work"
+role = "gateway"
+difficulty = 1
 
 # One exact model, for compaction and other cheap calls.
 [[routes]]

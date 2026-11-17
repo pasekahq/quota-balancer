@@ -24,6 +24,8 @@ pub const MAX_TURNS: u32 = 16;
 pub const MAX_REQUEST_BYTES: u32 = 32 << 20;
 /// Most route aliases.
 pub const MAX_ROUTES: usize = 64;
+/// Most steps of a route's `chain`.
+pub const MAX_CHAIN: usize = 8;
 /// Most attempts `max_attempts` may allow.
 pub const MAX_ATTEMPTS: u32 = 16;
 /// Most entries of `fronts.models`, and of `openai_models`.
@@ -183,7 +185,7 @@ pub struct GatewayLogin {
     pub credentials: PathBuf,
 }
 
-/// A route alias and what to ask qbd for: a ladder step of a role, or a pin.
+/// A route alias and what to ask qbd for: a ladder step of a role, a pin, or a chain of pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     /// Alias clients name in `route`.
@@ -198,13 +200,34 @@ pub struct Route {
     pub model: Option<String>,
     /// Reasoning effort of the pin.
     pub effort: Option<String>,
+    /// Pins a turn tries in order, 1 to [`MAX_CHAIN`]; empty unless the route is a chain.
+    pub chain: Vec<Step>,
     /// Expected minutes of a turn, for the lease's cost estimate.
     pub expected_minutes: Option<u32>,
 }
 
+/// One pin of a chain route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// Pinned vendor.
+    pub vendor: String,
+    /// Pinned model.
+    pub model: String,
+    /// Reasoning effort.
+    pub effort: Option<String>,
+}
+
 impl Route {
-    /// The pin of a pinned route.
-    pub fn pin(&self) -> Option<Pin> {
+    /// The pin of step `step` of a chain route, or of a pinned route.
+    pub fn pin(&self, step: usize) -> Option<Pin> {
+        if let Some(s) = self.chain.get(step) {
+            return Some(Pin {
+                vendor: s.vendor.clone(),
+                model: s.model.clone(),
+                effort: s.effort.clone(),
+                login: None,
+            });
+        }
         Some(Pin {
             vendor: self.vendor.clone()?,
             model: self.model.clone()?,
@@ -708,8 +731,10 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         vendor: None,
         model: None,
         effort: None,
+        chain: Vec::new(),
         expected_minutes: None,
     };
+    let mut chain_at = None;
     let known = [
         "alias",
         "role",
@@ -717,6 +742,7 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         "vendor",
         "model",
         "effort",
+        "chain",
         "expected_minutes",
     ];
     fields(at, t, &known, &["alias", "role"], |key, at, v| {
@@ -727,11 +753,54 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
             "vendor" => r.vendor = Some(string(at, v)?),
             "model" => r.model = Some(string(at, v)?),
             "effort" => r.effort = Some(string(at, v)?),
+            "chain" => {
+                r.chain = walk_chain(at, v)?;
+                chain_at = Some(v.span().start);
+            }
             _ => r.expected_minutes = Some(integer(at, v)?),
         }
         Ok(())
     })?;
+    let pinned = r.difficulty.is_some() || r.vendor.is_some() || r.model.is_some();
+    if let Some(span) = chain_at.filter(|_| pinned || r.effort.is_some()) {
+        let reason = "excludes `difficulty`, `vendor`, `model` and `effort`".into();
+        return Err((format!("{at}.chain"), reason, Some(span)));
+    }
     Ok(r)
+}
+
+/// The steps of the `chain` array `v`; a missing key's error carries its step's line.
+fn walk_chain(at: &str, v: &Value<'_>) -> Result<Vec<Step>, WalkError> {
+    let items = v
+        .get_ref()
+        .as_array()
+        .ok_or_else(|| wrong(at, v, "an array of tables"))?;
+    if items.is_empty() || items.len() > MAX_CHAIN {
+        let reason = format!("must have 1 to {MAX_CHAIN} steps, found {}", items.len());
+        return Err((at.to_owned(), reason, Some(v.span().start)));
+    }
+    let mut steps = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let at = format!("{at}[{i}]");
+        let t = table(&at, item)?;
+        let mut s = Step {
+            vendor: String::new(),
+            model: String::new(),
+            effort: None,
+        };
+        let keys = ["vendor", "model", "effort"];
+        fields(&at, t, &keys, &["vendor", "model"], |key, at, v| {
+            match key {
+                "vendor" => s.vendor = string(at, v)?,
+                "model" => s.model = string(at, v)?,
+                _ => s.effort = Some(string(at, v)?),
+            }
+            Ok(())
+        })
+        .map_err(|(field, reason, span)| (field, reason, span.or(Some(item.span().start))))?;
+        steps.push(s);
+    }
+    Ok(steps)
 }
 
 fn absolute(field: &str, path: &Path) -> Result<(), Fault> {
@@ -858,12 +927,14 @@ impl GatewayConfig {
             if r.role.trim().is_empty() {
                 return Err((format!("{at}.role"), "is empty".into()));
             }
-            match (r.difficulty, &r.vendor, &r.model) {
-                (Some(_), None, None) | (None, Some(_), Some(_)) => {}
+            match (r.difficulty, &r.vendor, &r.model, r.chain.is_empty()) {
+                (Some(_), None, None, true)
+                | (None, Some(_), Some(_), true)
+                | (None, None, None, false) => {}
                 _ => {
                     return Err((
                         at,
-                        "needs either `difficulty` or both `vendor` and `model`".into(),
+                        "needs `difficulty`, both `vendor` and `model`, or `chain`".into(),
                     ));
                 }
             }
@@ -971,7 +1042,7 @@ difficulty = 1
             "[[routes]]\nalias = \"fast\"\nrole = \"r\"\nvendor = \"v\"\nmodel = \"m\"\neffort = \"low\"\n",
         )
         .unwrap();
-        let pin = pinned.route("fast").unwrap().pin().unwrap();
+        let pin = pinned.route("fast").unwrap().pin(0).unwrap();
         assert_eq!(
             (pin.vendor.as_str(), pin.effort.as_deref()),
             ("v", Some("low"))
@@ -1095,7 +1166,7 @@ difficulty = 1
             (
                 "",
                 "[[routes]]\nalias = \"two\"\nrole = \"r\"\ndifficulty = 1\nvendor = \"v\"\nmodel = \"m\"\n",
-                "routes[1]: needs either",
+                "routes[1]: needs `difficulty`, both `vendor` and `model`, or `chain`",
             ),
             (
                 "",
@@ -1180,6 +1251,96 @@ difficulty = 1
             let err = check(top, extra).unwrap_err();
             assert!(err.contains(want), "{top}{extra}: {err}");
         }
+    }
+
+    #[test]
+    fn a_chain_route_pins_its_steps_in_order() {
+        let c = check(
+            "",
+            "[[routes]]\nalias = \"walk\"\nrole = \"r\"\nchain = [\n  { vendor = \"v1\", model = \"m1\", effort = \"high\" },\n  { vendor = \"v2\", model = \"m2\" },\n]\n",
+        )
+        .unwrap();
+        let route = c.route("walk").unwrap();
+        let pins: Vec<_> = (0..3)
+            .map(|i| route.pin(i).map(|p| (p.vendor, p.model, p.effort)))
+            .collect();
+        assert_eq!(
+            pins,
+            [
+                Some(("v1".into(), "m1".into(), Some("high".into()))),
+                Some(("v2".into(), "m2".into(), None)),
+                None,
+            ]
+        );
+        let tables = check(
+            "",
+            "[[routes]]\nalias = \"walk\"\nrole = \"r\"\n[[routes.chain]]\nvendor = \"v1\"\nmodel = \"m1\"\n",
+        )
+        .unwrap();
+        assert_eq!(tables.route("walk").unwrap().chain.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_chain_names_the_field_and_line() {
+        let route = "[[routes]]\nalias = \"walk\"\nrole = \"r\"\n";
+        let step = "{ vendor = \"v\", model = \"m\" }";
+        let nine = [step; 9].join(", ");
+        let cases = [
+            (
+                "chain = []\n".to_owned(),
+                "routes[1].chain: must have 1 to 8 steps, found 0 (line 16)",
+            ),
+            (
+                format!("chain = [{nine}]\n"),
+                "routes[1].chain: must have 1 to 8 steps, found 9 (line 16)",
+            ),
+            (
+                "chain = [{ vendor = \"v\", model = \"m\", login = \"l\" }]\n".to_owned(),
+                "routes[1].chain[0].login: unknown field, expected one of vendor, model, effort (line 16)",
+            ),
+            (
+                format!("chain = [\n  {step},\n  {{ model = \"m\" }},\n]\n"),
+                "routes[1].chain[1].vendor: is missing (line 18)",
+            ),
+            (
+                "chain = [{ vendor = \"v\" }]\n".to_owned(),
+                "routes[1].chain[0].model: is missing (line 16)",
+            ),
+            (
+                format!("difficulty = 1\nchain = [{step}]\n"),
+                "routes[1].chain: excludes `difficulty`, `vendor`, `model` and `effort` (line 17)",
+            ),
+            (
+                format!("chain = [{step}]\neffort = \"low\"\n"),
+                "routes[1].chain: excludes `difficulty`, `vendor`, `model` and `effort` (line 16)",
+            ),
+            (
+                format!("vendor = \"v\"\nmodel = \"m\"\nchain = [{step}]\n"),
+                "routes[1].chain: excludes",
+            ),
+            (
+                "[[routes.chain]]\nvendor = \"v\"\n".to_owned(),
+                "routes[1].chain[0].model: is missing (line 16)",
+            ),
+            (
+                "chain = \"v\"\n".to_owned(),
+                "routes[1].chain: expected an array of tables, found string (line 16)",
+            ),
+            (
+                format!("alias2 = 1\nchain = [{step}]\n"),
+                "routes[1].alias2: unknown field",
+            ),
+        ];
+        for (keys, want) in cases {
+            let err = check("", &format!("{route}{keys}")).unwrap_err();
+            assert!(err.contains(want), "{keys}: {err}");
+        }
+        let err = check(
+            "",
+            &format!("[[routes]]\nalias = \"walk\"\nchain = [{step}]\n"),
+        )
+        .unwrap_err();
+        assert!(err.contains("routes[1].role: is missing"), "{err}");
     }
 
     #[test]

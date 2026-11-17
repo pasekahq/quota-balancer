@@ -36,9 +36,9 @@ use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
-    Block, CancelAnswer, ErrorClass, GatewayError, LoginStatus, RouteState, RoutesAnswer,
-    StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, WindowReport,
-    paths,
+    Block, CancelAnswer, ErrorClass, GatewayError, LoginStatus, RouteState, RouteStatus,
+    RoutesAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
+    WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -100,6 +100,8 @@ struct Fake {
     scripts: Mutex<HashMap<String, Vec<Script>>>,
     /// `(login, secret, request)` of every call.
     calls: Mutex<Vec<(String, String, TurnRequest)>>,
+    /// `(vendor, model, effort)` of every call.
+    picked: Mutex<Vec<(String, String, Option<String>)>>,
 }
 
 impl Fake {
@@ -125,6 +127,11 @@ impl Upstream for Shared {
         cancel: &CancelToken,
     ) -> Result<Finished, Failure> {
         let login = at.login.to_owned();
+        self.0.picked.lock().unwrap().push((
+            at.vendor.to_owned(),
+            at.model.to_owned(),
+            at.effort.map(str::to_owned),
+        ));
         self.0.calls.lock().unwrap().push((
             login.clone(),
             credential.secret().to_owned(),
@@ -1379,6 +1386,299 @@ fn a_vendor_failure_before_the_first_event_repicks_avoiding_the_vendor() {
         "error marks nothing"
     );
     assert_eq!(s.leases, Vec::new());
+}
+
+const QBD_THREE_VENDORS: &str = r#"
+[journal]
+mode = "off"
+
+[[vendors]]
+name = "vendor-a"
+windows = [{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }]
+
+[[vendors]]
+name = "vendor-b"
+windows = [{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }]
+
+[[vendors]]
+name = "vendor-c"
+windows = [{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }]
+
+[[logins]]
+name = "login-1"
+vendor = "vendor-a"
+
+[[logins]]
+name = "login-2"
+vendor = "vendor-b"
+
+[[logins]]
+name = "login-3"
+vendor = "vendor-c"
+
+[[roles]]
+name = "gateway"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [{ vendor = "vendor-a", model = "model-a", tier = 1 }]
+
+[limits]
+rate_per_s = 1000.0
+burst = 1000
+"#;
+
+/// A rig whose route `chat` is the chain vendor-a, vendor-b, vendor-c with one login each.
+fn chain_rig() -> Rig {
+    let dir = temp_dir("chain");
+    let logins = ["login-1", "login-2", "login-3"];
+    let files: Vec<_> = logins
+        .iter()
+        .map(|l| (*l, api_key(&format!("test-token-{l}")), 0o600))
+        .collect();
+    credentials(&dir, &files);
+    let qbd = start_qbd(&dir, QBD_THREE_VENDORS);
+    let mut text = format!(
+        "socket = \"{dir}/gw.sock\"\nqbd_socket = \"{qbd}\"\n",
+        dir = dir.display(),
+        qbd = qbd.display()
+    );
+    for login in logins {
+        write!(
+            text,
+            "[[logins]]\nname = \"{login}\"\n{ANTHROPIC_KEY}\ncredentials = \"{}/creds/{login}.json\"\n",
+            dir.display()
+        )
+        .unwrap();
+    }
+    text.push_str(
+        r#"[[routes]]
+alias = "chat"
+role = "gateway"
+chain = [
+  { vendor = "vendor-a", model = "model-a" },
+  { vendor = "vendor-b", model = "model-b", effort = "high" },
+  { vendor = "vendor-c", model = "model-c" },
+]
+"#,
+    );
+    let fake = Arc::new(Fake::default());
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
+        Box::new(Counting(Arc::clone(&refreshes))),
+        own_uid(),
+        None,
+    );
+    Rig {
+        dir,
+        qbd,
+        gw,
+        fake,
+        refreshes,
+    }
+}
+
+fn usage_limit(resets: u64) -> Script {
+    Script::Fail(
+        Vec::new(),
+        FailureKind::UsageLimit {
+            resets_at: Some(resets),
+        },
+        window(1.0, resets),
+    )
+}
+
+/// Marks `login` exhausted in qbd until `resets`, without a turn.
+fn exhaust(qbd: &Path, login: &str, resets: u64) {
+    let body = json!({
+        "login": login,
+        "outcome": "usage_limit",
+        "windows": [{"name": "five_hour", "utilization": 1.0, "resets_at": resets}],
+    });
+    let body = body.to_string();
+    let (status, answer) =
+        qb::client::call(qbd, "POST", paths::REPORT, Some(body.as_bytes()), None).unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+}
+
+fn logins_called(r: &Rig) -> Vec<String> {
+    r.fake.calls().into_iter().map(|c| c.0).collect()
+}
+
+/// `(vendor, model)` of the turn's `route` event.
+fn route_of(events: &[StreamEvent]) -> (String, String) {
+    match events.first() {
+        Some(StreamEvent::Route { route }) => (route.vendor.clone(), route.model.clone()),
+        other => panic!("not a route event: {other:?}"),
+    }
+}
+
+fn tried(e: &GatewayError) -> Vec<(String, ErrorClass)> {
+    e.tried
+        .iter()
+        .map(|a| (a.login_label.clone().unwrap(), a.class))
+        .collect()
+}
+
+fn routes_of(gw: &Path) -> Vec<RouteStatus> {
+    let (status, body) = call(gw, "GET", paths::MODEL_ROUTES, "");
+    assert_eq!(status, 200);
+    serde_json::from_slice::<RoutesAnswer>(&body)
+        .unwrap()
+        .routes
+}
+
+#[test]
+fn a_chain_moves_to_the_next_step_after_a_usage_limit() {
+    let r = chain_rig();
+    let resets = unix_now() + 3600;
+    r.fake.script("login-1", usage_limit(resets));
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    assert_eq!(route_of(&events), ("vendor-b".into(), "model-b".into()));
+    assert_eq!(logins_called(&r), ["login-1", "login-2"]);
+    assert_eq!(
+        r.fake.picked.lock().unwrap().clone(),
+        [
+            ("vendor-a".into(), "model-a".into(), None),
+            ("vendor-b".into(), "model-b".into(), Some("high".into())),
+        ],
+        "each step runs its own pin"
+    );
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_chain_skips_a_step_qbd_makes_wait_without_calling_it() {
+    let r = chain_rig();
+    exhaust(&r.qbd, "login-1", unix_now() + 3600);
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    assert_eq!(route_of(&events), ("vendor-b".into(), "model-b".into()));
+    assert_eq!(logins_called(&r), ["login-2"]);
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn a_chain_reaches_its_third_step_when_the_first_two_fail() {
+    let r = chain_rig();
+    r.fake.script(
+        "login-1",
+        Script::Fail(
+            Vec::new(),
+            FailureKind::Overloaded { retry_after: None },
+            Vec::new(),
+        ),
+    );
+    r.fake.script(
+        "login-2",
+        Script::Fail(
+            Vec::new(),
+            FailureKind::RateLimited {
+                retry_after: Some(60),
+            },
+            Vec::new(),
+        ),
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-3", "text_delta", "stop End"]);
+    assert_eq!(route_of(&events), ("vendor-c".into(), "model-c".into()));
+    assert_eq!(logins_called(&r), ["login-1", "login-2", "login-3"]);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-2"), LoginStatus::RateLimited);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_chain_failure_after_the_first_event_ends_the_turn_without_a_fallback() {
+    let r = chain_rig();
+    let resets = unix_now() + 3600;
+    r.fake.script(
+        "login-1",
+        Script::Fail(
+            vec![text("partial")],
+            FailureKind::UsageLimit {
+                resets_at: Some(resets),
+            },
+            window(1.0, resets),
+        ),
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(
+        kinds(&events),
+        ["route login-1", "text_delta", "error QuotaExhausted"]
+    );
+    let e = last_error(&events);
+    assert_eq!(
+        tried(e),
+        [("login-1".to_owned(), ErrorClass::QuotaExhausted)]
+    );
+    assert_eq!(e.resets_at, Some(resets));
+    assert_eq!(logins_called(&r), ["login-1"], "no step after content");
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn a_spent_chain_answers_quota_exhausted_with_the_nearest_reset() {
+    let r = chain_rig();
+    let now = unix_now();
+    let resets = [now + 7200, now + 3600, now + 5400];
+    for (login, at) in ["login-1", "login-2", "login-3"].into_iter().zip(resets) {
+        r.fake.script(login, usage_limit(at));
+    }
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["error QuotaExhausted"]);
+    let e = last_error(&events);
+    assert_eq!(e.resets_at, Some(now + 3600));
+    assert!(e.retryable);
+    assert_eq!(
+        tried(e),
+        [
+            ("login-1".to_owned(), ErrorClass::QuotaExhausted),
+            ("login-2".to_owned(), ErrorClass::QuotaExhausted),
+            ("login-3".to_owned(), ErrorClass::QuotaExhausted),
+        ]
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+    let next = turn(&r.gw, &turn_body("turn-2")).2;
+    assert_eq!(kinds(&next), ["error QuotaExhausted"]);
+    assert_eq!(last_error(&next).resets_at, Some(now + 3600));
+    assert_eq!(last_error(&next).tried, Vec::new(), "no step needs a call");
+    assert_eq!(r.fake.calls().len(), 3);
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn routes_show_a_chain_on_its_first_ready_step_or_its_nearest_reset() {
+    let r = chain_rig();
+    let shown = |gw: &Path| {
+        let route = routes_of(gw).remove(0);
+        (route.state, route.vendor, route.model, route.resets_at)
+    };
+    let ready = |vendor: &str, model: &str| {
+        (
+            RouteState::Ready,
+            Some(vendor.to_owned()),
+            Some(model.to_owned()),
+            None,
+        )
+    };
+    assert_eq!(shown(&r.gw), ready("vendor-a", "model-a"));
+    let now = unix_now();
+    exhaust(&r.qbd, "login-1", now + 7200);
+    assert_eq!(shown(&r.gw), ready("vendor-b", "model-b"));
+    exhaust(&r.qbd, "login-2", now + 3600);
+    exhaust(&r.qbd, "login-3", now + 5400);
+    assert_eq!(
+        shown(&r.gw),
+        (RouteState::Exhausted, None, None, Some(now + 3600))
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+    assert_eq!(r.fake.calls(), Vec::new());
 }
 
 /// Runs `f` with this process's stderr in a file and returns what was written there.

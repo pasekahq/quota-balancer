@@ -834,7 +834,7 @@
       },
       "RouteStatus": {
         "type": "object",
-        "description": "One route alias and the logins it can run on: this gateway's logins of the pinned vendor, or every login of this gateway for a ladder route.",
+        "description": "One route alias and the logins it can run on: this gateway's logins of the pinned vendor, of each step's vendor of a chain route, or every login of this gateway for a ladder route.",
         "properties": {
           "alias": {
             "type": "string",
@@ -846,12 +846,12 @@
           },
           "vendor": {
             "type": "string",
-            "description": "Pinned vendor; absent for a ladder route.",
+            "description": "Pinned vendor, or of a ready chain route the vendor of its first step with a ready login; absent for a ladder route.",
             "minLength": 1
           },
           "model": {
             "type": "string",
-            "description": "Pinned model; absent for a ladder route.",
+            "description": "Pinned model, or of a ready chain route the model of its first step with a ready login; absent for a ladder route.",
             "minLength": 1
           },
           "resets_at": {

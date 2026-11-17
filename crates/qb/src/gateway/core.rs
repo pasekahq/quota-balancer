@@ -1,7 +1,8 @@
 //! The gateway core every front shares: admit a turn, then per attempt ask qbd for a login of
 //! the route, load its credential, run the vendor adapter and report the outcome to qbd. Until
 //! the client has seen an event a failure moves on within the turn (ADR 0001, "Rotation
-//! boundary"); after that, or when qbd has nothing left, the turn ends with `error`.
+//! boundary"), on a chain route also to its next step; after that, or when qbd has nothing
+//! left, the turn ends with `error`.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,6 +217,12 @@ struct Progress {
     avoid: Option<String>,
     /// Send `resume_of`; cleared by the first `wait` it causes.
     resume: bool,
+    /// Index of the chain step the next pick pins.
+    step: usize,
+    /// Every chain step that ended so far was spent or waiting.
+    spent: bool,
+    /// Nearest reset of the chain steps that ended.
+    resets_at: Option<u64>,
 }
 
 /// A `run` answer of qbd with the login's credential entry and adapter.
@@ -387,8 +394,12 @@ impl Gateway {
             failed: Vec::new(),
             avoid: None,
             resume: req.session_key.is_some(),
+            step: 0,
+            spent: true,
+            resets_at: None,
         };
-        for _ in 0..self.config.max_attempts {
+        // Bounds adapter attempts; a chain step that qbd cannot run takes none.
+        while progress.tried.len() < self.config.max_attempts as usize {
             if turn.cancel.is_cancelled() {
                 emit(StreamEvent::Error { error: cancelled() });
                 return turn.log("cancelled");
@@ -432,6 +443,10 @@ impl Gateway {
             pick.model.clone(),
             pick.login.clone(),
         ) else {
+            if !turn.route.chain.is_empty() {
+                let error = unpickable(&pick, &turn.route.alias);
+                return Err(next_step(&turn.route, progress, error, emit));
+            }
             let error = match progress.tried.last() {
                 // The re-pick after a vendor failure found nothing else: that failure stands.
                 Some(last) if progress.avoid.is_some() => {
@@ -451,6 +466,9 @@ impl Gateway {
                 .map_or(ErrorClass::Unavailable, |a| a.class);
             let message = format!("qbd has no other login for route `{}`", turn.route.alias);
             let error = GatewayError::new(class, retryable(class), message);
+            if !turn.route.chain.is_empty() {
+                return Err(next_step(&turn.route, progress, error, emit));
+            }
             return Err(fail(emit, error, progress, "no login left"));
         }
         let Some(entry) = self.config.login(&login) else {
@@ -632,6 +650,14 @@ impl Gateway {
         attempt.class = class;
         let vendor = attempt.vendor.clone();
         progress.tried.push(attempt);
+        let mut error = GatewayError::new(class, retryable(class), failure.message);
+        match failure.kind {
+            FailureKind::UsageLimit { resets_at } => error.resets_at = resets_at,
+            FailureKind::RateLimited { retry_after } | FailureKind::Overloaded { retry_after } => {
+                error.retry_after = retry_after;
+            }
+            _ => {}
+        }
         if !relay.emitted {
             if login_scoped(failure.kind) {
                 if failure.kind == FailureKind::Auth {
@@ -644,18 +670,13 @@ impl Gateway {
                 failure.kind,
                 FailureKind::Overloaded { .. } | FailureKind::Unavailable
             );
+            if vendor_scoped && !turn.route.chain.is_empty() {
+                return next_step(&turn.route, progress, error, &mut |e| relay.send(e));
+            }
             if vendor_scoped && progress.avoid.is_none() {
                 progress.avoid = Some(vendor);
                 return Next::Retry;
             }
-        }
-        let mut error = GatewayError::new(class, retryable(class), failure.message);
-        match failure.kind {
-            FailureKind::UsageLimit { resets_at } => error.resets_at = resets_at,
-            FailureKind::RateLimited { retry_after } | FailureKind::Overloaded { retry_after } => {
-                error.retry_after = retry_after;
-            }
-            _ => {}
         }
         error.tried = std::mem::take(&mut progress.tried);
         relay.send(StreamEvent::Error { error });
@@ -663,8 +684,8 @@ impl Gateway {
     }
 
     /// Each route alias, sorted, with the state of the logins it can run on in qbd's
-    /// `GET /v1/state`: this gateway's logins of the pinned vendor, or every login of this
-    /// gateway for a ladder route.
+    /// `GET /v1/state`: this gateway's logins of the pinned vendor, of each step's vendor of a
+    /// chain route, or every login of this gateway for a ladder route.
     pub fn routes(&self) -> RoutesAnswer {
         let state = self.state();
         let routes = self
@@ -682,36 +703,54 @@ impl Gateway {
                 let Some(state) = &state else {
                     return status;
                 };
-                let mut waiting = false;
-                for l in &state.logins {
-                    let ours = self.config.login(&l.login).is_some()
-                        && r.vendor.as_ref().is_none_or(|v| *v == l.vendor);
-                    if !ours {
-                        continue;
-                    }
-                    match l.status {
-                        LoginStatus::Ok | LoginStatus::Unknown | LoginStatus::AuthStale => {
-                            status.state = RouteState::Ready;
-                        }
-                        LoginStatus::Exhausted | LoginStatus::RateLimited => {
-                            waiting = true;
-                            status.resets_at = match (status.resets_at, l.dead_until) {
-                                (Some(a), Some(b)) => Some(a.min(b)),
-                                (a, b) => a.or(b),
-                            };
-                        }
-                        LoginStatus::AuthDead => {}
-                    }
+                if r.chain.is_empty() {
+                    (status.state, status.resets_at) = self.standing(state, r.vendor.as_deref());
+                    return status;
                 }
-                if status.state == RouteState::Ready {
-                    status.resets_at = None;
-                } else if waiting {
-                    status.state = RouteState::Exhausted;
+                for step in &r.chain {
+                    match self.standing(state, Some(&step.vendor)) {
+                        (RouteState::Ready, _) => {
+                            status.state = RouteState::Ready;
+                            status.vendor = Some(step.vendor.clone());
+                            status.model = Some(step.model.clone());
+                            status.resets_at = None;
+                            return status;
+                        }
+                        (RouteState::Exhausted, at) => {
+                            status.state = RouteState::Exhausted;
+                            status.resets_at = nearest(status.resets_at, at);
+                        }
+                        _ => {}
+                    }
                 }
                 status
             })
             .collect();
         RoutesAnswer { routes }
+    }
+
+    /// The state of this gateway's logins of `vendor`, or of all of them, in `state`: `ready`
+    /// when one is usable, else `exhausted` with the nearest reset when one waits, else
+    /// `unavailable`.
+    fn standing(&self, state: &State, vendor: Option<&str>) -> (RouteState, Option<u64>) {
+        let mut standing = (RouteState::Unavailable, None);
+        for l in &state.logins {
+            let ours =
+                self.config.login(&l.login).is_some() && vendor.is_none_or(|v| v == l.vendor);
+            if !ours {
+                continue;
+            }
+            match l.status {
+                LoginStatus::Ok | LoginStatus::Unknown | LoginStatus::AuthStale => {
+                    return (RouteState::Ready, None);
+                }
+                LoginStatus::Exhausted | LoginStatus::RateLimited => {
+                    standing = (RouteState::Exhausted, nearest(standing.1, l.dead_until));
+                }
+                LoginStatus::AuthDead => {}
+            }
+        }
+        standing
     }
 
     fn bearer(&self) -> Option<&str> {
@@ -749,7 +788,7 @@ impl Gateway {
         let mut pick = PickRequest {
             role: route.role.clone(),
             difficulty: route.difficulty,
-            pin: route.pin(),
+            pin: route.pin(progress.step),
             resume_of: session.filter(|_| progress.resume).cloned(),
             avoid_vendor: progress.avoid.clone(),
             need: Vec::new(),
@@ -849,6 +888,41 @@ fn fail(
     error.tried = std::mem::take(&mut progress.tried);
     emit(StreamEvent::Error { error });
     Next::Done(what.to_owned())
+}
+
+/// Ends the current step of chain `route` with `error`: the next pick pins the next step, and
+/// without one the turn ends with `quota_exhausted` at the nearest reset when every step was
+/// spent or waiting, else with `error`.
+fn next_step(
+    route: &Route,
+    progress: &mut Progress,
+    error: GatewayError,
+    emit: &mut dyn FnMut(StreamEvent) -> Flow,
+) -> Next {
+    progress.step += 1;
+    progress.spent &= error.class == ErrorClass::QuotaExhausted;
+    progress.resets_at = nearest(progress.resets_at, error.resets_at);
+    if progress.step < route.chain.len() {
+        return Next::Retry;
+    }
+    let error = if progress.spent {
+        let message = format!("every step of route `{}` is spent or waits", route.alias);
+        let mut e = GatewayError::new(ErrorClass::QuotaExhausted, true, message);
+        e.resets_at = progress.resets_at;
+        e
+    } else {
+        error
+    };
+    let what = format!("{} after the last step", error.class.as_str());
+    fail(emit, error, progress, &what)
+}
+
+/// The earlier of two optional times.
+fn nearest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// The error for a pick that is not `run`: `quota_exhausted` until the `retry_after` of a
