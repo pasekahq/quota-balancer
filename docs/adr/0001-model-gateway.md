@@ -75,7 +75,7 @@ Secrets:
   out of reach; the agent accepts the same limit.
 - An OAuth refresh writes the new token set to a temporary file created 0600 in the same
   directory, syncs it, renames it over the credential file and syncs the directory. One
-  refresh per login runs at a time; a turn waiting on it re-reads the file afterwards. Before
+  refresh per credential file runs at a time; a turn waiting on it re-reads the file afterwards. Before
   refreshing, the gateway re-reads the file and uses its token if another writer already
   replaced the one that failed.
 - The gateway's credential files are its own. A vendor CLI that refreshes the same login from

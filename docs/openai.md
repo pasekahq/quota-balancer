@@ -239,9 +239,32 @@ shuts the agent down, and the attempt ends `cancelled`.
 The credential's kind ([config.md](config.md#gateway-config)) picks the header mode: `api_key`
 is the `api_key` mode; `chatgpt_oauth`, a ChatGPT login's access token and account id, is the
 `chatgpt_oauth` mode with the account id in `chatgpt-account-id`. The secret's header value is
-built in a zeroizing string and dropped once the request is sent. The gateway does not refresh a
-ChatGPT token: the vendor's 401 for an expired or revoked token is an `auth` failure, and the
-turn moves to the next login.
+built in a zeroizing string and dropped once the request is sent.
+
+The gateway refreshes a ChatGPT token (`crates/qb/src/gateway/oauth.rs`) when its `expires_at`
+falls within 60 s, or once after a vendor 401 before the first event, and then retries the turn
+on the same login; a second 401 or a refused refresh makes the login `auth_dead`, and the turn
+moves to the next login. A file without `refresh_token` is used as it is and is unusable after
+a 401. The refresh is the OAuth refresh grant:
+
+- `POST` to the login's `token_url`, else to `identity::OAUTH_TOKEN_URL`
+  (`https://auth.openai.com/oauth/token`); ureq with rustls, no proxy, no redirects, 10 s to
+  connect and 30 s per request, `user-agent` `identity::CHATGPT_USER_AGENT`;
+- body `application/x-www-form-urlencoded`: `grant_type=refresh_token`, `refresh_token`, and
+  `client_id` `identity::OAUTH_CLIENT_ID`, the Codex CLI's public OAuth client id;
+- a 2xx answer is JSON with a required `access_token`, an optional rotated `refresh_token`
+  (without one the old refresh token stays) and an optional `id_token`. The new `expires_at` is
+  the gateway's clock plus `expires_in` when present, else the `exp` claim of the `id_token`'s
+  payload, else of the access token's, each read as base64url JSON without a signature check.
+
+| Answer | Result |
+|---|---|
+| 2xx with `access_token` and an expiry | the new tokens, written back to the credential file with the unchanged `account_id` |
+| 400, 401, or another non-5xx answer other than 429 whose error code (`"error": "<code>"` or `"error": {"code": "<code>"}`) is `invalid_grant`, `refresh_token_expired`, `refresh_token_reused` or `refresh_token_invalidated` | refused: the login is `auth_dead` until a new sign-in, the turn moves to the next login |
+| 429, 5xx, transport failure, another status, a 2xx without `access_token` or expiry | failed: the turn ends `unavailable`, retryable |
+
+A refresh error names the endpoint, the status and the error code, never a body value, header,
+token or account id.
 
 The endpoint is the login's `base_url` followed by `/responses`, else `AuthMode::url()`. The body
 is `request::build` with `target.reasoning` on, and the stream's event bound is
