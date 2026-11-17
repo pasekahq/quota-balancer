@@ -3,6 +3,7 @@
 //! [`EXTRA_CONNECTIONS`] at once; every rejection is a non-200 [`GatewayError`], every admitted
 //! turn a `200` with a chunked NDJSON stream whose head goes out with its first event.
 
+use std::cell::Cell;
 use std::convert::Infallible;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -31,6 +32,9 @@ pub const STACK_BYTES: usize = 512 * 1024;
 
 /// How long writing one event to a slow client may take before the turn is cut.
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long reading one request, head and body, may take.
+pub const READ_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Content type of the turn stream.
 pub const NDJSON: &str = "application/x-ndjson";
@@ -117,51 +121,31 @@ fn caller(gateway: &Gateway, uid: Option<u32>, own_uid: u32) -> Option<String> {
         .map(|c| c.name.clone())
 }
 
+/// Reads `stream` until `until`, each read bounded by [`IO_TIMEOUT`] and the time left.
+struct Deadline<'a> {
+    stream: &'a UnixStream,
+    until: Instant,
+}
+
+impl io::Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left.min(IO_TIMEOUT)))?;
+        (&mut &*self.stream).read(buf)
+    }
+}
+
 fn handle(mut stream: UnixStream, gateway: &Gateway, own_uid: u32, started: Instant) {
-    if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
-        || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
-    {
+    if stream.set_write_timeout(Some(IO_TIMEOUT)).is_err() {
         return;
     }
     let uid = rustix::net::sockopt::socket_peercred(&stream)
         .ok()
         .map(|c| c.uid.as_raw());
-    let max_body = gateway.config().max_request_bytes as usize;
-    let mut buf = Vec::new();
-    let req = match http::read_request_limited(&mut stream, &mut buf, max_body) {
-        Ok(r) => r,
-        Err(ReadError::Closed | ReadError::Io(_)) => return,
-        Err(ReadError::Malformed) => {
-            return reject(
-                &mut stream,
-                400,
-                ErrorClass::BadRequest,
-                "malformed HTTP request",
-            );
-        }
-        Err(ReadError::HeadTooLarge) => {
-            return reject(
-                &mut stream,
-                413,
-                ErrorClass::BadRequest,
-                "request head too large",
-            );
-        }
-        Err(ReadError::BodyTooLarge { unread }) => {
-            discard(&mut stream, unread);
-            let message = format!("request body over {max_body} bytes");
-            return reject(&mut stream, 413, ErrorClass::BadRequest, &message);
-        }
-        Err(ReadError::LengthRequired) => {
-            return reject(
-                &mut stream,
-                411,
-                ErrorClass::BadRequest,
-                "Content-Length required",
-            );
-        }
-    };
-    drop(buf);
+    // Checked before reading, so a foreign peer cannot make the gateway buffer a body.
     let Some(caller) = caller(gateway, uid, own_uid) else {
         return reject(
             &mut stream,
@@ -169,6 +153,9 @@ fn handle(mut stream: UnixStream, gateway: &Gateway, own_uid: u32, started: Inst
             ErrorClass::Auth,
             "caller is not an allowed client",
         );
+    };
+    let Some(req) = read(&mut stream, gateway.config().max_request_bytes as usize) else {
+        return;
     };
     match (req.method, req.path.as_str()) {
         (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, &caller, req.body),
@@ -215,6 +202,36 @@ fn handle(mut stream: UnixStream, gateway: &Gateway, own_uid: u32, started: Inst
         }
         _ => reject(&mut stream, 404, ErrorClass::BadRequest, "no such endpoint"),
     }
+}
+
+/// Reads one request under [`READ_DEADLINE`]: a turn body of at most `max_turn` bytes, any
+/// other of at most [`http::MAX_BODY`]. A request that cannot be read is answered here.
+fn read(stream: &mut UnixStream, max_turn: usize) -> Option<http::Request> {
+    let limit = Cell::new(http::MAX_BODY);
+    let max_body = |method, path: &str| {
+        if method == Method::Post && path == paths::MODEL_TURN {
+            limit.set(max_turn);
+        }
+        limit.get()
+    };
+    let mut buf = Vec::new();
+    let mut reader = Deadline {
+        stream,
+        until: Instant::now() + READ_DEADLINE,
+    };
+    let (status, message) = match http::read_request_limited(&mut reader, &mut buf, &max_body) {
+        Ok(r) => return Some(r),
+        Err(ReadError::Closed | ReadError::Io(_)) => return None,
+        Err(ReadError::Malformed) => (400, "malformed HTTP request".into()),
+        Err(ReadError::HeadTooLarge) => (413, "request head too large".into()),
+        Err(ReadError::BodyTooLarge { unread }) => {
+            discard(stream, unread);
+            (413, format!("request body over {} bytes", limit.get()))
+        }
+        Err(ReadError::LengthRequired) => (411, "Content-Length required".into()),
+    };
+    reject(stream, status, ErrorClass::BadRequest, &message);
+    None
 }
 
 fn turn(mut stream: UnixStream, gateway: &Gateway, caller: &str, body: Vec<u8>) {

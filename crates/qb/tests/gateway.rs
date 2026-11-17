@@ -852,6 +852,46 @@ fn malformed_and_oversized_requests_are_rejected_before_any_work() {
 }
 
 #[test]
+fn only_the_turn_path_takes_a_body_over_64_kib() {
+    let r = rig();
+    let pad = "x".repeat(70_000);
+    let cancel = format!(r#"{{"request_id":"{pad}"}}"#);
+    let (status, e) = rejection(&r.gw, "POST", paths::MODEL_CANCEL, &cancel);
+    assert_eq!((status, e.class), (413, ErrorClass::BadRequest));
+    assert!(
+        e.message.as_deref().unwrap().contains("over 65536 bytes"),
+        "{e:?}"
+    );
+    let mut big = turn_body("turn-1");
+    big["messages"][0]["content"][0]["text"] = json!(pad);
+    let (_, _, events) = turn(&r.gw, &big);
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+}
+
+#[test]
+fn a_foreign_peer_is_refused_before_its_body_is_read() {
+    let files = [("login-1", api_key("test-token-1"), 0o600)];
+    let r = rig_as(4, &files, "", own_uid() + 1);
+    // A head that announces a body it never sends: the answer must not wait for it.
+    let mut s = UnixStream::connect(&r.gw).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    write!(
+        s,
+        "POST {} HTTP/1.1\r\nHost: qb\r\nContent-Length: 60000\r\n\r\n",
+        paths::MODEL_TURN
+    )
+    .unwrap();
+    let mut answer = Vec::new();
+    let _ = s.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 401"), "{answer:?}");
+    assert!(answer.contains(r#""class":"auth""#), "{answer}");
+    let (status, e) = rejection(&r.gw, "GET", paths::HEALTH, "");
+    assert_eq!((status, e.class), (401, ErrorClass::Auth));
+    assert_eq!(r.fake.calls(), Vec::new());
+}
+
+#[test]
 fn a_configured_client_uid_is_served() {
     let files = [("login-1", api_key("test-token-1"), 0o600)];
     let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
@@ -860,6 +900,37 @@ fn a_configured_client_uid_is_served() {
     assert_eq!(status, 200);
     let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
     assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+}
+
+#[test]
+fn a_request_must_arrive_within_the_read_deadline() {
+    let r = rig();
+    let mut s = UnixStream::connect(&r.gw).unwrap();
+    let body = turn_body("turn-1").to_string();
+    write!(
+        s,
+        "POST {} HTTP/1.1\r\nHost: qb\r\nContent-Length: {}\r\n\r\n",
+        paths::MODEL_TURN,
+        body.len()
+    )
+    .unwrap();
+    // One byte at a time, each well within the per-read timeout.
+    let started = std::time::Instant::now();
+    let mut cut = false;
+    for b in body.bytes().take(40) {
+        if s.write_all(&[b]).is_err() {
+            cut = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let took = started.elapsed();
+    assert!(cut, "the gateway kept reading for {took:?}");
+    assert!(
+        took >= front::READ_DEADLINE && took < front::READ_DEADLINE + Duration::from_secs(3),
+        "{took:?}"
+    );
+    assert_eq!(r.fake.calls(), Vec::new());
 }
 
 #[test]

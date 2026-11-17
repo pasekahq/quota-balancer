@@ -221,12 +221,15 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 
 Framing is `qbd`'s: HTTP/1.1, one request per connection, head ≤ 8 KiB, `Content-Length`
-required, chunked request bodies refused; the body limit is the config's `max_request_bytes`
-(default 8 MiB). Requests reject unknown fields. Every non-200 answer of the gateway has the
+required, chunked request bodies refused. The body of `POST /v1/model/turn` may be up to the
+config's `max_request_bytes` (default 8 MiB), every other body up to 64 KiB; a request whose
+head and body have not arrived within 10 s is dropped without an answer. Requests reject
+unknown fields. Every non-200 answer of the gateway has the
 body `Error` below, whose `class` is authoritative and whose status is informative.
 
 **Callers.** The peer's uid from `SO_PEERCRED` must be the gateway's own uid or the `uid` of a
-`[[clients]]` entry of the gateway config; any other peer gets 401 `auth`. The socket file is
+`[[clients]]` entry of the gateway config; any other peer gets 401 `auth` before its request
+is read. The socket file is
 0600, or 0660 with `socket_mode = 0o660`.
 
 ### `POST /v1/model/turn`

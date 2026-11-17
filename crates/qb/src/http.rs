@@ -67,17 +67,17 @@ impl From<io::Error> for ReadError {
 /// # Errors
 /// See [`ReadError`].
 pub fn read_request<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<Request, ReadError> {
-    read_request_limited(r, buf, MAX_BODY)
+    read_request_limited(r, buf, &|_, _| MAX_BODY)
 }
 
-/// [`read_request`] with a body of at most `max_body` bytes.
+/// [`read_request`] with a body of at most `max_body(method, path)` bytes.
 ///
 /// # Errors
 /// See [`ReadError`].
 pub fn read_request_limited<R: Read>(
     r: &mut R,
     buf: &mut Vec<u8>,
-    max_body: usize,
+    max_body: &dyn Fn(Method, &str) -> usize,
 ) -> Result<Request, ReadError> {
     buf.clear();
     let mut chunk = [0u8; 2048];
@@ -116,7 +116,7 @@ pub fn read_request_limited<R: Read>(
                     return Err(ReadError::LengthRequired);
                 }
                 let want = content_length.unwrap_or(0);
-                if want > max_body {
+                if want > max_body(method, &path) {
                     let unread = want.saturating_sub(buf.len() - head_len);
                     return Err(ReadError::BodyTooLarge { unread });
                 }
@@ -318,10 +318,10 @@ mod tests {
         let raw = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
         let mut buf = Vec::new();
         assert!(matches!(
-            read_request_limited(&mut &raw[..], &mut buf, 4),
+            read_request_limited(&mut &raw[..], &mut buf, &|_, _| 4),
             Err(ReadError::BodyTooLarge { .. })
         ));
-        let r = read_request_limited(&mut &raw[..], &mut buf, 5).expect("fits");
+        let r = read_request_limited(&mut &raw[..], &mut buf, &|_, _| 5).expect("fits");
         assert_eq!(r.body, b"hello");
     }
 

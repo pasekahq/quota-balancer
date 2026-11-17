@@ -225,7 +225,7 @@ Top-level keys come before the tables:
 | `qbd_socket` | string | Absolute path of `qbd`'s socket, default `/run/qb/qb.sock`. |
 | `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`; without it `qbd` identifies the gateway by uid. |
 | `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
-| `max_request_bytes` | integer | Largest request body, default 8388608, at most 33554432. |
+| `max_request_bytes` | integer | Largest body of `POST /v1/model/turn`, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Picks per turn, default 4. |
 
 `[[clients]]`, optional: callers besides the gateway's own uid.
