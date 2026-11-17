@@ -6,56 +6,45 @@ use std::path::{Path, PathBuf};
 
 use qb_core::MAX_LOGINS;
 use qb_proto::Pin;
-use serde::Deserialize;
 
-use crate::config::{BearerHash, Client, Error, Fault, declare, deserialize, too_many};
+use toml::Spanned;
+use toml::de::{DeTable, DeValue};
 
-/// A validated gateway config.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+use crate::config::{
+    BEARER_HASH_EXPECTED, BearerHash, Client, Error, Fault, declare, toml_error, too_many,
+};
+
+/// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]` and
+/// `[[routes]]` tables. It is read by walking the TOML tree rather than by serde, which keeps
+/// the binary small.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// Absolute path of the gateway's unix socket.
     pub socket: PathBuf,
+    /// qbd's socket.
+    pub qbd_socket: PathBuf,
+    /// File with the gateway's bearer token for qbd; without it qbd knows the gateway by uid.
+    pub qbd_bearer_file: Option<PathBuf>,
     /// Absolute directories whose files `image` blocks may name by `path`.
-    #[serde(default)]
     pub media_dirs: Vec<PathBuf>,
-    /// How to reach qbd.
-    #[serde(default)]
-    pub qbd: Qbd,
+    /// Turns running at once; a further turn is refused with `overloaded`.
+    pub max_turns: u32,
+    /// Largest request body in bytes.
+    pub max_body_bytes: u32,
+    /// Per-caller refill rate in requests per second.
+    pub rate_per_s: f64,
+    /// Per-caller bucket size.
+    pub burst: u32,
     /// Callers allowed on the socket; none means every peer the socket mode lets in.
-    #[serde(default)]
     pub clients: Vec<GatewayClient>,
-    /// Concurrency, body size and per-caller rate.
-    #[serde(default)]
-    pub limits: GatewayLimits,
     /// Logins this gateway holds credentials for, 1 to [`MAX_LOGINS`].
     pub logins: Vec<GatewayLogin>,
     /// Route aliases.
     pub routes: Vec<Route>,
 }
 
-/// The qbd the gateway picks from and reports to.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Qbd {
-    /// qbd's socket.
-    pub socket: PathBuf,
-    /// File with the gateway's bearer token for qbd; without it qbd knows the gateway by uid.
-    pub bearer_file: Option<PathBuf>,
-}
-
-impl Default for Qbd {
-    fn default() -> Self {
-        Self {
-            socket: PathBuf::from(crate::DEFAULT_SOCKET),
-            bearer_file: None,
-        }
-    }
-}
-
 /// A caller of the gateway, by peer uid, bearer token or both.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayClient {
     /// Name in logs and in the cancel registry.
     pub name: String,
@@ -77,34 +66,8 @@ impl GatewayClient {
     }
 }
 
-/// Gateway limits.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct GatewayLimits {
-    /// Turns running at once; a further turn is refused with `overloaded`.
-    pub max_turns: u32,
-    /// Largest request body in bytes.
-    pub max_body_bytes: u32,
-    /// Per-caller refill rate in requests per second.
-    pub rate_per_s: f64,
-    /// Per-caller bucket size.
-    pub burst: u32,
-}
-
-impl Default for GatewayLimits {
-    fn default() -> Self {
-        Self {
-            max_turns: 4,
-            max_body_bytes: 8 << 20,
-            rate_per_s: 5.0,
-            burst: 20,
-        }
-    }
-}
-
 /// A login and its credential file.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayLogin {
     /// Login name as declared in qbd's config.
     pub name: String,
@@ -112,20 +75,37 @@ pub struct GatewayLogin {
     pub credentials: PathBuf,
 }
 
-/// A route alias and what to ask qbd for.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A route alias and what to ask qbd for: a ladder step of a role, or a pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     /// Alias clients name in `route`.
     pub alias: String,
     /// qbd role of the pick.
     pub role: String,
-    /// Ladder step of the role; exclusive with `pin`.
+    /// Ladder step of the role; exclusive with `vendor` and `model`.
     pub difficulty: Option<u8>,
-    /// Exact vendor and model (and optionally login); exclusive with `difficulty`.
-    pub pin: Option<Pin>,
+    /// Pinned vendor; goes with `model`.
+    pub vendor: Option<String>,
+    /// Pinned model; goes with `vendor`.
+    pub model: Option<String>,
+    /// Reasoning effort of the pin.
+    pub effort: Option<String>,
+    /// One login of the pinned vendor.
+    pub login: Option<String>,
     /// Expected minutes of a turn, for the lease's cost estimate.
     pub expected_minutes: Option<u32>,
+}
+
+impl Route {
+    /// The pin of a pinned route.
+    pub fn pin(&self) -> Option<Pin> {
+        Some(Pin {
+            vendor: self.vendor.clone()?,
+            model: self.model.clone()?,
+            effort: self.effort.clone(),
+            login: self.login.clone(),
+        })
+    }
 }
 
 /// Most route aliases.
@@ -150,13 +130,271 @@ pub fn load(file: &Path) -> Result<GatewayConfig, Error> {
 /// # Errors
 /// As [`load`], without the read.
 pub fn parse(file: &Path, text: &str) -> Result<GatewayConfig, Error> {
-    let config: GatewayConfig = deserialize(file, text)?;
-    config.validate().map_err(|(field, reason)| Error {
+    let doc = DeTable::parse(text).map_err(|e| toml_error(file, text, String::new(), &e))?;
+    let fail = |(field, reason): Fault| Error {
         file: file.to_owned(),
         field,
         reason,
+    };
+    let config = walk_config(doc.get_ref()).map_err(|(field, reason, span)| {
+        let reason = match span {
+            Some(at) => format!("{reason} (line {})", line(text, at)),
+            None => reason,
+        };
+        fail((field, reason))
     })?;
+    config.validate().map_err(fail)?;
     Ok(config)
+}
+
+fn line(text: &str, at: usize) -> usize {
+    text.get(..at).map_or(0, |s| s.matches('\n').count()) + 1
+}
+
+/// A field error with the byte offset of the value, for the line number.
+type WalkError = (String, String, Option<usize>);
+
+type Value<'i> = Spanned<DeValue<'i>>;
+
+fn wrong(at: &str, v: &Value<'_>, expected: &str) -> WalkError {
+    (
+        at.to_owned(),
+        format!("expected {expected}, found {}", v.get_ref().type_str()),
+        Some(v.span().start),
+    )
+}
+
+/// Calls `field` with each key of `table`, refusing keys outside `known`.
+fn fields<'v, 'i>(
+    at: &str,
+    table: &'v DeTable<'i>,
+    known: &[&str],
+    mut field: impl FnMut(&str, &str, &'v Value<'i>) -> Result<(), WalkError>,
+) -> Result<(), WalkError> {
+    for (key, value) in table {
+        let key = key.get_ref().as_ref();
+        let path = if at.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{at}.{key}")
+        };
+        if !known.contains(&key) {
+            return Err((
+                path,
+                format!("unknown field, expected one of {}", known.join(", ")),
+                Some(value.span().start),
+            ));
+        }
+        field(key, &path, value)?;
+    }
+    Ok(())
+}
+
+fn string(at: &str, v: &Value<'_>) -> Result<String, WalkError> {
+    v.get_ref()
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| wrong(at, v, "a string"))
+}
+
+fn integer<T: TryFrom<i64>>(at: &str, v: &Value<'_>) -> Result<T, WalkError> {
+    let n = v
+        .get_ref()
+        .as_integer()
+        .ok_or_else(|| wrong(at, v, "an integer"))?;
+    i64::from_str_radix(n.as_str(), n.radix())
+        .ok()
+        .and_then(|n| T::try_from(n).ok())
+        .ok_or_else(|| {
+            (
+                at.to_owned(),
+                "is out of range".into(),
+                Some(v.span().start),
+            )
+        })
+}
+
+fn float(at: &str, v: &Value<'_>) -> Result<f64, WalkError> {
+    match v.get_ref() {
+        DeValue::Float(f) => f.as_str().parse().map_err(|_| {
+            (
+                at.to_owned(),
+                "is not a number".into(),
+                Some(v.span().start),
+            )
+        }),
+        DeValue::Integer(_) => integer::<i32>(at, v).map(f64::from),
+        _ => Err(wrong(at, v, "a number")),
+    }
+}
+
+fn table<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<&'v DeTable<'i>, WalkError> {
+    v.get_ref()
+        .as_table()
+        .ok_or_else(|| wrong(at, v, "a table"))
+}
+
+/// Each element of the array `v` with its path `at[i]`.
+fn array<'v, 'i>(
+    at: &str,
+    v: &'v Value<'i>,
+) -> Result<impl Iterator<Item = (String, &'v Value<'i>)>, WalkError> {
+    let items = v
+        .get_ref()
+        .as_array()
+        .ok_or_else(|| wrong(at, v, "an array"))?;
+    Ok(items
+        .iter()
+        .enumerate()
+        .map(move |(i, item)| (format!("{at}[{i}]"), item)))
+}
+
+/// The config's fields out of the parsed TOML tree.
+fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
+    let mut c = GatewayConfig {
+        socket: PathBuf::new(),
+        qbd_socket: PathBuf::from(crate::DEFAULT_SOCKET),
+        qbd_bearer_file: None,
+        media_dirs: Vec::new(),
+        max_turns: 4,
+        max_body_bytes: 8 << 20,
+        rate_per_s: 5.0,
+        burst: 20,
+        clients: Vec::new(),
+        logins: Vec::new(),
+        routes: Vec::new(),
+    };
+    let mut seen = Vec::new();
+    let known = [
+        "socket",
+        "qbd_socket",
+        "qbd_bearer_file",
+        "media_dirs",
+        "max_turns",
+        "max_body_bytes",
+        "rate_per_s",
+        "burst",
+        "clients",
+        "logins",
+        "routes",
+    ];
+    fields("", doc, &known, |key, at, v| {
+        seen.push(key.to_owned());
+        match key {
+            "socket" => c.socket = string(at, v)?.into(),
+            "qbd_socket" => c.qbd_socket = string(at, v)?.into(),
+            "qbd_bearer_file" => c.qbd_bearer_file = Some(string(at, v)?.into()),
+            "media_dirs" => {
+                for (at, d) in array(at, v)? {
+                    c.media_dirs.push(string(&at, d)?.into());
+                }
+            }
+            "max_turns" => c.max_turns = integer(at, v)?,
+            "max_body_bytes" => c.max_body_bytes = integer(at, v)?,
+            "rate_per_s" => c.rate_per_s = float(at, v)?,
+            "burst" => c.burst = integer(at, v)?,
+            "clients" => {
+                for (at, t) in array(at, v)? {
+                    c.clients.push(walk_client(&at, table(&at, t)?)?);
+                }
+            }
+            "logins" => {
+                for (at, t) in array(at, v)? {
+                    c.logins.push(walk_login(&at, table(&at, t)?)?);
+                }
+            }
+            _ => {
+                for (at, t) in array(at, v)? {
+                    c.routes.push(walk_route(&at, table(&at, t)?)?);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    for required in ["socket", "logins", "routes"] {
+        if !seen.iter().any(|k| k == required) {
+            return Err((required.into(), "is missing".into(), None));
+        }
+    }
+    Ok(c)
+}
+
+fn walk_client(at: &str, t: &DeTable<'_>) -> Result<GatewayClient, WalkError> {
+    let mut c = GatewayClient {
+        name: String::new(),
+        uid: None,
+        bearer_sha256: None,
+    };
+    fields(at, t, &["name", "uid", "bearer_sha256"], |key, at, v| {
+        match key {
+            "name" => c.name = string(at, v)?,
+            "uid" => c.uid = Some(integer(at, v)?),
+            _ => {
+                let hash = BearerHash::from_hex(&string(at, v)?).ok_or_else(|| {
+                    (
+                        at.to_owned(),
+                        BEARER_HASH_EXPECTED.into(),
+                        Some(v.span().start),
+                    )
+                })?;
+                c.bearer_sha256 = Some(hash);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(c)
+}
+
+fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
+    let mut l = GatewayLogin {
+        name: String::new(),
+        credentials: PathBuf::new(),
+    };
+    fields(at, t, &["name", "credentials"], |key, at, v| {
+        match key {
+            "name" => l.name = string(at, v)?,
+            _ => l.credentials = string(at, v)?.into(),
+        }
+        Ok(())
+    })?;
+    Ok(l)
+}
+
+fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
+    let mut r = Route {
+        alias: String::new(),
+        role: String::new(),
+        difficulty: None,
+        vendor: None,
+        model: None,
+        effort: None,
+        login: None,
+        expected_minutes: None,
+    };
+    let known = [
+        "alias",
+        "role",
+        "difficulty",
+        "vendor",
+        "model",
+        "effort",
+        "login",
+        "expected_minutes",
+    ];
+    fields(at, t, &known, |key, at, v| {
+        match key {
+            "alias" => r.alias = string(at, v)?,
+            "role" => r.role = string(at, v)?,
+            "difficulty" => r.difficulty = Some(integer(at, v)?),
+            "vendor" => r.vendor = Some(string(at, v)?),
+            "model" => r.model = Some(string(at, v)?),
+            "effort" => r.effort = Some(string(at, v)?),
+            "login" => r.login = Some(string(at, v)?),
+            _ => r.expected_minutes = Some(integer(at, v)?),
+        }
+        Ok(())
+    })?;
+    Ok(r)
 }
 
 fn absolute(field: &str, path: &Path) -> Result<(), Fault> {
@@ -170,7 +408,7 @@ fn absolute(field: &str, path: &Path) -> Result<(), Fault> {
 impl GatewayConfig {
     fn validate(&self) -> Result<(), Fault> {
         absolute("socket", &self.socket)?;
-        absolute("qbd.socket", &self.qbd.socket)?;
+        absolute("qbd_socket", &self.qbd_socket)?;
         for (i, dir) in self.media_dirs.iter().enumerate() {
             absolute(&format!("media_dirs[{i}]"), dir)?;
         }
@@ -195,18 +433,17 @@ impl GatewayConfig {
                 ));
             }
         }
-        let l = &self.limits;
         for (key, value) in [
-            ("max_turns", l.max_turns),
-            ("max_body_bytes", l.max_body_bytes),
-            ("burst", l.burst),
+            ("max_turns", self.max_turns),
+            ("max_body_bytes", self.max_body_bytes),
+            ("burst", self.burst),
         ] {
             if value == 0 {
-                return Err((format!("limits.{key}"), "must be positive".into()));
+                return Err((key.into(), "must be positive".into()));
             }
         }
-        if !(l.rate_per_s.is_finite() && l.rate_per_s > 0.0) {
-            return Err(("limits.rate_per_s".into(), "must be positive".into()));
+        if !(self.rate_per_s.is_finite() && self.rate_per_s > 0.0) {
+            return Err(("rate_per_s".into(), "must be positive".into()));
         }
         if self.logins.is_empty() {
             return Err(("logins".into(), "is empty".into()));
@@ -242,9 +479,17 @@ impl GatewayConfig {
             if r.role.trim().is_empty() {
                 return Err((format!("{at}.role"), "is empty".into()));
             }
-            match (&r.difficulty, &r.pin) {
-                (Some(_), None) | (None, Some(_)) => {}
-                _ => return Err((at, "needs exactly one of `difficulty` and `pin`".into())),
+            match (r.difficulty, &r.vendor, &r.model) {
+                (Some(_), None, None) | (None, Some(_), Some(_)) => {}
+                _ => {
+                    return Err((
+                        at,
+                        "needs either `difficulty` or both `vendor` and `model`".into(),
+                    ));
+                }
+            }
+            if r.difficulty.is_some() && (r.effort.is_some() || r.login.is_some()) {
+                return Err((at, "`effort` and `login` belong to a pin".into()));
             }
         }
         Ok(())
@@ -286,8 +531,8 @@ difficulty = 1
     #[test]
     fn minimal_config_takes_defaults() {
         let c = check("").unwrap();
-        assert_eq!(c.qbd.socket, Path::new(crate::DEFAULT_SOCKET));
-        assert_eq!(c.limits.max_turns, 4);
+        assert_eq!(c.qbd_socket, Path::new(crate::DEFAULT_SOCKET));
+        assert_eq!(c.max_turns, 4);
         assert_eq!(
             c.credentials("login-1"),
             Some(Path::new("/var/lib/qb-gateway/login-1.json"))
@@ -307,20 +552,16 @@ difficulty = 1
                 "routes[1].alias: must match",
             ),
             (
-                "[[routes]]\nalias = \"two\"\nrole = \"r\"\ndifficulty = 1\npin = { vendor = \"v\", model = \"m\" }\n",
-                "routes[1]: needs exactly one",
+                "[[routes]]\nalias = \"two\"\nrole = \"r\"\ndifficulty = 1\nvendor = \"v\"\nmodel = \"m\"\n",
+                "routes[1]: needs either",
             ),
             (
                 "[[logins]]\nname = \"login-2\"\ncredentials = \"rel.json\"\n",
                 "logins[1].credentials: must be an absolute path",
             ),
-            (
-                "[limits]\nmax_turns = 0\n",
-                "limits.max_turns: must be positive",
-            ),
             ("[[clients]]\nname = \"c\"\n", "clients[0]: needs"),
             (
-                "[[routes]]\nalias = \"x\"\nrole = \"r\"\nmodel = 1\n",
+                "[[routes]]\nalias = \"x\"\nrole = \"r\"\nmodle = 1\n",
                 "unknown field",
             ),
         ];
@@ -328,8 +569,21 @@ difficulty = 1
             let err = check(extra).unwrap_err();
             assert!(err.contains(want), "{extra}: {err}");
         }
-        let top = format!("media_dirs = [\"media\"]\n{BASE}");
-        let err = parse(Path::new("gw.toml"), &top).unwrap_err().to_string();
-        assert!(err.contains("media_dirs[0]: must be an absolute"), "{err}");
+        for (top, want) in [
+            (
+                "media_dirs = [\"media\"]",
+                "media_dirs[0]: must be an absolute",
+            ),
+            ("max_turns = 0", "max_turns: must be positive"),
+            (
+                "qbd_socket = \"qb.sock\"",
+                "qbd_socket: must be an absolute",
+            ),
+            ("rate_per_s = -1.0", "rate_per_s: must be positive"),
+        ] {
+            let text = format!("{top}\n{BASE}");
+            let err = parse(Path::new("gw.toml"), &text).unwrap_err().to_string();
+            assert!(err.contains(want), "{err}");
+        }
     }
 }

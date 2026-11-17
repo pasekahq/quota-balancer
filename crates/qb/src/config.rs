@@ -390,20 +390,27 @@ impl<'de> Deserialize<'de> for Fraction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BearerHash(pub [u8; 32]);
 
-impl<'de> Deserialize<'de> for BearerHash {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let hex = String::deserialize(d)?;
-        // The value is never echoed: a misplaced plaintext token must not reach the logs.
-        let invalid = || de::Error::custom("expected the token's SHA-256 as 64 hex characters");
+impl BearerHash {
+    /// The hash in `hex`, 64 hex characters.
+    pub fn from_hex(hex: &str) -> Option<Self> {
         if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(invalid());
+            return None;
         }
         let mut out = [0; 32];
         for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
-            let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
-            *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
         }
-        Ok(Self(out))
+        Some(Self(out))
+    }
+}
+
+/// The value is never echoed: a misplaced plaintext token must not reach the logs.
+pub(crate) const BEARER_HASH_EXPECTED: &str = "expected the token's SHA-256 as 64 hex characters";
+
+impl<'de> Deserialize<'de> for BearerHash {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let hex = String::deserialize(d)?;
+        Self::from_hex(&hex).ok_or_else(|| de::Error::custom(BEARER_HASH_EXPECTED))
     }
 }
 
@@ -466,13 +473,18 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(
     file: &Path,
     text: &str,
 ) -> Result<T, Error> {
-    let error = |field: String, reason: String| Error {
-        file: file.to_owned(),
-        field,
-        reason,
-    };
-    // One line per error: the toml crate's own Display adds a multi-line source snippet.
-    let describe = |e: &toml::de::Error| match e.span() {
+    let document =
+        toml::Deserializer::parse(text).map_err(|e| toml_error(file, text, String::new(), &e))?;
+    serde_path_to_error::deserialize(document).map_err(|e| {
+        let field = e.path().to_string();
+        let field = if field == "." { String::new() } else { field };
+        toml_error(file, text, field, e.inner())
+    })
+}
+
+/// `e` as one line: the toml crate's own Display adds a multi-line source snippet.
+pub(crate) fn toml_error(file: &Path, text: &str, field: String, e: &toml::de::Error) -> Error {
+    let reason = match e.span() {
         Some(span) => {
             let line = text
                 .get(..span.start)
@@ -482,13 +494,11 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(
         }
         None => redact(e.message().trim_end()),
     };
-    let document =
-        toml::Deserializer::parse(text).map_err(|e| error(String::new(), describe(&e)))?;
-    serde_path_to_error::deserialize(document).map_err(|e| {
-        let field = e.path().to_string();
-        let field = if field == "." { String::new() } else { field };
-        error(field, describe(e.inner()))
-    })
+    Error {
+        file: file.to_owned(),
+        field,
+        reason,
+    }
 }
 
 /// `message` without the string values serde quotes in type and variant errors, so a token

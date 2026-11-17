@@ -150,6 +150,23 @@ pub struct Failure {
     pub message: String,
 }
 
+impl FailureKind {
+    /// A short name for logs, e.g. `usage_limit`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UsageLimit { .. } => "usage_limit",
+            Self::Auth => "auth",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::Overloaded { .. } => "overloaded",
+            Self::Unavailable => "unavailable",
+            Self::BadRequest => "bad_request",
+            Self::ContextTooLong => "context_too_long",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 impl Failure {
     /// A failure of `kind` without windows.
     pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {

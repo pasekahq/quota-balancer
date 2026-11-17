@@ -430,7 +430,7 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
 /// yet, so every turn ends with `unavailable`; the credential and qbd paths run in full.
 fn gateway(file: &Path) -> Result<ExitCode, String> {
     let config = qb::gateway::config::load(file).map_err(|e| e.to_string())?;
-    let qbd_bearer = bearer(config.qbd.bearer_file.clone())?.map(zeroize::Zeroizing::new);
+    let qbd_bearer = bearer(config.qbd_bearer_file.clone())?.map(zeroize::Zeroizing::new);
     let listener = if let Some(l) = listen::from_systemd().map_err(|e| e.to_string())? {
         log::info("qb gateway: using the socket passed by systemd");
         l

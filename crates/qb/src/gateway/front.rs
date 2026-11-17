@@ -44,11 +44,11 @@ pub fn serve(listener: &UnixListener, gateway: &Arc<Gateway>) -> io::Result<Infa
         .map(GatewayClient::as_client)
         .collect();
     let limits = Limits {
-        rate_per_s: config.limits.rate_per_s,
-        burst: config.limits.burst,
+        rate_per_s: config.rate_per_s,
+        burst: config.burst,
     };
     let gate = Arc::new(Mutex::new(Gate::new(&clients, &limits)));
-    let cap = config.limits.max_turns as usize + EXTRA_CONNECTIONS;
+    let cap = config.max_turns as usize + EXTRA_CONNECTIONS;
     let live = Arc::new(AtomicUsize::new(0));
     loop {
         let mut stream = match listener.accept() {
@@ -116,7 +116,7 @@ fn handle(mut stream: UnixStream, gateway: &Gateway, gate: &Mutex<Gate>) {
         return;
     }
     let uid = peer_uid(&stream);
-    let max_body = gateway.config().limits.max_body_bytes as usize;
+    let max_body = gateway.config().max_body_bytes as usize;
     let mut buf = Vec::new();
     let req = match http::read_request_limited(&mut stream, &mut buf, max_body) {
         Ok(r) => r,

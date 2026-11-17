@@ -48,7 +48,7 @@ fn gateway_may_rewrite_credentials_read_media_and_reach_qbd_only() {
     let config = qb::gateway::config::parse(
         Path::new("gateway.toml"),
         &format!(
-            "socket = \"{}\"\nmedia_dirs = [\"{}\"]\n[qbd]\nsocket = \"{}\"\n\
+            "socket = \"{}\"\nmedia_dirs = [\"{}\"]\nqbd_socket = \"{}\"\n\
              [[logins]]\nname = \"login-1\"\ncredentials = \"{}\"\n\
              [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n",
             dir.join("gw.sock").display(),

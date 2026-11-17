@@ -205,11 +205,20 @@ impl Gateway {
     /// A gateway for `config` with vendor adapters `upstreams`, OAuth refreshes through
     /// `refresher` and `qbd_bearer` for qbd, if qbd knows the gateway by token.
     pub fn new(
-        config: GatewayConfig,
+        mut config: GatewayConfig,
         upstreams: Upstreams,
         refresher: Box<dyn Refresher>,
         qbd_bearer: Option<Zeroizing<String>>,
     ) -> Self {
+        // Sorted once by alias for `routes`; a handful of entries needs no generic sort.
+        let routes = &mut config.routes;
+        for i in 1..routes.len() {
+            let mut j = i;
+            while j > 0 && routes[j - 1].alias > routes[j].alias {
+                routes.swap(j - 1, j);
+                j -= 1;
+            }
+        }
         let media = config
             .media_dirs
             .iter()
@@ -269,7 +278,7 @@ impl Gateway {
                 req.request_id
             )));
         }
-        if turns.len() >= self.config.limits.max_turns as usize {
+        if turns.len() >= self.config.max_turns as usize {
             let mut e = GatewayError::new(
                 ErrorClass::Overloaded,
                 true,
@@ -383,7 +392,7 @@ impl Gateway {
             pick.login.clone(),
         ) else {
             let error = unpickable(&pick, now, &progress.tried, &turn.route.alias);
-            let what = format!("{:?} ({})", error.class, pick.reason);
+            let what = format!("{} ({})", error.class.as_str(), pick.reason);
             return fail(error, progress, &what);
         };
         let Some(file) = self.config.credentials(&login) else {
@@ -482,7 +491,7 @@ impl Gateway {
                     relay.send(route);
                 }
                 relay.send(StreamEvent::Stop { reason: done.stop });
-                let what = format!("{:?} on {}", done.stop, sticky.login);
+                let what = format!("{} on {}", done.stop.as_str(), sticky.login);
                 if let Some(key) = progress.session.take() {
                     self.remember(key, sticky);
                 }
@@ -496,8 +505,11 @@ impl Gateway {
             return Next::Done("cut".into());
         }
         log::warn(&format!(
-            "gateway: turn {} on {}: {:?}: {}",
-            turn.request_id, sticky.login, failure.kind, failure.message
+            "gateway: turn {} on {}: {}: {}",
+            turn.request_id,
+            sticky.login,
+            failure.kind.as_str(),
+            failure.message
         ));
         attempt.class = class;
         progress.tried.push(attempt);
@@ -518,15 +530,16 @@ impl Gateway {
         }
         error.tried = std::mem::take(&mut progress.tried);
         relay.send(StreamEvent::Error { error });
-        Next::Done(format!("{class:?}"))
+        Next::Done(class.as_str().to_owned())
     }
 
-    /// Where a turn on each route would run now, by a pick that is released at once.
+    /// Where a turn on each route would run now, by a pick that is released at once; sorted by
+    /// alias.
     pub fn routes(&self) -> RoutesAnswer {
-        let mut routes: Vec<&Route> = self.config.routes.iter().collect();
-        routes.sort_by(|a, b| a.alias.cmp(&b.alias));
-        let routes = routes
-            .into_iter()
+        let routes = self
+            .config
+            .routes
+            .iter()
             .map(|r| {
                 let mut status = RouteStatus {
                     alias: r.alias.clone(),
@@ -576,7 +589,7 @@ impl Gateway {
                     login: Some(s.login.clone()),
                 }),
             ),
-            None => (route.difficulty, route.pin.clone()),
+            None => (route.difficulty, route.pin()),
         };
         PickRequest {
             role: route.role.clone(),
@@ -610,7 +623,7 @@ impl Gateway {
         let unavailable = |m: String| GatewayError::new(ErrorClass::Unavailable, true, m);
         let body = serde_json::to_vec(req).map_err(|e| unavailable(e.to_string()))?;
         let (status, resp) = client::call(
-            &self.config.qbd.socket,
+            &self.config.qbd_socket,
             "POST",
             paths::PICK,
             Some(&body),
@@ -655,7 +668,7 @@ impl Gateway {
             return;
         };
         match client::call(
-            &self.config.qbd.socket,
+            &self.config.qbd_socket,
             "POST",
             paths::REPORT,
             Some(&body),

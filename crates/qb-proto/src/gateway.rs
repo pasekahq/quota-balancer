@@ -88,7 +88,7 @@ pub struct Message {
 
 /// One message block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case", try_from = "WireBlock")]
 pub enum Block {
     /// Text.
     Text {
@@ -132,6 +132,105 @@ pub enum Block {
         /// Vendor payload.
         opaque: String,
     },
+}
+
+/// The kind of a [`Block`] on the wire.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BlockKind {
+    Text,
+    Image,
+    ToolUse,
+    ToolResult,
+    Thinking,
+}
+
+/// A [`Block`] as one flat object. Decoding through it, rather than through serde's buffered
+/// internally tagged enums, keeps the gateway binary small; the wire shape is the same.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireBlock {
+    #[serde(rename = "type")]
+    kind: BlockKind,
+    text: Option<String>,
+    media_type: Option<MediaType>,
+    path: Option<String>,
+    base64: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<Object>,
+    content: Option<String>,
+    is_error: Option<bool>,
+    vendor: Option<String>,
+    opaque: Option<String>,
+}
+
+impl TryFrom<WireBlock> for Block {
+    type Error = String;
+
+    fn try_from(w: WireBlock) -> Result<Self, String> {
+        let kind = match w.kind {
+            BlockKind::Text => "text",
+            BlockKind::Image => "image",
+            BlockKind::ToolUse => "tool_use",
+            BlockKind::ToolResult => "tool_result",
+            BlockKind::Thinking => "thinking",
+        };
+        let set = [
+            ("text", w.text.is_some()),
+            ("media_type", w.media_type.is_some()),
+            ("path", w.path.is_some()),
+            ("base64", w.base64.is_some()),
+            ("id", w.id.is_some()),
+            ("name", w.name.is_some()),
+            ("input", w.input.is_some()),
+            ("content", w.content.is_some()),
+            ("is_error", w.is_error.is_some()),
+            ("vendor", w.vendor.is_some()),
+            ("opaque", w.opaque.is_some()),
+        ];
+        let own: &[&str] = match w.kind {
+            BlockKind::Text => &["text"],
+            BlockKind::Image => &["media_type", "path", "base64"],
+            BlockKind::ToolUse => &["id", "name", "input"],
+            BlockKind::ToolResult => &["id", "content", "is_error"],
+            BlockKind::Thinking => &["vendor", "opaque"],
+        };
+        if let Some((field, _)) = set.iter().find(|(f, on)| *on && !own.contains(f)) {
+            return Err(format!("unknown field `{field}` in a `{kind}` block"));
+        }
+        let need = |v: Option<String>, field: &str| {
+            v.ok_or_else(|| format!("missing field `{field}` in a `{kind}` block"))
+        };
+        Ok(match w.kind {
+            BlockKind::Text => Self::Text {
+                text: need(w.text, "text")?,
+            },
+            BlockKind::Image => Self::Image {
+                media_type: w
+                    .media_type
+                    .ok_or("missing field `media_type` in a `image` block")?,
+                path: w.path,
+                base64: w.base64,
+            },
+            BlockKind::ToolUse => Self::ToolUse {
+                id: need(w.id, "id")?,
+                name: need(w.name, "name")?,
+                input: w
+                    .input
+                    .ok_or("missing field `input` in a `tool_use` block")?,
+            },
+            BlockKind::ToolResult => Self::ToolResult {
+                id: need(w.id, "id")?,
+                content: need(w.content, "content")?,
+                is_error: w.is_error,
+            },
+            BlockKind::Thinking => Self::Thinking {
+                vendor: need(w.vendor, "vendor")?,
+                opaque: need(w.opaque, "opaque")?,
+            },
+        })
+    }
 }
 
 /// Media type of an image.
@@ -351,6 +450,18 @@ pub enum StopReason {
     Refusal,
 }
 
+impl StopReason {
+    /// The wire name, e.g. `tool_use`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::End => "end",
+            Self::ToolUse => "tool_use",
+            Self::MaxTokens => "max_tokens",
+            Self::Refusal => "refusal",
+        }
+    }
+}
+
 /// Failure class of a turn or a rejected request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -370,6 +481,18 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
+    /// The wire name, e.g. `quota_exhausted`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::Auth => "auth",
+            Self::Unavailable => "unavailable",
+            Self::Overloaded => "overloaded",
+            Self::BadRequest => "bad_request",
+            Self::ContextTooLong => "context_too_long",
+        }
+    }
+
     /// HTTP status of a gateway answer that rejects a request with this class.
     pub fn http_status(self) -> u16 {
         match self {
@@ -500,6 +623,36 @@ mod tests {
         assert!(is_name("Turn_0-1"));
         assert!(!is_name("turn/1"));
         assert!(!is_name(""));
+    }
+
+    #[test]
+    fn blocks_take_only_their_own_fields() {
+        let ok: Block =
+            serde_json::from_str(r#"{"type":"tool_result","id":"c","content":"x"}"#).unwrap();
+        assert_eq!(
+            ok,
+            Block::ToolResult {
+                id: "c".into(),
+                content: "x".into(),
+                is_error: None
+            }
+        );
+        for (raw, want) in [
+            (
+                r#"{"type":"text","text":"a","id":"c"}"#,
+                "unknown field `id` in a `text` block",
+            ),
+            (r#"{"type":"text"}"#, "missing field `text`"),
+            (r#"{"type":"text","text":"a","x":1}"#, "unknown field `x`"),
+            (r#"{"type":"video","text":"a"}"#, "unknown variant `video`"),
+            (
+                r#"{"type":"image","base64":"AA=="}"#,
+                "missing field `media_type`",
+            ),
+        ] {
+            let e = serde_json::from_str::<Block>(raw).unwrap_err().to_string();
+            assert!(e.contains(want), "{raw}: {e}");
+        }
     }
 
     #[test]

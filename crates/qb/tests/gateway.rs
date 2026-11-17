@@ -219,12 +219,8 @@ fn start_qbd(dir: &Path) -> PathBuf {
 fn gateway_toml(dir: &Path, qbd: &Path, max_turns: u32, extra: &str) -> String {
     format!(
         r#"socket = "{dir}/gw.sock"
+qbd_socket = "{qbd}"
 media_dirs = ["{dir}/media"]
-
-[qbd]
-socket = "{qbd}"
-
-[limits]
 max_turns = {max_turns}
 max_body_bytes = 65536
 
@@ -244,7 +240,8 @@ difficulty = 1
 [[routes]]
 alias = "spare"
 role = "gateway"
-pin = {{ vendor = "vendor-b", model = "model-b" }}
+vendor = "vendor-b"
+model = "model-b"
 {extra}"#,
         dir = dir.display(),
         qbd = qbd.display()
