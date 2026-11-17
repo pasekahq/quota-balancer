@@ -14,6 +14,7 @@ pub mod api;
 pub mod auth;
 pub mod client;
 pub mod config;
+pub mod gateway;
 pub mod hooks;
 pub mod http;
 pub mod journal;
