@@ -125,7 +125,7 @@ usage limit. An unreadable value drops only its own window.
 
 | Answer | Failure kind | Client class | `qbd` outcome |
 |---|---|---|---|
-| `usage_limit_reached` (ChatGPT plan), `insufficient_quota` (API key out of credit), `billing_hard_limit_reached`, `billing_not_active`; a 429 when a subscription window is at 100 %; a 400 or 429 whose message says `usage limit`, `hit your limit`, `exceeded your current quota` or `credit balance` | `usage_limit{resets_at}` | `quota_exhausted` | `usage_limit` |
+| `usage_limit_reached` (ChatGPT plan), `insufficient_quota` (API key out of credit), `billing_hard_limit_reached`, `billing_not_active`; a 429, or a stream error with a rate code, when a subscription window is at 100 %; a 400 or 429 whose message says `usage limit`, `hit your limit`, `exceeded your current quota` or `credit balance` | `usage_limit{resets_at}` | `quota_exhausted` | `usage_limit` |
 | `usage_not_included`, `model_not_found`, 404; a 400 whose message says `model is not supported`, `does not exist`, `model not found` or `must be verified` (an organisation not verified for the model) | `model_unavailable` | `unavailable` | `model_unavailable` |
 | `context_length_exceeded`; any answer whose message says `request too large` or `must be reduced` (a request over a per-minute token limit, which no login with that limit can serve); a 400, 413 or 422 whose message says `context length`, `context window`, `maximum context`, `too many tokens`, `prompt is too long` or `input is too long` | `context_too_long` | `context_too_long` | `error` |
 | 401, 403 with a JSON body, `invalid_api_key`, `token_expired`, `account_deactivated` | `auth` | `auth` | `http_401` |

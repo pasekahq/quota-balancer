@@ -4,7 +4,9 @@
 mod common;
 
 use common::{Answer, NOW, OTHER, VENDOR, fixture, object, run};
-use qb_openai::limits::{FailureKind, RateLimits, classify_response, rate_limits};
+use qb_openai::limits::{
+    FailureKind, RateLimits, classify_response, classify_stream_error, rate_limits,
+};
 use qb_openai::request::{AuthMode, BuildError, Target, build, identity};
 use qb_openai::stream::{Progress, Reader, event_bound};
 use qb_proto::{
@@ -621,4 +623,44 @@ fn a_usage_limit_puts_its_limiting_window_at_full_use() {
     // Without subscription windows there is none to name.
     let f = classify_response(a.status, &[], &a.body, NOW);
     assert_eq!(f.windows, Vec::<WindowReport>::new());
+}
+
+#[test]
+fn a_stream_rate_limit_on_an_exhausted_window_is_a_usage_limit() {
+    let exhausted = [
+        ("x-codex-primary-used-percent", "100.0"),
+        ("x-codex-primary-window-minutes", "300"),
+        ("x-codex-primary-reset-after-seconds", "600"),
+    ];
+    let f = classify_stream_error(
+        "rate_limit_exceeded",
+        "Rate limit reached",
+        &rate_limits(&exhausted, NOW),
+    );
+    assert_eq!(
+        f.kind,
+        FailureKind::UsageLimit {
+            resets_at: Some(NOW + 600)
+        }
+    );
+    assert_eq!(
+        f.windows,
+        vec![window("five_hour", 1.0, Some(NOW + 600), Some(18_000))]
+    );
+
+    let open = [
+        ("x-codex-primary-used-percent", "40.0"),
+        ("x-codex-primary-window-minutes", "300"),
+    ];
+    let f = classify_stream_error(
+        "rate_limit_exceeded",
+        "Rate limit reached. Please try again in 2s.",
+        &rate_limits(&open, NOW),
+    );
+    assert_eq!(
+        f.kind,
+        FailureKind::RateLimited {
+            retry_after: Some(2)
+        }
+    );
 }

@@ -472,7 +472,8 @@ fn by_detail(status: Option<u16>, d: &Detail, limits: &RateLimits) -> FailureKin
         Some(403) if !d.json => FailureKind::Unavailable,
         Some(401 | 403) => FailureKind::Auth,
         _ if auth => FailureKind::Auth,
-        Some(429) => {
+        // A stream error has no status; its rate code on an exhausted window is the same limit.
+        Some(429) | None if status.is_some() || rate => {
             if limits.exhausted() || says(&d.message, USAGE_LIMIT_PHRASES) {
                 usage_limit()
             } else {
