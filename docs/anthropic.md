@@ -172,13 +172,20 @@ or token.
 
 `qb gateway` serves `POST /v1/messages` on its unix socket to the peers of its C4 front, when its
 config has a `[messages]` table ([config.md](config.md#gateway-config)), in
-`crates/qb/src/gateway/messages.rs`. `model` is a client model name of `messages.models` or a
-route alias; `native_vendor` is `messages.vendor`. Request headers other than the framing are ignored: `anthropic-version`,
-`anthropic-beta`, `x-api-key` and the SDK's own leave the turn as it is. The decoded turn runs
-through the same core as a C4 turn, with the same rotation, and the answer is:
+`crates/qb/src/gateway/messages.rs`. With `messages.listen` it also serves it on that loopback
+TCP address, where the request head must carry the local client token in `x-api-key` or
+`Authorization: Bearer`; the token's SHA-256 is compared in constant time with
+`messages.token_sha256` before the body is read. A missing or wrong token is 401
+`authentication_error`, any other method or path 404 `not_found_error`, both in the Messages
+error format. `model` is a client model name of `messages.models` or a route alias;
+`native_vendor` is `messages.vendor`. Other request headers are ignored: `anthropic-version`,
+`anthropic-beta`, `x-api-key` on the unix socket and the SDK's own leave the turn as it is. The
+decoded turn runs through the same core as a C4 turn, with the same rotation, and the answer is:
 
 - `stream: true`: `200` with `content-type: text/event-stream`, one chunk per canonical event
-  from `front::SseEncoder`; an error after the first event is an SSE `error` event;
+  from `front::SseEncoder`; an error after the first event is an SSE `error` event; once
+  `message_start` went out, a stream silent for `messages.ping_interval_s` gets a `ping` event,
+  so client read timeouts outlast a slow vendor;
 - `stream: false`: one `front::Assembler` body as `application/json` once the turn ended;
 - an error before the first event, an error of a non-streaming turn and a rejected request:
   `front::error_response` as status, `retry-after`, `x-should-retry` and Messages error body;

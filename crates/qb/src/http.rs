@@ -53,6 +53,24 @@ pub enum ReadError {
     },
     /// `POST` without `Content-Length`.
     LengthRequired,
+    /// The head was refused by the caller's check; the body is not read.
+    Refused {
+        /// Declared body bytes not read yet.
+        unread: usize,
+    },
+}
+
+/// What a request's head says before its body is read.
+#[derive(Debug, Clone, Copy)]
+pub struct Head<'a> {
+    /// Method.
+    pub method: Method,
+    /// Path without the query string.
+    pub path: &'a str,
+    /// Bearer token from `Authorization`, if any.
+    pub bearer: Option<&'a str>,
+    /// Value of `x-api-key`, if any.
+    pub api_key: Option<&'a str>,
 }
 
 impl From<io::Error> for ReadError {
@@ -67,17 +85,18 @@ impl From<io::Error> for ReadError {
 /// # Errors
 /// See [`ReadError`].
 pub fn read_request<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<Request, ReadError> {
-    read_request_limited(r, buf, &|_, _| MAX_BODY)
+    read_request_limited(r, buf, &|_| Some(MAX_BODY))
 }
 
-/// [`read_request`] with a body of at most `max_body(method, path)` bytes.
+/// [`read_request`] with a body of at most `max_body(head)` bytes; `None` refuses the request
+/// before its body is read.
 ///
 /// # Errors
 /// See [`ReadError`].
 pub fn read_request_limited<R: Read>(
     r: &mut R,
     buf: &mut Vec<u8>,
-    max_body: &dyn Fn(Method, &str) -> usize,
+    max_body: &dyn Fn(&Head<'_>) -> Option<usize>,
 ) -> Result<Request, ReadError> {
     buf.clear();
     let mut chunk = [0u8; 2048];
@@ -92,9 +111,10 @@ pub fn read_request_limited<R: Read>(
                     _ => Method::Other,
                 };
                 let raw_path = req.path.unwrap_or("/");
-                let path = raw_path.split('?').next().unwrap_or("/").to_owned();
+                let path = raw_path.split('?').next().unwrap_or("/");
                 let mut content_length = None;
                 let mut bearer = None;
+                let mut api_key = None;
                 for h in req.headers.iter() {
                     if h.name.eq_ignore_ascii_case("content-length") {
                         let v = std::str::from_utf8(h.value).map_err(|_| ReadError::Malformed)?;
@@ -108,17 +128,28 @@ pub fn read_request_limited<R: Read>(
                     } else if h.name.eq_ignore_ascii_case("authorization") {
                         let v = std::str::from_utf8(h.value).map_err(|_| ReadError::Malformed)?;
                         if let Some(token) = v.strip_prefix("Bearer ") {
-                            bearer = Some(token.trim().to_owned());
+                            bearer = Some(token.trim());
                         }
+                    } else if h.name.eq_ignore_ascii_case("x-api-key") {
+                        let v = std::str::from_utf8(h.value).map_err(|_| ReadError::Malformed)?;
+                        api_key = Some(v.trim());
                     }
                 }
                 if method == Method::Post && content_length.is_none() {
                     return Err(ReadError::LengthRequired);
                 }
                 let want = content_length.unwrap_or(0);
-                if want > max_body(method, &path) {
-                    let unread = want.saturating_sub(buf.len() - head_len);
-                    return Err(ReadError::BodyTooLarge { unread });
+                let unread = want.saturating_sub(buf.len() - head_len);
+                let head = Head {
+                    method,
+                    path,
+                    bearer,
+                    api_key,
+                };
+                match max_body(&head) {
+                    None => return Err(ReadError::Refused { unread }),
+                    Some(max) if want > max => return Err(ReadError::BodyTooLarge { unread }),
+                    Some(_) => {}
                 }
                 let mut body = Vec::with_capacity(want);
                 let already = &buf[head_len..];
@@ -133,8 +164,8 @@ pub fn read_request_limited<R: Read>(
                 }
                 return Ok(Request {
                     method,
-                    path,
-                    bearer,
+                    path: path.to_owned(),
+                    bearer: bearer.map(str::to_owned),
                     body,
                 });
             }
@@ -337,11 +368,32 @@ mod tests {
         let raw = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
         let mut buf = Vec::new();
         assert!(matches!(
-            read_request_limited(&mut &raw[..], &mut buf, &|_, _| 4),
+            read_request_limited(&mut &raw[..], &mut buf, &|_| Some(4)),
             Err(ReadError::BodyTooLarge { .. })
         ));
-        let r = read_request_limited(&mut &raw[..], &mut buf, &|_, _| 5).expect("fits");
+        let r = read_request_limited(&mut &raw[..], &mut buf, &|_| Some(5)).expect("fits");
         assert_eq!(r.body, b"hello");
+    }
+
+    #[test]
+    fn a_refused_head_leaves_the_body_unread() {
+        let raw = b"POST /v1/messages HTTP/1.1\r\nX-Api-Key: k1\r\nAuthorization: Bearer b1\r\n\
+Content-Length: 9\r\n\r\nhel";
+        let mut buf = Vec::new();
+        let seen = std::cell::RefCell::new(String::new());
+        let refuse = |h: &Head<'_>| {
+            *seen.borrow_mut() =
+                format!("{:?} {} {:?} {:?}", h.method, h.path, h.bearer, h.api_key);
+            None
+        };
+        assert!(matches!(
+            read_request_limited(&mut &raw[..], &mut buf, &refuse),
+            Err(ReadError::Refused { unread: 6 })
+        ));
+        assert_eq!(
+            seen.into_inner(),
+            r#"Post /v1/messages Some("b1") Some("k1")"#
+        );
     }
 
     #[test]

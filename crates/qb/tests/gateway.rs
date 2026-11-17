@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -324,6 +325,17 @@ fn own_uid() -> u32 {
 /// A rig whose gateway runs as `gateway_uid`, with `extra` in its config: appended when it is
 /// a table, else put first as top-level keys.
 fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_uid: u32) -> Rig {
+    rig_on(max_turns, files, extra, gateway_uid, None)
+}
+
+/// [`rig_as`] with the Messages front also on `loopback`.
+fn rig_on(
+    max_turns: u32,
+    files: &[(&str, String, u32)],
+    extra: &str,
+    gateway_uid: u32,
+    loopback: Option<TcpListener>,
+) -> Rig {
     let dir = temp_dir("gw");
     credentials(&dir, files);
     let qbd = start_qbd(&dir, QBD);
@@ -341,6 +353,7 @@ fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_ui
         vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
         Box::new(Counting(Arc::clone(&refreshes))),
         gateway_uid,
+        loopback,
     );
     Rig {
         dir,
@@ -351,18 +364,27 @@ fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_ui
     }
 }
 
-/// Serves a gateway of config `text` with `upstreams` as `gateway_uid`; its socket.
+/// Serves a gateway of config `text` with `upstreams` as `gateway_uid`, and its Messages front
+/// on `loopback` when set; its socket.
 fn serve_gateway(
     text: &str,
     upstreams: Upstreams,
     refresher: Box<dyn Refresher>,
     gateway_uid: u32,
+    loopback: Option<TcpListener>,
 ) -> PathBuf {
     let config = qb::gateway::config::parse(Path::new("gateway.toml"), text).unwrap();
     let gw = config.socket.clone();
     let gateway = Gateway::new(config, upstreams, refresher, None);
     let listener = UnixListener::bind(&gw).unwrap();
-    std::thread::spawn(move || front::serve(&listener, &Arc::new(gateway), gateway_uid));
+    std::thread::spawn(move || {
+        front::serve(
+            &listener,
+            loopback.as_ref(),
+            &Arc::new(gateway),
+            gateway_uid,
+        )
+    });
     gw
 }
 
@@ -418,7 +440,7 @@ fn finish_raw(raw: &[u8]) -> (u16, Vec<u8>) {
 }
 
 /// Status, head and (dechunked) body of a complete answer.
-fn finish(mut s: UnixStream, already: Vec<u8>) -> (u16, String, Vec<u8>) {
+fn finish(mut s: impl Read, already: Vec<u8>) -> (u16, String, Vec<u8>) {
     let mut raw = already;
     s.read_to_end(&mut raw).unwrap();
     let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
@@ -1405,8 +1427,16 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         .local_addr()
         .unwrap();
     let keys = format!("{ANTHROPIC_KEY}\nbase_url = \"http://{closed}\"");
+    // A free port the gateway binds itself, before its sandbox.
+    let listen = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let front = format!(
+        "{MESSAGES_FRONT}listen = \"{listen}\"\ntoken_sha256 = \"{CLIENT_TOKEN_SHA256}\"\n"
+    );
     let config = dir.join("gateway.toml");
-    std::fs::write(&config, gateway_toml(&dir, &qbd, 2, [&keys, &keys], "")).unwrap();
+    std::fs::write(&config, gateway_toml(&dir, &qbd, 2, [&keys, &keys], &front)).unwrap();
     let mut child = Command::new(exe)
         .args(["gateway", "--config"])
         .arg(&config)
@@ -1450,6 +1480,8 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     assert!(!String::from_utf8_lossy(&body).contains(MARK));
     let (status, body) = call(&gw, "GET", paths::MODEL_ROUTES, "");
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+
+    loopback_admits_the_client_token_only(listen);
     let mut logged = Vec::new();
     while let Some(line) = line_with(&lines, "", Duration::from_millis(500)) {
         logged.push(line);
@@ -1458,6 +1490,8 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         logged.iter().any(|l| l.contains("listening on")),
         "{logged:?}"
     );
+    let serving = format!("serving /v1/messages on {listen}");
+    assert!(logged.iter().any(|l| l.contains(&serving)), "{logged:?}");
     assert!(
         logged
             .iter()
@@ -1472,6 +1506,20 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     };
     assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
     assert_eq!(s.leases, Vec::new());
+}
+
+/// Over the binary's loopback listener `listen`: no token is 401, the token reaches a turn,
+/// which fails `unavailable` as the vendor port is closed.
+fn loopback_admits_the_client_token_only(listen: SocketAddr) {
+    let body = sdk_body("chat", false).to_string();
+    let (status, _, _) = finish(
+        tcp_send(listen, "POST", paths::MESSAGES, "", &body),
+        Vec::new(),
+    );
+    assert_eq!(status, 401);
+    let token = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+    let s = tcp_send(listen, "POST", paths::MESSAGES, &token, &body);
+    assert_eq!(error_type(s), (502, "api_error".into()));
 }
 
 /// What the scripted vendor answers to one request.
@@ -1664,18 +1712,29 @@ fn vendor_rig(
     files: &[(&str, String, u32)],
     logins: impl Fn(&Vendor) -> [String; 2],
 ) -> (Rig, Vendor) {
+    vendor_rig_on(files, logins, MESSAGES_FRONT, None)
+}
+
+/// [`vendor_rig`] with the `[messages]` table `front` and the Messages front also on `loopback`.
+fn vendor_rig_on(
+    files: &[(&str, String, u32)],
+    logins: impl Fn(&Vendor) -> [String; 2],
+    front: &str,
+    loopback: Option<TcpListener>,
+) -> (Rig, Vendor) {
     let vendor = Vendor::start();
     let dir = temp_dir("gwv");
     credentials(&dir, files);
     let qbd = start_qbd(&dir, QBD);
     let keys = logins(&vendor);
-    let text = gateway_toml(&dir, &qbd, 4, [&keys[0], &keys[1]], MESSAGES_FRONT);
+    let text = gateway_toml(&dir, &qbd, 4, [&keys[0], &keys[1]], front);
     let refreshes = Arc::new(AtomicUsize::new(0));
     let gw = serve_gateway(
         &text,
         vec![(Api::Anthropic, Box::new(Anthropic::new()))],
         Box::new(Counting(Arc::clone(&refreshes))),
         own_uid(),
+        loopback,
     );
     let rig = Rig {
         dir,
@@ -1908,7 +1967,7 @@ fn stream_start() -> Vec<u8> {
 }
 
 /// Reads `s` until its stream holds a `text_delta`; the bytes so far.
-fn until_text(s: &mut UnixStream) -> Vec<u8> {
+fn until_text(s: &mut impl Read) -> Vec<u8> {
     let mut seen = Vec::new();
     let mut chunk = [0u8; 1024];
     while !String::from_utf8_lossy(&seen).contains("text_delta") {
@@ -2029,6 +2088,7 @@ fn oauth_rig(login_1: String, qbd_config: &str) -> (Rig, Vendor, Vendor) {
         vec![(Api::Anthropic, Box::new(Anthropic::new()))],
         Box::new(AnthropicOauth::new(&config)),
         own_uid(),
+        None,
     );
     let rig = Rig {
         dir,
@@ -2573,6 +2633,242 @@ fn a_messages_client_that_closes_its_connection_shuts_the_vendor_stream_down() {
     vendor.answer(Answer::Hold(stream_start()));
     let mut client = sdk_send(&r.gw, &sdk_body("model-2025-01-01", true), None);
     until_text(&mut client);
+    let dropped = std::time::Instant::now();
+    drop(client);
+    let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(closed.duration_since(dropped) < Duration::from_secs(1));
+    let mut leases = 1;
+    for _ in 0..50 {
+        leases = state(&r.qbd).leases.len();
+        if leases == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(leases, 0, "the lease is released");
+}
+
+/// The local client token of the loopback tests, as the recorded SDK request carries it.
+const CLIENT_TOKEN: &str = "qb-local-test-token";
+/// `printf %s qb-local-test-token | sha256sum`.
+const CLIENT_TOKEN_SHA256: &str =
+    "d313474a473655cadbfe1cbb9e2314d155d497a6902d4c72a2fa8dee7fb42444";
+
+/// A loopback listener on a free port and the `[messages]` table that serves it, `keys` added.
+fn loopback_front(keys: &str) -> (TcpListener, SocketAddr, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let front = format!(
+        "{MESSAGES_FRONT}listen = \"{addr}\"\ntoken_sha256 = \"{CLIENT_TOKEN_SHA256}\"\n{keys}\n"
+    );
+    (listener, addr, front)
+}
+
+/// Sends one request to `addr` with the header lines `auth` and leaves the connection open.
+fn tcp_send(addr: SocketAddr, method: &str, path: &str, auth: &str, body: &str) -> TcpStream {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    s
+}
+
+/// Status and Messages error type of a complete answer.
+fn error_type(s: impl Read) -> (u16, String) {
+    let (status, _, body) = finish(s, Vec::new());
+    let body: Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&body)));
+    assert_eq!(body["type"], "error", "{body}");
+    (status, body["error"]["type"].as_str().unwrap().to_owned())
+}
+
+#[test]
+fn the_loopback_listener_serves_messages_to_the_client_token_only() {
+    let (listener, addr, front) = loopback_front("");
+    let r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let body = sdk_body("chat", true).to_string();
+    for auth in [
+        format!("X-Api-Key: {CLIENT_TOKEN}\r\n"),
+        format!("Authorization: Bearer {CLIENT_TOKEN}\r\n"),
+    ] {
+        let s = tcp_send(addr, "POST", paths::MESSAGES, &auth, &body);
+        let (status, head, sse) = finish(s, Vec::new());
+        assert_eq!(status, 200, "{auth}{}", String::from_utf8_lossy(&sse));
+        assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+        let got = frames(&sse);
+        assert_eq!(names(&got).first(), Some(&"message_start"));
+        assert_eq!(names(&got).last(), Some(&"message_stop"));
+    }
+    assert_eq!(r.fake.calls().len(), 2);
+
+    // Heads that announce a body they never send: the 401 does not wait for it.
+    for auth in [
+        String::new(),
+        "X-Api-Key: qb-wrong-token\r\n".into(),
+        "Authorization: Bearer qb-wrong-token\r\n".into(),
+        format!("X-Api-Key: {CLIENT_TOKEN}-2\r\n"),
+        format!("Authorization: {CLIENT_TOKEN}\r\n"),
+    ] {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(
+            s,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Length: 60000\r\n\r\n",
+            paths::MESSAGES
+        )
+        .unwrap();
+        assert_eq!(
+            error_type(s),
+            (401, "authentication_error".into()),
+            "{auth}"
+        );
+    }
+
+    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+    for (method, path) in [
+        ("GET", paths::HEALTH),
+        ("GET", paths::MODEL_ROUTES),
+        ("POST", paths::MODEL_TURN),
+        ("POST", paths::MODEL_CANCEL),
+        ("GET", paths::MESSAGES),
+        ("POST", "/v1/messages/count_tokens"),
+    ] {
+        let s = tcp_send(addr, method, path, &auth, "{}");
+        assert_eq!(error_type(s), (404, "not_found_error".into()), "{path}");
+    }
+    assert_eq!(
+        r.fake.calls().len(),
+        2,
+        "a refused request reaches no vendor"
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+    let (status, _) = call(&r.gw, "GET", paths::HEALTH, "");
+    assert_eq!(status, 200, "the unix socket needs no token");
+}
+
+/// The request the official Anthropic Python SDK's `messages.stream` sends with the base URL
+/// `http://127.0.0.1:8080` and the key [`CLIENT_TOKEN`], recorded byte for byte.
+fn recorded_sdk_request() -> Vec<u8> {
+    let v: Value = serde_json::from_slice(&vendor_fixture("client_sdk_http_request.json")).unwrap();
+    let text = |v: &Value| v.as_str().unwrap().to_owned();
+    let mut raw = format!("{} {} HTTP/1.1\r\n", text(&v["method"]), text(&v["path"]));
+    for h in v["headers"].as_array().unwrap() {
+        write!(raw, "{}: {}\r\n", text(&h[0]), text(&h[1])).unwrap();
+    }
+    raw.push_str("\r\n");
+    raw.push_str(&text(&v["body"]));
+    raw.into_bytes()
+}
+
+#[test]
+fn a_recorded_sdk_request_streams_over_the_loopback_listener() {
+    let (listener, addr, front) = loopback_front("");
+    let (r, vendor) = vendor_rig_on(&key_files(), two_keys, &front, Some(listener));
+    for _ in 0..2 {
+        vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    }
+    let raw = recorded_sdk_request();
+    let mut tcp = TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    tcp.write_all(&raw).unwrap();
+    let (status, head, sse) = finish(tcp, Vec::new());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+    let got = frames(&sse);
+    assert_eq!(
+        names(&got),
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    let start: Value = serde_json::from_str(&got[0].data).unwrap();
+    assert_eq!(start["message"]["model"], "model-2025-01-01");
+    assert_eq!(
+        content_of(&sse),
+        content_of(&vendor_fixture("upstream_text.sse"))
+    );
+
+    let mut unix = UnixStream::connect(&r.gw).unwrap();
+    unix.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    unix.write_all(&raw).unwrap();
+    let (status, _, over_unix) = finish(unix, Vec::new());
+    assert_eq!(status, 200);
+    let tail = |sse: &[u8]| frames(sse).into_iter().skip(1).collect::<Vec<_>>();
+    assert_eq!(tail(&sse), tail(&over_unix), "both listeners answer alike");
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].body, sent[1].body);
+    assert_eq!(sent[0].body["model"], "model-large");
+    assert_eq!(sent[0].body["tools"][0]["name"], "read");
+    assert!(
+        sent[0].body.to_string().contains("What is in notes.txt?"),
+        "{}",
+        sent[0].body
+    );
+    for s in sent.iter() {
+        let key = s.header("x-api-key");
+        assert!(
+            matches!(key, Some("test-token-1" | "test-token-2")),
+            "{key:?}"
+        );
+        assert!(
+            s.headers.iter().all(|(_, v)| !v.contains(CLIENT_TOKEN)),
+            "the client token stays local"
+        );
+    }
+}
+
+#[test]
+fn a_silent_stream_gets_pings_after_message_start_only() {
+    let (listener, addr, front) = loopback_front("ping_interval_s = 1");
+    let (r, vendor) = vendor_rig_on(&key_files(), two_keys, &front, Some(listener));
+    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+    let body = sdk_body("model-2025-01-01", true).to_string();
+
+    let silence = Duration::from_millis(1500);
+    let refused = Box::new(recorded("400_invalid", None));
+    vendor.answer(Answer::After(silence, refused));
+    let asked = std::time::Instant::now();
+    let s = tcp_send(addr, "POST", paths::MESSAGES, &auth, &body);
+    let (status, head, answer) = finish(s, Vec::new());
+    assert!(asked.elapsed() >= silence);
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&answer));
+    assert!(head.contains("Content-Type: application/json"), "{head}");
+    assert!(!String::from_utf8_lossy(&answer).contains("ping"));
+
+    vendor.answer(Answer::Hold(stream_start()));
+    let mut client = tcp_send(addr, "POST", paths::MESSAGES, &auth, &body);
+    until_text(&mut client);
+    let quiet = std::time::Instant::now();
+    let mut pinged = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while pinged.len() < 2 {
+        let n = client.read(&mut chunk).unwrap();
+        assert!(n > 0, "stream ended early");
+        let text = String::from_utf8_lossy(&chunk[..n]).into_owned();
+        assert!(text.contains("event: ping\n"), "{text:?}");
+        pinged.push(quiet.elapsed());
+    }
+    assert!(pinged[0] >= Duration::from_millis(900), "{pinged:?}");
+    assert!(
+        pinged[1].saturating_sub(pinged[0]) >= Duration::from_millis(900),
+        "{pinged:?}"
+    );
+    assert!(pinged[1] < Duration::from_secs(4), "{pinged:?}");
+
     let dropped = std::time::Instant::now();
     drop(client);
     let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();

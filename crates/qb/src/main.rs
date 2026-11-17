@@ -35,8 +35,10 @@ COMMANDS:
                                         else /etc/qb/qbd.toml
     agent --config PATH                 run the credential-owner agent: wait for the daemon's
                                         probe jobs and answer them
-    gateway --config PATH               run the model gateway: serve /v1/model/* on the socket
-                                        named in its config, picking and reporting via qbd
+    gateway --config PATH               run the model gateway: serve /v1/model/* and
+                                        /v1/messages on the socket named in its config,
+                                        /v1/messages also on its loopback port, picking and
+                                        reporting via qbd
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -445,6 +447,14 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         ));
         l
     };
+    let loopback = match config.messages.as_ref().and_then(|m| m.listen) {
+        Some(addr) => {
+            let l = std::net::TcpListener::bind(addr).map_err(|e| format!("{addr}: {e}"))?;
+            log::info(&format!("qb gateway: serving /v1/messages on {addr}"));
+            Some(l)
+        }
+        None => None,
+    };
     let gaps = sandbox::harden_gateway(&config)?;
     if !gaps.is_empty() {
         log::warn(&format!(
@@ -457,6 +467,7 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
     let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer);
     let Err(e) = front::serve(
         &listener,
+        loopback.as_ref(),
         &std::sync::Arc::new(gateway),
         rustix::process::geteuid().as_raw(),
     );

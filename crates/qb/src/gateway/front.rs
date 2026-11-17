@@ -1,14 +1,17 @@
-//! The gateway's unix socket: the C4 front, `/v1/model/turn`, `/v1/model/routes`,
-//! `/v1/model/cancel` and `/v1/health`, and the Messages front's `/v1/messages`
-//! ([`super::messages`]). One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`]
-//! at once. On the C4 front every rejection is a non-200 [`GatewayError`], every admitted turn a
-//! `200` with a chunked NDJSON stream whose head goes out with its first event. The main thread
-//! accepts and cancels a turn whose client hangs up.
+//! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
+//! `/v1/model/routes`, `/v1/model/cancel` and `/v1/health`, and the Messages front's
+//! `/v1/messages` ([`super::messages`]); the optional loopback TCP listener serves only
+//! `/v1/messages`, to clients with the client token. One thread per connection, at most
+//! `max_turns` + [`EXTRA_CONNECTIONS`] at once. On the C4 front every rejection is a non-200
+//! [`GatewayError`], every admitted turn a `200` with a chunked NDJSON stream whose head goes out
+//! with its first event. The main thread accepts, cancels a turn whose client hangs up and pings
+//! silent Messages streams.
 
 use std::cell::Cell;
 use std::convert::Infallible;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,14 +21,15 @@ use qb_proto::{
     API_VERSION, CancelAnswer, CancelRequest, ErrorClass, GatewayError, HealthResponse,
     HealthStatus, StreamEvent, TurnRequest, paths,
 };
-use rustix::event::{EventfdFlags, PollFd, PollFlags};
+use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use serde::Serialize;
 
 use super::core::{Cancel, Gateway};
-use super::messages;
+use super::messages::{self, Keepalive};
 use super::upstream::{CancelToken, Flow};
-use crate::http::{self, Method, ReadError};
+use crate::auth::token_matches;
+use crate::http::{self, Head, Method, ReadError};
 use crate::log;
 use crate::server::{IO_TIMEOUT, discard, drain_pending};
 
@@ -45,16 +49,94 @@ pub const READ_DEADLINE: Duration = Duration::from_secs(10);
 /// Content type of the turn stream.
 pub const NDJSON: &str = "application/x-ndjson";
 
-/// A client connection of a running turn and the turn's cancel token.
+/// Caller name of the requests on the loopback listener, which carry the client token, not a uid.
+const TOKEN_CALLER: &str = "client-token";
+
+/// A client connection: a peer of the unix socket or of the loopback TCP listener.
+pub(super) enum Conn {
+    /// A unix socket peer, known by its uid.
+    Unix(UnixStream),
+    /// A loopback TCP peer, known by its client token.
+    Tcp(TcpStream),
+}
+
+impl Conn {
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(match self {
+            Self::Unix(s) => Self::Unix(s.try_clone()?),
+            Self::Tcp(s) => Self::Tcp(s.try_clone()?),
+        })
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Unix(s) => s.set_read_timeout(timeout),
+            Self::Tcp(s) => s.set_read_timeout(timeout),
+        }
+    }
+
+    pub(super) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Unix(s) => s.set_write_timeout(timeout),
+            Self::Tcp(s) => s.set_write_timeout(timeout),
+        }
+    }
+
+    /// The poll events that tell a hung-up client: a TCP peer's close only shuts our read side.
+    fn hangup_events(&self) -> PollFlags {
+        match self {
+            Self::Unix(_) => PollFlags::empty(),
+            Self::Tcp(_) => PollFlags::RDHUP,
+        }
+    }
+}
+
+impl AsFd for Conn {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Unix(s) => s.as_fd(),
+            Self::Tcp(s) => s.as_fd(),
+        }
+    }
+}
+
+impl io::Read for &Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Conn::Unix(s) => (&mut &*s).read(buf),
+            Conn::Tcp(s) => (&mut &*s).read(buf),
+        }
+    }
+}
+
+impl io::Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(s) => s.write(buf),
+            Self::Tcp(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Unix(s) => s.flush(),
+            Self::Tcp(s) => s.flush(),
+        }
+    }
+}
+
+/// A client connection of a running turn, the turn's cancel token and, for a Messages stream,
+/// its keepalive.
 #[derive(Clone)]
 struct Watched {
     id: u64,
-    stream: Arc<UnixStream>,
+    stream: Arc<Conn>,
     cancel: CancelToken,
+    keepalive: Option<Arc<Keepalive>>,
 }
 
 /// The client connections of running turns, which the main thread polls for a hang-up so a turn
-/// blocked on a silent vendor ends with its client.
+/// blocked on a silent vendor ends with its client, and pings when a Messages stream is silent.
 pub(super) struct Watch {
     turns: Mutex<Vec<Watched>>,
     /// An eventfd that wakes the main thread when the set changes.
@@ -74,6 +156,12 @@ impl Drop for Watching<'_> {
     }
 }
 
+/// Which listeners have a connection waiting.
+struct Ready {
+    unix: bool,
+    tcp: bool,
+}
+
 impl Watch {
     fn new() -> io::Result<Self> {
         let wake = rustix::event::eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
@@ -88,11 +176,22 @@ impl Watch {
         self.turns.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Watches `stream` until the guard drops; a hang-up cancels `cancel`.
-    pub(super) fn add(&self, stream: &UnixStream, cancel: CancelToken) -> io::Result<Watching<'_>> {
+    /// Watches `stream` until the guard drops; a hang-up cancels `cancel`, and `keepalive` gets
+    /// its pings.
+    pub(super) fn add(
+        &self,
+        stream: &Conn,
+        cancel: CancelToken,
+        keepalive: Option<Arc<Keepalive>>,
+    ) -> io::Result<Watching<'_>> {
         let stream = Arc::new(stream.try_clone()?);
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.turns().push(Watched { id, stream, cancel });
+        self.turns().push(Watched {
+            id,
+            stream,
+            cancel,
+            keepalive,
+        });
         self.ring();
         Ok(Watching { watch: self, id })
     }
@@ -102,25 +201,37 @@ impl Watch {
         self.ring();
     }
 
-    fn ring(&self) {
+    /// Wakes the main thread to poll the set again.
+    pub(super) fn ring(&self) {
         // A full counter already wakes the main thread.
         let _ = rustix::io::write(&self.wake, &1u64.to_ne_bytes());
     }
 
-    /// Sleeps until `listener` has a connection, cancelling the turns whose clients hang up
-    /// meanwhile.
-    fn wait(&self, listener: &UnixListener) {
+    /// Sleeps until `listener` or `loopback` has a connection, cancelling the turns whose clients
+    /// hang up and pinging the silent Messages streams meanwhile. Without a stream to ping it
+    /// sleeps without a timeout.
+    fn wait(&self, listener: &UnixListener, loopback: Option<&TcpListener>) -> Ready {
         loop {
             let watched = self.turns().clone();
-            let mut fds = Vec::with_capacity(2 + watched.len());
-            fds.push(PollFd::new(listener, PollFlags::IN));
+            let mut fds = Vec::with_capacity(3 + watched.len());
             fds.push(PollFd::new(&self.wake, PollFlags::IN));
+            fds.push(PollFd::new(listener, PollFlags::IN));
+            if let Some(l) = loopback {
+                fds.push(PollFd::new(l, PollFlags::IN));
+            }
+            let first = fds.len();
             fds.extend(
                 watched
                     .iter()
-                    .map(|w| PollFd::new(&*w.stream, PollFlags::empty())),
+                    .map(|w| PollFd::new(&*w.stream, w.stream.hangup_events())),
             );
-            match rustix::event::poll(&mut fds, None) {
+            let due = watched
+                .iter()
+                .filter_map(|w| w.keepalive.as_ref()?.due())
+                .min();
+            let timeout = due
+                .and_then(|d| Timespec::try_from(d.saturating_duration_since(Instant::now())).ok());
+            match rustix::event::poll(&mut fds, timeout.as_ref()) {
                 Ok(_) | Err(Errno::INTR) => {}
                 Err(e) => {
                     log::warn(&format!("gateway: poll failed: {e}"));
@@ -128,30 +239,43 @@ impl Watch {
                     continue;
                 }
             }
-            if fds[1].revents().contains(PollFlags::IN) {
+            if fds[0].revents().contains(PollFlags::IN) {
                 let _ = rustix::io::read(&self.wake, &mut [0u8; 8]);
             }
-            for (w, fd) in watched.iter().zip(&fds[2..]) {
-                if fd.revents().intersects(PollFlags::HUP | PollFlags::ERR) {
+            let hangup = PollFlags::HUP | PollFlags::ERR | PollFlags::RDHUP;
+            for (w, fd) in watched.iter().zip(&fds[first..]) {
+                if fd.revents().intersects(hangup) {
                     self.remove(w.id);
                     w.cancel.cancel();
                 }
             }
-            if fds[0].revents().contains(PollFlags::IN) {
-                return;
+            let now = Instant::now();
+            for w in &watched {
+                if let Some(keepalive) = &w.keepalive {
+                    keepalive.tick(&w.stream, now);
+                }
+            }
+            let ready = Ready {
+                unix: fds[1].revents().contains(PollFlags::IN),
+                tcp: loopback.is_some() && fds[2].revents().contains(PollFlags::IN),
+            };
+            if ready.unix || ready.tcp {
+                return ready;
             }
         }
     }
 }
 
 /// Serves `gateway` on `listener` to peers of uid `own_uid`, the gateway's own, and the
-/// configured clients. The main thread accepts and watches the clients of running turns; each
+/// configured clients, and its Messages front on `loopback` to peers with the client token of
+/// `[messages]`. The main thread accepts and watches the clients of running turns; each
 /// connection runs on its own thread.
 ///
 /// # Errors
 /// The eventfd of the watch cannot be created.
 pub fn serve(
     listener: &UnixListener,
+    loopback: Option<&TcpListener>,
     gateway: &Arc<Gateway>,
     own_uid: u32,
 ) -> io::Result<Infallible> {
@@ -160,46 +284,56 @@ pub fn serve(
     let live = Arc::new(AtomicUsize::new(0));
     let watch = Arc::new(Watch::new()?);
     loop {
-        watch.wait(listener);
-        let mut stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                log::warn(&format!("gateway: accept failed: {e}"));
-                std::thread::sleep(Duration::from_millis(50));
+        let ready = watch.wait(listener, loopback);
+        let mut accepted = Vec::with_capacity(2);
+        if ready.unix {
+            accepted.push(listener.accept().map(|(s, _)| Conn::Unix(s)));
+        }
+        if let (true, Some(l)) = (ready.tcp, loopback) {
+            accepted.push(l.accept().map(|(s, _)| Conn::Tcp(s)));
+        }
+        for conn in accepted {
+            let mut conn = match conn {
+                Ok(c) => c,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    log::warn(&format!("gateway: accept failed: {e}"));
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            };
+            if live.load(Ordering::SeqCst) >= cap {
+                let _ = conn.set_write_timeout(Some(IO_TIMEOUT));
+                let mut e = GatewayError::new(ErrorClass::Overloaded, true, "too many connections");
+                e.retry_after = Some(1);
+                match conn {
+                    Conn::Unix(_) => reply(&mut conn, 429, &e),
+                    Conn::Tcp(_) => messages::reject(&mut conn, Some(429), &e),
+                }
                 continue;
             }
-        };
-        if live.load(Ordering::SeqCst) >= cap {
-            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-            reject(
-                &mut stream,
-                429,
-                ErrorClass::Overloaded,
-                "too many connections",
-            );
-            continue;
-        }
-        live.fetch_add(1, Ordering::SeqCst);
-        let (gateway, done, watch) = (Arc::clone(gateway), Arc::clone(&live), Arc::clone(&watch));
-        let spawned = std::thread::Builder::new()
-            .name("qb-gateway".into())
-            .stack_size(STACK_BYTES)
-            .spawn(move || {
-                handle(stream, &gateway, &watch, own_uid, started);
-                done.fetch_sub(1, Ordering::SeqCst);
-            });
-        if let Err(e) = spawned {
-            live.fetch_sub(1, Ordering::SeqCst);
-            log::warn(&format!("gateway: cannot start a connection thread: {e}"));
+            live.fetch_add(1, Ordering::SeqCst);
+            let (gateway, done, watch) =
+                (Arc::clone(gateway), Arc::clone(&live), Arc::clone(&watch));
+            let spawned = std::thread::Builder::new()
+                .name("qb-gateway".into())
+                .stack_size(STACK_BYTES)
+                .spawn(move || {
+                    handle(conn, &gateway, &watch, own_uid, started);
+                    done.fetch_sub(1, Ordering::SeqCst);
+                });
+            if let Err(e) = spawned {
+                live.fetch_sub(1, Ordering::SeqCst);
+                log::warn(&format!("gateway: cannot start a connection thread: {e}"));
+            }
         }
     }
 }
 
 /// Writes `body` as a JSON answer with `status`, first reading what the peer still sends.
-fn reply<T: Serialize>(stream: &mut UnixStream, status: u16, body: &T) {
+fn reply<T: Serialize>(stream: &mut Conn, status: u16, body: &T) {
     if status >= 400 {
-        drain_pending(stream);
+        drain_pending(&*stream);
     }
     let bytes = serde_json::to_vec(body).unwrap_or_default();
     if let Err(e) = http::write_response(stream, status, &bytes) {
@@ -207,13 +341,8 @@ fn reply<T: Serialize>(stream: &mut UnixStream, status: u16, body: &T) {
     }
 }
 
-fn reject(stream: &mut UnixStream, status: u16, class: ErrorClass, message: &str) {
-    let retryable = class == ErrorClass::Overloaded;
-    let mut e = GatewayError::new(class, retryable, message);
-    if retryable {
-        e.retry_after = Some(1);
-    }
-    reply(stream, status, &e);
+fn reject(stream: &mut Conn, status: u16, class: ErrorClass, message: &str) {
+    reply(stream, status, &GatewayError::new(class, false, message));
 }
 
 /// The caller's name: the gateway's own uid, or a configured client's.
@@ -231,7 +360,7 @@ fn caller(gateway: &Gateway, uid: Option<u32>, own_uid: u32) -> Option<String> {
 
 /// Reads `stream` until `until`, each read bounded by [`IO_TIMEOUT`] and the time left.
 struct Deadline<'a> {
-    stream: &'a UnixStream,
+    stream: &'a Conn,
     until: Instant,
 }
 
@@ -246,19 +375,16 @@ impl io::Read for Deadline<'_> {
     }
 }
 
-fn handle(
-    mut stream: UnixStream,
-    gateway: &Gateway,
-    watch: &Watch,
-    own_uid: u32,
-    started: Instant,
-) {
+fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, started: Instant) {
     if stream.set_write_timeout(Some(IO_TIMEOUT)).is_err() {
         return;
     }
-    let uid = rustix::net::sockopt::socket_peercred(&stream)
-        .ok()
-        .map(|c| c.uid.as_raw());
+    let uid = match &stream {
+        Conn::Unix(s) => rustix::net::sockopt::socket_peercred(s)
+            .ok()
+            .map(|c| c.uid.as_raw()),
+        Conn::Tcp(_) => return loopback(stream, gateway, watch),
+    };
     // Checked before reading, so a foreign peer cannot make the gateway buffer a body.
     let Some(caller) = caller(gateway, uid, own_uid) else {
         return reject(
@@ -268,8 +394,20 @@ fn handle(
             "caller is not an allowed client",
         );
     };
-    let Some(req) = read(&mut stream, gateway.config().max_request_bytes as usize) else {
-        return;
+    let max_turn = gateway.config().max_request_bytes as usize;
+    let limit = Cell::new(http::MAX_BODY);
+    let to_messages = Cell::new(false);
+    let max_body = |head: &Head<'_>| {
+        to_messages.set(head.path == paths::MESSAGES);
+        if head.method == Method::Post && [paths::MODEL_TURN, paths::MESSAGES].contains(&head.path)
+        {
+            limit.set(max_turn);
+        }
+        Some(limit.get())
+    };
+    let req = match read(&stream, &max_body) {
+        Ok(r) => r,
+        Err(e) => return unreadable(&mut stream, &e, limit.get(), to_messages.get()),
     };
     match (req.method, req.path.as_str()) {
         (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, watch, &caller, req.body),
@@ -325,45 +463,88 @@ fn handle(
     }
 }
 
-/// Reads one request under [`READ_DEADLINE`]: a turn or Messages body of at most `max_turn`
-/// bytes, any other of at most [`http::MAX_BODY`]. A request that cannot be read is answered
-/// here, in the Messages error format when its path is `/v1/messages`.
-fn read(stream: &mut UnixStream, max_turn: usize) -> Option<http::Request> {
-    let limit = Cell::new(http::MAX_BODY);
-    let to_messages = Cell::new(false);
-    let max_body = |method, path: &str| {
-        to_messages.set(path == paths::MESSAGES);
-        if method == Method::Post && [paths::MODEL_TURN, paths::MESSAGES].contains(&path) {
-            limit.set(max_turn);
+/// Why the loopback listener refused a request head.
+#[derive(Clone, Copy)]
+enum Refusal {
+    /// No client token, or a wrong one.
+    Token,
+    /// Not `POST /v1/messages`.
+    Path,
+}
+
+/// Serves one connection of the loopback listener: `POST /v1/messages` with the client token in
+/// `x-api-key` or `Authorization: Bearer`, checked before the body is read; every answer is in the
+/// Messages format.
+fn loopback(mut stream: Conn, gateway: &Gateway, watch: &Watch) {
+    let config = gateway.config();
+    let token = config.messages.as_ref().and_then(|m| m.token_sha256);
+    let max_turn = config.max_request_bytes as usize;
+    let refusal = Cell::new(None);
+    let check = |head: &Head<'_>| {
+        let mut presented = [head.api_key, head.bearer].into_iter().flatten();
+        if !token.is_some_and(|hash| presented.any(|t| token_matches(t, &hash))) {
+            refusal.set(Some(Refusal::Token));
+            return None;
         }
-        limit.get()
+        if (head.method, head.path) != (Method::Post, paths::MESSAGES) {
+            refusal.set(Some(Refusal::Path));
+            return None;
+        }
+        Some(max_turn)
     };
+    match (read(&stream, &check), refusal.get()) {
+        (Ok(req), _) => messages::turn(stream, gateway, watch, TOKEN_CALLER, req.body),
+        (Err(ReadError::Refused { .. }), Some(Refusal::Token)) => messages::refuse(
+            &mut stream,
+            401,
+            "authentication_error",
+            "invalid x-api-key: not this gateway's client token",
+        ),
+        (Err(ReadError::Refused { .. }), _) => messages::refuse(
+            &mut stream,
+            404,
+            "not_found_error",
+            "this listener serves only `POST /v1/messages`",
+        ),
+        (Err(e), _) => unreadable(&mut stream, &e, max_turn, true),
+    }
+}
+
+/// Reads one request under [`READ_DEADLINE`] with a body of at most `max_body(head)` bytes.
+fn read(
+    stream: &Conn,
+    max_body: &dyn Fn(&Head<'_>) -> Option<usize>,
+) -> Result<http::Request, ReadError> {
     let mut buf = Vec::new();
     let mut reader = Deadline {
         stream,
         until: Instant::now() + READ_DEADLINE,
     };
-    let (status, message) = match http::read_request_limited(&mut reader, &mut buf, &max_body) {
-        Ok(r) => return Some(r),
-        Err(ReadError::Closed | ReadError::Io(_)) => return None,
-        Err(ReadError::Malformed) => (400, "malformed HTTP request".into()),
-        Err(ReadError::HeadTooLarge) => (413, "request head too large".into()),
-        Err(ReadError::BodyTooLarge { unread }) => {
-            discard(stream, unread);
-            (413, format!("request body over {} bytes", limit.get()))
+    http::read_request_limited(&mut reader, &mut buf, max_body)
+}
+
+/// Answers a request that could not be read, its body limit `limit`, in the Messages error
+/// format when `to_messages`; a closed connection or a refused head gets no answer here.
+fn unreadable(stream: &mut Conn, e: &ReadError, limit: usize, to_messages: bool) {
+    let (status, message) = match *e {
+        ReadError::Closed | ReadError::Io(_) | ReadError::Refused { .. } => return,
+        ReadError::Malformed => (400, "malformed HTTP request".into()),
+        ReadError::HeadTooLarge => (413, "request head too large".into()),
+        ReadError::BodyTooLarge { unread } => {
+            discard(&*stream, unread);
+            (413, format!("request body over {limit} bytes"))
         }
-        Err(ReadError::LengthRequired) => (411, "Content-Length required".into()),
+        ReadError::LengthRequired => (411, "Content-Length required".into()),
     };
-    if to_messages.get() {
+    if to_messages {
         let e = GatewayError::new(ErrorClass::BadRequest, false, message);
         messages::reject(stream, Some(status), &e);
     } else {
         reject(stream, status, ErrorClass::BadRequest, &message);
     }
-    None
 }
 
-fn turn(mut stream: UnixStream, gateway: &Gateway, watch: &Watch, caller: &str, body: Vec<u8>) {
+fn turn(mut stream: Conn, gateway: &Gateway, watch: &Watch, caller: &str, body: Vec<u8>) {
     let req: TurnRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return reject(&mut stream, 400, ErrorClass::BadRequest, &e.to_string()),
@@ -373,7 +554,7 @@ fn turn(mut stream: UnixStream, gateway: &Gateway, watch: &Watch, caller: &str, 
         Ok(a) => a,
         Err(e) => return reply(&mut stream, e.class.http_status(), &e),
     };
-    let _watching = match watch.add(&stream, admitted.cancel_token().clone()) {
+    let _watching = match watch.add(&stream, admitted.cancel_token().clone(), None) {
         Ok(w) => w,
         Err(e) => {
             let message = format!("cannot watch the connection: {e}");

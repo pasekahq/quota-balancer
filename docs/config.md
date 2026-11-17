@@ -294,3 +294,20 @@ Without it that endpoint answers 404.
 |---|---|---|
 | `vendor` | string | Required. The `qbd` vendor whose logins speak the Anthropic API: its thinking blocks reach clients as Anthropic blocks, and the thinking blocks clients send back count as its own. |
 | `models` | table of strings | Client `model` names, each mapped to a route alias, at most 256; for example `{ "claude-sonnet-4-5-20250929" = "chat" }`. A `model` equal to an alias needs no entry; a key may not be an alias, and a value must be one. Any other `model` is answered 400 `invalid_request_error`. |
+| `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves `POST /v1/messages` besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`. |
+| `token_sha256` | string | With `listen`, and only with it: SHA-256 of the local client token as 64 hex characters. Plaintext tokens are rejected. |
+| `ping_interval_s` | integer 1..=30 | Seconds a started stream may stay silent before the front writes an SSE `ping` event, default 10. |
+
+Every request on `listen` carries the local client token in `x-api-key` or
+`Authorization: Bearer`, so a client switches to the gateway with its Anthropic base URL
+(`http://127.0.0.1:<port>`) and API key. Generate the token and its hash with:
+
+```sh
+TOKEN="qb-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+printf %s "$TOKEN" | sha256sum
+```
+
+The token must not start with `sk-ant-`, `eyJ` or `cc-`: some Anthropic clients take a key of
+that shape for a subscription OAuth token and send it with another identity. The `qb-` prefix
+above avoids that. Anyone on the host who knows the token can spend the gateway's logins, so
+keep it as private as a vendor key.

@@ -5,7 +5,7 @@
 //! The file is read by walking toml's parsed tree rather than through serde: per-type serde code
 //! would not fit the binary budget. Errors still name the field path and the line.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use qb_core::MAX_LOGINS;
@@ -13,7 +13,9 @@ use qb_proto::Pin;
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
-use crate::config::{Error, Fault, declare, toml_error, too_many};
+use crate::config::{
+    BEARER_HASH_EXPECTED, BearerHash, Error, Fault, declare, toml_error, too_many,
+};
 
 /// Most turns one gateway runs at once.
 pub const MAX_TURNS: u32 = 16;
@@ -25,6 +27,10 @@ pub const MAX_ROUTES: usize = 64;
 pub const MAX_ATTEMPTS: u32 = 16;
 /// Most entries of `messages.models`.
 pub const MAX_MODELS: usize = 256;
+/// Default of `messages.ping_interval_s`.
+pub const PING_INTERVAL_S: u32 = 10;
+/// Largest `messages.ping_interval_s`.
+pub const MAX_PING_INTERVAL_S: u32 = 30;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
 /// `[[routes]]` and `[messages]` tables.
@@ -62,6 +68,13 @@ pub struct MessagesFront {
     pub vendor: String,
     /// Client `model` names and the route alias each runs on.
     pub models: Vec<(String, String)>,
+    /// Loopback TCP address that serves this front besides the unix socket.
+    pub listen: Option<SocketAddr>,
+    /// SHA-256 of the local client token every TCP request carries; set exactly when `listen` is.
+    pub token_sha256: Option<BearerHash>,
+    /// Seconds of silence in a started stream before a `ping` event, 1 to
+    /// [`MAX_PING_INTERVAL_S`].
+    pub ping_interval_s: u32,
 }
 
 /// A caller of the gateway by peer uid.
@@ -361,10 +374,46 @@ fn walk_messages(at: &str, t: &DeTable<'_>) -> Result<MessagesFront, WalkError> 
     let mut m = MessagesFront {
         vendor: String::new(),
         models: Vec::new(),
+        listen: None,
+        token_sha256: None,
+        ping_interval_s: PING_INTERVAL_S,
     };
-    fields(at, t, &["vendor", "models"], &["vendor"], |key, at, v| {
+    let (mut listen_at, mut token_at) = (None, None);
+    let keys = [
+        "vendor",
+        "models",
+        "listen",
+        "token_sha256",
+        "ping_interval_s",
+    ];
+    fields(at, t, &keys, &["vendor"], |key, at, v| {
+        let bad = |reason: &str| (at.to_owned(), reason.to_owned(), Some(v.span().start));
         match key {
             "vendor" => m.vendor = string(at, v)?,
+            "listen" => {
+                let addr: SocketAddr = string(at, v)?
+                    .parse()
+                    .map_err(|_| bad("expected `127.0.0.1:<port>` or `[::1]:<port>`"))?;
+                if !addr.ip().is_loopback() {
+                    return Err(bad("must be a loopback address"));
+                }
+                if addr.port() == 0 {
+                    return Err(bad("needs a port other than 0"));
+                }
+                m.listen = Some(addr);
+                listen_at = Some(v.span().start);
+            }
+            "token_sha256" => {
+                let hash = BearerHash::from_hex(&string(at, v)?);
+                m.token_sha256 = Some(hash.ok_or_else(|| bad(BEARER_HASH_EXPECTED))?);
+                token_at = Some(v.span().start);
+            }
+            "ping_interval_s" => {
+                m.ping_interval_s = integer(at, v)?;
+                if !(1..=MAX_PING_INTERVAL_S).contains(&m.ping_interval_s) {
+                    return Err(bad(&format!("must be 1 to {MAX_PING_INTERVAL_S}")));
+                }
+            }
             _ => {
                 for (model, alias) in table(at, v)? {
                     let model = model.get_ref().as_ref();
@@ -375,7 +424,19 @@ fn walk_messages(at: &str, t: &DeTable<'_>) -> Result<MessagesFront, WalkError> 
         }
         Ok(())
     })?;
-    Ok(m)
+    match (listen_at, token_at) {
+        (Some(line), None) => Err((
+            format!("{at}.token_sha256"),
+            "is missing; `listen` needs the client token's hash".into(),
+            Some(line),
+        )),
+        (None, Some(line)) => Err((
+            format!("{at}.token_sha256"),
+            "belongs to a `listen` address".into(),
+            Some(line),
+        )),
+        _ => Ok(m),
+    }
 }
 
 fn walk_client(at: &str, t: &DeTable<'_>) -> Result<GatewayClient, WalkError> {
@@ -894,6 +955,78 @@ difficulty = 1
         for (extra, want) in cases {
             let err = check("", extra).unwrap_err();
             assert!(err.contains(want), "{extra}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_listener_needs_the_client_token_hash() {
+        let hash = "ab".repeat(32);
+        let front = |keys: &str| format!("[messages]\nvendor = \"vendor-a\"\n{keys}\n");
+        let listen = |addr: &str| format!("listen = \"{addr}\"\ntoken_sha256 = \"{hash}\"");
+        let m = check(
+            "",
+            &front(&format!(
+                "{}\nping_interval_s = 30",
+                listen("127.0.0.1:8080")
+            )),
+        )
+        .unwrap()
+        .messages
+        .unwrap();
+        assert_eq!(m.listen, Some(SocketAddr::from(([127, 0, 0, 1], 8080))));
+        assert_eq!(m.token_sha256, Some(BearerHash([0xab; 32])));
+        assert_eq!(m.ping_interval_s, 30);
+        let m = check("", &front(&listen("[::1]:8080")))
+            .unwrap()
+            .messages
+            .unwrap();
+        assert_eq!(m.listen.map(|a| a.ip().is_loopback()), Some(true));
+        assert_eq!(m.ping_interval_s, 10, "the default");
+        let without = check("", &front("")).unwrap().messages.unwrap();
+        assert_eq!((without.listen, without.token_sha256), (None, None));
+
+        let cases = [
+            (
+                listen("0.0.0.0:8080"),
+                "messages.listen: must be a loopback address (line 15)",
+            ),
+            (
+                listen("192.0.2.1:8080"),
+                "messages.listen: must be a loopback address",
+            ),
+            (
+                listen("localhost:8080"),
+                "messages.listen: expected `127.0.0.1:<port>` or `[::1]:<port>`",
+            ),
+            (
+                listen("127.0.0.1:0"),
+                "messages.listen: needs a port other than 0",
+            ),
+            (
+                "listen = \"127.0.0.1:8080\"".into(),
+                "messages.token_sha256: is missing; `listen` needs the client token's hash (line 15)",
+            ),
+            (
+                listen("127.0.0.1:8080").replace(&hash, "qb-plaintext-token"),
+                "messages.token_sha256: expected the token's SHA-256 as 64 hex characters (line 16)",
+            ),
+            (
+                format!("token_sha256 = \"{hash}\""),
+                "messages.token_sha256: belongs to a `listen` address",
+            ),
+            (
+                "ping_interval_s = 31".into(),
+                "messages.ping_interval_s: must be 1 to 30 (line 15)",
+            ),
+            (
+                "ping_interval_s = 0".into(),
+                "messages.ping_interval_s: must be 1 to 30",
+            ),
+        ];
+        for (keys, want) in cases {
+            let err = check("", &front(&keys)).unwrap_err();
+            assert!(err.contains(want), "{keys}: {err}");
+            assert!(!err.contains("qb-plaintext-token"), "{err}");
         }
     }
 

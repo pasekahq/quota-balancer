@@ -233,7 +233,9 @@ error format.
 **Callers.** The peer's uid from `SO_PEERCRED` must be the gateway's own uid or the `uid` of a
 `[[clients]]` entry of the gateway config; any other peer gets 401 `auth` before its request
 is read. The socket file is
-0600, or 0660 with `socket_mode = 0o660`.
+0600, or 0660 with `socket_mode = 0o660`. The optional loopback listener (`messages.listen`)
+serves only `POST /v1/messages`, to requests with the local client token
+([anthropic.md](anthropic.md#the-v1messages-front)).
 
 ### `POST /v1/model/turn`
 

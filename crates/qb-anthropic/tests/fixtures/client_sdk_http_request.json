@@ -1,0 +1,95 @@
+{
+  "method": "POST",
+  "path": "/v1/messages",
+  "headers": [
+    [
+      "Host",
+      "127.0.0.1:8080"
+    ],
+    [
+      "Accept-Encoding",
+      "gzip, deflate"
+    ],
+    [
+      "Connection",
+      "keep-alive"
+    ],
+    [
+      "x-stainless-timeout",
+      "NOT_GIVEN"
+    ],
+    [
+      "Accept",
+      "application/json"
+    ],
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "User-Agent",
+      "Anthropic/Python 0.87.0"
+    ],
+    [
+      "X-Stainless-Lang",
+      "python"
+    ],
+    [
+      "X-Stainless-Package-Version",
+      "0.87.0"
+    ],
+    [
+      "X-Stainless-OS",
+      "Linux"
+    ],
+    [
+      "X-Stainless-Arch",
+      "x64"
+    ],
+    [
+      "X-Stainless-Runtime",
+      "CPython"
+    ],
+    [
+      "X-Stainless-Runtime-Version",
+      "3.11.16"
+    ],
+    [
+      "X-Api-Key",
+      "qb-local-test-token"
+    ],
+    [
+      "anthropic-beta",
+      "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+    ],
+    [
+      "X-Stainless-Async",
+      "false"
+    ],
+    [
+      "anthropic-version",
+      "2023-06-01"
+    ],
+    [
+      "X-Stainless-Helper-Method",
+      "stream"
+    ],
+    [
+      "X-Stainless-Stream-Helper",
+      "messages"
+    ],
+    [
+      "x-stainless-retry-count",
+      "0"
+    ],
+    [
+      "x-stainless-read-timeout",
+      "900.0"
+    ],
+    [
+      "Content-Length",
+      "346"
+    ]
+  ],
+  "body": "{\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":\"What is in notes.txt?\"}],\"model\":\"model-2025-01-01\",\"system\":\"You are a helpful assistant.\",\"tools\":[{\"name\":\"read\",\"description\":\"Read a text file.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}],\"tool_choice\":{\"type\":\"auto\"},\"stream\":true}"
+}

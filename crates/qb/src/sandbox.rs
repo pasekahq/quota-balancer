@@ -1,8 +1,8 @@
 //! Self-restriction of `qb agent` and `qb gateway` before their first connection: the process
 //! becomes non-dumpable, and landlock limits it to the credential directories (read-only for the
 //! agent; for the gateway also writing, creating and removing regular files, as a refreshed
-//! token is written back by rename), the resolver files and TCP connections to port 443, with no
-//! TCP bind.
+//! token is written back by rename), the resolver files and TCP connections to port 443. The only
+//! TCP bind allowed is the gateway's on the port of its loopback Messages listener.
 
 use std::path::{Path, PathBuf};
 
@@ -37,13 +37,14 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, false)
+    confine(&files, false, None)
 }
 
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
 /// truncate files, create regular files and remove files, so a refreshed token can be written
-/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. Call
-/// it before starting any thread.
+/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. TCP
+/// bind only on the port of `messages.listen`, whose listener must exist before. Call it before
+/// starting any thread.
 ///
 /// # Errors
 /// The dumpable flag cannot be cleared.
@@ -53,10 +54,19 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, true)
+    let bind = config
+        .messages
+        .as_ref()
+        .and_then(|m| m.listen)
+        .map(|a| a.port());
+    confine(&files, true, bind)
 }
 
-fn confine(credential_files: &[&Path], writable: bool) -> Result<Vec<String>, String> {
+fn confine(
+    credential_files: &[&Path],
+    writable: bool,
+    bind: Option<u16>,
+) -> Result<Vec<String>, String> {
     set_dumpable_behavior(DumpableBehavior::NotDumpable)
         .map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;
     let mut gaps = Vec::new();
@@ -90,7 +100,7 @@ fn confine(credential_files: &[&Path], writable: bool) -> Result<Vec<String>, St
             Err(e) => gaps.push(format!("{} stays unreadable: {e}", path.display())),
         }
     }
-    match restrict(rules) {
+    match restrict(rules, bind) {
         Ok((RulesetStatus::FullyEnforced, _)) => {}
         Ok((RulesetStatus::PartiallyEnforced, LandlockStatus::Available { effective_abi, .. })) => {
             gaps.push(format!(
@@ -121,13 +131,17 @@ fn credential_dir(file: &Path) -> std::io::Result<PathBuf> {
 
 fn restrict(
     rules: Vec<PathBeneath<PathFd>>,
+    bind: Option<u16>,
 ) -> Result<(RulesetStatus, LandlockStatus), landlock::RulesetError> {
+    let bind =
+        bind.map(|port| Ok::<_, landlock::RulesetError>(NetPort::new(port, AccessNet::BindTcp)));
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(TARGET_ABI))?
         .handle_access(AccessNet::from_all(TARGET_ABI))?
         .create()?
         .add_rules(rules.into_iter().map(Ok::<_, landlock::RulesetError>))?
         .add_rule(NetPort::new(HTTPS_PORT, AccessNet::ConnectTcp))?
+        .add_rules(bind)?
         .restrict_self()?;
     Ok((status.ruleset, status.landlock))
 }
