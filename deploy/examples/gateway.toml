@@ -1,0 +1,37 @@
+# qb gateway config: model traffic for the credential owner, picked and reported through qbd.
+# Format: docs/config.md#gateway-config. qbd needs a [[clients]] entry for the gateway's uid
+# with role "gateway", a ladder for that role, and logins named as below.
+
+socket = "/run/user/1000/qb-gateway/gateway.sock"
+qbd_socket = "/run/qb/qb.sock"
+max_turns = 4
+max_attempts = 4
+
+[[logins]]
+name = "login-1"
+kind = "oauth_anthropic"
+credentials = "/var/lib/qb-gateway/credentials/login-1.json"
+
+[[logins]]
+name = "login-2"
+kind = "oauth_anthropic"
+credentials = "/var/lib/qb-gateway/credentials/login-2.json"
+
+[[logins]]
+name = "key-1"
+kind = "api_key"
+credentials = "/var/lib/qb-gateway/credentials/key-1.json"
+
+# Ladder step 1 of qbd's role "gateway": subscription logins first, the key as the last tier.
+[[routes]]
+alias = "chat"
+role = "gateway"
+difficulty = 1
+expected_minutes = 2
+
+# One exact model, for compaction and other cheap calls.
+[[routes]]
+alias = "compact"
+role = "gateway"
+vendor = "vendor-a"
+model = "model-small"

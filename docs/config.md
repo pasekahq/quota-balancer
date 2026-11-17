@@ -208,3 +208,69 @@ credentials = ".claude/.credentials.json"
 
 The agent connects as a client of the daemon, so it needs a `[[clients]]` entry listed in
 `[probe] agents` there, and `--bearer-file` or `$QB_BEARER_FILE` when it connects by bearer.
+
+## Gateway config
+
+`qb gateway --config PATH` reads its own TOML file, under the same rules for the whole file and
+with the same exit code 2 and one-line errors naming the field path and line. Decisions behind
+it: [ADR 0001](adr/0001-model-gateway.md); its API: [api.md](api.md#model-gateway-v1model).
+Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml).
+
+Top-level keys come before the tables:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `socket` | string | Required. Absolute path of the gateway's unix socket; a stale socket file is replaced. |
+| `socket_mode` | integer | `0o600` (default): only the gateway's user may connect; `0o660`: its group too. |
+| `qbd_socket` | string | Absolute path of `qbd`'s socket, default `/run/qb/qb.sock`. |
+| `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`; without it `qbd` identifies the gateway by uid. |
+| `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
+| `max_request_bytes` | integer | Largest request body, default 8388608, at most 33554432. |
+| `max_attempts` | integer 1..=16 | Picks per turn, default 4. |
+
+`[[clients]]`, optional: callers besides the gateway's own uid.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | Caller name in the log. |
+| `uid` | integer | Peer uid (`SO_PEERCRED`); unique. |
+
+`[[logins]]`, 1 to 32: the logins this gateway holds credentials for.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | Login name as declared in `qbd`'s `[[logins]]`. |
+| `kind` | `"oauth_anthropic"` or `"api_key"` | Credential type; it selects the vendor adapter and its auth mode, and must match the file's `type`. |
+| `credentials` | string | Absolute path of the credential file. |
+
+Every login `qbd` can pick for a route of this gateway needs an entry here: a pick of a login
+without one fails the turn as a configuration error. Give the gateway's logins their own `qbd`
+vendor and role to keep them apart from logins used elsewhere.
+
+A credential file is the gateway's own copy, never a vendor CLI's file (two refreshers would race
+for one rotating refresh token). It is JSON, a regular file owned by the gateway's user with
+mode 0600; anything else is refused:
+
+```json
+{"type": "oauth_anthropic", "access_token": "...", "refresh_token": "...", "expires_at": 1800000000}
+{"type": "api_key", "key": "..."}
+```
+
+An OAuth token expiring within 60 s, or rejected by the vendor, is refreshed and the file
+replaced atomically (temporary 0600 file in the same directory, fsync, rename, fsync of the
+directory). The gateway may create, write and remove files in the credential files'
+directories and nowhere else.
+
+`[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to one `qbd` pick target.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `alias` | string | `^[a-z][a-z0-9_-]{0,63}$`, unique. |
+| `role` | string | `qbd` role of the pick. |
+| `difficulty` | integer 0..=255 | Ladder step of the role, with `qbd`'s fallback to neighbouring steps, tiers and reserves. |
+| `vendor`, `model` | string | Instead of `difficulty`: a pin of one vendor and model, without ladder or role reserve. |
+| `effort` | string | Reasoning effort of a pin. |
+| `expected_minutes` | integer | Expected length of a turn, for the lease's cost. |
+
+`qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
+`qbd_bearer_file`) whose `role` is one the routes name.

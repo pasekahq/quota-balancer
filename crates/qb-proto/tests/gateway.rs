@@ -169,3 +169,53 @@ fn invalid_fixtures_are_rejected() {
     }
     assert!(seen >= 15, "only {seen} invalid fixtures");
 }
+
+/// The names `values` serialize to.
+fn names<T: Serialize>(values: &[T]) -> Vec<String> {
+    values
+        .iter()
+        .map(|v| {
+            serde_json::to_value(v)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn openapi_enums_match_the_types() {
+    use qb_proto::{ErrorClass as C, RouteState as R, StopReason as S};
+    let path = format!(
+        "{}/../../docs/openapi-gateway.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let schema = |name: &str| -> Vec<String> {
+        doc["components"]["schemas"][name]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let classes = [
+        C::QuotaExhausted,
+        C::Auth,
+        C::Unavailable,
+        C::Overloaded,
+        C::BadRequest,
+        C::ContextTooLong,
+        C::Cancelled,
+        C::NoRoute,
+    ];
+    assert_eq!(schema("ErrorClass"), names(&classes));
+    for c in classes {
+        assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+    }
+    let stops = [S::End, S::ToolUse, S::MaxTokens, S::Refusal];
+    assert_eq!(schema("StopReason"), names(&stops));
+    let states = [R::Ready, R::Degraded, R::Exhausted, R::Unavailable];
+    assert_eq!(schema("RouteState"), names(&states));
+}
