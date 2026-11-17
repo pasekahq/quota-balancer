@@ -30,7 +30,7 @@ fn kernel_abi() -> Option<ABI> {
 }
 
 #[test]
-fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
+fn gateway_may_rewrite_credentials_read_its_config_and_reach_qbd_only() {
     let dir = Path::new("/tmp").join(format!("qb-gw-sandbox-{}", std::process::id()));
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
@@ -44,28 +44,39 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = tcp.local_addr().unwrap().port();
     let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let config = qb::gateway::config::parse(
-        Path::new("gateway.toml"),
-        &format!(
-            "socket = \"{}\"\nqbd_socket = \"{}\"\n\
+    let etc = dir.join("etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    let file = etc.join("gateway.toml");
+    let text = format!(
+        "socket = \"{}\"\nqbd_socket = \"{}\"\n\
              [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\napi = \"anthropic\"\ncredentials = \"{}\"\n\
              [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n\
              [fronts]\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\n\
              [fronts.messages]\nvendor = \"vendor-a\"\n",
-            dir.join("gw.sock").display(),
-            qbd.display(),
-            credential.display(),
-            "0".repeat(64)
-        ),
-    )
-    .unwrap();
+        dir.join("gw.sock").display(),
+        qbd.display(),
+        credential.display(),
+        "0".repeat(64)
+    );
+    std::fs::write(&file, &text).unwrap();
+    let config = qb::gateway::config::load(&file).unwrap();
     let abi = kernel_abi();
     if std::env::var_os("QB_REQUIRE_LANDLOCK").is_some() {
         assert!(abi >= Some(ABI::V4), "landlock ABI {abi:?} < V4");
     }
     let (written, unreadable) = (credential.clone(), outside.clone());
-    std::thread::spawn(move || {
+    let (hardened, edit) = std::sync::mpsc::channel();
+    let (edited, reload) = std::sync::mpsc::channel();
+    let reread = file.clone();
+    let gateway = std::thread::spawn(move || {
         let gaps = qb::sandbox::harden_gateway(&config).unwrap();
+        hardened.send(()).unwrap();
+        reload.recv().unwrap();
+        assert_eq!(
+            qb::gateway::config::load(&reread).unwrap(),
+            config,
+            "a reload reads the replaced file"
+        );
         assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
         qb::gateway::creds::write_atomic(&written, br#"{"type":"api_key","key":"k2"}"#).unwrap();
         assert!(UnixStream::connect(&qbd).is_ok(), "qbd stays reachable");
@@ -98,9 +109,15 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
             eprintln!("landlock {abi:?}: warning branch");
             assert!(gaps.iter().any(|g| g.contains("landlock")), "{gaps:?}");
         }
-    })
-    .join()
-    .unwrap();
+    });
+    // An editor replaces the config by rename while the sandboxed gateway runs.
+    if edit.recv().is_ok() {
+        let replaced = file.with_extension("new");
+        std::fs::write(&replaced, &text).unwrap();
+        std::fs::rename(&replaced, &file).unwrap();
+        let _ = edited.send(());
+    }
+    gateway.join().unwrap();
     assert_eq!(
         std::fs::read_to_string(&credential).unwrap(),
         r#"{"type":"api_key","key":"k2"}"#

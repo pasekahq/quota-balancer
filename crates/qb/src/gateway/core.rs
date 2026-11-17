@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use qb_proto::{
     Attempt, Block, Decision, ErrorClass, GatewayError, LoginStatus, Outcome, PickRequest,
-    PickResponse, ReportRequest, RouteInfo, RouteState, RouteStatus, RoutesAnswer, StreamEvent,
-    TurnRequest, WindowReport, paths,
+    PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState, RouteStatus, RoutesAnswer,
+    StreamEvent, TurnRequest, WindowReport, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -20,6 +20,8 @@ use zeroize::Zeroizing;
 use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::creds::{CredentialStore, Refresher};
 use super::upstream::{CancelToken, Failure, FailureKind, Finished, Flow, Picked, Upstream};
+use crate::config::Error;
+use crate::sandbox::file_dir;
 use crate::server::unix_now;
 use crate::{client, log};
 
@@ -59,11 +61,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A turn that passed admission: it counts against `max_turns` and can be cancelled until it is
-/// dropped.
+/// dropped. It runs on the config snapshot current at its admission.
 pub struct Admitted {
     id: u64,
     client: String,
     request_id: String,
+    config: Arc<GatewayConfig>,
     route: Route,
     cancel: CancelToken,
     running: Arc<Running>,
@@ -102,7 +105,13 @@ impl Drop for Admitted {
 
 /// The gateway's shared state. One value serves every connection thread.
 pub struct Gateway {
-    config: GatewayConfig,
+    /// The snapshot later admissions take; a reload swaps it.
+    config: Mutex<Arc<GatewayConfig>>,
+    /// The config of the start: the restart-only fields and the qbd connection.
+    startup: Arc<GatewayConfig>,
+    /// Held for a whole reload, so the last file read is the one that serves.
+    reloading: Mutex<()>,
+    /// Shared by every snapshot, so a file's refresh lock outlives a reload.
     store: CredentialStore,
     upstreams: Upstreams,
     qbd_bearer: Option<Zeroizing<String>>,
@@ -261,22 +270,16 @@ impl Gateway {
     /// A gateway for `config` with vendor adapters `upstreams`, OAuth refreshes through
     /// `refresher` and `qbd_bearer` for qbd, if qbd knows the gateway by token.
     pub fn new(
-        mut config: GatewayConfig,
+        config: GatewayConfig,
         upstreams: Upstreams,
         refresher: Box<dyn Refresher>,
         qbd_bearer: Option<Zeroizing<String>>,
     ) -> Self {
-        // Sorted once by alias for `routes`; a handful of entries needs no generic sort.
-        let routes = &mut config.routes;
-        for i in 1..routes.len() {
-            let mut j = i;
-            while j > 0 && routes[j - 1].alias > routes[j].alias {
-                routes.swap(j - 1, j);
-                j -= 1;
-            }
-        }
+        let startup = Arc::new(sorted(config));
         Self {
-            config,
+            config: Mutex::new(Arc::clone(&startup)),
+            startup,
+            reloading: Mutex::new(()),
             store: CredentialStore::new(refresher),
             upstreams,
             qbd_bearer,
@@ -288,9 +291,42 @@ impl Gateway {
         }
     }
 
-    /// The config the gateway runs with.
-    pub fn config(&self) -> &GatewayConfig {
-        &self.config
+    /// The current config snapshot.
+    pub fn config(&self) -> Arc<GatewayConfig> {
+        Arc::clone(&lock(&self.config))
+    }
+
+    /// Reads the config file again. A config that parses and validates as at startup and keeps
+    /// every restart-only field becomes the snapshot of later admissions; admitted turns keep
+    /// theirs. Logs one line either way.
+    ///
+    /// # Errors
+    /// The file is unreadable or invalid, or changes a restart-only field; the running config
+    /// stays.
+    pub fn reload(&self) -> Result<ReloadAnswer, String> {
+        let _one = lock(&self.reloading);
+        let loaded = super::config::load(&self.startup.file)
+            .map_err(|e| e.to_string())
+            .and_then(|c| restart_only(&self.startup, &c).map_or(Ok(c), Err));
+        let config = match loaded {
+            Ok(c) => sorted(c),
+            Err(e) => {
+                log::warn(&format!("gateway: reload refused: {e}"));
+                return Err(e);
+            }
+        };
+        let answer = ReloadAnswer {
+            routes: config.routes.len(),
+            logins: config.logins.len(),
+        };
+        *lock(&self.config) = Arc::new(config);
+        log::info(&format!(
+            "gateway: reloaded {}: {} routes, {} logins",
+            self.startup.file.display(),
+            answer.routes,
+            answer.logins
+        ));
+        Ok(answer)
     }
 
     /// Admits `client`'s turn `req`: valid, a known route, images inline, its `request_id` not
@@ -300,10 +336,11 @@ impl Gateway {
     /// `bad_request` for an invalid request, `overloaded` at the turn limit.
     pub fn admit(&self, client: &str, req: &TurnRequest) -> Result<Admitted, GatewayError> {
         req.validate().map_err(|e| bad_request(e.0))?;
-        let route = self
-            .config
+        let config = self.config();
+        let route = config
             .route(&req.route)
-            .ok_or_else(|| bad_request(format!("unknown route alias `{}`", req.route)))?;
+            .ok_or_else(|| bad_request(format!("unknown route alias `{}`", req.route)))?
+            .clone();
         let by_path = |b: &Block| matches!(b, Block::Image { path: Some(_), .. });
         if req.messages.iter().flat_map(|m| &m.content).any(by_path) {
             return Err(bad_request(
@@ -317,7 +354,7 @@ impl Gateway {
                 req.request_id
             )));
         }
-        if turns.len() >= self.config.max_turns as usize {
+        if turns.len() >= config.max_turns as usize {
             let mut e = GatewayError::new(
                 ErrorClass::Overloaded,
                 true,
@@ -338,7 +375,8 @@ impl Gateway {
             id,
             client: client.to_owned(),
             request_id: req.request_id.clone(),
-            route: route.clone(),
+            config,
+            route,
             cancel,
             running: Arc::clone(&self.running),
         })
@@ -399,7 +437,7 @@ impl Gateway {
             resets_at: None,
         };
         // Bounds adapter attempts; a chain step that qbd cannot run takes none.
-        while progress.tried.len() < self.config.max_attempts as usize {
+        while progress.tried.len() < turn.config.max_attempts as usize {
             if turn.cancel.is_cancelled() {
                 emit(StreamEvent::Error { error: cancelled() });
                 return turn.log("cancelled");
@@ -416,7 +454,7 @@ impl Gateway {
         let mut error = GatewayError::new(
             class,
             retryable(class),
-            format!("gave up after {} attempts", self.config.max_attempts),
+            format!("gave up after {} attempts", turn.config.max_attempts),
         );
         error.tried = progress.tried;
         emit(StreamEvent::Error { error });
@@ -425,13 +463,13 @@ impl Gateway {
 
     /// One pick, resolved to the login's credential entry and adapter; `Err` ends or retries
     /// the turn.
-    fn ready(
-        &self,
-        turn: &Admitted,
+    fn ready<'t>(
+        &'t self,
+        turn: &'t Admitted,
         req: &TurnRequest,
         progress: &mut Progress,
         emit: &mut dyn FnMut(StreamEvent) -> Flow,
-    ) -> Result<Ready<'_>, Next> {
+    ) -> Result<Ready<'t>, Next> {
         let pick = match self.pick(&turn.route, req, progress) {
             Ok(p) => p,
             Err(e) => return Err(fail(emit, e, progress, "qbd failed")),
@@ -471,7 +509,7 @@ impl Gateway {
             }
             return Err(fail(emit, error, progress, "no login left"));
         }
-        let Some(entry) = self.config.login(&login) else {
+        let Some(entry) = turn.config.login(&login) else {
             self.report(&lease, Outcome::Error, Vec::new());
             log::error(&format!(
                 "gateway: qbd picked login `{login}`, which has no credential entry"
@@ -524,9 +562,7 @@ impl Gateway {
         };
         let mut refreshed = false;
         loop {
-            let loaded = self
-                .store
-                .load(&login, &entry.credentials, entry.kind, now, refreshed);
+            let loaded = self.store.load(entry, now, refreshed);
             let credential = match loaded {
                 Ok(c) => c,
                 Err(e) => {
@@ -548,7 +584,7 @@ impl Gateway {
                 vendor: &attempt.vendor,
                 model: &attempt.model,
                 effort: pick.effort.as_deref(),
-                reasoning: self.config.reasoning(&attempt.model),
+                reasoning: turn.config.reasoning(&attempt.model),
                 login: &login,
                 base_url: entry.base_url.as_deref(),
                 referer: entry.referer.as_deref(),
@@ -687,9 +723,9 @@ impl Gateway {
     /// `GET /v1/state`: this gateway's logins of the pinned vendor, of each step's vendor of a
     /// chain route, or every login of this gateway for a ladder route.
     pub fn routes(&self) -> RoutesAnswer {
+        let config = self.config();
         let state = self.state();
-        let routes = self
-            .config
+        let routes = config
             .routes
             .iter()
             .map(|r| {
@@ -704,11 +740,12 @@ impl Gateway {
                     return status;
                 };
                 if r.chain.is_empty() {
-                    (status.state, status.resets_at) = self.standing(state, r.vendor.as_deref());
+                    (status.state, status.resets_at) =
+                        standing(&config, state, r.vendor.as_deref());
                     return status;
                 }
                 for step in &r.chain {
-                    match self.standing(state, Some(&step.vendor)) {
+                    match standing(&config, state, Some(&step.vendor)) {
                         (RouteState::Ready, _) => {
                             status.state = RouteState::Ready;
                             status.vendor = Some(step.vendor.clone());
@@ -729,37 +766,13 @@ impl Gateway {
         RoutesAnswer { routes }
     }
 
-    /// The state of this gateway's logins of `vendor`, or of all of them, in `state`: `ready`
-    /// when one is usable, else `exhausted` with the nearest reset when one waits, else
-    /// `unavailable`.
-    fn standing(&self, state: &State, vendor: Option<&str>) -> (RouteState, Option<u64>) {
-        let mut standing = (RouteState::Unavailable, None);
-        for l in &state.logins {
-            let ours =
-                self.config.login(&l.login).is_some() && vendor.is_none_or(|v| v == l.vendor);
-            if !ours {
-                continue;
-            }
-            match l.status {
-                LoginStatus::Ok | LoginStatus::Unknown | LoginStatus::AuthStale => {
-                    return (RouteState::Ready, None);
-                }
-                LoginStatus::Exhausted | LoginStatus::RateLimited => {
-                    standing = (RouteState::Exhausted, nearest(standing.1, l.dead_until));
-                }
-                LoginStatus::AuthDead => {}
-            }
-        }
-        standing
-    }
-
     fn bearer(&self) -> Option<&str> {
         self.qbd_bearer.as_ref().map(|b| b.as_str())
     }
 
     fn state(&self) -> Option<State> {
         match client::call(
-            &self.config.qbd_socket,
+            &self.startup.qbd_socket,
             "GET",
             paths::STATE,
             None,
@@ -807,7 +820,7 @@ impl Gateway {
     fn pick_once(&self, req: &PickRequest) -> Result<PickResponse, GatewayError> {
         let unavailable = |m: String| GatewayError::new(ErrorClass::Unavailable, true, m);
         let body = serde_json::to_vec(req).map_err(|e| unavailable(e.to_string()))?;
-        let socket = &self.config.qbd_socket;
+        let socket = &self.startup.qbd_socket;
         let (status, resp) = client::call(socket, "POST", paths::PICK, Some(&body), self.bearer())
             .map_err(|e| {
                 log::warn(&format!("gateway: qbd pick: {e}"));
@@ -866,7 +879,7 @@ impl Gateway {
         };
         let of = req.lease_id.as_ref().or(req.login.as_ref());
         let of = of.map_or("", String::as_str);
-        let socket = &self.config.qbd_socket;
+        let socket = &self.startup.qbd_socket;
         match client::call(socket, "POST", paths::REPORT, Some(&body), self.bearer()) {
             Ok((200, _)) => {}
             Ok((status, resp)) => log::warn(&format!(
@@ -876,6 +889,86 @@ impl Gateway {
             Err(e) => log::warn(&format!("gateway: qbd report of {of}: {e}")),
         }
     }
+}
+
+/// The state of the logins of `config` of `vendor`, or of all of them, in `state`: `ready` when
+/// one is usable, else `exhausted` with the nearest reset when one waits, else `unavailable`.
+fn standing(
+    config: &GatewayConfig,
+    state: &State,
+    vendor: Option<&str>,
+) -> (RouteState, Option<u64>) {
+    let mut standing = (RouteState::Unavailable, None);
+    for l in &state.logins {
+        let ours = config.login(&l.login).is_some() && vendor.is_none_or(|v| v == l.vendor);
+        if !ours {
+            continue;
+        }
+        match l.status {
+            LoginStatus::Ok | LoginStatus::Unknown | LoginStatus::AuthStale => {
+                return (RouteState::Ready, None);
+            }
+            LoginStatus::Exhausted | LoginStatus::RateLimited => {
+                standing = (RouteState::Exhausted, nearest(standing.1, l.dead_until));
+            }
+            LoginStatus::AuthDead => {}
+        }
+    }
+    standing
+}
+
+/// `config` with its routes sorted by alias, for `routes`.
+fn sorted(mut config: GatewayConfig) -> GatewayConfig {
+    // A handful of entries needs no generic sort.
+    let routes = &mut config.routes;
+    for i in 1..routes.len() {
+        let mut j = i;
+        while j > 0 && routes[j - 1].alias > routes[j].alias {
+            routes.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    config
+}
+
+/// The first restart-only change of `new` against the startup config `old`, naming its file
+/// and field: the listeners, the qbd connection, and a credential file outside the directories
+/// the sandbox opened at startup.
+fn restart_only(old: &GatewayConfig, new: &GatewayConfig) -> Option<String> {
+    let fail = |field: String, reason: &str| {
+        let e = Error {
+            file: new.file.clone(),
+            field,
+            reason: format!("{reason}; it takes effect only on a restart"),
+        };
+        Some(e.to_string())
+    };
+    let listen = |c: &GatewayConfig| c.fronts.as_ref().and_then(|f| f.listen);
+    let changed = [
+        ("socket", old.socket != new.socket),
+        ("socket_mode", old.socket_mode != new.socket_mode),
+        ("qbd_socket", old.qbd_socket != new.qbd_socket),
+        (
+            "qbd_bearer_file",
+            old.qbd_bearer_file != new.qbd_bearer_file,
+        ),
+        ("fronts.listen", listen(old) != listen(new)),
+    ];
+    if let Some((field, _)) = changed.into_iter().find(|(_, c)| *c) {
+        return fail(field.to_owned(), "changed");
+    }
+    let opened: Vec<_> = old
+        .logins
+        .iter()
+        .filter_map(|l| file_dir(&l.credentials).ok())
+        .collect();
+    for (i, login) in new.logins.iter().enumerate() {
+        if !file_dir(&login.credentials).is_ok_and(|d| opened.contains(&d)) {
+            let reason = "lies outside the credential directories the sandbox opened";
+            return fail(format!("logins[{i}].credentials"), reason);
+        }
+    }
+    None
 }
 
 /// Ends the turn with `error`, carrying the attempts so far.

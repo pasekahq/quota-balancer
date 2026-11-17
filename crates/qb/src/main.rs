@@ -15,6 +15,7 @@ use qb::gateway::core::{Gateway, Upstreams};
 use qb::gateway::front;
 use qb::gateway::oauth::OauthRefresher;
 use qb::gateway::openai_upstream::Openai;
+use qb::hangup::Hangup;
 use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb::{
@@ -41,7 +42,9 @@ COMMANDS:
                                         HTTP fronts (/v1/messages, /v1/chat/completions,
                                         /v1/responses) on the socket named in its config,
                                         the HTTP fronts also on its loopback port, picking
-                                        and reporting via qbd
+                                        and reporting via qbd; SIGHUP reloads its config
+    reload                              POST /v1/model/reload: the gateway on --socket reads
+                                        its config again; exit 1 with the reason if it refuses
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -88,6 +91,7 @@ enum Cmd {
 enum Call {
     Health,
     State,
+    Reload,
     Why(String),
     Pick(PickRequest),
     Report(ReportRequest),
@@ -240,6 +244,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
         Some("gateway") => Cmd::Gateway(config.ok_or("--config is required")?),
         Some("health") => Cmd::Call(Call::Health),
         Some("state") => Cmd::Call(Call::State),
+        Some("reload") => Cmd::Call(Call::Reload),
         Some("version") => Cmd::Version,
         Some("why") => {
             let lease = operand.ok_or("a lease id is required")?;
@@ -331,6 +336,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
             match call {
                 Call::Health => send("GET", paths::HEALTH, None),
                 Call::State => send("GET", paths::STATE, None),
+                Call::Reload => send("POST", paths::MODEL_RELOAD, Some(b"")),
                 Call::Why(lease) => send("GET", &format!("{}{lease}", paths::WHY), None),
                 Call::Pick(req) => send("POST", paths::PICK, Some(&encode(&req)?)),
                 Call::Report(req) => send("POST", paths::REPORT, Some(&encode(&req)?)),
@@ -436,6 +442,8 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
 /// Runs the model gateway of the config in `file` with the adapters of the `anthropic`, `openai`
 /// and `chat_completions` API families.
 fn gateway(file: &Path) -> Result<ExitCode, String> {
+    // First, so a SIGHUP during startup waits for the loop instead of ending the process.
+    let hangup = Hangup::new().map_err(|e| format!("SIGHUP: {e}"))?;
     let config = qb::gateway::config::load(file).map_err(|e| e.to_string())?;
     let qbd_bearer = bearer(config.qbd_bearer_file.clone())?.map(zeroize::Zeroizing::new);
     let listener = if let Some(l) = listen::from_systemd().map_err(|e| e.to_string())? {
@@ -470,11 +478,12 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         (Api::Openai, Box::new(Openai::new())),
         (Api::ChatCompletions, Box::new(ChatCompletions::new())),
     ];
-    let refresher = Box::new(OauthRefresher::new(&config));
+    let refresher = Box::new(OauthRefresher::new());
     let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer);
     let Err(e) = front::serve(
         &listener,
         loopback.as_ref(),
+        Some(&hangup),
         &std::sync::Arc::new(gateway),
         rustix::process::geteuid().as_raw(),
     );

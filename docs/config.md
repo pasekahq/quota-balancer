@@ -363,3 +363,26 @@ above avoids that. Anyone on the host who knows the token can spend the gateway'
 keep it as private as a vendor key.
 
 Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).
+
+### Reload
+
+SIGHUP, `systemctl --user reload qb-gateway` or `qb --socket <gateway socket> reload`
+([api.md](api.md#post-v1modelreload)) makes the running gateway read its config file again. The
+new file goes through the same parsing and validation as at startup. A valid file that changes
+no restart-only key becomes the config of every turn admitted from then on: routes and their
+chains, logins and their credential files, `token_url`, `max_turns`, `max_request_bytes`,
+`max_attempts`, `[openai_models]`, `[[clients]]`, and `[fronts]` but `listen`, so the fronts'
+`models`, the client token and the fronts served. The gateway logs
+`gateway: reloaded <file>: <n> routes, <m> logins`.
+
+A turn already admitted finishes on the config of its admission, its retries and chain steps
+included; its stream is not cut. Refresh locks of the credential files carry over.
+
+These keys need a restart: `socket`, `socket_mode`, `fronts.listen` (the listeners exist before
+the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup), and a
+login whose `credentials` lies in a directory no login of the startup config uses (the sandbox
+opens the credential directories once). A file that cannot be read, does not validate or
+changes one of them is refused: the running config stays, the gateway logs one line
+`gateway: reload refused: <file>: <field>: <reason>` with the line where the file has one, and
+`qb reload` exits 1 with the same reason. The sandbox lets the gateway read the files of its
+config file's directory, so an editor may replace the file by rename.

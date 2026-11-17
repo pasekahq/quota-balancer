@@ -352,6 +352,7 @@ const TURN_KB: u64 = 1024;
 struct Gateway {
     vendor: Vendor,
     sock: PathBuf,
+    config: PathBuf,
     process: Daemon,
     _qbd: Daemon,
 }
@@ -414,6 +415,7 @@ vendor = "vendor-a"
         Self {
             vendor,
             sock,
+            config,
             process,
             _qbd: qbd_process,
         }
@@ -516,5 +518,78 @@ fn gateway_turns_reach_the_vendor_within_the_p99_budget() {
     assert!(
         p99 <= GATEWAY_MAX_P99,
         "gateway p99 {p99:?} > {GATEWAY_MAX_P99:?}"
+    );
+}
+
+/// The route aliases the gateway on `sock` serves.
+fn aliases(sock: &Path) -> Vec<String> {
+    let (status, body) = call(sock, "GET", paths::MODEL_ROUTES, None, None).unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let routes: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    routes["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["alias"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// `qb reload` against the gateway on `sock`: its exit status and output.
+fn qb_reload(sock: &Path) -> (bool, String) {
+    let out = Command::new(exe())
+        .arg("--socket")
+        .arg(sock)
+        .arg("reload")
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+#[ignore = "acceptance lane, run by the budgets CI job"]
+fn the_gateway_reloads_its_config_on_sighup_and_on_qb_reload() {
+    let gw = Gateway::start("acc-gw-reload");
+    let text = std::fs::read_to_string(&gw.config).unwrap();
+    let with = |aliases: &[&str]| {
+        let mut t = text.clone();
+        for alias in aliases {
+            write!(
+                t,
+                "\n[[routes]]\nalias = \"{alias}\"\nrole = \"worker\"\ndifficulty = 1\n"
+            )
+            .unwrap();
+        }
+        t
+    };
+
+    std::fs::write(&gw.config, with(&["hup"])).unwrap();
+    let pid = rustix::process::Pid::from_raw(i32::try_from(gw.pid()).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !aliases(&gw.sock).contains(&"hup".to_owned()) {
+        assert!(Instant::now() < deadline, "SIGHUP did not add the alias");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut body: serde_json::Value = serde_json::from_str(&turn_body(1, "Hi")).unwrap();
+    body["route"] = json!("hup");
+    gw.turn(&body.to_string());
+
+    std::fs::write(&gw.config, with(&["hup", "cli"])).unwrap();
+    let (ok, answer) = qb_reload(&gw.sock);
+    assert!(ok, "{answer}");
+    assert!(answer.contains(r#""routes":3"#), "{answer}");
+    assert_eq!(aliases(&gw.sock), ["chat", "cli", "hup"]);
+
+    std::fs::write(&gw.config, format!("{}[[routes]\n", with(&["hup", "cli"]))).unwrap();
+    let (ok, answer) = qb_reload(&gw.sock);
+    assert!(!ok, "{answer}");
+    assert!(answer.contains("reload refused"), "{answer}");
+    assert_eq!(
+        aliases(&gw.sock),
+        ["chat", "cli", "hup"],
+        "the running config stays"
     );
 }

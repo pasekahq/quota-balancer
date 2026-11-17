@@ -39,6 +39,8 @@ pub const MAX_PING_INTERVAL_S: u32 = 30;
 /// `[[routes]]`, `[openai_models]` and `[fronts]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
+    /// The file the config was read from; a reload reads it again.
+    pub file: PathBuf,
     /// Absolute path of the gateway's unix socket.
     pub socket: PathBuf,
     /// Mode of the socket file: 0o600 (the gateway's own user only) or 0o660 (its group too).
@@ -262,7 +264,7 @@ pub fn parse(file: &Path, text: &str) -> Result<GatewayConfig, Error> {
         field,
         reason,
     };
-    let config = walk_config(doc.get_ref()).map_err(|(field, reason, at)| {
+    let at_line = |(field, reason, at): WalkError| {
         let reason = match at {
             Some(at) => {
                 let line = text.get(..at).map_or(0, |s| s.matches('\n').count()) + 1;
@@ -271,13 +273,41 @@ pub fn parse(file: &Path, text: &str) -> Result<GatewayConfig, Error> {
             None => reason,
         };
         fail((field, reason))
+    };
+    let mut config = walk_config(doc.get_ref()).map_err(at_line)?;
+    config.validate().map_err(|(field, reason)| {
+        let at = offset(doc.get_ref(), &field);
+        at_line((field, reason, at))
     })?;
-    config.validate().map_err(fail)?;
+    file.clone_into(&mut config.file);
     Ok(config)
 }
 
 /// A field error with the byte offset of the value, for the line number.
 type WalkError = (String, String, Option<usize>);
+
+/// The byte offset of the value at the field path `field` of `doc`, such as `routes[1].alias`
+/// or `fronts.models."m"`; `None` when the file does not hold it.
+fn offset(doc: &DeTable<'_>, field: &str) -> Option<usize> {
+    let (mut table, mut rest, mut at) = (Some(doc), field, None);
+    while !rest.is_empty() {
+        let (key, after) = match rest.strip_prefix('"') {
+            Some(quoted) => quoted.split_at(quoted.find('"')?),
+            None => rest.split_at(rest.find(['.', '[']).unwrap_or(rest.len())),
+        };
+        let mut value = table?.get(key)?;
+        rest = after.strip_prefix('"').unwrap_or(after);
+        while let Some(index) = rest.strip_prefix('[') {
+            let (i, after) = index.split_at(index.find(']')?);
+            value = value.get_ref().as_array()?.get(i.parse::<usize>().ok()?)?;
+            rest = &after[1..];
+        }
+        at = Some(value.span().start);
+        table = value.get_ref().as_table();
+        rest = rest.strip_prefix('.').unwrap_or(rest);
+    }
+    at
+}
 
 type Value<'i> = Spanned<DeValue<'i>>;
 
@@ -376,6 +406,7 @@ fn tables<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<Vec<(String, &'v DeTable
 /// The config's fields out of the parsed TOML tree.
 fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
     let mut c = GatewayConfig {
+        file: PathBuf::new(),
         socket: PathBuf::new(),
         socket_mode: 0o600,
         qbd_socket: PathBuf::from(crate::DEFAULT_SOCKET),
@@ -1156,7 +1187,7 @@ difficulty = 1
             (
                 "",
                 "[[routes]]\nalias = \"chat\"\nrole = \"r\"\ndifficulty = 1\n",
-                "gw.toml: routes[1].alias: duplicate `chat`",
+                "gw.toml: routes[1].alias: duplicate `chat` (line 14)",
             ),
             (
                 "",
@@ -1166,7 +1197,7 @@ difficulty = 1
             (
                 "",
                 "[[routes]]\nalias = \"two\"\nrole = \"r\"\ndifficulty = 1\nvendor = \"v\"\nmodel = \"m\"\n",
-                "routes[1]: needs `difficulty`, both `vendor` and `model`, or `chain`",
+                "routes[1]: needs `difficulty`, both `vendor` and `model`, or `chain` (line 13)",
             ),
             (
                 "",

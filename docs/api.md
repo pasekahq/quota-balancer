@@ -218,6 +218,7 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/turn` | `TurnRequest` | 200 chunked NDJSON of `StreamEvent`; a rejection is an `Error` with 400, 401, 411, 413 or 429 |
 | `GET /v1/model/routes` | — | 200 `RoutesAnswer` |
 | `POST /v1/model/cancel` | `CancelRequest` | 200 `CancelAnswer`, 403 another caller's turn, 404 no such running turn |
+| `POST /v1/model/reload` | — | 200 `ReloadAnswer`, 400 refused, 403 a caller other than the gateway's own uid |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -377,3 +378,13 @@ interrupted, the lease is released, the stream ends with an `error` of class `ca
 the answer `{"cancelled": true}` comes once the turn has ended (at most 5 s). 404 when no turn
 with that id runs, 403 when another caller started it. A client that closes its stream cancels
 its turn the same way, without an event.
+
+### `POST /v1/model/reload`
+
+The gateway reads its config file again, as SIGHUP makes it do; `qb --socket <gateway socket>
+reload` sends it. Only the gateway's own uid may: any other caller gets 403 `auth`. The body is
+ignored. A new config that parses and validates and changes no restart-only field serves every
+later turn, and the answer is `{"routes": 3, "logins": 2}`, its counts. Otherwise the answer is
+400 `bad_request` with the message `reload refused: <file>: <field>: <reason>`, naming the line
+where the file has one, and the running config stays. What a reload changes:
+[config.md](config.md#reload).

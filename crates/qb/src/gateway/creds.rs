@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
-use super::config::CredentialKind;
+use super::config::{CredentialKind, GatewayLogin};
 use super::upstream::Credential;
 
 /// An OAuth token is refreshed when it expires within this many seconds.
@@ -51,11 +51,12 @@ pub struct RefreshError {
 
 /// Exchanges an OAuth refresh token for a new access token.
 pub trait Refresher: Send + Sync {
-    /// Refreshes `login`'s tokens with `refresh_token`.
+    /// Refreshes the tokens of the login of entry `login` with `refresh_token`.
     ///
     /// # Errors
     /// The vendor refused (`rejected`) or could not be asked.
-    fn refresh(&self, login: &str, refresh_token: &str) -> Result<Refreshed, RefreshError>;
+    fn refresh(&self, login: &GatewayLogin, refresh_token: &str)
+    -> Result<Refreshed, RefreshError>;
 }
 
 /// Why a credential could not be used.
@@ -145,7 +146,7 @@ impl CredentialStore {
         l
     }
 
-    /// The credential of `login` in `file`, which must hold `kind`, at `now`. An OAuth token
+    /// The credential of the entry `login` in its file, which must hold its kind, at `now`. An OAuth token
     /// expiring within [`REFRESH_MARGIN_S`], or any such token when `stale` (the vendor just
     /// rejected it), is refreshed first unless another attempt already replaced it; an expiring
     /// `chatgpt_oauth` token without `refresh_token` is used as it is.
@@ -154,12 +155,11 @@ impl CredentialStore {
     /// The file is unreadable, too open, malformed, or the refresh failed.
     pub fn load(
         &self,
-        login: &str,
-        file: &Path,
-        kind: CredentialKind,
+        login: &GatewayLogin,
         now: u64,
         stale: bool,
     ) -> Result<Credential, CredError> {
+        let (file, kind) = (login.credentials.as_path(), login.kind);
         let first = read(file)?;
         let found = match first.kind {
             Kind::OauthAnthropic => CredentialKind::OauthAnthropic,
@@ -425,7 +425,11 @@ mod tests {
     }
 
     impl Refresher for Counting {
-        fn refresh(&self, _: &str, refresh_token: &str) -> Result<Refreshed, RefreshError> {
+        fn refresh(
+            &self,
+            _: &GatewayLogin,
+            refresh_token: &str,
+        ) -> Result<Refreshed, RefreshError> {
             assert!(refresh_token.starts_with("refresh-"));
             let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if let Some(rejected) = self.fail {
@@ -442,6 +446,20 @@ mod tests {
         }
     }
 
+    /// The `anthropic` entry of `login` with its credentials in `file` of `kind`.
+    fn entry(login: &str, file: &Path, kind: CredentialKind) -> GatewayLogin {
+        GatewayLogin {
+            name: login.into(),
+            kind,
+            api: crate::gateway::config::Api::Anthropic,
+            base_url: None,
+            referer: None,
+            title: None,
+            token_url: None,
+            credentials: file.to_owned(),
+        }
+    }
+
     fn store(fail: Option<bool>) -> (CredentialStore, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let s = CredentialStore::new(Box::new(Counting {
@@ -455,10 +473,10 @@ mod tests {
     fn api_keys_and_fresh_tokens_load_as_they_are() {
         let (s, calls) = store(None);
         let f = file("key", r#"{"type":"api_key","key":"test-token-1"}"#, 0o600);
-        let c = s.load("login-1", &f, KEY, NOW, false).unwrap();
+        let c = s.load(&entry("login-1", &f, KEY), NOW, false).unwrap();
         assert_eq!((c.kind(), c.secret()), ("api_key", "test-token-1"));
         let f = file("fresh", &oauth("access-0", NOW + 600), 0o600);
-        let c = s.load("login-1", &f, KIND, NOW, false).unwrap();
+        let c = s.load(&entry("login-1", &f, KIND), NOW, false).unwrap();
         assert_eq!((c.kind(), c.secret()), ("oauth_anthropic", "access-0"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -481,7 +499,7 @@ mod tests {
                 &chatgpt(Some(&format!("refresh-{MARK}")), expires_at),
                 0o600,
             );
-            let c = s.load("login-1", &f, CHATGPT, NOW, stale).unwrap();
+            let c = s.load(&entry("login-1", &f, CHATGPT), NOW, stale).unwrap();
             assert_eq!(
                 (c.kind(), c.secret(), c.account_id()),
                 ("chatgpt_oauth", "access-1", Some("account-1"))
@@ -506,7 +524,7 @@ mod tests {
             chatgpt(None, NOW - 600),
         ] {
             let f = file("chatgpt-as-is", &body, 0o600);
-            let c = s.load("login-1", &f, CHATGPT, NOW, false).unwrap();
+            let c = s.load(&entry("login-1", &f, CHATGPT), NOW, false).unwrap();
             assert_eq!(
                 (c.kind(), c.secret(), c.account_id()),
                 ("chatgpt_oauth", "access-0", Some("account-1"))
@@ -515,7 +533,9 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let f = file("chatgpt-stale", &chatgpt(None, NOW + 600), 0o600);
-        let e = s.load("login-1", &f, CHATGPT, NOW, true).unwrap_err();
+        let e = s
+            .load(&entry("login-1", &f, CHATGPT), NOW, true)
+            .unwrap_err();
         assert!(e.unusable, "{e}");
         assert!(e.message.starts_with(&f.display().to_string()), "{e}");
         assert!(e.message.contains("no `refresh_token`"), "{e}");
@@ -543,12 +563,14 @@ mod tests {
             ),
         ] {
             let f = file("chatgpt-bad", &body, 0o600);
-            let e = s.load("login-1", &f, CHATGPT, NOW, false).unwrap_err();
+            let e = s
+                .load(&entry("login-1", &f, CHATGPT), NOW, false)
+                .unwrap_err();
             assert!(e.unusable && e.message.contains(want), "{body}: {e}");
             assert!(!e.message.contains(MARK), "{body}: {e}");
         }
         let f = file("chatgpt-kind", &chatgpt(None, NOW), 0o600);
-        let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
+        let e = s.load(&entry("login-1", &f, KIND), NOW, false).unwrap_err();
         assert!(
             e.message
                 .contains("has type `chatgpt_oauth`, the config says `oauth_anthropic`"),
@@ -560,7 +582,7 @@ mod tests {
     fn a_file_of_another_kind_than_configured_is_refused() {
         let (s, _) = store(None);
         let f = file("kind", r#"{"type":"api_key","key":"test-token-1"}"#, 0o600);
-        let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
+        let e = s.load(&entry("login-1", &f, KIND), NOW, false).unwrap_err();
         assert!(e.unusable, "{e}");
         assert!(
             e.message
@@ -574,7 +596,7 @@ mod tests {
         let (s, _) = store(None);
         for mode in [0o640, 0o604, 0o660, 0o644] {
             let f = file("mode", r#"{"type":"api_key","key":"test-token-1"}"#, mode);
-            let e = s.load("login-1", &f, KEY, NOW, false).unwrap_err();
+            let e = s.load(&entry("login-1", &f, KEY), NOW, false).unwrap_err();
             assert!(
                 e.unusable && e.message.contains("too open"),
                 "{mode:o}: {e}"
@@ -584,7 +606,7 @@ mod tests {
         let target = file("target", r#"{"type":"api_key","key":"k"}"#, 0o600);
         std::os::unix::fs::symlink(&target, d.join("link.json")).unwrap();
         assert!(
-            s.load("login-1", &d.join("link.json"), KEY, NOW, false)
+            s.load(&entry("login-1", &d.join("link.json"), KEY), NOW, false)
                 .is_err()
         );
     }
@@ -593,7 +615,7 @@ mod tests {
     fn an_expiring_token_is_refreshed_and_written_back_atomically() {
         let (s, calls) = store(None);
         let f = file("refresh", &oauth("access-0", NOW + 30), 0o600);
-        let c = s.load("login-1", &f, KIND, NOW, false).unwrap();
+        let c = s.load(&entry("login-1", &f, KIND), NOW, false).unwrap();
         assert_eq!(c.secret(), "access-1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let meta = std::fs::metadata(&f).unwrap();
@@ -608,7 +630,7 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["login-1.json"], "no temporary file is left");
-        let again = s.load("login-1", &f, KIND, NOW, false).unwrap();
+        let again = s.load(&entry("login-1", &f, KIND), NOW, false).unwrap();
         assert_eq!(again.secret(), "access-1");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -622,7 +644,9 @@ mod tests {
         let (s, calls) = store(None);
         let f = file("stale", &oauth("access-0", NOW + 600), 0o600);
         assert_eq!(
-            s.load("login-1", &f, KIND, NOW, true).unwrap().secret(),
+            s.load(&entry("login-1", &f, KIND), NOW, true)
+                .unwrap()
+                .secret(),
             "access-1"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -634,7 +658,7 @@ mod tests {
             let (s, _) = store(Some(rejected));
             let body = oauth("access-0", NOW);
             let f = file("fail", &body, 0o600);
-            let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
+            let e = s.load(&entry("login-1", &f, KIND), NOW, false).unwrap_err();
             assert_eq!(e.unusable, rejected);
             assert!(!e.message.contains(MARK), "{e}");
             assert_eq!(std::fs::read_to_string(&f).unwrap(), body);
@@ -654,7 +678,7 @@ mod tests {
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
             return;
         }
-        let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
+        let e = s.load(&entry("login-1", &f, KIND), NOW, false).unwrap_err();
         std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(e.message.contains("cannot write"), "{e}");
         assert!(!e.message.contains(MARK), "{e}");
@@ -670,13 +694,15 @@ mod tests {
             std::thread::spawn(move || {
                 let (s, _) = store(None);
                 for _ in 0..300 {
-                    let c = s.load("login-1", &f, KIND, NOW - 7200, false).unwrap();
+                    let c = s
+                        .load(&entry("login-1", &f, KIND), NOW - 7200, false)
+                        .unwrap();
                     assert!(c.secret().starts_with("access-"));
                 }
             })
         };
         for _ in 0..100 {
-            s.load("login-1", &f, KIND, NOW, true).unwrap();
+            s.load(&entry("login-1", &f, KIND), NOW, true).unwrap();
         }
         reader.join().unwrap();
     }
@@ -688,7 +714,8 @@ mod tests {
     }
 
     impl Refresher for Stuck {
-        fn refresh(&self, login: &str, _: &str) -> Result<Refreshed, RefreshError> {
+        fn refresh(&self, login: &GatewayLogin, _: &str) -> Result<Refreshed, RefreshError> {
+            let login = login.name.as_str();
             if login == "login-1" {
                 self.entered.lock().unwrap().send(()).unwrap();
                 let release = self.release.lock().unwrap();
@@ -714,14 +741,14 @@ mod tests {
         let two = file("two", &oauth("access-0", NOW), 0o600);
         let stuck = {
             let s = Arc::clone(&s);
-            std::thread::spawn(move || s.load("login-1", &one, KIND, NOW, true).unwrap())
+            std::thread::spawn(move || s.load(&entry("login-1", &one, KIND), NOW, true).unwrap())
         };
         on_enter.recv_timeout(Duration::from_secs(10)).unwrap();
         let (done, finished) = mpsc::channel();
         let other = {
             let s = Arc::clone(&s);
             std::thread::spawn(move || {
-                let c = s.load("login-2", &two, KIND, NOW, true).unwrap();
+                let c = s.load(&entry("login-2", &two, KIND), NOW, true).unwrap();
                 done.send(c.secret().to_owned()).unwrap();
             })
         };
@@ -739,7 +766,7 @@ mod tests {
         let f = file("shared", &chatgpt(Some("refresh-0"), NOW + 30), 0o600);
         let load = |login: &'static str| {
             let (s, f) = (Arc::clone(&s), f.clone());
-            std::thread::spawn(move || s.load(login, &f, CHATGPT, NOW, false).unwrap())
+            std::thread::spawn(move || s.load(&entry(login, &f, CHATGPT), NOW, false).unwrap())
         };
         let (one, two) = (load("login-1"), load("login-2"));
         for t in [one, two] {
@@ -788,7 +815,7 @@ mod tests {
         for (body, want) in cases {
             let f = file("leak", &body, 0o600);
             let kind = if body.contains("api_key") { KEY } else { KIND };
-            let e = s.load("login-1", &f, kind, NOW, false).unwrap_err();
+            let e = s.load(&entry("login-1", &f, kind), NOW, false).unwrap_err();
             assert!(e.message.starts_with(&f.display().to_string()), "{e}");
             assert!(e.message.contains(want), "{body}: {e}");
             assert!(!e.message.contains(MARK), "{body}: {e}");
