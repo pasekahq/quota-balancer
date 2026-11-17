@@ -461,10 +461,14 @@ fn shipped_examples_validate() {
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "toml") {
-            let loaded = if path.file_name().is_some_and(|n| n == "agent.toml") {
-                config::load_agent(&path).map(drop)
-            } else {
-                config::load(&path).map(drop)
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let loaded = match name {
+                "agent.toml" => config::load_agent(&path).map(drop),
+                "gateway.toml" => qb::gateway::config::load(&path).map(drop),
+                _ => config::load(&path).map(drop),
             };
             if let Err(e) = loaded {
                 panic!("{e}");

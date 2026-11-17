@@ -1,6 +1,8 @@
 //! Gateway contract fixtures: valid ones decode, validate and re-encode to the same JSON; invalid
 //! ones fail to decode or to validate.
 
+#![allow(clippy::unwrap_used)]
+
 use qb_proto::{
     Block, CancelAnswer, CancelRequest, ErrorClass, GatewayError, Message, Role, RouteState,
     RoutesAnswer, StopReason, StreamEvent, TurnRequest,

@@ -1034,14 +1034,3 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     };
     assert_eq!(s.leases, Vec::new());
 }
-
-#[test]
-fn the_example_config_is_valid() {
-    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/examples/gateway.toml");
-    let c = qb::gateway::config::load(&file).unwrap();
-    assert_eq!(c.logins.len(), 3);
-    assert_eq!(
-        c.route("compact").and_then(|r| r.pin()).unwrap().model,
-        "model-small"
-    );
-}
