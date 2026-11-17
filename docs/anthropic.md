@@ -142,7 +142,9 @@ vendor's message, cut to 300 characters; it never carries a header value.
   block as JSON, except a `redacted_thinking` this front wrapped for another vendor (below);
 - `output_config.effort`: `xhigh` reads as `high`; an unknown effort is `bad_request`;
 - `metadata.user_id` of 1 to 128 bytes is the `session_key`;
-- `cache` is `auto` when any `cache_control` appears in the request, else absent;
+- `cache` is `auto` when `cache_control` is set at the top level, on a `system` block, a tool, a
+  message content block or a block inside a tool result, else absent; a `cache_control` key
+  inside a tool schema or tool input is data and does not count;
 - sampling parameters, `tool_choice`, `stop_sequences` and thinking budgets are ignored; unknown
   fields are ignored;
 - documents, URL or file images, images inside tool results, roles other than `user` and

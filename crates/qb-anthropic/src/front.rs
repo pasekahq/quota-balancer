@@ -50,7 +50,7 @@ fn bad(message: impl Into<String>) -> GatewayError {
 ///
 /// `route_of` maps the client's `model` to a route alias. Thinking blocks become canonical
 /// thinking of `native_vendor`, except redacted blocks this front wrapped for another vendor.
-/// `cache` is `auto` when the request carries any `cache_control`. Sampling parameters,
+/// `cache` is `auto` when the request sets `cache_control` on a block, a tool or the request. Sampling parameters,
 /// `tool_choice`, `stop_sequences` and thinking budgets are ignored.
 ///
 /// # Errors
@@ -159,14 +159,24 @@ pub fn decode_request(
     })
 }
 
+/// Whether the request sets `cache_control` where the vendor reads it: at the top level, on a
+/// `system` block, a tool, a message content block or a block inside a tool result. Keys of the
+/// same name inside schemas or tool inputs are data, not breakpoints.
 fn has_cache_control(v: &Value) -> bool {
-    match v {
-        Value::Object(m) => m
-            .iter()
-            .any(|(k, v)| (k == "cache_control" && !v.is_null()) || has_cache_control(v)),
-        Value::Array(a) => a.iter().any(has_cache_control),
-        _ => false,
+    fn set(v: &Value) -> bool {
+        v.get("cache_control").is_some_and(|c| !c.is_null())
     }
+    fn blocks(v: Option<&Value>) -> &[Value] {
+        v.and_then(Value::as_array).map_or(&[], Vec::as_slice)
+    }
+    set(v)
+        || blocks(v.get("system")).iter().any(set)
+        || blocks(v.get("tools")).iter().any(set)
+        || blocks(v.get("messages")).iter().any(|m| {
+            blocks(m.get("content"))
+                .iter()
+                .any(|b| set(b) || blocks(b.get("content")).iter().any(set))
+        })
 }
 
 fn media_type(s: &str) -> Option<MediaType> {

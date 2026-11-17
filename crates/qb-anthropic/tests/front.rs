@@ -336,3 +336,53 @@ fn an_error_after_the_start_is_an_error_event() {
     });
     assert_eq!(after, b"");
 }
+
+#[test]
+fn cache_control_counts_only_at_block_positions() {
+    let decoys = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 16,
+        "tools": [{
+            "name": "set",
+            "input_schema": {
+                "type": "object",
+                "properties": {"cache_control": {"type": "object"}}
+            }
+        }],
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_test_1", "name": "set",
+                "input": {"cache_control": {"type": "ephemeral"}}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_test_1", "content": "ok"
+            }]}
+        ]
+    });
+    let got = decode_request(decoys.to_string().as_bytes(), "m", VENDOR, &route_of).expect("ok");
+    assert_eq!(got.turn.cache, None);
+
+    let ephemeral = json!({"type": "ephemeral"});
+    let mut cases: Vec<(&str, Value)> = Vec::new();
+    let mut v = decoys.clone();
+    v["cache_control"] = ephemeral.clone();
+    cases.push(("top level", v));
+    let mut v = decoys.clone();
+    v["system"] = json!([{"type": "text", "text": "Be brief.", "cache_control": ephemeral}]);
+    cases.push(("system block", v));
+    let mut v = decoys.clone();
+    v["tools"][0]["cache_control"] = ephemeral.clone();
+    cases.push(("tool", v));
+    let mut v = decoys.clone();
+    v["messages"][1]["content"][0]["cache_control"] = ephemeral.clone();
+    cases.push(("message block", v));
+    let mut v = decoys.clone();
+    v["messages"][2]["content"][0]["content"] =
+        json!([{"type": "text", "text": "ok", "cache_control": ephemeral}]);
+    cases.push(("tool result block", v));
+    for (what, body) in cases {
+        let got = decode_request(body.to_string().as_bytes(), "m", VENDOR, &route_of).expect(what);
+        assert_eq!(got.turn.cache, Some(CacheMode::Auto), "{what}");
+    }
+}
