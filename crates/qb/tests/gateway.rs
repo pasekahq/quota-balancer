@@ -3868,8 +3868,18 @@ fn a_usage_limit_on_a_chatgpt_login_moves_the_turn_to_the_next_openai_login() {
     );
     vendor.answer(openai_recorded("429_usage_limit", None));
     vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
-    let mut events = Vec::new();
-    let logged = stderr_of(|| events = turn(&r.gw, &turn_body("turn-1")).2);
+    let mut answer = Vec::new();
+    let logged = stderr_of(|| {
+        let s = send(
+            &r.gw,
+            "POST",
+            paths::MODEL_TURN,
+            &turn_body("turn-1").to_string(),
+        );
+        answer = finish(s, Vec::new()).2;
+    });
+    let answer = String::from_utf8(answer).unwrap();
+    let events = events(answer.as_bytes());
 
     assert_eq!(kinds(&events)[0], "route login-2");
     assert_eq!(kinds(&events).last().unwrap(), "stop End");
@@ -3894,7 +3904,8 @@ fn a_usage_limit_on_a_chatgpt_login_moves_the_turn_to_the_next_openai_login() {
     );
     assert!(logged.contains("login-1: usage_limit"), "{logged}");
     for secret in [ACCESS, ACCOUNT, KEY] {
-        assert!(!logged.contains(secret), "{secret}: {logged}");
+        assert!(!logged.contains(secret), "{secret} logged: {logged}");
+        assert!(!answer.contains(secret), "{secret} sent: {answer}");
     }
 }
 

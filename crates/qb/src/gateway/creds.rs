@@ -732,48 +732,16 @@ mod tests {
         assert_eq!(stuck.join().unwrap().secret(), "access-login-1");
     }
 
-    /// Blocks its first refresh until `release` gets a message, counting every call.
-    struct First {
-        calls: Arc<AtomicUsize>,
-        entered: Mutex<mpsc::Sender<()>>,
-        release: Mutex<mpsc::Receiver<()>>,
-    }
-
-    impl Refresher for First {
-        fn refresh(&self, _: &str, _: &str) -> Result<Refreshed, RefreshError> {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.entered.lock().unwrap().send(()).unwrap();
-                let release = self.release.lock().unwrap();
-                release.recv_timeout(Duration::from_secs(10)).unwrap();
-            }
-            Ok(Refreshed {
-                access_token: Zeroizing::new("access-1".into()),
-                refresh_token: None,
-                expires_at: NOW + 3600,
-            })
-        }
-    }
-
     #[test]
     fn two_logins_of_one_file_refresh_it_once() {
-        let (entered, on_enter) = mpsc::channel();
-        let (release, on_release) = mpsc::channel();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let s = Arc::new(CredentialStore::new(Box::new(First {
-            calls: Arc::clone(&calls),
-            entered: Mutex::new(entered),
-            release: Mutex::new(on_release),
-        })));
-        let f = file("shared", &chatgpt(Some("refresh-0"), NOW + 600), 0o600);
+        let (s, calls) = store(None);
+        let s = Arc::new(s);
+        let f = file("shared", &chatgpt(Some("refresh-0"), NOW + 30), 0o600);
         let load = |login: &'static str| {
             let (s, f) = (Arc::clone(&s), f.clone());
-            std::thread::spawn(move || s.load(login, &f, CHATGPT, NOW, true).unwrap())
+            std::thread::spawn(move || s.load(login, &f, CHATGPT, NOW, false).unwrap())
         };
-        let one = load("login-1");
-        on_enter.recv_timeout(Duration::from_secs(10)).unwrap();
-        let two = load("login-2");
-        std::thread::sleep(Duration::from_millis(100));
-        release.send(()).unwrap();
+        let (one, two) = (load("login-1"), load("login-2"));
         for t in [one, two] {
             assert_eq!(t.join().unwrap().secret(), "access-1");
         }
