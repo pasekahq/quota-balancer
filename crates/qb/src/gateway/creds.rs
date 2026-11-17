@@ -223,13 +223,7 @@ fn unusable(file: &Path, what: impl fmt::Display) -> CredError {
 /// Reads and decodes `file` after checking it is a regular file of ours that nobody else may
 /// read or write.
 fn read(file: &Path) -> Result<Stored, CredError> {
-    let link = std::fs::symlink_metadata(file).map_err(|e| unusable(file, e))?;
-    let f = File::open(file).map_err(|e| unusable(file, e))?;
-    let meta = f.metadata().map_err(|e| unusable(file, e))?;
-    // The path itself, not a symlink to it, must be the regular file that was opened.
-    if !link.is_file() || !meta.is_file() || (link.dev(), link.ino()) != (meta.dev(), meta.ino()) {
-        return Err(unusable(file, "is not a regular file"));
-    }
+    let (f, meta) = open_regular(file)?;
     if meta.mode() & 0o077 != 0 {
         return Err(unusable(
             file,
@@ -267,6 +261,23 @@ fn read(file: &Path) -> Result<Stored, CredError> {
     de.end()
         .map_err(|_| unusable(file, "trailing data after the JSON object"))?;
     Ok(stored)
+}
+
+/// `file` opened, when the path itself (not a symlink) names a regular file. A refresh may
+/// replace the file between the `lstat` and the `open`; that is retried a few times.
+fn open_regular(file: &Path) -> Result<(File, std::fs::Metadata), CredError> {
+    for _ in 0..3 {
+        let link = std::fs::symlink_metadata(file).map_err(|e| unusable(file, e))?;
+        if !link.is_file() {
+            break;
+        }
+        let f = File::open(file).map_err(|e| unusable(file, e))?;
+        let meta = f.metadata().map_err(|e| unusable(file, e))?;
+        if (link.dev(), link.ino()) == (meta.dev(), meta.ino()) {
+            return Ok((f, meta));
+        }
+    }
+    Err(unusable(file, "is not a regular file"))
 }
 
 /// `secret` copied out, if it is a non-empty run of visible ASCII (safe in a header).
