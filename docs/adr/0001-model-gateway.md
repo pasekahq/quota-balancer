@@ -113,10 +113,10 @@ vendor failure. Stickiness serves the prompt cache and must not block a turn: a 
 a pick with `resume_of` is retried once without it.
 
 The gateway config has one credential entry per login it holds: the `qbd` login name, the kind
-(`oauth_anthropic` or `api_key` in G1) and the file. The `login` of a `run` answer selects the
-entry by exact name; the kind selects the adapter and its auth mode; the answer's `model` is the
-vendor model id; its `effort` becomes the adapter's reasoning parameter. A `run` naming a login
-without an entry is a configuration error: the gateway reports `error` with `release: true`,
+(`oauth_anthropic` or `api_key` in G1), the vendor API family and the file. The `login` of a
+`run` answer selects the entry by exact name; the family selects the adapter and the kind its
+auth mode; the answer's `model` is the vendor model id; its `effort` becomes the adapter's
+reasoning parameter. A `run` naming a login without an entry is a configuration error: the gateway reports `error` with `release: true`,
 logs the login name and fails the turn without retry. Every login of a vendor that one of the
 gateway's routes can reach therefore needs a credential in this gateway; a separate `qbd`
 vendor keeps the gateway's logins apart from logins used elsewhere.
@@ -152,15 +152,17 @@ There is no async runtime: the gateway uses std threads and blocking I/O.
   bounded event size. Each event is translated and written as one chunk and flushed: one NDJSON
   line on the C4 front, one SSE event on the Messages front. Only a non-streaming Messages
   request is assembled in memory, from the same events.
-- Each attempt is bounded by the route's turn timeout through ureq's global timeout.
-- Cancel: turns in flight are registered by `request_id` with a cancel flag and a clone of the
-  upstream TCP stream, which the gateway's ureq agent records through a small connector of the
-  gateway's own. `POST /v1/model/cancel` sets the flag and shuts the stream down; the turn's
-  blocked read returns at once, and the turn ends with an `error` event of class `cancelled`.
-  Cancel answers 404 for an unknown `request_id` and 403 when the caller is not the peer that
-  started the turn. A client that closes its connection cancels its turn too: the next write
-  fails and the turn ends the same way. The Messages front has no cancel request; closing the
-  connection is its cancel.
+- Each attempt is bounded by a 10 s connect timeout and a 10 min attempt timeout through ureq's
+  timeouts.
+- Cancel: turns in flight are registered by `request_id` with a cancel flag. Each attempt runs on
+  its own ureq agent, and the flag's hook shuts that agent down (`Agent::shutdown`), which shuts
+  its upstream TCP stream down. `POST /v1/model/cancel` sets the flag; the turn's blocked read
+  returns at once, and the turn ends with an `error` event of class `cancelled`. Cancel answers
+  404 for an unknown `request_id` and 403 when the caller is not the peer that started the turn.
+  A client that closes its connection cancels its turn too: the main thread polls the
+  connections of running turns with the listener and sets the flag on a hang-up, and a failed
+  write does the same. The Messages front has no cancel request; closing the connection is its
+  cancel.
 
 ### Rotation boundary
 
@@ -209,9 +211,7 @@ G1 reuses `ureq` with rustls (ring) for upstream HTTPS and token refresh, `landl
 `serde` and `serde_json` for C4, Messages and SSE payloads, `httparse` and the existing framing
 for the server side, and `rustix` for `SO_PEERCRED`, `poll()` and the dumpable flag. G1 adds no
 crate: the SSE parser, the chunked writer and the atomic file replace are small code of its own.
-The connector uses ureq's `unversioned` transport interface, which may change in a minor
-release; `Cargo.lock` pins ureq, and an upgrade is checked by compiling. A G2 vendor type crate
-needs its own reason and measured cost under AGENTS.md rule 4.
+A G2 vendor type crate needs its own reason and measured cost under AGENTS.md rule 4.
 
 ### Budgets
 

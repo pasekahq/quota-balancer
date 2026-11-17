@@ -8,7 +8,9 @@ use std::process::ExitCode;
 
 use qb::auth::Gate;
 use qb::config::Config;
-use qb::gateway::core::Gateway;
+use qb::gateway::anthropic::Anthropic;
+use qb::gateway::config::Api;
+use qb::gateway::core::{Gateway, Upstreams};
 use qb::gateway::creds::NoRefresher;
 use qb::gateway::front;
 use qb::hooks::Runner;
@@ -426,8 +428,8 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Runs the model gateway of the config in `file`. Vendor adapters are not part of this build
-/// yet, so every turn ends with `unavailable`; the credential and qbd paths run in full.
+/// Runs the model gateway of the config in `file` with the adapter of the `anthropic` API
+/// family; a login of another family ends its turn with `unavailable`.
 fn gateway(file: &Path) -> Result<ExitCode, String> {
     let config = qb::gateway::config::load(file).map_err(|e| e.to_string())?;
     let qbd_bearer = bearer(config.qbd_bearer_file.clone())?.map(zeroize::Zeroizing::new);
@@ -450,7 +452,8 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
             gaps.join("; ")
         ));
     }
-    let gateway = Gateway::new(config, Vec::new(), Box::new(NoRefresher), qbd_bearer);
+    let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
+    let gateway = Gateway::new(config, upstreams, Box::new(NoRefresher), qbd_bearer);
     let Err(e) = front::serve(
         &listener,
         &std::sync::Arc::new(gateway),

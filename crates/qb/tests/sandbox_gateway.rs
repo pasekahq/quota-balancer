@@ -46,7 +46,7 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
         Path::new("gateway.toml"),
         &format!(
             "socket = \"{}\"\nqbd_socket = \"{}\"\n\
-             [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\ncredentials = \"{}\"\n\
+             [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\napi = \"anthropic\"\ncredentials = \"{}\"\n\
              [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n",
             dir.join("gw.sock").display(),
             qbd.display(),

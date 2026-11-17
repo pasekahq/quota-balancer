@@ -20,6 +20,7 @@ credentials = "/var/lib/qb-gateway/credentials/login-2.json"
 [[logins]]
 name = "key-1"
 kind = "api_key"
+api = "anthropic"
 credentials = "/var/lib/qb-gateway/credentials/key-1.json"
 
 # Ladder step 1 of qbd's role "gateway": subscription logins first, the key as the last tier.
