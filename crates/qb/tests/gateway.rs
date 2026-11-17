@@ -1380,6 +1380,12 @@ fn a_vendor_failure_before_the_first_event_repicks_avoiding_the_vendor() {
 
 /// Runs `f` with this process's stderr in a file and returns what was written there.
 fn stderr_of(f: impl FnOnce()) -> String {
+    stderr_until("", f)
+}
+
+/// [`stderr_of`] that keeps stderr in the file until it holds `needle`, for at most 5 s after
+/// `f` returned.
+fn stderr_until(needle: &str, f: impl FnOnce()) -> String {
     use std::os::fd::AsFd;
     static ONE: Mutex<()> = Mutex::new(());
     let _one = ONE.lock().unwrap();
@@ -1388,6 +1394,12 @@ fn stderr_of(f: impl FnOnce()) -> String {
     let saved = rustix::io::dup(std::io::stderr().as_fd()).unwrap();
     rustix::stdio::dup2_stderr(&file).unwrap();
     f();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&path).unwrap().contains(needle)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     rustix::stdio::dup2_stderr(&saved).unwrap();
     std::fs::read_to_string(&path).unwrap()
 }
@@ -2005,8 +2017,16 @@ fn a_key_login_of_another_api_family_is_never_sent_to_anthropic() {
 /// The first two events of `upstream_text.sse`: `message_start` and a text block's start and
 /// first delta, with nothing after.
 fn stream_start() -> Vec<u8> {
-    let sse = String::from_utf8(vendor_fixture("upstream_text.sse")).unwrap();
-    let cut = sse.find("event: content_block_delta").unwrap();
+    through_first(
+        &vendor_fixture("upstream_text.sse"),
+        "event: content_block_delta",
+    )
+}
+
+/// `sse` up to the end of its first event that starts with `event`.
+fn through_first(sse: &[u8], event: &str) -> Vec<u8> {
+    let sse = std::str::from_utf8(sse).unwrap();
+    let cut = sse.find(event).unwrap();
     let rest = &sse[cut..];
     let end = cut + rest.find("\n\n").unwrap() + 2;
     sse.as_bytes()[..end].to_vec()
@@ -2837,10 +2857,10 @@ fn the_loopback_listener_serves_messages_to_the_client_token_only() {
     assert_eq!(status, 200, "the unix socket needs no token");
 }
 
-/// The request the official Anthropic Python SDK's `messages.stream` sends with the base URL
-/// `http://127.0.0.1:8080` and the key [`CLIENT_TOKEN`], recorded byte for byte.
-fn recorded_sdk_request() -> Vec<u8> {
-    let v: Value = serde_json::from_slice(&vendor_fixture("client_sdk_http_request.json")).unwrap();
+/// A request an official vendor Python SDK sent with the base URL `http://127.0.0.1:8080` and
+/// the key [`CLIENT_TOKEN`], recorded byte for byte in the fixture `name` of `krate`.
+fn recorded_sdk_request(krate: &str, name: &str) -> Vec<u8> {
+    let v: Value = serde_json::from_slice(&fixture_of(krate, name)).unwrap();
     let text = |v: &Value| v.as_str().unwrap().to_owned();
     let mut raw = format!("{} {} HTTP/1.1\r\n", text(&v["method"]), text(&v["path"]));
     for h in v["headers"].as_array().unwrap() {
@@ -2858,7 +2878,7 @@ fn a_recorded_sdk_request_streams_over_the_loopback_listener() {
     for _ in 0..2 {
         vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
     }
-    let raw = recorded_sdk_request();
+    let raw = recorded_sdk_request("qb-anthropic", "client_sdk_http_request.json");
     let mut tcp = TcpStream::connect(addr).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
     tcp.write_all(&raw).unwrap();
@@ -3623,18 +3643,27 @@ fn chatgpt(access_token: &str, account_id: &str) -> String {
 }
 
 /// A rig whose gateway runs both adapters against one scripted vendor, with qbd of
-/// [`openai_qbd`]`(vendor_1)` and the `[fronts]` table `front`.
+/// [`openai_qbd`]`(vendor_1)`, the `[fronts]` table `front` and the HTTP fronts also on
+/// `loopback`.
 fn openai_rig(
     vendor_1: &str,
     files: &[(&str, String, u32)],
     logins: impl Fn(&Vendor) -> [String; 2],
     front: &str,
+    loopback: Option<TcpListener>,
 ) -> (Rig, Vendor) {
     let upstreams: Upstreams = vec![
         (Api::Anthropic, Box::new(Anthropic::new())),
         (Api::Openai, Box::new(Openai::new())),
     ];
-    vendor_rig_with(&openai_qbd(vendor_1), upstreams, files, logins, front, None)
+    vendor_rig_with(
+        &openai_qbd(vendor_1),
+        upstreams,
+        files,
+        logins,
+        front,
+        loopback,
+    )
 }
 
 /// The reasoning item of `upstream_reasoning.sse` as the adapter passes it on.
@@ -3658,6 +3687,7 @@ fn the_openai_adapter_streams_reasoning_text_and_a_tool_call_on_a_key_login() {
         &files,
         |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
         &fronts(""),
+        None,
     );
     vendor.answer(openai_recorded(
         "200_api_key",
@@ -3744,6 +3774,7 @@ fn reasoning_of_an_openai_login_goes_back_to_it_in_the_next_turn() {
         &key_files(),
         |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
         &fronts(""),
+        None,
     );
     vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
     let mut next = turn_body("turn-2");
@@ -3798,6 +3829,7 @@ fn messages_on_a_chatgpt_login_sends_its_account_and_never_shows_reasoning_as_th
         &files,
         |v| [v.login(CHATGPT), v.login(CHATGPT)],
         &fronts(""),
+        None,
     );
     vendor.answer(openai_recorded(
         "200_chatgpt",
@@ -3917,6 +3949,7 @@ fn responses_gives_the_same_canonical_content_on_an_anthropic_and_an_openai_logi
         &files,
         |v| [v.login(ANTHROPIC_KEY), v.login(OPENAI_KEY)],
         &format!("{pins}{}", fronts("")),
+        None,
     );
     let cases = [
         (
@@ -3990,6 +4023,7 @@ fn a_usage_limit_on_a_chatgpt_login_moves_the_turn_to_the_next_openai_login() {
         &files,
         |v| [v.login(CHATGPT), v.login(OPENAI_KEY)],
         &fronts(""),
+        None,
     );
     vendor.answer(openai_recorded("429_usage_limit", None));
     vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
@@ -4019,4 +4053,406 @@ fn a_usage_limit_on_a_chatgpt_login_moves_the_turn_to_the_next_openai_login() {
     for secret in [ACCESS, ACCOUNT, KEY] {
         assert!(!logged.contains(secret), "{secret}: {logged}");
     }
+}
+
+/// The canonical events and stop reason an OpenAI vendor stream carries, read as the adapter
+/// reads it.
+fn openai_content_of(sse: &[u8]) -> (Vec<StreamEvent>, StopReason) {
+    let mut reader =
+        qb_openai::stream::Reader::new("vendor-o", qb_openai::limits::RateLimits::default());
+    let mut events = Vec::new();
+    reader.feed(sse, &mut events).unwrap();
+    (events, reader.finish().unwrap())
+}
+
+/// The canonical blocks of a Chat Completions assistant message, read back as the front reads a
+/// client's next turn.
+fn blocks_of_chat(message: &Value) -> Vec<Block> {
+    let next = json!({"model": "any", "messages": [{"role": "user", "content": "Hi"}, message]});
+    let route_of = |_: &str| Some("chat".to_owned());
+    let decoded =
+        qb_openai::chat::decode_request(next.to_string().as_bytes(), "turn-x", &route_of, 64)
+            .unwrap();
+    decoded.turn.messages[1].content.clone()
+}
+
+/// The assistant message an OpenAI SDK assembles from Chat Completions chunks: the content
+/// joined, and the tool call deltas merged by `index`, where the first delta of a call carries
+/// its id, type and name and every later one that names them names the same.
+fn chat_message_of(chunks: &[Value]) -> Value {
+    let mut calls: Vec<Value> = Vec::new();
+    let deltas = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+        .flatten();
+    for delta in deltas {
+        let i = usize::try_from(delta["index"].as_u64().unwrap()).unwrap();
+        assert!(i <= calls.len(), "calls open in index order: {delta}");
+        if i == calls.len() {
+            assert!(delta["id"].is_string(), "{delta}");
+            assert_eq!(delta["type"], "function", "{delta}");
+            assert!(delta["function"]["name"].is_string(), "{delta}");
+            calls.push(json!({"id": delta["id"], "type": "function",
+                              "function": {"name": delta["function"]["name"], "arguments": ""}}));
+        }
+        let call = &mut calls[i];
+        if let Some(id) = delta.get("id") {
+            assert_eq!(&call["id"], id, "a stable id");
+        }
+        if let Some(name) = delta["function"].get("name") {
+            assert_eq!(&call["function"]["name"], name, "a stable name");
+        }
+        let part = delta["function"]["arguments"].as_str().unwrap_or_default();
+        let joined = format!("{}{part}", call["function"]["arguments"].as_str().unwrap());
+        call["function"]["arguments"] = json!(joined);
+    }
+    let text = chat_text(chunks);
+    let mut message = json!({"role": "assistant", "content": text});
+    if text.is_empty() {
+        message["content"] = Value::Null;
+    }
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
+    }
+    message
+}
+
+/// The chunks of a well-formed Chat Completions stream with usage, without `[DONE]`: one id, one
+/// `finish_reason`, the usage chunk last.
+fn well_formed_chat_stream(sse: &[u8]) -> Vec<Value> {
+    let mut chunks = chat_chunks(sse);
+    assert_eq!(chunks.pop(), Some(json!("[DONE]")), "{chunks:?}");
+    let id = &chunks[0]["id"];
+    assert!(id.as_str().unwrap().starts_with("chatcmpl-"), "{id}");
+    for c in &chunks {
+        assert_eq!(
+            (&c["id"], &c["object"], &c["model"]),
+            (
+                id,
+                &json!("chat.completion.chunk"),
+                &json!("model-2025-01-01")
+            ),
+            "{c}"
+        );
+    }
+    let finishes = chunks
+        .iter()
+        .filter(|c| !c["choices"][0]["finish_reason"].is_null())
+        .count();
+    assert_eq!(finishes, 1, "{chunks:?}");
+    let usage = chunks.last().unwrap();
+    assert_eq!(usage["choices"], json!([]), "{usage}");
+    assert!(usage["usage"]["total_tokens"].is_u64(), "{usage}");
+    chunks
+}
+
+/// The frames of a well-formed Responses stream: `response.created` and `.in_progress` first,
+/// `response.completed` last, `sequence_number` counting from 0.
+fn well_formed_responses_stream(sse: &[u8]) -> Vec<qb_openai::sse::Frame> {
+    let got = openai_frames(sse);
+    let names: Vec<&str> = got.iter().map(|f| f.event.as_str()).collect();
+    assert_eq!(names[..2], ["response.created", "response.in_progress"]);
+    assert_eq!(names.last(), Some(&"response.completed"), "{names:?}");
+    for (n, f) in got.iter().enumerate() {
+        let data: Value = serde_json::from_str(&f.data).unwrap();
+        assert_eq!(
+            (data["type"].as_str(), data["sequence_number"].as_u64()),
+            (Some(f.event.as_str()), Some(n as u64))
+        );
+    }
+    got
+}
+
+/// The canonical blocks of the answer to the recorded SDK request `name`, which must be a
+/// well-formed OpenAI answer of a model that called a tool.
+fn blocks_of_answer(name: &str, answer: &[u8]) -> Vec<Block> {
+    match name {
+        "chat" => {
+            let answer: Value = serde_json::from_slice(answer).unwrap();
+            assert_eq!(
+                (&answer["object"], &answer["model"]),
+                (&json!("chat.completion"), &json!("model-2025-01-01"))
+            );
+            let choice = &answer["choices"][0];
+            assert_eq!(choice["finish_reason"], "tool_calls");
+            blocks_of_chat(&choice["message"])
+        }
+        "chat_stream" => {
+            let chunks = well_formed_chat_stream(answer);
+            let finish = &chunks[chunks.len() - 2];
+            assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+            blocks_of_chat(&chat_message_of(&chunks))
+        }
+        "responses" => {
+            let answer: Value = serde_json::from_slice(answer).unwrap();
+            assert_eq!(
+                (&answer["object"], &answer["status"], &answer["model"]),
+                (
+                    &json!("response"),
+                    &json!("completed"),
+                    &json!("model-2025-01-01")
+                )
+            );
+            blocks_of_output(&answer["output"])
+        }
+        _ => {
+            let got = well_formed_responses_stream(answer);
+            let completed: Value = serde_json::from_str(&got.last().unwrap().data).unwrap();
+            assert_eq!(completed["response"]["status"], "completed");
+            blocks_of_output(&completed["response"]["output"])
+        }
+    }
+}
+
+/// Checks that the vendor request `body` of the recorded SDK request `name` carries its prompt,
+/// tool, bound, session and the tool round trip of its history.
+fn assert_sdk_history_reached_the_vendor(name: &str, body: &Value) {
+    assert_eq!(
+        (
+            &body["model"],
+            &body["instructions"],
+            &body["max_output_tokens"],
+            &body["prompt_cache_key"],
+            &body["tools"][0]["name"]
+        ),
+        (
+            &json!("model-o"),
+            &json!("Be brief."),
+            &json!(512),
+            &json!("session-1"),
+            &json!("read")
+        ),
+        "{name}: {body}"
+    );
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(
+        input[0]["content"][0]["text"], "What is in notes.txt?",
+        "{name}"
+    );
+    let item = |kind: &str| input.iter().find(|i| i["type"] == kind).unwrap();
+    let call = item("function_call");
+    assert_eq!(
+        (
+            &call["call_id"],
+            &call["name"],
+            arguments(&call["arguments"])
+        ),
+        (
+            &json!("call_a1"),
+            &json!("read"),
+            json!({"path": "notes.txt"})
+        ),
+        "{name}"
+    );
+    let output = item("function_call_output");
+    assert_eq!(
+        (&output["call_id"], &output["output"]),
+        (&json!("call_a1"), &json!("line one")),
+        "{name}"
+    );
+}
+
+#[test]
+fn recorded_openai_sdk_requests_run_on_an_openai_login_over_the_loopback_listener() {
+    const KEYS: [&str; 2] = ["test-key-7a3e", "test-key-9b1f"];
+    let files = [
+        ("login-1", api_key(KEYS[0]), 0o600),
+        ("login-2", api_key(KEYS[1]), 0o600),
+    ];
+    let (listener, addr, front) = loopback_front("");
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &files,
+        |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
+        &front,
+        Some(listener),
+    );
+    let (events, stop) = openai_content_of(&fixture_of("qb-openai", "upstream_reasoning.sse"));
+    assert_eq!(stop, StopReason::ToolUse);
+    let blocks = blocks_of(&events);
+    let shown: Vec<Block> = blocks
+        .iter()
+        .filter(|b| !matches!(b, Block::Thinking { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        blocks.len(),
+        3,
+        "thinking, text and a tool call: {blocks:?}"
+    );
+
+    for name in ["chat", "chat_stream", "responses", "responses_stream"] {
+        vendor.answer(openai_recorded(
+            "200_api_key",
+            Some("upstream_reasoning.sse"),
+        ));
+        let raw = recorded_sdk_request("qb-openai", &format!("client_sdk_http_{name}.json"));
+        let mut tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        tcp.write_all(&raw).unwrap();
+        let (status, head, answer) = finish(tcp, Vec::new());
+        assert_eq!(status, 200, "{name}: {}", String::from_utf8_lossy(&answer));
+        let kind = if name.ends_with("_stream") {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        assert!(
+            head.contains(&format!("Content-Type: {kind}")),
+            "{name}: {head}"
+        );
+        let expected = if name.starts_with("chat") {
+            &shown
+        } else {
+            &blocks
+        };
+        assert_eq!(&blocks_of_answer(name, &answer), expected, "{name}");
+    }
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 4);
+    for (name, s) in ["chat", "chat_stream", "responses", "responses_stream"]
+        .iter()
+        .zip(sent.iter())
+    {
+        assert_eq!(s.path, "/responses", "{name}");
+        let auth = s.header("authorization").unwrap();
+        assert!(KEYS.iter().any(|k| auth == format!("Bearer {k}")), "{name}");
+        assert!(
+            s.headers.iter().all(|(_, v)| !v.contains(CLIENT_TOKEN)),
+            "the client token stays local"
+        );
+        assert_sdk_history_reached_the_vendor(name, &s.body);
+    }
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn a_streamed_chat_tool_call_reaches_the_client_with_one_id_name_and_its_arguments() {
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &key_files(),
+        |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
+        &fronts(""),
+        None,
+    );
+    vendor.answer(openai_recorded(
+        "200_api_key",
+        Some("upstream_tool_calls.sse"),
+    ));
+    let (status, head, sse) = openai_call(
+        &r.gw,
+        paths::CHAT_COMPLETIONS,
+        &chat_body("model-2025-01-01", true),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+    let chunks = well_formed_chat_stream(&sse);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    let finish = &chunks[chunks.len() - 2];
+    assert_eq!(finish["choices"][0]["finish_reason"], "tool_calls");
+
+    let message = chat_message_of(&chunks);
+    assert_eq!(message["content"], Value::Null, "{message}");
+    let calls = message["tool_calls"].as_array().unwrap();
+    let got: Vec<(&Value, &Value, Value)> = calls
+        .iter()
+        .map(|c| {
+            (
+                &c["id"],
+                &c["function"]["name"],
+                arguments(&c["function"]["arguments"]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                &json!("call_a1"),
+                &json!("read_file"),
+                json!({"path": "notes.txt"})
+            ),
+            (&json!("call_b2"), &json!("list_dir"), json!({"dir": "src"})),
+        ]
+    );
+    assert_eq!(vendor.received()[0].path, "/responses");
+}
+
+/// The events of `upstream_text.sse` of the OpenAI fixtures through its first text delta, with
+/// nothing after.
+fn openai_stream_start() -> Vec<u8> {
+    through_first(
+        &fixture_of("qb-openai", "upstream_text.sse"),
+        "event: response.output_text.delta",
+    )
+}
+
+#[test]
+fn cancel_and_a_closed_client_shut_a_silent_openai_login_stream_down_at_once() {
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &key_files(),
+        |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
+        &fronts(""),
+        None,
+    );
+    vendor.answer(Answer::Hold(openai_stream_start()));
+    vendor.answer(Answer::Hold(openai_stream_start()));
+
+    let mut client = send(
+        &r.gw,
+        "POST",
+        paths::MODEL_TURN,
+        &turn_body("turn-cancel-o").to_string(),
+    );
+    let seen = until_text(&mut client);
+    let asked = std::time::Instant::now();
+    let (status, body) = call(
+        &r.gw,
+        "POST",
+        paths::MODEL_CANCEL,
+        r#"{"request_id":"turn-cancel-o"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let answer: CancelAnswer = serde_json::from_slice(&body).unwrap();
+    assert!(answer.cancelled);
+    let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(closed.duration_since(asked) < Duration::from_secs(1));
+    let (_, _, body) = finish(client, seen);
+    let events = events(&body);
+    assert_eq!(
+        kinds(&events),
+        ["route login-1", "text_delta", "error Cancelled"]
+    );
+    assert_eq!(text_of(&events), "Hello");
+    assert!(!last_error(&events).retryable);
+
+    let logged = stderr_until("turn turn-hangup-o of ", || {
+        let mut client = send(
+            &r.gw,
+            "POST",
+            paths::MODEL_TURN,
+            &turn_body("turn-hangup-o").to_string(),
+        );
+        until_text(&mut client);
+        let dropped = std::time::Instant::now();
+        drop(client);
+        let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(closed.duration_since(dropped) < Duration::from_secs(1));
+    });
+    let ended = logged
+        .lines()
+        .find(|l| l.contains("turn turn-hangup-o of "))
+        .unwrap_or_else(|| panic!("{logged}"));
+    assert!(ended.ends_with(": cancelled"), "{ended}");
+
+    let s = state(&r.qbd);
+    assert_eq!(s.leases, Vec::new(), "the leases are released");
+    assert_eq!(
+        status_of(&s, "login-1"),
+        LoginStatus::Unknown,
+        "a cancelled stream does not mark the login"
+    );
+    assert_eq!(vendor.received().len(), 2);
 }

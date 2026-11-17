@@ -336,7 +336,12 @@ and `error{code, message}`.
 
 ## Fixtures
 
-The streams, answers and SDK requests in `crates/qb-openai/tests/fixtures/` are synthetic: they
-are written by hand in the shape the OpenAI API, the ChatGPT backend and the OpenAI SDKs use, with
-neutral ids and values, and none was captured from a vendor. Recorded streams and requests, with
+The streams, answers and the request bodies `chat_sdk_request.json` and
+`responses_sdk_request.json` in `crates/qb-openai/tests/fixtures/` are synthetic: they are written
+by hand in the shape the OpenAI API, the ChatGPT backend and the OpenAI SDKs use, with neutral ids
+and values, and none was captured from a vendor. The `client_sdk_http_*.json` requests are
+recorded byte for byte from the OpenAI Python SDK 2.24.0 (`chat.completions.create` and
+`responses.create`, each with and without `stream`, with a tool call and its result in the
+history) against a loopback listener, with synthetic content, the base URL
+`http://127.0.0.1:8080/v1` and the test client token. Recorded vendor streams and answers, with
 every identifier anonymised, are added with the live smoke of the wired gateway.
