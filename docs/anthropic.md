@@ -34,9 +34,16 @@ value.
 | `tools[]` | `tools[]{name,description,input_schema}` |
 | `max_tokens` | `max_tokens` |
 | `effort`, else the ladder candidate's effort | `output_config.effort`; a value other than `low`, `medium`, `high`, `xhigh`, `max` is dropped |
-| — | `stream: true`; `thinking: {type: adaptive}` unless the target turns it off |
+| — | `stream: true`; `thinking: {type: adaptive}` unless the target turns it off or the history lost its thinking (below) |
 
 A message left without blocks is dropped. The model id comes from `qbd`'s pick.
+
+With thinking on, the vendor refuses (400 `invalid_request_error`) a request whose last assistant
+message calls a tool without its thinking block; earlier assistant messages may lack thinking.
+Clients that strip thinking from their history send exactly that in every tool loop, so when the
+last assistant message of the built request holds a `tool_use` but no `thinking` or
+`redacted_thinking` block (none of the picked vendor survived the table above), the request goes
+without `thinking`. The model then answers that turn without thinking.
 
 ### Prompt cache (`cache: auto`)
 

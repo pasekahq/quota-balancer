@@ -1530,6 +1530,8 @@ enum Answer {
     Hold(Vec<u8>),
     /// The answer, after a pause.
     After(Duration, Box<Answer>),
+    /// The answer this function gives to the request body.
+    Judge(fn(&Value) -> Answer),
 }
 
 /// One request the scripted vendor received.
@@ -1571,8 +1573,11 @@ impl Vendor {
                 std::thread::spawn(move || {
                     let mut conn = conn.unwrap();
                     let req = read_http(&mut conn);
+                    let mut answer = queue.lock().unwrap().remove(0);
+                    if let Answer::Judge(judge) = answer {
+                        answer = judge(&req.body);
+                    }
                     log.lock().unwrap().push(req);
-                    let answer = queue.lock().unwrap().remove(0);
                     answer_with(&mut conn, answer, &tx);
                 });
             }
@@ -1672,6 +1677,7 @@ fn answer_with(
             std::thread::sleep(pause);
             answer_with(conn, *answer, closed);
         }
+        Answer::Judge(_) => unreachable!("judged on receipt"),
     }
 }
 
@@ -2499,6 +2505,47 @@ fn messages_carries_a_tool_round_trip_with_signed_thinking_to_the_vendor() {
         "{}",
         sent[1].body
     );
+}
+
+/// The vendor's thinking rule: with `thinking` set, the last assistant message of a tool loop
+/// starts with its thinking block, or the request is invalid.
+fn thinking_rule(body: &Value) -> Answer {
+    let messages = body["messages"].as_array().unwrap();
+    let last = messages.iter().rev().find(|m| m["role"] == "assistant");
+    let content = last.map_or(&[][..], |m| m["content"].as_array().unwrap());
+    let calls = content.iter().any(|b| b["type"] == "tool_use");
+    let starts_thinking = content
+        .first()
+        .is_some_and(|b| b["type"] == "thinking" || b["type"] == "redacted_thinking");
+    if body.get("thinking").is_some() && calls && !starts_thinking {
+        recorded("400_invalid", None)
+    } else {
+        recorded("200_allowed", Some("upstream_text.sse"))
+    }
+}
+
+#[test]
+fn a_tool_loop_without_thinking_in_its_history_streams_a_normal_answer() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(Answer::Judge(thinking_rule));
+    let mut body = sdk_body("model-2025-01-01", true);
+    let history = body["messages"].as_array_mut().unwrap();
+    history.push(json!({"role": "assistant", "content": [
+        {"type": "text", "text": "Reading it."},
+        {"type": "tool_use", "id": "toolu_test_1", "name": "read", "input": {"path": "notes.txt"}},
+    ]}));
+    history.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_test_1", "content": "line one"},
+    ]}));
+
+    let (status, _, sse) = sdk_call(&r.gw, &body, None);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    assert!(!names(&frames(&sse)).contains(&"error"));
+    assert_eq!(
+        content_of(&sse),
+        content_of(&vendor_fixture("upstream_text.sse"))
+    );
+    assert_eq!(vendor.received().len(), 1);
 }
 
 #[test]

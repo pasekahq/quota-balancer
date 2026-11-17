@@ -118,6 +118,8 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 ///
 /// Empty text blocks, thinking blocks of another vendor and own blocks whose payload is not an
 /// Anthropic thinking block are dropped, and so is a message left without blocks. With `cache: auto`, breakpoints follow [`place_cache_breakpoints`].
+/// The `thinking` config is left out when the last assistant message calls a tool without a
+/// thinking block, a history the vendor refuses while thinking is on.
 ///
 /// # Errors
 /// [`BuildError::Image`] when `load` fails.
@@ -161,6 +163,7 @@ pub fn build(
         .or(at.effort)
         .filter(|e| EFFORTS.contains(e));
 
+    let thinking = at.adaptive_thinking && !tool_call_lacks_thinking(&messages);
     let mut body = CreateMessage {
         model: at.model.into(),
         max_tokens: req.max_tokens,
@@ -177,7 +180,7 @@ pub fn build(
             })
             .collect(),
         stream: Some(true),
-        thinking: at.adaptive_thinking.then(|| ThinkingConfig {
+        thinking: thinking.then(|| ThinkingConfig {
             kind: "adaptive".into(),
             budget_tokens: None,
         }),
@@ -191,6 +194,26 @@ pub fn build(
         place_cache_breakpoints(&mut body);
     }
     Ok(body)
+}
+
+/// The last assistant message of `messages` calls a tool and carries no thinking block.
+fn tool_call_lacks_thinking(messages: &[MessageParam]) -> bool {
+    let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return false;
+    };
+    let Content::Blocks(blocks) = &last.content else {
+        return false;
+    };
+    let calls = blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    let thinks = blocks.iter().any(|b| {
+        matches!(
+            b,
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+        )
+    });
+    calls && !thinks
 }
 
 fn text_block(text: &str) -> TextBlock {

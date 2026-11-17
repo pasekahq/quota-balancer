@@ -231,9 +231,14 @@ list.
 1. Append two lines to `<hermes-profile-dir>/.env`, with the token from the shell above:
 
    ```sh
+   env_file=<hermes-profile-dir>/.env
+   [ -s "$env_file" ] && [ -n "$(tail -c 1 "$env_file")" ] && echo >> "$env_file"
    printf 'ANTHROPIC_BASE_URL=http://127.0.0.1:<port>\nANTHROPIC_API_KEY=%s\n' "$TOKEN" \
-     >> <hermes-profile-dir>/.env
+     >> "$env_file"
    ```
+
+   The second line ends a last line that lacks its newline, so the first appended variable does
+   not join it.
 
    Hermes loads the profile `.env` over its process environment. With `ANTHROPIC_API_KEY` set and
    no `ANTHROPIC_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`, it takes the API-key path: it seeds one pool
@@ -274,8 +279,10 @@ hold:
 
   `client-token` is the caller on the loopback port. No `warn` line `gateway: turn ... on
   <login-1>: ...` for these turns.
-- `qb state` shows that login's windows updated by the turn: `source` is `stream`,
-  `observed_at` is within the last minutes, and no lease of the gateway is left live.
+- `qb state` shows no lease of the gateway left live, and for an `oauth_anthropic` login its
+  windows updated by the turn: `source` is `stream`, `observed_at` is within the last minutes.
+  The vendor sends no quota windows to an `api_key` login, so its windows do not change; for it
+  the gateway log line naming the login is the signal.
   (`curl --unix-socket /run/qb/qb.sock http://qb/v1/state` answers the same.)
 - No 401 on the loopback port: the gateway logs no refusal, so read Hermes' side, where none of
   `401`, `authentication_error` or `invalid x-api-key` appears:
@@ -285,7 +292,8 @@ hold:
   ```
 
 A fallback provider in `config.yaml` can answer a turn the gateway failed, so the answer alone
-does not prove the route: the gateway line and the `qb state` update do.
+does not prove the route: the gateway line does, and for an `oauth_anthropic` login the
+`qb state` update too.
 
 ## Rollback
 
@@ -308,9 +316,14 @@ owner's permission; the gateway holds no state Hermes depends on once Hermes no 
 Roll back at once on any of these during the verification turn or the first hours after it:
 
 - Any 401 from the loopback port in Hermes' errors log.
+- Any 400 `invalid_request_error` from the gateway: the vendor refused a request the gateway
+  built from Hermes' history.
 - Any 5xx or 529 answer from the gateway (`api_error`, `overloaded_error`), or a gateway `warn`
   line for a turn, or a gateway login `auth_dead` in `qb state`.
-- A turn that lacks a tool call or the thinking the same message produces directly.
+- A turn that lacks a tool call, or whose first answer lacks the thinking the same message
+  produces directly. Answers that follow a tool result come without thinking: Hermes strips
+  thinking from its history for a non-Anthropic base URL, and the gateway then requests none
+  ([anthropic.md](../anthropic.md#upstream-request)).
 - Time to the answer well above direct use: more than twice the baseline for the same message.
 - A quota error (429 `rate_limit_error`) while `qb state` shows a gateway login with status `ok`
   and every window below 0.9 `used`.

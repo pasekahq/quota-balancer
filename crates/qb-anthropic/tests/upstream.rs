@@ -327,6 +327,97 @@ fn without_cache_auto_no_breakpoints_and_without_system_the_last_tool_is_marked(
     assert!(body.system.is_none());
 }
 
+fn signed_thinking(vendor: &str) -> Block {
+    Block::Thinking {
+        vendor: vendor.into(),
+        opaque: json!({"type": "thinking", "thinking": "t", "signature": "s"}).to_string(),
+    }
+}
+
+fn call(id: &str) -> Block {
+    Block::ToolUse {
+        id: id.into(),
+        name: "read".into(),
+        input: obj(json!({"path": "notes.txt"})),
+    }
+}
+
+fn result(id: &str) -> Block {
+    Block::ToolResult {
+        id: id.into(),
+        content: "line one".into(),
+        is_error: None,
+    }
+}
+
+fn says(text: &str) -> Block {
+    Block::Text { text: text.into() }
+}
+
+/// `turn()` with the history `user: Hi`, then each assistant message followed by a user message.
+fn history(rounds: Vec<(Vec<Block>, Block)>) -> TurnRequest {
+    let mut messages = vec![Message {
+        role: Role::User,
+        content: vec![says("Hi")],
+    }];
+    for (assistant, user) in rounds {
+        messages.push(Message {
+            role: Role::Assistant,
+            content: assistant,
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: vec![user],
+        });
+    }
+    TurnRequest { messages, ..turn() }
+}
+
+#[test]
+fn thinking_is_requested_unless_the_last_assistant_tool_call_lost_its_thinking() {
+    let cases = [
+        (
+            "tool loop with the last assistant thinking",
+            history(vec![(
+                vec![signed_thinking(VENDOR), call("c1")],
+                result("c1"),
+            )]),
+            true,
+        ),
+        (
+            "stripped last assistant",
+            history(vec![(vec![call("c1")], result("c1"))]),
+            false,
+        ),
+        (
+            "last assistant with thinking of another vendor only",
+            history(vec![(
+                vec![signed_thinking("vendor-b"), call("c1")],
+                result("c1"),
+            )]),
+            false,
+        ),
+        (
+            "stripped earlier assistant only",
+            history(vec![
+                (vec![call("c1")], result("c1")),
+                (vec![signed_thinking(VENDOR), call("c2")], result("c2")),
+            ]),
+            true,
+        ),
+        (
+            "no tool calls",
+            history(vec![(vec![says("(thinking elided)")], says("Go on."))]),
+            true,
+        ),
+    ];
+    for (name, req, kept) in cases {
+        let body = build(&req, &target(AuthMode::ApiKey), &mut load).expect("builds");
+        assert_eq!(body.thinking.is_some(), kept, "{name}");
+        assert_eq!(body.messages.len(), req.messages.len(), "{name}");
+    }
+}
+
 #[test]
 fn unreadable_image_is_a_build_error() {
     let mut none = |_: &str| None;
