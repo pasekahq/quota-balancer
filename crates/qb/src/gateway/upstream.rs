@@ -28,6 +28,10 @@ pub struct Picked<'a> {
     /// Base URL of the vendor API from the login's config; `None` for the adapter's public
     /// endpoint.
     pub base_url: Option<&'a str>,
+    /// `http-referer` of a `chat_completions` login.
+    pub referer: Option<&'a str>,
+    /// `x-title` of a `chat_completions` login.
+    pub title: Option<&'a str>,
 }
 
 /// What the adapter authenticates with, read from the login's credential file for one attempt

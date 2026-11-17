@@ -9,6 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use qb_core::MAX_LOGINS;
+use qb_openai::chat_upstream;
 use qb_proto::Pin;
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
@@ -133,6 +134,8 @@ pub enum Api {
     Anthropic,
     /// The OpenAI APIs.
     Openai,
+    /// The Chat Completions API of an OpenAI-compatible vendor.
+    ChatCompletions,
 }
 
 impl Api {
@@ -141,6 +144,7 @@ impl Api {
         match self {
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
+            Self::ChatCompletions => "chat_completions",
         }
     }
 }
@@ -155,8 +159,12 @@ pub struct GatewayLogin {
     /// API family; `anthropic` for an `oauth_anthropic` login, `openai` for a `chatgpt_oauth` one.
     pub api: Api,
     /// Base URL of the vendor API without a trailing `/`; `None` for the adapter's public
-    /// endpoint.
+    /// endpoint. Always set on a `chat_completions` login.
     pub base_url: Option<String>,
+    /// `http-referer` header of a `chat_completions` login; non-empty printable ASCII.
+    pub referer: Option<String>,
+    /// `x-title` header of a `chat_completions` login; non-empty printable ASCII.
+    pub title: Option<String>,
     /// URL of the OAuth token endpoint of an `oauth_anthropic` login; `None` for the vendor's
     /// endpoints.
     pub token_url: Option<String>,
@@ -508,16 +516,21 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
         kind: CredentialKind::ApiKey,
         api: Api::Anthropic,
         base_url: None,
+        referer: None,
+        title: None,
         token_url: None,
         credentials: PathBuf::new(),
     };
     let mut api = None;
     let mut token_url_at = None;
+    let mut header_at = None;
     let keys = [
         "name",
         "kind",
         "api",
         "base_url",
+        "referer",
+        "title",
         "token_url",
         "credentials",
     ];
@@ -529,14 +542,27 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
                 let family = match string(at, v)?.as_str() {
                     "anthropic" => Api::Anthropic,
                     "openai" => Api::Openai,
+                    "chat_completions" => Api::ChatCompletions,
                     _ => {
-                        let reason = "expected `anthropic` or `openai`".into();
+                        let reason = "expected `anthropic`, `openai` or `chat_completions`".into();
                         return Err((at.to_owned(), reason, Some(v.span().start)));
                     }
                 };
                 api = Some((family, v.span().start));
             }
             "base_url" => l.base_url = Some(url(at, v)?),
+            "referer" | "title" => {
+                let value = string(at, v)?;
+                if chat_upstream::headers(Some(&value), None).is_err() {
+                    let reason = "must be non-empty printable ASCII".into();
+                    return Err((at.to_owned(), reason, Some(v.span().start)));
+                }
+                header_at.get_or_insert((at.to_owned(), v.span().start));
+                match key {
+                    "referer" => l.referer = Some(value),
+                    _ => l.title = Some(value),
+                }
+            }
             "token_url" => {
                 l.token_url = Some(url(at, v)?);
                 token_url_at = Some(v.span().start);
@@ -557,30 +583,45 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
         }
         Ok(())
     })?;
-    l.api = match (l.kind, api) {
-        (CredentialKind::OauthAnthropic, None | Some((Api::Anthropic, _))) => Api::Anthropic,
-        (CredentialKind::OauthAnthropic, Some((_, span))) => {
-            let reason = "an `oauth_anthropic` login is `anthropic`".into();
-            return Err((format!("{at}.api"), reason, Some(span)));
-        }
-        (CredentialKind::ChatgptOauth, None | Some((Api::Openai, _))) => Api::Openai,
-        (CredentialKind::ChatgptOauth, Some((_, span))) => {
-            let reason = "a `chatgpt_oauth` login is `openai`".into();
-            return Err((format!("{at}.api"), reason, Some(span)));
-        }
-        (CredentialKind::ApiKey, Some((family, _))) => family,
-        (CredentialKind::ApiKey, None) => {
-            let reason = "is missing; an `api_key` login names its API".into();
-            return Err((format!("{at}.api"), reason, None));
-        }
-    };
+    l.api = family(at, l.kind, api)?;
     if let (CredentialKind::ApiKey | CredentialKind::ChatgptOauth, Some(span)) =
         (l.kind, token_url_at)
     {
         let reason = "belongs to an `oauth_anthropic` login".into();
         return Err((format!("{at}.token_url"), reason, Some(span)));
     }
+    if l.api == Api::ChatCompletions {
+        if l.base_url.is_none() {
+            let span = api.map(|(_, span)| span);
+            let reason = "is missing; a `chat_completions` login names its vendor's URL".into();
+            return Err((format!("{at}.base_url"), reason, span));
+        }
+    } else if let Some((field, span)) = header_at {
+        let reason = "belongs to a `chat_completions` login".into();
+        return Err((field, reason, Some(span)));
+    }
     Ok(l)
+}
+
+/// The API family of a login of `kind` whose `api` key, if given, names `api` at its span.
+fn family(at: &str, kind: CredentialKind, api: Option<(Api, usize)>) -> Result<Api, WalkError> {
+    match (kind, api) {
+        (CredentialKind::OauthAnthropic, None | Some((Api::Anthropic, _))) => Ok(Api::Anthropic),
+        (CredentialKind::OauthAnthropic, Some((_, span))) => {
+            let reason = "an `oauth_anthropic` login is `anthropic`".into();
+            Err((format!("{at}.api"), reason, Some(span)))
+        }
+        (CredentialKind::ChatgptOauth, None | Some((Api::Openai, _))) => Ok(Api::Openai),
+        (CredentialKind::ChatgptOauth, Some((_, span))) => {
+            let reason = "a `chatgpt_oauth` login is `openai`".into();
+            Err((format!("{at}.api"), reason, Some(span)))
+        }
+        (CredentialKind::ApiKey, Some((family, _))) => Ok(family),
+        (CredentialKind::ApiKey, None) => {
+            let reason = "is missing; an `api_key` login names its API".into();
+            Err((format!("{at}.api"), reason, None))
+        }
+    }
 }
 
 /// A URL without its trailing `/`: `https://` with port 443, or `http://` with a loopback host,
@@ -901,6 +942,88 @@ difficulty = 1
             err.contains("logins[1].api: a `chatgpt_oauth` login is `openai` (line 16)"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_chat_completions_login_is_an_api_key_with_a_base_url_and_attribution() {
+        let login = |kind: &str, api: &str, rest: &str| {
+            format!(
+                "[[logins]]\nname = \"login-2\"\nkind = \"{kind}\"\napi = \"{api}\"\n{rest}credentials = \"/c.json\"\n"
+            )
+        };
+        let url = "base_url = \"https://vendor.example.com/api/v1/\"\n";
+        let full = login(
+            "api_key",
+            "chat_completions",
+            &format!("{url}referer = \"https://app.example.com\"\ntitle = \"Test App\"\n"),
+        );
+        let c = check("", &full).unwrap();
+        let l = c.login("login-2").unwrap();
+        assert_eq!(
+            (l.kind, l.api, l.base_url.as_deref()),
+            (
+                CredentialKind::ApiKey,
+                Api::ChatCompletions,
+                Some("https://vendor.example.com/api/v1")
+            )
+        );
+        assert_eq!(
+            (l.referer.as_deref(), l.title.as_deref()),
+            (Some("https://app.example.com"), Some("Test App"))
+        );
+        let bare = check("", &login("api_key", "chat_completions", url)).unwrap();
+        let l = bare.login("login-2").unwrap();
+        assert_eq!((l.referer.as_deref(), l.title.as_deref()), (None, None));
+
+        for (extra, want) in [
+            (
+                login("api_key", "chat_completions", ""),
+                "logins[1].base_url: is missing; a `chat_completions` login names its vendor's URL (line 16)",
+            ),
+            (
+                login("oauth_anthropic", "chat_completions", url),
+                "logins[1].api: an `oauth_anthropic` login is `anthropic` (line 16)",
+            ),
+            (
+                login("chatgpt_oauth", "chat_completions", url),
+                "logins[1].api: a `chatgpt_oauth` login is `openai` (line 16)",
+            ),
+            (
+                login(
+                    "api_key",
+                    "openai",
+                    "referer = \"https://app.example.com\"\n",
+                ),
+                "logins[1].referer: belongs to a `chat_completions` login (line 17)",
+            ),
+            (
+                login("api_key", "anthropic", "title = \"Test App\"\n"),
+                "logins[1].title: belongs to a `chat_completions` login (line 17)",
+            ),
+            (
+                login(
+                    "api_key",
+                    "chat_completions",
+                    &format!("{url}title = \"\"\n"),
+                ),
+                "logins[1].title: must be non-empty printable ASCII (line 18)",
+            ),
+            (
+                login(
+                    "api_key",
+                    "chat_completions",
+                    &format!("{url}referer = \"https://a.example\\r\\nx: 1\"\n"),
+                ),
+                "logins[1].referer: must be non-empty printable ASCII (line 18)",
+            ),
+            (
+                login("api_key", "chat", url),
+                "logins[1].api: expected `anthropic`, `openai` or `chat_completions` (line 16)",
+            ),
+        ] {
+            let err = check("", &extra).unwrap_err();
+            assert!(err.contains(want), "{err}");
+        }
     }
 
     #[test]

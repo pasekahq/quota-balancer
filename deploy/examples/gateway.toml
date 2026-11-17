@@ -37,6 +37,17 @@ kind = "api_key"
 api = "openai"
 credentials = "/var/lib/qb-gateway/credentials/key-2.json"
 
+# An OpenAI-compatible vendor's API key over Chat Completions; referer and title are
+# OpenRouter's optional app attribution.
+[[logins]]
+name = "key-3"
+kind = "api_key"
+api = "chat_completions"
+base_url = "https://openrouter.ai/api/v1"
+referer = "https://app.example.com"
+title = "example-app"
+credentials = "/var/lib/qb-gateway/credentials/key-3.json"
+
 # Ladder step 1 of qbd's role "gateway": subscription logins first, the key as the last tier.
 [[routes]]
 alias = "chat"

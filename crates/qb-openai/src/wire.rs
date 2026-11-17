@@ -344,6 +344,9 @@ pub struct ChunkDelta {
     /// Next piece of the text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Next piece of the model's refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     /// Tool-call pieces, by `index`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChunkToolCall>>,
@@ -353,8 +356,9 @@ pub struct ChunkDelta {
 /// of each `index`, `arguments` may be split over many.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ChunkToolCall {
-    /// Position of the call in the message.
-    pub index: u32,
+    /// Position of the call in the message; some OpenAI-compatible vendors omit it.
+    #[serde(default)]
+    pub index: Option<u32>,
     /// Tool-call id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

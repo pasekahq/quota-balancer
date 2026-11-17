@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use qb::auth::Gate;
 use qb::gateway::anthropic::Anthropic;
+use qb::gateway::chat_upstream::ChatCompletions;
 use qb::gateway::config::Api;
 use qb::gateway::core::{Cancel, Gateway, Upstreams};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
@@ -1545,17 +1546,17 @@ fn vendor_fixture(name: &str) -> Vec<u8> {
 /// The recorded Anthropic answer `answer_<name>.json`; `sse`, a stream fixture, as the body of
 /// a 200.
 fn recorded(name: &str, sse: Option<&str>) -> Answer {
-    recorded_of("qb-anthropic", name, sse)
+    recorded_of("qb-anthropic", &format!("answer_{name}.json"), sse)
 }
 
 /// [`recorded`] of the OpenAI fixtures.
 fn openai_recorded(name: &str, sse: Option<&str>) -> Answer {
-    recorded_of("qb-openai", name, sse)
+    recorded_of("qb-openai", &format!("answer_{name}.json"), sse)
 }
 
-fn recorded_of(krate: &str, name: &str, sse: Option<&str>) -> Answer {
-    let v: Value =
-        serde_json::from_slice(&fixture_of(krate, &format!("answer_{name}.json"))).unwrap();
+/// The recorded answer fixture `file` of `krate`; `sse`, a stream fixture, as the body of a 200.
+fn recorded_of(krate: &str, file: &str, sse: Option<&str>) -> Answer {
+    let v: Value = serde_json::from_slice(&fixture_of(krate, file)).unwrap();
     let status = u16::try_from(v["status"].as_u64().unwrap()).unwrap();
     let headers = v["headers"]
         .as_array()
@@ -4288,4 +4289,333 @@ fn cancel_and_a_closed_client_shut_a_silent_openai_login_stream_down_at_once() {
         "a cancelled stream does not mark the login"
     );
     assert_eq!(vendor.received().len(), 2);
+}
+
+/// The keys of an `api_key` login of the `chat_completions` API family, without `base_url`.
+const CHAT_KEY: &str = "kind = \"api_key\"\napi = \"chat_completions\"";
+
+/// The login keys of a `chat_completions` login on `v` below `path`, with OpenRouter's app
+/// attribution.
+fn chat_login(v: &Vendor, path: &str) -> String {
+    format!(
+        "{CHAT_KEY}\nbase_url = \"{}{path}\"\nreferer = \"https://app.example.com\"\ntitle = \"qb test\"",
+        v.base_url
+    )
+}
+
+/// A rig whose gateway runs every adapter against one scripted vendor, with qbd of
+/// [`openai_qbd`]`("vendor-o")`, login-1 a `chat_completions` login at the vendor's root and
+/// login-2 one below `/api/v1`.
+fn chat_rig(files: &[(&str, String, u32)]) -> (Rig, Vendor) {
+    let upstreams: Upstreams = vec![
+        (Api::Anthropic, Box::new(Anthropic::new())),
+        (Api::Openai, Box::new(Openai::new())),
+        (Api::ChatCompletions, Box::new(ChatCompletions::new())),
+    ];
+    vendor_rig_with(
+        &openai_qbd("vendor-o"),
+        upstreams,
+        files,
+        |v| [chat_login(v, ""), chat_login(v, "/api/v1")],
+        &fronts(""),
+        None,
+    )
+}
+
+/// A 200 Chat Completions stream of `text`, its finish reason and a usage chunk.
+fn chat_text_answer(text: &str) -> Answer {
+    let chunk = |choices: Value, usage: Value| {
+        let c = json!({"id": "chatcmpl-test-9", "object": "chat.completion.chunk",
+            "created": 1_800_000_000, "model": "model-o", "choices": choices, "usage": usage});
+        format!("data: {c}\n\n")
+    };
+    let sse = [
+        chunk(
+            json!([{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": null}]),
+            Value::Null,
+        ),
+        chunk(
+            json!([{"index": 0, "delta": {}, "finish_reason": "stop"}]),
+            Value::Null,
+        ),
+        chunk(
+            json!([]),
+            json!({"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55}),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat();
+    chat_stream(sse.into_bytes())
+}
+
+/// A 200 answer with the event stream `sse`.
+fn chat_stream(sse: Vec<u8>) -> Answer {
+    let headers = vec![("content-type".to_owned(), "text/event-stream".to_owned())];
+    Answer::Full(200, headers, sse)
+}
+
+/// The recorded Chat Completions vendor answer `chat_answer_<name>.json`.
+fn chat_recorded(name: &str) -> Answer {
+    recorded_of("qb-openai", &format!("chat_answer_{name}.json"), None)
+}
+
+/// The `(id, name, input)` of each `tool_call` event.
+fn tool_calls(events: &[StreamEvent]) -> Vec<(String, String, Value)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolCall { tool_call } => Some((
+                tool_call.id.clone(),
+                tool_call.name.clone(),
+                Value::Object(tool_call.input.clone()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The second turn of the Chat Completions tool loop as the vendor got it: the assistant's two
+/// calls, then one `tool` message per result with the same call id.
+fn assert_tool_results_reached_the_chat_vendor(body: &Value) {
+    let messages = body["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "tool", "tool"]);
+    let ids: Vec<&Value> = messages[1]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| &c["id"])
+        .collect();
+    assert_eq!(ids, [&json!("call_a1"), &json!("call_b2")]);
+    assert_eq!(
+        (&messages[2]["tool_call_id"], &messages[2]["content"]),
+        (&json!("call_a1"), &json!("line one"))
+    );
+    assert_eq!(
+        (&messages[3]["tool_call_id"], &messages[3]["content"]),
+        (&json!("call_b2"), &json!("a.txt"))
+    );
+}
+
+#[test]
+fn a_chat_completions_login_runs_a_tool_loop_with_its_attribution_headers() {
+    const KEY: &str = "test-key-3e9a";
+    let files = [
+        ("login-1", api_key(KEY), 0o600),
+        ("login-2", api_key("test-key-2"), 0o600),
+    ];
+    let (r, vendor) = chat_rig(&files);
+    vendor.answer(chat_stream(fixture_of(
+        "qb-openai",
+        "chat_upstream_openai.sse",
+    )));
+    vendor.answer(chat_text_answer("Both read."));
+
+    let mut first = Vec::new();
+    let logged = stderr_of(|| first = turn(&r.gw, &turn_body("turn-1")).2);
+    assert_eq!(
+        kinds(&first),
+        [
+            "route login-1",
+            "text_delta",
+            "text_delta",
+            "tool_call",
+            "tool_call",
+            "usage",
+            "stop ToolUse"
+        ]
+    );
+    assert_eq!(text_of(&first), "Reading both.");
+    assert_eq!(
+        tool_calls(&first),
+        [
+            (
+                "call_a1".to_owned(),
+                "read_file".to_owned(),
+                json!({"path": "notes.txt"})
+            ),
+            (
+                "call_b2".to_owned(),
+                "list_dir".to_owned(),
+                json!({"dir": "src"})
+            ),
+        ]
+    );
+    assert_eq!(
+        first[5],
+        StreamEvent::Usage {
+            usage: Usage {
+                input: 300,
+                output: 40,
+                cache_read: 2000,
+                cache_write: 0
+            }
+        }
+    );
+
+    let mut next = turn_body("turn-2");
+    next["messages"] = json!([
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Reading both."},
+            {"type": "tool_use", "id": "call_a1", "name": "read_file", "input": {"path": "notes.txt"}},
+            {"type": "tool_use", "id": "call_b2", "name": "list_dir", "input": {"dir": "src"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "id": "call_a1", "content": "line one"},
+            {"type": "tool_result", "id": "call_b2", "content": "a.txt"},
+        ]},
+    ]);
+    let (_, _, second) = turn(&r.gw, &next);
+    assert_eq!(
+        kinds(&second),
+        ["route login-1", "text_delta", "usage", "stop End"]
+    );
+    assert_eq!(text_of(&second), "Both read.");
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    for s in sent.iter() {
+        assert_eq!(s.path, "/chat/completions");
+        let bearer = format!("Bearer {KEY}");
+        assert_eq!(s.header("authorization"), Some(bearer.as_str()));
+        assert_eq!(s.header("http-referer"), Some("https://app.example.com"));
+        assert_eq!(s.header("x-title"), Some("qb test"));
+        assert_eq!(
+            (&s.body["model"], &s.body["stream"]),
+            (&json!("model-o"), &json!(true))
+        );
+    }
+    assert_tool_results_reached_the_chat_vendor(&sent[1].body);
+    assert!(!logged.contains(KEY), "{logged}");
+}
+
+#[test]
+fn a_402_on_a_chat_completions_login_moves_a_chat_client_to_the_next_login() {
+    const KEYS: [&str; 2] = ["test-key-6b1d", "test-key-0c4f"];
+    let files = [
+        ("login-1", api_key(KEYS[0]), 0o600),
+        ("login-2", api_key(KEYS[1]), 0o600),
+    ];
+    let (r, vendor) = chat_rig(&files);
+    vendor.answer(chat_recorded("402_credits"));
+    vendor.answer(chat_text_answer("From the next login."));
+
+    let mut answer = Vec::new();
+    let logged = stderr_of(|| {
+        let (status, _, body) = openai_call(
+            &r.gw,
+            paths::CHAT_COMPLETIONS,
+            &chat_body("model-2025-01-01", true),
+        );
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        answer = body;
+    });
+    let chunks = chat_chunks(&answer);
+    assert!(
+        chunks.iter().all(|c| c.get("error").is_none()),
+        "{chunks:?}"
+    );
+    assert_eq!(chat_text(&chunks), "From the next login.");
+
+    let sent = vendor.received();
+    let seen: Vec<(&str, Option<&str>)> = sent
+        .iter()
+        .map(|s| (s.path.as_str(), s.header("authorization")))
+        .collect();
+    let bearers = KEYS.map(|k| format!("Bearer {k}"));
+    assert_eq!(
+        seen,
+        [
+            ("/chat/completions", Some(bearers[0].as_str())),
+            ("/api/v1/chat/completions", Some(bearers[1].as_str())),
+        ]
+    );
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+    assert_eq!(s.leases, Vec::new());
+    assert!(logged.contains("login-1: usage_limit"), "{logged}");
+    let answer = String::from_utf8(answer).unwrap();
+    for key in KEYS {
+        assert!(!logged.contains(key), "{key}: {logged}");
+        assert!(!answer.contains(key), "{key}: {answer}");
+    }
+}
+
+#[test]
+fn a_429_with_retry_after_on_a_chat_completions_login_is_rate_limited() {
+    const KEYS: [&str; 2] = ["test-key-9d2e", "test-key-5a7b"];
+    let files = [
+        ("login-1", api_key(KEYS[0]), 0o600),
+        ("login-2", api_key(KEYS[1]), 0o600),
+    ];
+    let (r, vendor) = chat_rig(&files);
+    vendor.answer(chat_recorded("429_retry"));
+    vendor.answer(chat_recorded("429_retry"));
+
+    let mut answer = Vec::new();
+    let logged = stderr_of(|| {
+        let s = send(
+            &r.gw,
+            "POST",
+            paths::MODEL_TURN,
+            &turn_body("turn-1").to_string(),
+        );
+        answer = finish(s, Vec::new()).2;
+    });
+    let events = events(&answer);
+    let error = last_error(&events);
+    assert!(error.retryable, "{error:?}");
+    let tried: Vec<(Option<&str>, ErrorClass)> = error
+        .tried
+        .iter()
+        .map(|a| (a.login_label.as_deref(), a.class))
+        .collect();
+    assert_eq!(
+        tried,
+        [
+            (Some("login-1"), ErrorClass::Overloaded),
+            (Some("login-2"), ErrorClass::Overloaded)
+        ]
+    );
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::RateLimited);
+    assert_eq!(status_of(&s, "login-2"), LoginStatus::RateLimited);
+    assert_eq!(s.leases, Vec::new());
+    for login in ["login-1", "login-2"] {
+        let line = format!("{login}: rate_limited: vendor answered HTTP 429");
+        assert!(logged.contains(&line), "{logged}");
+    }
+    let answer = String::from_utf8(answer).unwrap();
+    for key in KEYS {
+        assert!(!logged.contains(key), "{key}: {logged}");
+        assert!(!answer.contains(key), "{key}: {answer}");
+    }
+}
+
+#[test]
+fn the_chat_completions_adapter_refuses_a_credential_of_another_kind_without_quoting_it() {
+    const TOKEN: &str = "test-access-2f8c";
+    let at = Picked {
+        vendor: "vendor-o",
+        model: "model-o",
+        effort: None,
+        login: "login-1",
+        base_url: Some("http://127.0.0.1:9"),
+        referer: None,
+        title: None,
+    };
+    let credential = Credential::OauthAnthropic {
+        access_token: Zeroizing::new(TOKEN.into()),
+    };
+    let req: TurnRequest = serde_json::from_value(turn_body("turn-1")).unwrap();
+    let mut sink = |_: StreamEvent| Flow::Continue;
+    let failure = ChatCompletions::new()
+        .turn(&at, &credential, &req, &mut sink, &CancelToken::new())
+        .unwrap_err();
+    assert_eq!(failure.kind, FailureKind::Auth);
+    assert!(!failure.message.contains(TOKEN), "{}", failure.message);
 }

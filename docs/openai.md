@@ -191,9 +191,10 @@ with the 1 MiB event bound; comments such as `: OPENROUTER PROCESSING` are skipp
 | Chunk | Canonical event |
 |---|---|
 | `delta.content` | `text_delta` per non-empty piece |
-| `delta.tool_calls[]` | accumulated by `index`: `id` and `function.name` from the first piece that has them, `function.arguments` concatenated |
-| `finish_reason` | every accumulated call as one `tool_call{id, name, input}` in `index` order (empty arguments are `{}`); the stop reason `stop` → `end`, `tool_calls` → `tool_use`, `length` → `max_tokens`, `content_filter` → `refusal`, any other → `end`; `end` with tool calls is `tool_use` |
-| `usage` | one `usage`: `input` = `prompt_tokens` − `cached_tokens`, `cache_read` = `cached_tokens`, `output` = `completion_tokens`, `cache_write` = 0; `usage.cost` (USD) is `Reader::cost()` |
+| `delta.refusal` | `text_delta` per non-empty piece; the turn's stop reason is `refusal` |
+| `delta.tool_calls[]` | accumulated by `index`: `id` and `function.name` from the first piece that has them, `function.arguments` concatenated; a piece without `index` starts a call when it has an `id` other than the last call's, and else continues the last call |
+| `finish_reason` | every accumulated call as one `tool_call{id, name, input}` in `index` order, calls without `index` last in arrival order (empty arguments are `{}`); the stop reason `stop` → `end`, `tool_calls` → `tool_use`, `length` → `max_tokens`, `content_filter` → `refusal`, any other → `end`; `end` with tool calls is `tool_use` |
+| `usage` | the last one of the stream becomes the one `usage`, emitted at `[DONE]` or when the vendor closes the stream: `input` = `prompt_tokens` − `cached_tokens`, `cache_read` = `cached_tokens`, `output` = `completion_tokens`, `cache_write` = 0; `usage.cost` (USD) is `Reader::cost()` |
 | `delta.reasoning`, `delta.reasoning_details`, other fields | nothing |
 | `data: [DONE]` | `Progress::Finished` with the stop reason |
 | `{"error": {...}}` | a classified `Failure` (below) |
@@ -202,7 +203,8 @@ A stream the vendor closes after a finish reason but without `[DONE]` ends with 
 `[DONE]` or the end of the stream before a finish reason, a `finish_reason` of `error`, a chunk
 that does not decode, content after the finish reason, data after `[DONE]`, a tool call without
 id or name, arguments that are not a JSON object, more than 64 tool calls or more than 768 KiB of
-them, and an oversized event are `unavailable` failures. Events already returned stay delivered.
+them, and an oversized event are `unavailable` failures. Events already returned stay delivered;
+a failed stream emits no `usage`.
 
 ### Chat Completions failures
 
@@ -247,6 +249,14 @@ is `request::build` with `target.reasoning` on, and the stream's event bound is
 ends with the stop reason and the windows of `limits::rate_limits`, read with the gateway's clock;
 any other status reads up to 64 KiB of the body and ends with `limits::classify_response`, whose
 usage limit already carries its limiting window at 1.0.
+
+Every login of `api = "chat_completions"`, an `api_key` login, runs through `chat_upstream` in
+`crates/qb/src/gateway/chat_upstream.rs` over the same transport; any other credential is an
+`auth` failure. The endpoint is the login's `base_url` followed by `chat_upstream::PATH`, the
+headers are `chat_upstream::headers` of the login's `referer` and `title`, and the key goes in
+`chat_upstream::secret_header()`. A 200 streams through `chat_upstream::Reader` into the turn
+and ends with the stop reason and no windows; the reader's cost is not passed on. Any other
+status reads up to 64 KiB of the body and ends with `limits::classify_chat_response`.
 
 ## Serving the fronts
 

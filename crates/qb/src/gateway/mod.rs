@@ -11,6 +11,7 @@
 //! - [`vendor`]: the transport the adapters share;
 //! - [`anthropic`]: the adapter of the `anthropic` API family;
 //! - [`openai_upstream`]: the adapter of the `openai` API family;
+//! - [`chat_upstream`]: the adapter of the `chat_completions` API family;
 //! - [`oauth`]: the token refresher of `oauth_anthropic` logins;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`front`]: the listeners and the C4 front;
@@ -20,6 +21,7 @@
 
 pub mod answer;
 pub mod anthropic;
+pub mod chat_upstream;
 pub mod config;
 pub mod core;
 pub mod creds;
