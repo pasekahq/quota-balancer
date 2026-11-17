@@ -599,6 +599,8 @@ pub struct ErrorResponse {
     pub status: u16,
     /// `retry-after` header in seconds, when set.
     pub retry_after: Option<u64>,
+    /// `x-should-retry` header, when set; Anthropic SDKs follow it over their own retry rules.
+    pub should_retry: Option<bool>,
     /// JSON body.
     pub body: ErrorBody,
 }
@@ -610,7 +612,7 @@ pub fn error_body(e: &GatewayError) -> ErrorBody {
             "rate_limit_error",
             "every login of the route is out of quota",
         ),
-        ErrorClass::Auth => ("authentication_error", "authentication failed"),
+        ErrorClass::Auth => ("api_error", "the vendor rejected the gateway's credential"),
         ErrorClass::Unavailable => ("api_error", "no vendor of the route answered"),
         ErrorClass::Overloaded => ("overloaded_error", "overloaded"),
         ErrorClass::BadRequest => ("invalid_request_error", "invalid request"),
@@ -627,12 +629,17 @@ pub fn error_body(e: &GatewayError) -> ErrorBody {
     ErrorBody::new(kind, message)
 }
 
+/// A quota reset further away than this tells SDK clients not to retry.
+pub const NO_RETRY_AFTER_S: u64 = 300;
+
 /// The Anthropic error answer of a canonical error at `now`: 429 with `retry-after` until
-/// `resets_at` for `quota_exhausted`, 529 for `overloaded`, 401 for `auth`, 400 for
-/// `bad_request` and `context_too_long`, 502 for `unavailable`.
+/// `resets_at` for `quota_exhausted` (and `x-should-retry: false` beyond [`NO_RETRY_AFTER_S`]),
+/// 529 for `overloaded`, 400 for `bad_request` and `context_too_long`, 502 for `unavailable`
+/// and for `auth`, which is the vendor rejecting the gateway's credential, not the client's.
 pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
     let status = match e.class {
         ErrorClass::Overloaded => 529,
+        ErrorClass::Auth => 502,
         c => c.http_status(),
     };
     let retry_after = match e.class {
@@ -642,9 +649,13 @@ pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
             .or(e.retry_after),
         _ => e.retry_after,
     };
+    let should_retry = (e.class == ErrorClass::QuotaExhausted
+        && retry_after.is_some_and(|s| s > NO_RETRY_AFTER_S))
+    .then_some(false);
     ErrorResponse {
         status,
         retry_after,
+        should_retry,
         body: error_body(e),
     }
 }

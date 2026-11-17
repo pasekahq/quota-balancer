@@ -288,6 +288,13 @@ fn errors_map_to_messages_answers() {
         serde_json::to_value(&r.body).expect("json"),
         json!({"type": "error", "error": {"type": "rate_limit_error", "message": "out of quota"}})
     );
+    assert_eq!(r.should_retry, Some(false), "a reset an hour away");
+    quota.resets_at = Some(NOW + 120);
+    assert_eq!(
+        error_response(&quota, NOW).should_retry,
+        None,
+        "a reset soon"
+    );
     quota.resets_at = Some(NOW - 5);
     assert_eq!(error_response(&quota, NOW).retry_after, Some(1));
 
@@ -298,7 +305,9 @@ fn errors_map_to_messages_answers() {
     assert_eq!(r.body.error.kind, "overloaded_error");
 
     for (class, status, kind) in [
-        (ErrorClass::Auth, 401, "authentication_error"),
+        // The vendor rejected the gateway's credential, not the client's: an SDK client must
+        // not take it for a bad key of its own.
+        (ErrorClass::Auth, 502, "api_error"),
         (ErrorClass::BadRequest, 400, "invalid_request_error"),
         (ErrorClass::ContextTooLong, 400, "invalid_request_error"),
         (ErrorClass::Unavailable, 502, "api_error"),

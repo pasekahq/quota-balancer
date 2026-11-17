@@ -179,7 +179,14 @@ block, so a turn can switch vendors under a Messages client.
 |---|---|---|---|
 | `quota_exhausted` | 429 | `rate_limit_error` | seconds to `resets_at` (at least 1), else `retry_after` |
 | `overloaded` | 529 | `overloaded_error` | `retry_after` |
-| `auth` | 401 | `authentication_error` | — |
+| `auth` | 502 | `api_error` | — |
 | `bad_request` | 400 | `invalid_request_error` | — |
 | `context_too_long` | 400 | `invalid_request_error`, message starting `prompt is too long` | — |
 | `unavailable` | 502 | `api_error` | — |
+
+A `quota_exhausted` answer whose `retry-after` is more than 300 s also carries
+`x-should-retry: false`, so SDK clients stop their automatic retries until the reset.
+
+`auth` here is the vendor rejecting the gateway's own credential. To an SDK client a 401 means
+its own key is wrong, and some clients then discard that key, so the front answers 502. A bad
+local client token is the gateway's own check and stays 401 there.
