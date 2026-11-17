@@ -23,6 +23,9 @@ pub struct Picked<'a> {
     pub model: &'a str,
     /// Reasoning effort of the ladder candidate, if any; the request's `effort` wins when set.
     pub effort: Option<&'a str>,
+    /// Whether the model reasons, from the config's `openai_models`; the OpenAI adapter sends no
+    /// reasoning, effort or `include` without it.
+    pub reasoning: bool,
     /// Login name; for logs and errors, never a credential.
     pub login: &'a str,
     /// Base URL of the vendor API from the login's config; `None` for the adapter's public

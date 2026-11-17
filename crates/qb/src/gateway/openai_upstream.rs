@@ -79,7 +79,7 @@ impl Upstream for Openai {
             model: at.model,
             effort: at.effort,
             auth,
-            reasoning: true,
+            reasoning: at.reasoning,
         };
         let body = request::build(req, &target)
             .map_err(|e| Failure::new(FailureKind::BadRequest, e.to_string()))?;

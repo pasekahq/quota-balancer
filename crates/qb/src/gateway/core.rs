@@ -530,6 +530,7 @@ impl Gateway {
                 vendor: &attempt.vendor,
                 model: &attempt.model,
                 effort: pick.effort.as_deref(),
+                reasoning: self.config.reasoning(&attempt.model),
                 login: &login,
                 base_url: entry.base_url.as_deref(),
                 referer: entry.referer.as_deref(),

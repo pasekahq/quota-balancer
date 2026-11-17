@@ -33,7 +33,7 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | Any OpenAI front | `cache` is always `auto`, since OpenAI clients expect caching without asking; on an Anthropic API key that means cache writes at their price. |
 | `tool_result.is_error` to an OpenAI upstream | Dropped: `function_call_output` and the Chat Completions `tool` message have no error flag. |
 | Usage | OpenAI reports no cache writes: `cache_write` reads as 0 upstream, and fronts fold it into `prompt_tokens`/`input_tokens`. The canonical usage has no reasoning count, so fronts write `reasoning_tokens: 0`. |
-| `reasoning.summary`, `include`, `store` of a Responses client | Ignored: the upstream adapter always asks for summaries and encrypted reasoning and never stores. |
+| `reasoning.summary`, `include`, `store` of a Responses client | Ignored: the upstream adapter asks for summaries and encrypted reasoning of every model that reasons, and never stores. |
 | `n` > 1, logprobs, audio, structured output (`response_format`, `text.format`), non-function tools, image URLs, files | Refused with a clear `400`. |
 | `tool_choice` other than `auto` (`none` with tools, `required`, a named tool) | Refused with a clear `400`: the canonical turn always leaves the choice to the model, so honouring it is impossible and ignoring it would run tools the client forbade. `none` without tools is accepted. |
 | `reasoning_effort` / `reasoning.effort` `none` | Read as `low`: the canonical effort has no "off", so the model still reasons a little. |
@@ -264,10 +264,15 @@ a 401. The refresh is the OAuth refresh grant:
 | 429, 5xx, transport failure, another status, a 2xx without `access_token` or expiry | failed: the turn ends `unavailable`, retryable |
 
 A refresh error names the endpoint, the status and the error code, never a body value, header,
-token or account id.
+token or account id. These field names, the refusal shape and the use of the `id_token`'s `exp`
+come from references, not from captured answers; the operator runbook
+[openai-live-smoke.md](runbooks/openai-live-smoke.md) checks them against the vendor with a
+forced refresh.
 
 The endpoint is the login's `base_url` followed by `/responses`, else `AuthMode::url()`. The body
-is `request::build` with `target.reasoning` on, and the stream's event bound is
+is `request::build` with `target.reasoning` on, unless the gateway config's `openai_models` sets
+`reasoning = false` for the picked model ([config.md](config.md#gateway-config)): then the body
+carries no `reasoning`, no effort and no `include`. The stream's event bound is
 `stream::event_bound` of the body's size. A 200 streams through `stream::Reader` into the turn and
 ends with the stop reason and the windows of `limits::rate_limits`, read with the gateway's clock;
 any other status reads up to 64 KiB of the body and ends with `limits::classify_response`, whose
@@ -279,7 +284,10 @@ Every login of `api = "chat_completions"`, an `api_key` login, runs through `cha
 headers are `chat_upstream::headers` of the login's `referer` and `title`, and the key goes in
 `chat_upstream::secret_header()`. A 200 streams through `chat_upstream::Reader` into the turn
 and ends with the stop reason and no windows; the reader's cost is not passed on. Any other
-status reads up to 64 KiB of the body and ends with `limits::classify_chat_response`.
+status reads up to 64 KiB of the body and ends with `limits::classify_chat_response`. The
+runbook [openai-live-smoke.md](runbooks/openai-live-smoke.md) checks the usage, the charge and
+the 402 answer against OpenRouter with one short turn per key, and names what a short turn
+cannot show: the `usage.cost` field and the in-stream error chunk.
 
 ## Serving the fronts
 
@@ -454,5 +462,6 @@ and values, and none was captured from a vendor. The `client_sdk_http_*.json` re
 recorded byte for byte from the OpenAI Python SDK 2.24.0 (`chat.completions.create` and
 `responses.create`, each with and without `stream`, with a tool call and its result in the
 history) against a loopback listener, with synthetic content, the base URL
-`http://127.0.0.1:8080/v1` and the test client token. Recorded vendor streams and answers, with
-every identifier anonymised, are added with the live smoke of the wired gateway.
+`http://127.0.0.1:8080/v1` and the test client token. The operator runbook
+[openai-live-smoke.md](runbooks/openai-live-smoke.md) checks the vendor shapes they assume
+against live logins.
