@@ -227,7 +227,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`; without it `qbd` identifies the gateway by uid. |
 | `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
-| `max_attempts` | integer 1..=16 | Picks per turn, default 4. |
+| `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
 the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
@@ -282,7 +282,8 @@ vendor rejects makes the login unusable: the attempt is reported to `qbd` as `ht
 turn moves to the next login. Any other field is refused. The gateway may create, write and remove files in the credential files'
 directories and nowhere else.
 
-`[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to one `qbd` pick target.
+`[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to a `qbd` pick target: a
+ladder step, a pin, or a chain of pins.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -291,7 +292,19 @@ directories and nowhere else.
 | `difficulty` | integer 0..=255 | Ladder step of the role, with `qbd`'s fallback to neighbouring steps, tiers and reserves. |
 | `vendor`, `model` | string | Instead of `difficulty`: a pin of one vendor and model, without ladder or role reserve. |
 | `effort` | string | Reasoning effort of a pin. |
+| `chain` | array of tables | Instead of `difficulty`, `vendor`, `model` and `effort`: 1 to 8 steps `{ vendor, model, effort }`, each a pin (`vendor` and `model` required), which a turn tries in order ([api.md](api.md#attempts-and-rotation)). |
 | `expected_minutes` | integer | Expected length of a turn, for the lease's cost. |
+
+```toml
+[[routes]]
+alias = "chat"
+role = "gateway"
+chain = [
+  { vendor = "vendor-a", model = "model-large" },
+  { vendor = "vendor-c", model = "model-large", effort = "medium" },
+  { vendor = "vendor-d", model = "vendor-x/model-large" },
+]
+```
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
