@@ -120,7 +120,7 @@ unreadable utilisation or reset drops that window only.
 | 401, 403, `authentication_error`, `permission_error` | `auth` | `auth` | `http_401` |
 | 429 with unified status `rejected`, or a message about a usage limit (`usage limit`, `hit your limit`, `limit reached`) | `usage_limit{resets_at}` | `quota_exhausted` | `usage_limit` |
 | other 429, `rate_limit_error` | `rate_limited{retry_after}` | `overloaded` | `http_429` |
-| 402, `billing_error` | `usage_limit` without reset | `quota_exhausted` | `usage_limit` |
+| 402, `billing_error`, or a 400 whose message is about credit or billing (`credit balance`, `billing`), as an API key out of prepaid credit gets | `usage_limit` without reset | `quota_exhausted` | `usage_limit` |
 | 529, `overloaded_error` | `overloaded{retry_after}` | `overloaded` | `error` |
 | 404, `not_found_error` | `model_unavailable` | `unavailable` | `model_unavailable` |
 | 400, 413 whose message says the prompt is too long (`prompt is too long`, `context length`, `context window`, `exceed context limit`, `too many tokens`) | `context_too_long` | `context_too_long` | `error` |

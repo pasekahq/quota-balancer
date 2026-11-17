@@ -426,6 +426,12 @@ fn vendor_answers_classify() {
             Outcome::Error,
         ),
         (
+            "answer_400_credit_balance.json",
+            FailureKind::UsageLimit { resets_at: None },
+            ErrorClass::QuotaExhausted,
+            Outcome::UsageLimit,
+        ),
+        (
             "answer_500_html.json",
             FailureKind::Unavailable,
             ErrorClass::Unavailable,

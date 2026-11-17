@@ -263,6 +263,12 @@ fn says_usage_limit(message: &str) -> bool {
     .any(|p| m.contains(p))
 }
 
+/// An API key's prepaid credit ran out; Anthropic answers this as a 400, not a 402.
+fn says_out_of_credit(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    ["credit balance", "billing"].iter().any(|p| m.contains(p))
+}
+
 fn says_context_too_long(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     [
@@ -303,6 +309,8 @@ fn by_detail(status: Option<u16>, detail: &ErrorDetail, limits: &RateLimits) -> 
                 FailureKind::ContextTooLong
             } else if says_usage_limit(&detail.message) {
                 usage_limit()
+            } else if says_out_of_credit(&detail.message) {
+                FailureKind::UsageLimit { resets_at: None }
             } else {
                 FailureKind::BadRequest
             }
