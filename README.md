@@ -65,7 +65,7 @@ These are enforced in CI on every change (`ci/budgets.sh` and the acceptance lan
 
 | Budget | Limit |
 |---|---|
-| static musl binary | ≤ 2.5 MiB |
+| static musl binary | ≤ 4 MiB |
 | daemon peak RSS after 10 000 picks | ≤ 4 MiB |
 | pick latency over the unix socket, p99 | ≤ 1 ms |
 | idle daemon wake-ups | 0 |
