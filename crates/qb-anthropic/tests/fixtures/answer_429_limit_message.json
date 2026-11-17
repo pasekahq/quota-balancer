@@ -1,0 +1,11 @@
+{
+  "status": 429,
+  "headers": [],
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "rate_limit_error",
+      "message": "You've hit your limit \u00b7 resets 3pm"
+    }
+  }
+}

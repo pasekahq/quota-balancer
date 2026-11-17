@@ -1,0 +1,20 @@
+{
+  "status": 429,
+  "headers": [
+    [
+      "anthropic-ratelimit-unified-status",
+      "allowed_warning"
+    ],
+    [
+      "retry-after",
+      "30"
+    ]
+  ],
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "rate_limit_error",
+      "message": "Number of request tokens has exceeded your per-minute rate limit"
+    }
+  }
+}

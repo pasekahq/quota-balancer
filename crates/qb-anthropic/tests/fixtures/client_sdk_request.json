@@ -1,0 +1,114 @@
+{
+  "max_tokens": 32000,
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is in this picture and in notes.txt?"
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "Read the file first.",
+          "signature": "c2lnbmF0dXJlLXRlc3QtMQ=="
+        },
+        {
+          "type": "redacted_thinking",
+          "data": "cmVkYWN0ZWQtdGVzdC0x"
+        },
+        {
+          "type": "text",
+          "text": "Reading the file first.",
+          "citations": null
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_test_1",
+          "name": "read",
+          "input": {
+            "path": "notes.txt"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_test_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "line one"
+            },
+            {
+              "type": "text",
+              "text": "line two"
+            }
+          ],
+          "is_error": false,
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "model": "claude-opus-5-5",
+  "metadata": {
+    "user_id": "session-test-1"
+  },
+  "output_config": {
+    "effort": "high"
+  },
+  "stream": true,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a helpful assistant.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "temperature": 1,
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 16000
+  },
+  "tool_choice": {
+    "type": "auto"
+  },
+  "tools": [
+    {
+      "name": "read",
+      "description": "Read a text file.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  ]
+}
