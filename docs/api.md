@@ -2,8 +2,8 @@
 
 JSON over HTTP/1.1 on a unix socket (or a forwarded one). One request per connection;
 `Content-Length` is required for `POST`; bodies ≤ 64 KiB, headers ≤ 8 KiB. Times are Unix
-seconds, utilisation is `0.0..=1.0`, enums are `snake_case`. Requests reject unknown fields.
-Types are defined in `crates/qb-proto`; example payloads are in `crates/qb-proto/tests/fixtures/`.
+seconds, utilisation is `0.0..=1.0`, enums are `snake_case`. Requests reject unknown fields;
+responses may gain optional fields, which clients ignore. Types are defined in `crates/qb-proto`; example payloads are in `crates/qb-proto/tests/fixtures/`.
 
 | Endpoint | Request | Response |
 |---|---|---|

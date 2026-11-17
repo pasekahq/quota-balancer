@@ -92,6 +92,13 @@ fn stream_events_in_order() {
 }
 
 #[test]
+fn stream_events_ignore_fields_a_later_version_adds() {
+    let line = r#"{"type":"text_delta","text":"Hi","index":0}"#;
+    let event: StreamEvent = serde_json::from_str(line).unwrap();
+    assert_eq!(event, StreamEvent::TextDelta { text: "Hi".into() });
+}
+
+#[test]
 fn errors_routes_cancel() {
     let StreamEvent::Error { error } = roundtrip("gateway_error_quota_exhausted.json") else {
         panic!("not an error event");
@@ -161,7 +168,11 @@ fn invalid_fixtures_are_rejected() {
         let refused = match kind {
             "TurnRequest" => rejected(&raw, |r: TurnRequest| r.validate().is_ok()),
             "Block" => rejected(&raw, |b: Block| around(b).validate().is_ok()),
-            "StreamEvent" => rejected(&raw, |_: StreamEvent| true),
+            // The decoder ignores fields a later version adds, so the rule that an event
+            // carries only its own payload is checked here: it must re-encode to itself.
+            "StreamEvent" => rejected(&raw, |e: StreamEvent| {
+                serde_json::to_value(e).unwrap() == serde_json::from_str::<Value>(&raw).unwrap()
+            }),
             "CancelRequest" => rejected(&raw, |_: CancelRequest| true),
             "Error" => rejected(&raw, |_: GatewayError| true),
             other => panic!("{name}: no type {other}"),

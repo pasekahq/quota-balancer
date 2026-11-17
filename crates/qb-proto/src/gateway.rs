@@ -351,9 +351,10 @@ impl TurnRequest {
 /// One NDJSON line of the turn stream. A stream carries `route`, then any number of
 /// `text_delta`, `thinking`, `tool_call` and `usage`, and ends with exactly one `stop` or
 /// `error`; a turn that fails before any vendor answered is one `error` without `route`. A
-/// stream without a final event was cut by a transport failure.
+/// stream without a final event was cut by a transport failure. A response type: fields a later
+/// version adds are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// Where the turn runs; sent before the first other event.
     Route {
