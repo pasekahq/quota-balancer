@@ -7,8 +7,13 @@ login has quota left, which window resets soonest and should be spent first, and
 candidates are dead until a reset. `qb` answers in microseconds over a local unix socket and
 holds a short lease so that parallel workers do not all pile onto the same last 2 % of a window.
 
-`qb` is **not a proxy**. Your agents talk to their vendors directly, with their own CLIs and their
-own credentials. `qb` never sees model traffic and never stores or refreshes anyone's tokens.
+With `qbd` and `qb agent` alone, your agents talk to their vendors directly, with their own CLIs
+and credentials, and `qbd` never sees model traffic or a token. An agent loop without vendor
+adapters of its own can instead send its model requests through the optional `qb gateway` role:
+it runs as the owner of the logins, holds their OAuth tokens and API keys, refreshes the tokens,
+picks and rotates logins through `qbd` and streams the answers back. It carries model traffic
+only for its own credential owner. The decision is [ADR 0001](docs/adr/0001-model-gateway.md);
+the gateway is not built yet.
 
 > **Status: pre-alpha skeleton (0.0.x).** The API contract, transport, CLI and service templates
 > are in place, and the agent probes the vendors' usage endpoints; the scheduling policy and
@@ -32,17 +37,23 @@ keeps a tiny model of every window, and turns them into a decision:
 ```
  orchestrator / CLI ──HTTP/1.1 over unix socket──▶ qbd   (policy, leases, journal)
    (reports windows seen in vendor streams)          no vendor secrets, no network
-                                                      ▲ "probe login X" (optional)
- qb agent (runs as the credential owner) ─────────────┘ answers with numbers only
+                                                      ▲ ▲ "probe login X" (optional)
+ qb agent (runs as the credential owner) ─────────────┘ │ answers with numbers only
+                                                        │ pick / report
+ agent loop ──unix socket──▶ qb gateway (optional) ─────┘
+   (one model API)           runs as the credential owner,
+                             holds and refreshes its tokens ──HTTPS──▶ vendor APIs
 ```
 
-- **One static binary, three roles**: `qbd` (daemon), `qb agent`, `qb` CLI.
+- **One static binary, four roles**: `qbd` (daemon), `qb agent`, `qb gateway` (optional), `qb`
+  CLI.
 - **Synchronous and minimal**: no async runtime; `httparse` + `serde_json` + `rustix`.
 - **State in RAM** plus an append-only journal (or no disk writes at all).
 - **Hardened by default**: the daemon runs with `DynamicUser`, `PrivateNetwork`, a syscall
   filter and a 16 MB memory cap; `systemd-analyze security` rates the template 0.2 ("SAFE").
 - **No telemetry.** `qb` makes no network connections except, optionally, the agent's
-  probe to the vendor endpoints you configure.
+  probe to the vendor endpoints you configure and the gateway's requests to the vendors of its
+  own credentials.
 
 More in [docs/design.md](docs/design.md); the wire contract is in [docs/api.md](docs/api.md), the
 daemon's config file in [docs/config.md](docs/config.md).
@@ -119,8 +130,17 @@ users allowed to talk to the daemon, then `systemctl enable --now qbd.socket`. T
 
 ## Terms of service
 
-Use `qb` only with your own subscriptions, for your own work. It does not share, relay or pool
-accounts between people, and it must not be used to do so. Vendor terms change; read them.
+Use `qb` only with your own subscriptions and keys, for your own work. It does not share, relay
+or pool accounts between people, and it must not be used to do so: a gateway serves the one
+person who owns its credentials, and its sockets are not for other people's clients.
+
+The gateway's OAuth mode uses a subscription login through a client that is not the vendor's
+own: it presents itself to the subscription endpoint as the vendor's CLI. A vendor's terms may
+allow subscription logins only in its own clients, and may restrict or close an account used
+otherwise. Read the terms of every vendor whose logins you put into the gateway. Where they
+forbid it, use the key mode: an API key on the vendor's public API, which the gateway serves
+through the same routes, so its clients do not change. Vendor terms change; read them again
+when they do.
 
 ## License
 

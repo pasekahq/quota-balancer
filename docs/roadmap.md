@@ -46,6 +46,40 @@ Order matters; each item lands as its own PR with tests.
 Also in S1: `clients/python/qb_client.py` — a single-file stdlib client (~60 lines) for
 Python orchestrators, with a fallback to local logic when the daemon is unreachable.
 
+## G1: model gateway, contract and Anthropic
+
+The optional `qb gateway` role as decided in [ADR 0001](adr/0001-model-gateway.md).
+
+1. ADR and the positioning of README, design, rules and roadmap.
+2. Gateway contract: `POST /v1/model/turn` streaming NDJSON events, `GET /v1/model/routes`,
+   `POST /v1/model/cancel`, in `docs/api.md` and an OpenAPI document, with fixtures and contract
+   tests over a unix socket.
+3. Credential store: 0600 files from the gateway's config, kinds `oauth_anthropic` and
+   `api_key`, OAuth refresh with an atomic replace; a test that no secret reaches a log.
+4. Anthropic Messages adapter: canonical request and SSE stream to gateway events, automatic
+   prompt caching, signed thinking; OAuth mode with the vendor CLI's identity and beta headers,
+   and key mode; tests on recorded synthetic streams.
+5. Pick and report around each request: route alias to a `qbd` pick, windows reported from
+   rate-limit headers and errors, rotation to the next login within the turn on `usage_limit`,
+   and `quota_exhausted` with the nearest `resets_at` when every candidate is spent.
+6. Messages-compatible front: `POST /v1/messages` on the same core, on the unix socket and
+   optionally on a loopback port with a local client token.
+7. Operation: gateway budgets in `ci/budgets.sh` and the acceptance lane, a hardened systemd
+   user unit with its exposure threshold in CI, a manual smoke test on one OAuth login.
+
+## G2: model gateway, OpenAI and Codex, keys, OpenRouter, chains
+
+1. OpenAI Responses adapter: ChatGPT/Codex OAuth (account id, refresh) and API keys.
+2. Chat Completions adapter for OpenRouter and other API keys.
+3. Cross-vendor fallback: foreign thinking blocks dropped, tool call ids stable across
+   vendors, end-to-end test of a chain that falls from one vendor to the next.
+4. Chains across vendors in the route config, and a config reload (`qb reload` or `SIGHUP`)
+   that does not cut streams in flight.
+5. Spend cap per API key, from the cost of reported usage.
+6. Login import and login: `qb login import` from existing credential files by path,
+   without printing values; `qb login` with PKCE for Anthropic and OpenAI.
+7. CI and budgets green, `docs/config.md` with neutral examples.
+
 ## S2 — several hosts
 
 Remote clients through an ssh-forwarded unix socket with bearer tokens; agents on other hosts
