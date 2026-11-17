@@ -5,7 +5,7 @@ mod common;
 
 use common::{NOW, VENDOR, fixture, run};
 use qb_anthropic::front::{
-    Assembler, FOREIGN_THINKING, SseEncoder, decode_request, error_response,
+    Assembler, FOREIGN_THINKING, ForeignThinking, SseEncoder, decode_request, error_response,
 };
 use qb_anthropic::wire::ContentBlock;
 use qb_proto::{
@@ -427,4 +427,48 @@ fn a_long_user_id_gives_a_fixed_length_session_key() {
     assert_ne!(ka, kb);
     assert_eq!(key_of("session-test-1").as_deref(), Some("session-test-1"));
     assert_eq!(key_of(""), None);
+}
+
+#[test]
+fn foreign_thinking_can_be_dropped_on_the_front() {
+    let foreign = StreamEvent::Thinking {
+        thinking: Thinking {
+            vendor: "vendor-b".into(),
+            opaque: "b3BhcXVlLWI=".into(),
+        },
+    };
+    let mut events = turn_events();
+    events.insert(2, foreign.clone());
+
+    let mut a = Assembler::new("msg_test_1", "claude-opus-5-5", VENDOR)
+        .foreign_thinking(ForeignThinking::Drop);
+    for e in &events {
+        a.push(e);
+    }
+    let content = a.finish().expect("stopped").content;
+    assert_eq!(content.len(), 3, "{content:?}");
+    assert!(matches!(content[0], ContentBlock::Thinking { .. }));
+
+    let mut enc = SseEncoder::new("msg_test_1", "claude-opus-5-5", VENDOR)
+        .foreign_thinking(ForeignThinking::Drop);
+    let mut bytes = Vec::new();
+    for e in &events {
+        bytes.extend(enc.push(e));
+    }
+    assert_eq!(
+        String::from_utf8(bytes).expect("utf-8"),
+        String::from_utf8(fixture("client_stream.sse")).expect("utf-8"),
+        "the foreign block leaves no trace"
+    );
+
+    let mut keep = Assembler::new("m", "claude-opus-5-5", VENDOR);
+    keep.push(&foreign);
+    keep.push(&StreamEvent::Stop {
+        reason: StopReason::End,
+    });
+    let content = keep.finish().expect("stopped").content;
+    assert!(
+        matches!(&content[0], ContentBlock::RedactedThinking { data } if data.starts_with(FOREIGN_THINKING)),
+        "kept by default"
+    );
 }

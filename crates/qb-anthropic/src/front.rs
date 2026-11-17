@@ -22,6 +22,16 @@ use crate::wire::{
 /// Messages client passes it back like any redacted block.
 pub const FOREIGN_THINKING: &str = "qb-thinking:";
 
+/// What the front does with thinking of a vendor other than its native one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ForeignThinking {
+    /// Show it as a `redacted_thinking` block the client passes back, so the turn keeps it.
+    #[default]
+    Keep,
+    /// Leave it out, so the client's history stays valid for the native vendor itself.
+    Drop,
+}
+
 /// Longest `metadata.user_id` taken as the session key.
 const MAX_SESSION_KEY: usize = qb_proto::gateway::MAX_SESSION_KEY;
 
@@ -299,6 +309,22 @@ pub fn thinking_block(t: &Thinking, native_vendor: &str) -> ContentBlock {
     }
 }
 
+/// The block a thinking event is shown as under `policy`; `None` when it is dropped.
+fn shown_thinking(
+    t: &Thinking,
+    native_vendor: &str,
+    policy: ForeignThinking,
+) -> Option<ContentBlock> {
+    match thinking_block(t, native_vendor) {
+        ContentBlock::RedactedThinking { data }
+            if policy == ForeignThinking::Drop && data.starts_with(FOREIGN_THINKING) =>
+        {
+            None
+        }
+        block => Some(block),
+    }
+}
+
 fn wire_usage(u: Usage) -> WireUsage {
     WireUsage {
         input_tokens: Some(u.input),
@@ -346,6 +372,7 @@ pub struct SseEncoder {
     id: String,
     model: String,
     native_vendor: String,
+    foreign: ForeignThinking,
     started: bool,
     text_open: Option<u32>,
     next_index: u32,
@@ -360,12 +387,20 @@ impl SseEncoder {
             id: id.to_owned(),
             model: model.to_owned(),
             native_vendor: native_vendor.to_owned(),
+            foreign: ForeignThinking::Keep,
             started: false,
             text_open: None,
             next_index: 0,
             usage: Usage::default(),
             done: false,
         }
+    }
+
+    /// The encoder with `policy` for thinking of other vendors.
+    #[must_use]
+    pub fn foreign_thinking(mut self, policy: ForeignThinking) -> Self {
+        self.foreign = policy;
+        self
     }
 
     /// Whether any byte went out; before that an error is better answered as an HTTP error.
@@ -439,8 +474,11 @@ impl SseEncoder {
 
     fn thinking(&mut self, thinking: &Thinking, out: &mut Vec<u8>) {
         self.start(out);
+        let Some(block) = shown_thinking(thinking, &self.native_vendor, self.foreign) else {
+            return;
+        };
         self.close_text(out);
-        match thinking_block(thinking, &self.native_vendor) {
+        match block {
             ContentBlock::Thinking {
                 thinking,
                 signature,
@@ -523,6 +561,7 @@ impl SseEncoder {
 pub struct Assembler {
     message: MessageResponse,
     native_vendor: String,
+    foreign: ForeignThinking,
     usage: Usage,
     stop: Option<StopReason>,
     error: Option<GatewayError>,
@@ -534,10 +573,18 @@ impl Assembler {
         Self {
             message: empty_message(id, model, Usage::default()),
             native_vendor: native_vendor.to_owned(),
+            foreign: ForeignThinking::Keep,
             usage: Usage::default(),
             stop: None,
             error: None,
         }
+    }
+
+    /// The assembler with `policy` for thinking of other vendors.
+    #[must_use]
+    pub fn foreign_thinking(mut self, policy: ForeignThinking) -> Self {
+        self.foreign = policy;
+        self
     }
 
     /// Adds one canonical event.
@@ -557,7 +604,7 @@ impl Assembler {
                 }),
             },
             StreamEvent::Thinking { thinking } => {
-                content.push(thinking_block(thinking, &self.native_vendor));
+                content.extend(shown_thinking(thinking, &self.native_vendor, self.foreign));
             }
             StreamEvent::ToolCall { tool_call } => content.push(ContentBlock::ToolUse {
                 id: tool_call.id.clone(),

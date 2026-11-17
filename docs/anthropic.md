@@ -173,6 +173,13 @@ of another vendor goes out as `redacted_thinking` whose `data` is `qb-thinking:`
 `{"vendor": …, "opaque": …}`; the client echoes it back and the decoder restores the canonical
 block, so a turn can switch vendors under a Messages client.
 
+Such a block breaks a rollback: a client pointed back at the vendor directly, with a
+`qb-thinking:` block in its history, sends a `redacted_thinking` whose `data` the vendor did not
+issue, and the vendor rejects the request. Where a rollback to the direct vendor must stay
+possible, build the encoder and assembler with `.foreign_thinking(ForeignThinking::Drop)`:
+thinking of another vendor is then left out of the answer (that vendor's reasoning is lost to
+later turns, as when the upstream request drops it). The default is `Keep`.
+
 `front::error_response(error, now)`:
 
 | Class | Status | Error type | `retry-after` |
