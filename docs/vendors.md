@@ -3,7 +3,9 @@
 `crates/qb-vendors` turns the quota data that vendor CLIs and usage endpoints already emit into
 `WindowReport`s for `POST /v1/report` (see [api.md](api.md)). The parsers are pure: no I/O, no
 clock; a source with relative times takes `now` from the caller. They are total: any byte string
-returns a value. The formats are undocumented, so unknown fields are ignored.
+returns a value. The formats are undocumented, so unknown fields are ignored. The gateway reads
+the same Claude windows from Messages API rate-limit headers; that mapping is in
+[anthropic.md](anthropic.md).
 
 ## Sources
 
