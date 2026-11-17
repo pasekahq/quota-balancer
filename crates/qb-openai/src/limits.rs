@@ -505,6 +505,8 @@ pub fn classify_response(status: u16, headers: &[(&str, &str)], body: &[u8], now
     let limits = rate_limits(headers, now);
     let detail = detail_of(body, now);
     let kind = by_detail(Some(status), &detail, &limits);
+    let mut windows = limits.windows;
+    mark_limiting(kind, &mut windows);
     let message = if detail.message.trim().is_empty() {
         format!("vendor answered HTTP {status}")
     } else {
@@ -515,8 +517,37 @@ pub fn classify_response(status: u16, headers: &[(&str, &str)], body: &[u8], now
     };
     Failure {
         kind,
-        windows: limits.windows,
+        windows,
         message,
+    }
+}
+
+/// Puts the limiting window of a usage limit at 1.0 with its reset, since qbd learns the reset
+/// only from the windows: a subscription window already at 1.0 is the limiting one; else the
+/// subscription window whose reset is nearest to the limit's. Without a subscription window the
+/// limit names none.
+fn mark_limiting(kind: FailureKind, windows: &mut [WindowReport]) {
+    let FailureKind::UsageLimit {
+        resets_at: Some(at),
+    } = kind
+    else {
+        return;
+    };
+    let subscription = |w: &&mut WindowReport| !API_KEY_WINDOWS.contains(&w.name.as_str());
+    if windows
+        .iter_mut()
+        .filter(subscription)
+        .any(|w| w.utilization >= 1.0)
+    {
+        return;
+    }
+    if let Some(w) = windows
+        .iter_mut()
+        .filter(subscription)
+        .min_by_key(|w| w.resets_at.map_or(u64::MAX, |r| r.abs_diff(at)))
+    {
+        w.utilization = 1.0;
+        w.resets_at = Some(at);
     }
 }
 
@@ -530,9 +561,12 @@ pub fn classify_stream_error(code: &str, message: &str, limits: &RateLimits) -> 
         message: message.to_owned(),
         resets_at: None,
     };
+    let kind = by_detail(None, &detail, limits);
+    let mut windows = limits.windows.clone();
+    mark_limiting(kind, &mut windows);
     Failure {
-        kind: by_detail(None, &detail, limits),
-        windows: limits.windows.clone(),
+        kind,
+        windows,
         message: format!(
             "vendor stream error {}: {}",
             shorten(code),

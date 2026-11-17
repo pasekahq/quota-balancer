@@ -135,6 +135,11 @@ usage limit. An unreadable value drops only its own window.
 | other 400, 413, 422, `invalid_request_error`, `invalid_prompt` | `bad_request` | `bad_request` | `error` |
 | anything else (5xx, `server_error`, a 403 whose body is not JSON such as a bot wall, another body that is not JSON) | `unavailable` | `unavailable` | `error` |
 
+A usage limit also marks its limiting window, since `qbd` learns the reset only from the
+reported windows: a subscription window already at 100 % is it; else the subscription window
+whose reset is nearest to the limit's is reported at 1.0 with the limit's reset. An API key's
+`insufficient_quota` names no window and no reset.
+
 `resets_at` of a usage limit is the body's `resets_at`, else `now` + `resets_in_seconds`, else
 the latest reset of a subscription window at 100 %. `retry_after` is the header, else the
 duration after `try again in` in the message (`1.8s`, `6m0s`, `5 minutes`). The failure carries the windows of the headers and

@@ -597,3 +597,28 @@ fn lifecycle_events_that_repeat_a_large_request_fit_the_event_bound() {
         Ok(Progress::Finished(StopReason::End))
     );
 }
+
+#[test]
+fn a_usage_limit_puts_its_limiting_window_at_full_use() {
+    // The body names the reset; the headers name the windows but none at 100 %.
+    let headers = [
+        ("x-codex-primary-used-percent", "97"),
+        ("x-codex-primary-window-minutes", "300"),
+        ("x-codex-primary-reset-after-seconds", "3590"),
+        ("x-codex-secondary-used-percent", "40"),
+        ("x-codex-secondary-window-minutes", "10080"),
+        ("x-codex-secondary-reset-after-seconds", "500000"),
+    ];
+    let a = Answer::load("answer_429_usage_limit_relative.json");
+    let f = classify_response(a.status, &headers, &a.body, NOW);
+    assert_eq!(
+        f.windows,
+        vec![
+            window("five_hour", 1.0, Some(NOW + 3600), Some(18_000)),
+            window("seven_day", 0.4, Some(NOW + 500_000), Some(604_800)),
+        ]
+    );
+    // Without subscription windows there is none to name.
+    let f = classify_response(a.status, &[], &a.body, NOW);
+    assert_eq!(f.windows, Vec::<WindowReport>::new());
+}
