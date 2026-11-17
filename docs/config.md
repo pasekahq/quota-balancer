@@ -311,3 +311,5 @@ The token must not start with `sk-ant-`, `eyJ` or `cc-`: some Anthropic clients 
 that shape for a subscription OAuth token and send it with another identity. The `qb-` prefix
 above avoids that. Anyone on the host who knows the token can spend the gateway's logins, so
 keep it as private as a vendor key.
+
+Switching a Hermes agent to this front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).
