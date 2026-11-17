@@ -68,6 +68,9 @@ result); thinking blocks cannot. Without `cache` the request has no breakpoints.
 
 All identity values (version, betas, user agent, `x-app`, identity line) are constants in
 `request::identity`, the one place to change them. Clients of the gateway never see or send them.
+The subscription endpoint refuses newer models for an old CLI version in the user agent
+(HTTP 400 `version 2.1.280 or newer is required` for `claude-opus-5-5`), so the version in
+`OAUTH_USER_AGENT` follows the current vendor CLI; a test pins the known minimum.
 
 ## Upstream answer
 
