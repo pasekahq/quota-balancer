@@ -8,7 +8,9 @@
 //! - [`config`]: the gateway's TOML config;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
 //! - [`upstream`]: the seam vendor adapters implement;
+//! - [`vendor`]: the transport the adapters share;
 //! - [`anthropic`]: the adapter of the `anthropic` API family;
+//! - [`openai_upstream`]: the adapter of the `openai` API family;
 //! - [`oauth`]: the token refresher of `oauth_anthropic` logins;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`front`]: the listeners and the C4 front;
@@ -25,4 +27,6 @@ pub mod front;
 pub mod messages;
 pub mod oauth;
 pub mod openai;
+pub mod openai_upstream;
 pub mod upstream;
+pub mod vendor;

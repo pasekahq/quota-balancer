@@ -25,6 +25,18 @@ kind = "api_key"
 api = "anthropic"
 credentials = "/var/lib/qb-gateway/credentials/key-1.json"
 
+# A ChatGPT subscription login: access token and account id, not refreshed by the gateway.
+[[logins]]
+name = "login-3"
+kind = "chatgpt_oauth"
+credentials = "/var/lib/qb-gateway/credentials/login-3.json"
+
+[[logins]]
+name = "key-2"
+kind = "api_key"
+api = "openai"
+credentials = "/var/lib/qb-gateway/credentials/key-2.json"
+
 # Ladder step 1 of qbd's role "gateway": subscription logins first, the key as the last tier.
 [[routes]]
 alias = "chat"

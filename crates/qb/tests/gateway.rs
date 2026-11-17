@@ -23,6 +23,7 @@ use qb::gateway::core::{Cancel, Gateway, Upstreams};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
 use qb::gateway::front;
 use qb::gateway::oauth::AnthropicOauth;
+use qb::gateway::openai_upstream::Openai;
 use qb::gateway::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Sink, Upstream,
 };
@@ -31,6 +32,7 @@ use qb::journal::Journal;
 use qb::server::unix_now;
 use qb_anthropic::request::identity;
 use qb_core::Core;
+use qb_openai::request::identity as openai_identity;
 use qb_proto::{
     Block, CancelAnswer, ErrorClass, GatewayError, LoginStatus, RouteState, RoutesAnswer,
     StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, WindowReport,
@@ -1550,7 +1552,7 @@ impl Received {
     }
 }
 
-/// An Anthropic-compatible endpoint on a loopback TCP port that replays [`Answer`]s in order.
+/// A vendor endpoint on a loopback TCP port that replays [`Answer`]s in order.
 struct Vendor {
     base_url: String,
     answers: Arc<Mutex<Vec<Answer>>>,
@@ -1681,15 +1683,34 @@ fn answer_with(
     }
 }
 
-/// A file of `crates/qb-anthropic/tests/fixtures`.
-fn vendor_fixture(name: &str) -> Vec<u8> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../qb-anthropic/tests/fixtures");
+/// A file of `crates/<krate>/tests/fixtures`.
+fn fixture_of(krate: &str, name: &str) -> Vec<u8> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(krate)
+        .join("tests/fixtures");
     std::fs::read(dir.join(name)).unwrap()
 }
 
-/// The recorded answer `answer_<name>.json`; `sse`, a stream fixture, as the body of a 200.
+/// A file of `crates/qb-anthropic/tests/fixtures`.
+fn vendor_fixture(name: &str) -> Vec<u8> {
+    fixture_of("qb-anthropic", name)
+}
+
+/// The recorded Anthropic answer `answer_<name>.json`; `sse`, a stream fixture, as the body of
+/// a 200.
 fn recorded(name: &str, sse: Option<&str>) -> Answer {
-    let v: Value = serde_json::from_slice(&vendor_fixture(&format!("answer_{name}.json"))).unwrap();
+    recorded_of("qb-anthropic", name, sse)
+}
+
+/// [`recorded`] of the OpenAI fixtures.
+fn openai_recorded(name: &str, sse: Option<&str>) -> Answer {
+    recorded_of("qb-openai", name, sse)
+}
+
+fn recorded_of(krate: &str, name: &str, sse: Option<&str>) -> Answer {
+    let v: Value =
+        serde_json::from_slice(&fixture_of(krate, &format!("answer_{name}.json"))).unwrap();
     let status = u16::try_from(v["status"].as_u64().unwrap()).unwrap();
     let headers = v["headers"]
         .as_array()
@@ -1701,7 +1722,7 @@ fn recorded(name: &str, sse: Option<&str>) -> Answer {
         })
         .collect();
     let body = match sse {
-        Some(file) => vendor_fixture(file),
+        Some(file) => fixture_of(krate, file),
         None => serde_json::to_vec(&v["body"]).unwrap(),
     };
     Answer::Full(status, headers, body)
@@ -1734,16 +1755,29 @@ fn vendor_rig_on(
     front: &str,
     loopback: Option<TcpListener>,
 ) -> (Rig, Vendor) {
+    let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
+    vendor_rig_with(QBD, upstreams, files, logins, front, loopback)
+}
+
+/// [`vendor_rig_on`] with the qbd config `qbd` and the adapters `upstreams`.
+fn vendor_rig_with(
+    qbd: &str,
+    upstreams: Upstreams,
+    files: &[(&str, String, u32)],
+    logins: impl Fn(&Vendor) -> [String; 2],
+    front: &str,
+    loopback: Option<TcpListener>,
+) -> (Rig, Vendor) {
     let vendor = Vendor::start();
     let dir = temp_dir("gwv");
     credentials(&dir, files);
-    let qbd = start_qbd(&dir, QBD);
+    let qbd = start_qbd(&dir, qbd);
     let keys = logins(&vendor);
     let text = gateway_toml(&dir, &qbd, 4, [&keys[0], &keys[1]], front);
     let refreshes = Arc::new(AtomicUsize::new(0));
     let gw = serve_gateway(
         &text,
-        vec![(Api::Anthropic, Box::new(Anthropic::new()))],
+        upstreams,
         Box::new(Counting(Arc::clone(&refreshes))),
         own_uid(),
         loopback,
@@ -3531,5 +3565,458 @@ fn a_silent_openai_stream_gets_keepalives_and_a_hang_up_cancels_it() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(leases, 0, "{path}: the lease is released");
+    }
+}
+
+/// qbd for the OpenAI adapter tests: login-1 of `vendor_1`, login-2 of `vendor-o`, which has the
+/// ChatGPT windows; the ladder of role `gateway` runs on `vendor-o` with `model-o`.
+fn openai_qbd(vendor_1: &str) -> String {
+    format!(
+        r#"
+[journal]
+mode = "off"
+
+[[vendors]]
+name = "vendor-a"
+windows = [{{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }}]
+
+[[vendors]]
+name = "vendor-o"
+windows = [
+  {{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }},
+  {{ name = "seven_day", length_s = 604800, t_burn_s = 43200 }},
+]
+
+[[logins]]
+name = "login-1"
+vendor = "{vendor_1}"
+
+[[logins]]
+name = "login-2"
+vendor = "vendor-o"
+
+[[roles]]
+name = "gateway"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [{{ vendor = "vendor-o", model = "model-o", tier = 1 }}]
+
+[limits]
+rate_per_s = 1000.0
+burst = 1000
+"#
+    )
+}
+
+/// The keys of an `api_key` login of the `openai` API family.
+const OPENAI_KEY: &str = "kind = \"api_key\"\napi = \"openai\"";
+
+/// The keys of a ChatGPT subscription login.
+const CHATGPT: &str = "kind = \"chatgpt_oauth\"";
+
+/// A ChatGPT credential file with a refresh token the gateway does not use.
+fn chatgpt(access_token: &str, account_id: &str) -> String {
+    format!(
+        r#"{{"type":"chatgpt_oauth","access_token":"{access_token}","account_id":"{account_id}","refresh_token":"refresh-0"}}"#
+    )
+}
+
+/// A rig whose gateway runs both adapters against one scripted vendor, with qbd of
+/// [`openai_qbd`]`(vendor_1)` and the `[fronts]` table `front`.
+fn openai_rig(
+    vendor_1: &str,
+    files: &[(&str, String, u32)],
+    logins: impl Fn(&Vendor) -> [String; 2],
+    front: &str,
+) -> (Rig, Vendor) {
+    let upstreams: Upstreams = vec![
+        (Api::Anthropic, Box::new(Anthropic::new())),
+        (Api::Openai, Box::new(Openai::new())),
+    ];
+    vendor_rig_with(&openai_qbd(vendor_1), upstreams, files, logins, front, None)
+}
+
+/// The reasoning item of `upstream_reasoning.sse` as the adapter passes it on.
+fn fixture_reasoning() -> Value {
+    json!({
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": "**Checking the file**"}],
+        "encrypted_content": "Z0FBQUFBQnN5bnRoZXRpYy1lbmNyeXB0ZWQ=",
+    })
+}
+
+#[test]
+fn the_openai_adapter_streams_reasoning_text_and_a_tool_call_on_a_key_login() {
+    const KEY: &str = "test-key-4c8e";
+    let files = [
+        ("login-1", api_key(KEY), 0o600),
+        ("login-2", api_key("test-key-2"), 0o600),
+    ];
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &files,
+        |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
+        &fronts(""),
+    );
+    vendor.answer(openai_recorded(
+        "200_api_key",
+        Some("upstream_reasoning.sse"),
+    ));
+    vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
+
+    let mut first = Vec::new();
+    let logged = stderr_of(|| first = turn(&r.gw, &turn_body("turn-1")).2);
+    assert_eq!(
+        kinds(&first),
+        [
+            "route login-1",
+            "thinking",
+            "text_delta",
+            "tool_call",
+            "usage",
+            "stop ToolUse"
+        ]
+    );
+    let StreamEvent::Thinking { thinking } = &first[1] else {
+        panic!("{first:?}");
+    };
+    assert_eq!(thinking.vendor, "vendor-o");
+    let opaque: Value = serde_json::from_str(&thinking.opaque).unwrap();
+    assert_eq!(opaque, fixture_reasoning());
+    assert_eq!(text_of(&first), "Reading it now.");
+    let StreamEvent::ToolCall { tool_call } = &first[3] else {
+        panic!("{first:?}");
+    };
+    assert_eq!(
+        (
+            tool_call.id.as_str(),
+            tool_call.name.as_str(),
+            Value::Object(tool_call.input.clone())
+        ),
+        ("call_c3", "read_file", json!({"path": "a.txt"}))
+    );
+    assert_eq!(
+        first[4],
+        StreamEvent::Usage {
+            usage: Usage {
+                input: 372,
+                output: 200,
+                cache_read: 128,
+                cache_write: 0
+            }
+        }
+    );
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 1);
+    let req = &sent[0];
+    assert_eq!(req.path, "/responses");
+    assert_eq!(
+        req.header("authorization"),
+        Some(format!("Bearer {KEY}").as_str())
+    );
+    assert_eq!(req.header(openai_identity::ACCOUNT_HEADER), None);
+    assert_eq!(
+        req.header("user-agent"),
+        Some(openai_identity::API_KEY_USER_AGENT)
+    );
+    assert_eq!(req.header("accept"), Some("text/event-stream"));
+    assert_eq!(
+        (
+            &req.body["model"],
+            &req.body["stream"],
+            &req.body["store"],
+            &req.body["max_output_tokens"]
+        ),
+        (&json!("model-o"), &json!(true), &json!(false), &json!(64))
+    );
+    assert_eq!(req.body["input"][0]["content"][0]["text"], "Hi");
+    assert_eq!(req.body["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+    assert!(!logged.contains(KEY), "{logged}");
+}
+
+#[test]
+fn reasoning_of_an_openai_login_goes_back_to_it_in_the_next_turn() {
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &key_files(),
+        |v| [v.login(OPENAI_KEY), v.login(OPENAI_KEY)],
+        &fronts(""),
+    );
+    vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
+    let mut next = turn_body("turn-2");
+    next["messages"] = json!([
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "vendor": "vendor-o", "opaque": fixture_reasoning().to_string()},
+            {"type": "thinking", "vendor": "vendor-a", "opaque": "{\"type\":\"thinking\"}"},
+            {"type": "text", "text": "Reading it now."},
+            {"type": "tool_use", "id": "call_c3", "name": "read_file", "input": {"path": "a.txt"}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "id": "call_c3", "content": "line one"}]},
+    ]);
+    let (_, _, events) = turn(&r.gw, &next);
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    assert_eq!(text_of(&events), "Hello, w\u{f6}rld!");
+
+    let sent = vendor.received();
+    let input = sent[0].body["input"].as_array().unwrap();
+    let types: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        [
+            "message",
+            "reasoning",
+            "message",
+            "function_call",
+            "function_call_output"
+        ]
+    );
+    assert_eq!(
+        input[1],
+        fixture_reasoning(),
+        "the reasoning goes back as it came"
+    );
+    assert_eq!(
+        (&input[4]["call_id"], &input[4]["output"]),
+        (&json!("call_c3"), &json!("line one"))
+    );
+}
+
+#[test]
+fn messages_on_a_chatgpt_login_sends_its_account_and_never_shows_reasoning_as_thinking() {
+    const ACCESS: &str = "test-access-6d1f";
+    const ACCOUNT: &str = "test-account-3a9c";
+    let files = [
+        ("login-1", chatgpt(ACCESS, ACCOUNT), 0o600),
+        ("login-2", chatgpt("test-access-2", "test-account-2"), 0o600),
+    ];
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &files,
+        |v| [v.login(CHATGPT), v.login(CHATGPT)],
+        &fronts(""),
+    );
+    vendor.answer(openai_recorded(
+        "200_chatgpt",
+        Some("upstream_reasoning.sse"),
+    ));
+
+    let mut answer = (0, String::new(), Vec::new());
+    let body = sdk_body("model-2025-01-01", false);
+    let logged = stderr_of(|| answer = sdk_call(&r.gw, &body, None));
+    let (status, _, answer) = answer;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let message: Value = serde_json::from_slice(&answer).unwrap();
+    let content = message["content"].as_array().unwrap();
+    let types: Vec<&str> = content
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["redacted_thinking", "text", "tool_use"]);
+    let wrapped = content[0]["data"].as_str().unwrap();
+    let wrapped: Value =
+        serde_json::from_str(wrapped.strip_prefix("qb-thinking:").unwrap()).unwrap();
+    assert_eq!(wrapped["vendor"], "vendor-o");
+    let opaque: Value = serde_json::from_str(wrapped["opaque"].as_str().unwrap()).unwrap();
+    assert_eq!(opaque, fixture_reasoning());
+    assert_eq!(content[1]["text"], "Reading it now.");
+    assert_eq!(
+        (&content[2]["id"], &content[2]["name"], &content[2]["input"]),
+        (
+            &json!("call_c3"),
+            &json!("read_file"),
+            &json!({"path": "a.txt"})
+        )
+    );
+    assert_eq!(message["stop_reason"], "tool_use");
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 1);
+    let req = &sent[0];
+    assert_eq!(req.path, "/responses");
+    assert_eq!(
+        req.header("authorization"),
+        Some(format!("Bearer {ACCESS}").as_str())
+    );
+    assert_eq!(req.header(openai_identity::ACCOUNT_HEADER), Some(ACCOUNT));
+    assert_eq!(
+        req.header("openai-beta"),
+        Some(openai_identity::OPENAI_BETA)
+    );
+    assert_eq!(req.header("originator"), Some(openai_identity::ORIGINATOR));
+    assert_eq!(
+        req.header("user-agent"),
+        Some(openai_identity::CHATGPT_USER_AGENT)
+    );
+    assert_eq!(
+        req.header(openai_identity::SESSION_HEADER),
+        Some("session-1")
+    );
+    assert_eq!(req.body["instructions"], "Be brief.");
+    assert_eq!(req.body.get("max_output_tokens"), None);
+
+    let s = state(&r.qbd);
+    assert!((used(&s, "login-1") - 0.425).abs() < 1e-9, "{s:?}");
+    assert_eq!(s.leases, Vec::new());
+    assert!(
+        !logged.contains(ACCESS) && !logged.contains(ACCOUNT),
+        "{logged}"
+    );
+}
+
+/// The canonical blocks of an answer's events: consecutive text joined, as one message item.
+fn blocks_of(events: &[StreamEvent]) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    for e in events {
+        match e {
+            StreamEvent::Thinking { thinking } => out.push(Block::Thinking {
+                vendor: thinking.vendor.clone(),
+                opaque: thinking.opaque.clone(),
+            }),
+            StreamEvent::TextDelta { text } => match out.last_mut() {
+                Some(Block::Text { text: run }) => run.push_str(text),
+                _ => out.push(Block::Text { text: text.clone() }),
+            },
+            StreamEvent::ToolCall { tool_call } => out.push(Block::ToolUse {
+                id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                input: tool_call.input.clone(),
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The canonical blocks of a Responses answer's output, read back as the front reads a client's
+/// next turn.
+fn blocks_of_output(output: &Value) -> Vec<Block> {
+    let mut input = vec![json!({"role": "user", "content": "Hi"})];
+    input.extend(output.as_array().unwrap().iter().cloned());
+    let next = json!({"model": "any", "input": input}).to_string();
+    let route_of = |_: &str| Some("chat".to_owned());
+    let decoded =
+        qb_openai::responses::decode_request(next.as_bytes(), "turn-x", "vendor-o", &route_of, 64)
+            .unwrap();
+    decoded.turn.messages[1].content.clone()
+}
+
+#[test]
+fn responses_gives_the_same_canonical_content_on_an_anthropic_and_an_openai_login() {
+    let files = [
+        ("login-1", api_key("test-key-1"), 0o600),
+        ("login-2", api_key("test-key-2"), 0o600),
+    ];
+    let pins = "[[routes]]\nalias = \"claude\"\nrole = \"gateway\"\nvendor = \"vendor-a\"\nmodel = \"model-large\"\n\n\
+                [[routes]]\nalias = \"gpt\"\nrole = \"gateway\"\nvendor = \"vendor-o\"\nmodel = \"model-o\"\n\n";
+    let (r, vendor) = openai_rig(
+        "vendor-a",
+        &files,
+        |v| [v.login(ANTHROPIC_KEY), v.login(OPENAI_KEY)],
+        &format!("{pins}{}", fronts("")),
+    );
+    let cases = [
+        (
+            "claude",
+            "login-1",
+            recorded("200_allowed", Some("upstream_thinking.sse")),
+            recorded("200_allowed", Some("upstream_thinking.sse")),
+        ),
+        (
+            "gpt",
+            "login-2",
+            openai_recorded("200_api_key", Some("upstream_reasoning.sse")),
+            openai_recorded("200_api_key", Some("upstream_reasoning.sse")),
+        ),
+    ];
+    for (n, (alias, login, c4, front)) in cases.into_iter().enumerate() {
+        vendor.answer(c4);
+        vendor.answer(front);
+        let mut body = turn_body(&format!("turn-{n}"));
+        body["route"] = json!(alias);
+        let (_, _, events) = turn(&r.gw, &body);
+        assert_eq!(kinds(&events)[0], format!("route {login}"));
+        let usage = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                StreamEvent::Usage { usage } => Some(*usage),
+                _ => None,
+            })
+            .unwrap();
+
+        let (status, _, answer) =
+            openai_call(&r.gw, paths::RESPONSES, &responses_body(alias, false));
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+        let answer: Value = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(answer["status"], "completed", "{alias}");
+        let blocks = blocks_of(&events);
+        assert!(blocks.len() >= 2, "{alias}: {blocks:?}");
+        assert_eq!(blocks_of_output(&answer["output"]), blocks, "{alias}");
+        assert_eq!(
+            (
+                &answer["usage"]["input_tokens"],
+                &answer["usage"]["output_tokens"]
+            ),
+            (
+                &json!(usage.input + usage.cache_read + usage.cache_write),
+                &json!(usage.output)
+            ),
+            "{alias}"
+        );
+    }
+    let sent = vendor.received();
+    let paths: Vec<&str> = sent.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["/v1/messages", "/v1/messages", "/responses", "/responses"]
+    );
+}
+
+#[test]
+fn a_usage_limit_on_a_chatgpt_login_moves_the_turn_to_the_next_openai_login() {
+    const ACCESS: &str = "test-access-8e2b";
+    const ACCOUNT: &str = "test-account-5f7a";
+    const KEY: &str = "test-key-1d6c";
+    let files = [
+        ("login-1", chatgpt(ACCESS, ACCOUNT), 0o600),
+        ("login-2", api_key(KEY), 0o600),
+    ];
+    let (r, vendor) = openai_rig(
+        "vendor-o",
+        &files,
+        |v| [v.login(CHATGPT), v.login(OPENAI_KEY)],
+        &fronts(""),
+    );
+    vendor.answer(openai_recorded("429_usage_limit", None));
+    vendor.answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
+    let mut events = Vec::new();
+    let logged = stderr_of(|| events = turn(&r.gw, &turn_body("turn-1")).2);
+
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    assert_eq!(text_of(&events), "Hello, w\u{f6}rld!");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+    assert_eq!(s.leases, Vec::new());
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    let (chatgpt, key) = (&sent[0], &sent[1]);
+    assert_eq!(
+        chatgpt.header(openai_identity::ACCOUNT_HEADER),
+        Some(ACCOUNT)
+    );
+    assert_eq!(key.header(openai_identity::ACCOUNT_HEADER), None);
+    assert_eq!(
+        key.header("authorization"),
+        Some(format!("Bearer {KEY}").as_str())
+    );
+    assert!(logged.contains("login-1: usage_limit"), "{logged}");
+    for secret in [ACCESS, ACCOUNT, KEY] {
+        assert!(!logged.contains(secret), "{secret}: {logged}");
     }
 }

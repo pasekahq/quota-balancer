@@ -8,9 +8,9 @@ use qb_anthropic::request::identity;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::anthropic::CONNECT_TIMEOUT;
 use super::config::{CredentialKind, GatewayConfig};
 use super::creds::{RefreshError, Refreshed, Refresher, Secret};
+use super::vendor::CONNECT_TIMEOUT;
 use crate::server::unix_now;
 
 /// Bound of one token request, from connect to the end of the answer.

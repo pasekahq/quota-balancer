@@ -111,6 +111,8 @@ pub enum CredentialKind {
     OauthAnthropic,
     /// A vendor API key.
     ApiKey,
+    /// ChatGPT subscription OAuth access token and account id.
+    ChatgptOauth,
 }
 
 impl CredentialKind {
@@ -119,6 +121,7 @@ impl CredentialKind {
         match self {
             Self::OauthAnthropic => "oauth_anthropic",
             Self::ApiKey => "api_key",
+            Self::ChatgptOauth => "chatgpt_oauth",
         }
     }
 }
@@ -149,7 +152,7 @@ pub struct GatewayLogin {
     pub name: String,
     /// Credential type.
     pub kind: CredentialKind,
-    /// API family; `anthropic` for an `oauth_anthropic` login.
+    /// API family; `anthropic` for an `oauth_anthropic` login, `openai` for a `chatgpt_oauth` one.
     pub api: Api,
     /// Base URL of the vendor API without a trailing `/`; `None` for the adapter's public
     /// endpoint.
@@ -542,8 +545,10 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
                 l.kind = match string(at, v)?.as_str() {
                     "oauth_anthropic" => CredentialKind::OauthAnthropic,
                     "api_key" => CredentialKind::ApiKey,
+                    "chatgpt_oauth" => CredentialKind::ChatgptOauth,
                     _ => {
-                        let reason = "expected `oauth_anthropic` or `api_key`".into();
+                        let reason =
+                            "expected `oauth_anthropic`, `chatgpt_oauth` or `api_key`".into();
                         return Err((at.to_owned(), reason, Some(v.span().start)));
                     }
                 };
@@ -558,13 +563,20 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
             let reason = "an `oauth_anthropic` login is `anthropic`".into();
             return Err((format!("{at}.api"), reason, Some(span)));
         }
+        (CredentialKind::ChatgptOauth, None | Some((Api::Openai, _))) => Api::Openai,
+        (CredentialKind::ChatgptOauth, Some((_, span))) => {
+            let reason = "a `chatgpt_oauth` login is `openai`".into();
+            return Err((format!("{at}.api"), reason, Some(span)));
+        }
         (CredentialKind::ApiKey, Some((family, _))) => family,
         (CredentialKind::ApiKey, None) => {
             let reason = "is missing; an `api_key` login names its API".into();
             return Err((format!("{at}.api"), reason, None));
         }
     };
-    if let (CredentialKind::ApiKey, Some(span)) = (l.kind, token_url_at) {
+    if let (CredentialKind::ApiKey | CredentialKind::ChatgptOauth, Some(span)) =
+        (l.kind, token_url_at)
+    {
         let reason = "belongs to an `oauth_anthropic` login".into();
         return Err((format!("{at}.token_url"), reason, Some(span)));
     }
@@ -873,6 +885,25 @@ difficulty = 1
     }
 
     #[test]
+    fn a_chatgpt_login_speaks_openai() {
+        let login = |api: &str| {
+            format!(
+                "[[logins]]\nname = \"login-2\"\nkind = \"chatgpt_oauth\"\n{api}credentials = \"/c.json\"\n"
+            )
+        };
+        for api in ["", "api = \"openai\"\n"] {
+            let c = check("", &login(api)).unwrap();
+            let l = c.login("login-2").unwrap();
+            assert_eq!((l.kind, l.api), (CredentialKind::ChatgptOauth, Api::Openai));
+        }
+        let err = check("", &login("api = \"anthropic\"\n")).unwrap_err();
+        assert!(
+            err.contains("logins[1].api: a `chatgpt_oauth` login is `openai` (line 16)"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn rule_violations_name_the_field_and_line() {
         let cases = [
             (
@@ -918,7 +949,7 @@ difficulty = 1
             (
                 "",
                 "[[logins]]\nname = \"login-2\"\nkind = \"oauth\"\ncredentials = \"/c.json\"\n",
-                "logins[1].kind: expected `oauth_anthropic` or `api_key` (line 15)",
+                "logins[1].kind: expected `oauth_anthropic`, `chatgpt_oauth` or `api_key` (line 15)",
             ),
             (
                 "",
@@ -1161,6 +1192,10 @@ difficulty = 1
                     "https://example.com/t",
                 ),
                 "logins[1].token_url: belongs to an `oauth_anthropic` login (line 17)",
+            ),
+            (
+                login("kind = \"chatgpt_oauth\"", "https://example.com/t"),
+                "logins[1].token_url: belongs to an `oauth_anthropic` login (line 16)",
             ),
         ];
         for (extra, want) in cases {
