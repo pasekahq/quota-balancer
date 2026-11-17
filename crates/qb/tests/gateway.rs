@@ -21,6 +21,7 @@ use qb::gateway::config::Api;
 use qb::gateway::core::{Cancel, Gateway, Upstreams};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
 use qb::gateway::front;
+use qb::gateway::oauth::AnthropicOauth;
 use qb::gateway::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Sink, Upstream,
 };
@@ -232,10 +233,11 @@ struct Rig {
     refreshes: Arc<AtomicUsize>,
 }
 
-fn start_qbd(dir: &Path) -> PathBuf {
+/// A qbd of config `text` on a fresh socket in `dir`.
+fn start_qbd(dir: &Path, text: &str) -> PathBuf {
     let sock = dir.join("qb.sock");
     let listener = UnixListener::bind(&sock).unwrap();
-    let config = qb::config::parse(Path::new("qbd.toml"), QBD).unwrap();
+    let config = qb::config::parse(Path::new("qbd.toml"), text).unwrap();
     std::thread::spawn(move || {
         let mut core = Core::new(config.core_spec()).unwrap();
         let mut gate = Gate::new(&[], &config.limits);
@@ -324,7 +326,7 @@ fn own_uid() -> u32 {
 fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_uid: u32) -> Rig {
     let dir = temp_dir("gw");
     credentials(&dir, files);
-    let qbd = start_qbd(&dir);
+    let qbd = start_qbd(&dir, QBD);
     let keys = |i: usize| files.get(i).map_or(ANTHROPIC_KEY, |f| keys_of(&f.1));
     let text = if extra.trim_start().starts_with('[') {
         gateway_toml(&dir, &qbd, max_turns, [keys(0), keys(1)], extra)
@@ -1478,6 +1480,8 @@ enum Answer {
     Full(u16, Vec<(String, String)>, Vec<u8>),
     /// A 200 stream that sends these bytes and then stays silent until the gateway closes it.
     Hold(Vec<u8>),
+    /// The answer, after a pause.
+    After(Duration, Box<Answer>),
 }
 
 /// One request the scripted vendor received.
@@ -1485,6 +1489,7 @@ struct Received {
     path: String,
     /// Header names in lowercase.
     headers: Vec<(String, String)>,
+    /// A JSON body, or a form body as a string.
     body: Value,
 }
 
@@ -1567,10 +1572,18 @@ fn read_http(conn: &mut std::net::TcpStream) -> Received {
         .unwrap();
     let mut body = vec![0u8; length];
     conn.read_exact(&mut body).unwrap();
+    let form = headers
+        .iter()
+        .any(|(n, v)| n == "content-type" && v == "application/x-www-form-urlencoded");
+    let body = if form {
+        Value::String(String::from_utf8(body).unwrap())
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
     Received {
         path,
         headers,
-        body: serde_json::from_slice(&body).unwrap(),
+        body,
     }
 }
 
@@ -1606,6 +1619,10 @@ fn answer_with(
             let mut rest = Vec::new();
             let _ = conn.read_to_end(&mut rest);
             let _ = closed.send(std::time::Instant::now());
+        }
+        Answer::After(pause, answer) => {
+            std::thread::sleep(pause);
+            answer_with(conn, *answer, closed);
         }
     }
 }
@@ -1645,7 +1662,7 @@ fn vendor_rig(
     let vendor = Vendor::start();
     let dir = temp_dir("gwv");
     credentials(&dir, files);
-    let qbd = start_qbd(&dir);
+    let qbd = start_qbd(&dir, QBD);
     let keys = logins(&vendor);
     let text = gateway_toml(&dir, &qbd, 4, [&keys[0], &keys[1]], "");
     let refreshes = Arc::new(AtomicUsize::new(0));
@@ -1951,4 +1968,233 @@ fn cancel_and_a_closed_client_shut_a_silent_vendor_stream_down_at_once() {
     }
     assert_eq!(leases, 0, "the lease is released");
     assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::Unknown);
+}
+
+/// Synthetic tokens of the OAuth tests; none may reach a log or a client.
+const OLD_ACCESS: &str = "test-access-old-41d7";
+const OLD_REFRESH: &str = "test-refresh-old-41d7";
+const NEW_ACCESS: &str = "test-access-new-41d7";
+const NEW_REFRESH: &str = "test-refresh-new-41d7";
+const TOKENS: [&str; 4] = [OLD_ACCESS, OLD_REFRESH, NEW_ACCESS, NEW_REFRESH];
+
+/// login-1's OAuth credential file with the old tokens, expiring at `expires_at`.
+fn old_oauth(expires_at: u64) -> String {
+    format!(
+        r#"{{"type":"oauth_anthropic","access_token":"{OLD_ACCESS}","refresh_token":"{OLD_REFRESH}","expires_at":{expires_at}}}"#
+    )
+}
+
+/// A token answer that grants the new tokens for 8 hours.
+fn grant() -> Answer {
+    let body = json!({
+        "token_type": "Bearer",
+        "access_token": NEW_ACCESS,
+        "refresh_token": NEW_REFRESH,
+        "expires_in": 28800,
+        "scope": "user:inference",
+    });
+    let headers = vec![("content-type".into(), "application/json".into())];
+    Answer::Full(200, headers, serde_json::to_vec(&body).unwrap())
+}
+
+/// A gateway with the Anthropic adapter and the shipped OAuth refresher: login-1 an OAuth login
+/// with `login_1` as its file, login-2 a key login, both on a scripted vendor, login-1 refreshing
+/// at a scripted token endpoint; qbd runs `qbd_config`.
+fn oauth_rig(login_1: String, qbd_config: &str) -> (Rig, Vendor, Vendor) {
+    let vendor = Vendor::start();
+    let tokens = Vendor::start();
+    let dir = temp_dir("gwo");
+    credentials(
+        &dir,
+        &[
+            ("login-1", login_1, 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    let qbd = start_qbd(&dir, qbd_config);
+    let oauth = format!(
+        "{}\ntoken_url = \"{}/v1/oauth/token\"",
+        vendor.login("kind = \"oauth_anthropic\""),
+        tokens.base_url
+    );
+    let text = gateway_toml(&dir, &qbd, 4, [&oauth, &vendor.login(ANTHROPIC_KEY)], "");
+    let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Anthropic, Box::new(Anthropic::new()))],
+        Box::new(AnthropicOauth::new(&config)),
+        own_uid(),
+    );
+    let rig = Rig {
+        dir,
+        qbd,
+        gw,
+        fake: Arc::default(),
+        refreshes: Arc::default(),
+    };
+    (rig, vendor, tokens)
+}
+
+/// Runs `turn` with stderr captured; its events, after checking that neither the log nor the
+/// client's answer holds a token.
+fn turn_without_leaks(r: &Rig, request_id: &str) -> Vec<StreamEvent> {
+    let mut answer = Vec::new();
+    let logged = stderr_of(|| {
+        let s = send(
+            &r.gw,
+            "POST",
+            paths::MODEL_TURN,
+            &turn_body(request_id).to_string(),
+        );
+        answer = finish(s, Vec::new()).2;
+    });
+    let answer = String::from_utf8(answer).unwrap();
+    for token in TOKENS {
+        assert!(!logged.contains(token), "{token} logged: {logged}");
+        assert!(!answer.contains(token), "{token} sent: {answer}");
+    }
+    events(answer.as_bytes())
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// The stored credential file of login-1.
+fn stored(r: &Rig) -> (Value, u32) {
+    let f = r.dir.join("creds/login-1.json");
+    let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+    (
+        serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap(),
+        mode,
+    )
+}
+
+#[test]
+fn an_expired_token_is_refreshed_before_the_call_and_written_back() {
+    let (r, vendor, tokens) = oauth_rig(old_oauth(unix_now()), QBD);
+    tokens.answer(grant());
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let before = unix_now();
+    let events = turn_without_leaks(&r, "turn-1");
+    let after = unix_now();
+    assert_eq!(kinds(&events)[0], "route login-1");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+
+    let asked = tokens.received();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].path, "/v1/oauth/token");
+    let form = asked[0].body.as_str().unwrap();
+    assert!(
+        form.starts_with(&format!(
+            "grant_type=refresh_token&refresh_token={OLD_REFRESH}&client_id="
+        )),
+        "{form}"
+    );
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].header("authorization"),
+        Some(bearer(NEW_ACCESS).as_str())
+    );
+
+    let (file, mode) = stored(&r);
+    assert_eq!(mode, 0o600);
+    assert_eq!(file["access_token"], NEW_ACCESS);
+    assert_eq!(file["refresh_token"], NEW_REFRESH);
+    let expires_at = file["expires_at"].as_u64().unwrap();
+    assert!(
+        (before + 28800..=after + 28800).contains(&expires_at),
+        "{expires_at}"
+    );
+}
+
+#[test]
+fn a_401_on_a_fresh_token_refreshes_once_and_the_same_turn_succeeds() {
+    let (r, vendor, tokens) = oauth_rig(old_oauth(unix_now() + 3600), QBD);
+    tokens.answer(grant());
+    vendor.answer(recorded("401", None));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let events = turn_without_leaks(&r, "turn-1");
+    assert_eq!(kinds(&events)[0], "route login-1");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    assert_eq!(tokens.received().len(), 1);
+    let auth: Vec<Option<String>> = vendor
+        .received()
+        .iter()
+        .map(|s| s.header("authorization").map(str::to_owned))
+        .collect();
+    assert_eq!(auth, [Some(bearer(OLD_ACCESS)), Some(bearer(NEW_ACCESS))]);
+    assert_eq!(stored(&r).0["access_token"], NEW_ACCESS);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Ok);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_rejected_refresh_moves_the_turn_to_the_next_login() {
+    let (r, vendor, tokens) = oauth_rig(old_oauth(unix_now()), QBD);
+    let refusal = json!({
+        "error": "invalid_grant",
+        "error_description": format!("refresh token {OLD_REFRESH} is revoked"),
+    });
+    tokens.answer(Answer::Full(
+        400,
+        vec![("content-type".into(), "application/json".into())],
+        serde_json::to_vec(&refusal).unwrap(),
+    ));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let events = turn_without_leaks(&r, "turn-1");
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 1, "the expired token is never sent");
+    assert_eq!(sent[0].header("x-api-key"), Some("test-token-2"));
+    assert_eq!(stored(&r).0["access_token"], OLD_ACCESS);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn an_unreachable_token_endpoint_ends_the_turn_retryable_without_a_token_in_sight() {
+    let (r, vendor, tokens) = oauth_rig(old_oauth(unix_now()), QBD);
+    let echo = format!(r#"{{"error":"server_error","detail":"{OLD_REFRESH}"}}"#);
+    tokens.answer(Answer::Full(503, Vec::new(), echo.into_bytes()));
+    let events = turn_without_leaks(&r, "turn-1");
+    let e = last_error(&events);
+    assert_eq!((e.class, e.retryable), (ErrorClass::Unavailable, true));
+    assert_eq!(vendor.received().len(), 0);
+    assert_eq!(stored(&r).0["access_token"], OLD_ACCESS);
+}
+
+#[test]
+fn concurrent_turns_on_one_expiring_login_make_one_token_request() {
+    let one_login = QBD.replace(
+        "[[logins]]\nname = \"login-2\"\nvendor = \"vendor-a\"\n\n",
+        "",
+    );
+    let (r, vendor, tokens) = oauth_rig(old_oauth(unix_now()), &one_login);
+    tokens.answer(Answer::After(Duration::from_millis(300), Box::new(grant())));
+    for _ in 0..2 {
+        vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    }
+    let r = Arc::new(r);
+    let turns: Vec<_> = (0..2)
+        .map(|i| {
+            let r = Arc::clone(&r);
+            std::thread::spawn(move || turn(&r.gw, &turn_body(&format!("turn-{i}"))).2)
+        })
+        .collect();
+    for t in turns {
+        let events = t.join().unwrap();
+        assert_eq!(kinds(&events)[0], "route login-1");
+        assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    }
+    assert_eq!(tokens.received().len(), 1);
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    for s in sent.iter() {
+        assert_eq!(s.header("authorization"), Some(bearer(NEW_ACCESS).as_str()));
+    }
 }

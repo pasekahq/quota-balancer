@@ -114,7 +114,8 @@ State, all in one thread, no locks, no allocation on the hot path:
    `resume_of` keeps the session's login. A pin takes the logins of the pinned vendor (or the
    one named login) and no role reserve.
 2. Drop dead logins/models, the avoided vendor, and candidates missing a required capability;
-   `auth_stale` logins stay, the vendor CLI refreshes its token on next use.
+   `auth_stale` logins stay: the token is refreshed on next use, by the vendor CLI or, for its
+   own logins, by `qb gateway`.
 3. Admissible if for every window of the login's vendor `left = 1 − used − reserved − cost`
    is above 0 and `left ≥ reserve(role, difficulty, w)`, where the reserve is dropped when the
    window resets within `T_burn(w)`; a reserve naming a window the vendor does not declare

@@ -246,8 +246,13 @@ or put the socket in a directory outside it.
 | `name` | string | Login name as declared in `qbd`'s `[[logins]]`. |
 | `kind` | `"oauth_anthropic"` or `"api_key"` | Credential type; it selects the adapter's auth mode and must match the file's `type`. |
 | `api` | `"anthropic"` or `"openai"` | The vendor API family the login speaks; it selects the adapter, and a login whose family has no adapter in this build ends its turns `unavailable`. `"anthropic"` (the default) for an `oauth_anthropic` login; required for an `api_key` login. |
-| `base_url` | string | Base URL of the vendor API, default the family's public endpoint (`https://api.anthropic.com` for `anthropic`). `https://` on port 443, the only port the sandbox connects to, or `http://` with a loopback host (`localhost`, `127.0.0.0/8`, `::1`); an optional path, no user, query or fragment. |
+| `base_url` | string | Base URL of the vendor API, default the family's public endpoint (`https://api.anthropic.com` for `anthropic`). `https://` on port 443, or `http://` with a loopback host (`localhost`, `127.0.0.0/8`, `::1`); an optional path, no user, query or fragment. |
+| `token_url` | string | Only for an `oauth_anthropic` login: the full URL of the OAuth token endpoint its refreshes go to, instead of the vendor's endpoints ([anthropic.md](anthropic.md#oauth-token-refresh)). Same rules as `base_url`. |
 | `credentials` | string | Absolute path of the credential file. |
+
+The sandbox lets the gateway connect to TCP port 443 only, on every host: a loopback `http`
+`base_url` or `token_url` must name port 443 too (`http://127.0.0.1:443`), or its requests fail
+`unavailable`. Other ports work only where the sandbox is not enforced.
 
 Every login `qbd` can pick for a route of this gateway needs an entry here: a pick of a login
 without one fails the turn as a configuration error. Give the gateway's logins their own `qbd`

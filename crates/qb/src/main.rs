@@ -11,8 +11,8 @@ use qb::config::Config;
 use qb::gateway::anthropic::Anthropic;
 use qb::gateway::config::Api;
 use qb::gateway::core::{Gateway, Upstreams};
-use qb::gateway::creds::NoRefresher;
 use qb::gateway::front;
+use qb::gateway::oauth::AnthropicOauth;
 use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb::{
@@ -453,7 +453,8 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         ));
     }
     let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
-    let gateway = Gateway::new(config, upstreams, Box::new(NoRefresher), qbd_bearer);
+    let refresher = Box::new(AnthropicOauth::new(&config));
+    let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer);
     let Err(e) = front::serve(
         &listener,
         &std::sync::Arc::new(gateway),

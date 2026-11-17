@@ -142,6 +142,30 @@ the latest reset of a window at 1.0. The failure carries the windows of the head
 vendor's message, cut to 300 characters with control characters (line ends included) replaced
 by spaces; it never carries a header value.
 
+## OAuth token refresh
+
+`qb gateway` refreshes the token of an `oauth_anthropic` login (`crates/qb/src/gateway/oauth.rs`)
+when it expires within 60 s or the vendor answered 401, through the vendor's OAuth refresh grant:
+
+- `POST` to the login's `token_url`, else to `https://platform.claude.com/v1/oauth/token` and,
+  when that fails in transport or with a 5xx, to `https://console.anthropic.com/v1/oauth/token`;
+  ureq with rustls, no proxy, no redirects, 10 s to connect and 30 s per request;
+- body `application/x-www-form-urlencoded`: `grant_type=refresh_token`, `refresh_token`, and
+  `client_id` `9d1c250a-e61b-44d9-88ed-5944d1962f5e`, the vendor CLI's public OAuth client id
+  (`identity::OAUTH_CLIENT_ID`; the endpoints are `identity::OAUTH_TOKEN_URLS`);
+- a 2xx answer is JSON with `access_token` and `expires_in` (seconds), both required, and an
+  optional rotated `refresh_token`; without one the old refresh token stays. The new
+  `expires_at` is the gateway's clock plus `expires_in`.
+
+| Answer | Result |
+|---|---|
+| 2xx with the required fields | the new tokens, written back to the credential file |
+| 400, 401, or any answer with `"error": "invalid_grant"` | refused: the login is `auth_dead` until a new sign-in, the turn moves to the next login |
+| transport failure or 5xx at every endpoint, another status, a malformed 2xx | failed: the turn ends `unavailable`, retryable |
+
+A refresh error names the endpoint, the status and the OAuth `error` code, never a body, header
+or token.
+
 ## The `/v1/messages` front
 
 `front::decode_request(body, request_id, native_vendor, route_of)`:

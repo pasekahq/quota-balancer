@@ -55,19 +55,6 @@ pub trait Refresher: Send + Sync {
     fn refresh(&self, login: &str, refresh_token: &str) -> Result<Refreshed, RefreshError>;
 }
 
-/// A [`Refresher`] for builds without a vendor refresh: every refresh fails, not rejected.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoRefresher;
-
-impl Refresher for NoRefresher {
-    fn refresh(&self, _: &str, _: &str) -> Result<Refreshed, RefreshError> {
-        Err(RefreshError {
-            rejected: false,
-            message: "no OAuth refresher is configured".into(),
-        })
-    }
-}
-
 /// Why a credential could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredError {
@@ -84,8 +71,8 @@ impl fmt::Display for CredError {
     }
 }
 
-/// A secret string from a credential file, zeroized on drop.
-struct Secret(Zeroizing<String>);
+/// A secret string of a JSON document, zeroized on drop.
+pub(super) struct Secret(pub(super) Zeroizing<String>);
 
 impl<'de> Deserialize<'de> for Secret {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
