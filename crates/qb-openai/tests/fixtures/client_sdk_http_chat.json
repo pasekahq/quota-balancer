@@ -1,0 +1,75 @@
+{
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "headers": [
+    [
+      "Host",
+      "127.0.0.1:8080"
+    ],
+    [
+      "Accept-Encoding",
+      "gzip, deflate"
+    ],
+    [
+      "Connection",
+      "keep-alive"
+    ],
+    [
+      "Accept",
+      "application/json"
+    ],
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "User-Agent",
+      "OpenAI/Python 2.24.0"
+    ],
+    [
+      "X-Stainless-Lang",
+      "python"
+    ],
+    [
+      "X-Stainless-Package-Version",
+      "2.24.0"
+    ],
+    [
+      "X-Stainless-OS",
+      "Linux"
+    ],
+    [
+      "X-Stainless-Arch",
+      "x64"
+    ],
+    [
+      "X-Stainless-Runtime",
+      "CPython"
+    ],
+    [
+      "X-Stainless-Runtime-Version",
+      "3.11.16"
+    ],
+    [
+      "Authorization",
+      "Bearer qb-local-test-token"
+    ],
+    [
+      "X-Stainless-Async",
+      "false"
+    ],
+    [
+      "x-stainless-retry-count",
+      "0"
+    ],
+    [
+      "x-stainless-read-timeout",
+      "600"
+    ],
+    [
+      "Content-Length",
+      "662"
+    ]
+  ],
+  "body": "{\"messages\":[{\"role\":\"developer\",\"content\":\"Be brief.\"},{\"role\":\"user\",\"content\":\"What is in notes.txt?\"},{\"role\":\"assistant\",\"content\":\"Reading the file first.\",\"tool_calls\":[{\"id\":\"call_a1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_a1\",\"content\":\"line one\"}],\"model\":\"model-2025-01-01\",\"max_completion_tokens\":512,\"tool_choice\":\"auto\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a text file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false},\"strict\":true}}],\"user\":\"session-1\"}"
+}

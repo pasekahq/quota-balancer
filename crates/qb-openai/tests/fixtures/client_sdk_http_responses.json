@@ -1,0 +1,75 @@
+{
+  "method": "POST",
+  "path": "/v1/responses",
+  "headers": [
+    [
+      "Host",
+      "127.0.0.1:8080"
+    ],
+    [
+      "Accept-Encoding",
+      "gzip, deflate"
+    ],
+    [
+      "Connection",
+      "keep-alive"
+    ],
+    [
+      "Accept",
+      "application/json"
+    ],
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "User-Agent",
+      "OpenAI/Python 2.24.0"
+    ],
+    [
+      "X-Stainless-Lang",
+      "python"
+    ],
+    [
+      "X-Stainless-Package-Version",
+      "2.24.0"
+    ],
+    [
+      "X-Stainless-OS",
+      "Linux"
+    ],
+    [
+      "X-Stainless-Arch",
+      "x64"
+    ],
+    [
+      "X-Stainless-Runtime",
+      "CPython"
+    ],
+    [
+      "X-Stainless-Runtime-Version",
+      "3.11.16"
+    ],
+    [
+      "Authorization",
+      "Bearer qb-local-test-token"
+    ],
+    [
+      "X-Stainless-Async",
+      "false"
+    ],
+    [
+      "x-stainless-retry-count",
+      "0"
+    ],
+    [
+      "x-stainless-read-timeout",
+      "600"
+    ],
+    [
+      "Content-Length",
+      "608"
+    ]
+  ],
+  "body": "{\"include\":[\"reasoning.encrypted_content\"],\"input\":[{\"role\":\"user\",\"content\":\"What is in notes.txt?\"},{\"type\":\"function_call\",\"call_id\":\"call_a1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_a1\",\"output\":\"line one\"}],\"instructions\":\"Be brief.\",\"max_output_tokens\":512,\"model\":\"model-2025-01-01\",\"prompt_cache_key\":\"session-1\",\"store\":false,\"tools\":[{\"type\":\"function\",\"name\":\"read\",\"description\":\"Read a text file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false},\"strict\":true}]}"
+}
