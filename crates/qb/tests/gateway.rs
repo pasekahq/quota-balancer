@@ -1432,9 +1432,9 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         .unwrap()
         .local_addr()
         .unwrap();
-    let front = format!(
-        "{MESSAGES_FRONT}listen = \"{listen}\"\ntoken_sha256 = \"{CLIENT_TOKEN_SHA256}\"\n"
-    );
+    let front = fronts(&format!(
+        "listen = \"{listen}\"\ntoken_sha256 = \"{CLIENT_TOKEN_SHA256}\""
+    ));
     let config = dir.join("gateway.toml");
     std::fs::write(&config, gateway_toml(&dir, &qbd, 2, [&keys, &keys], &front)).unwrap();
     let mut child = Command::new(exe)
@@ -1490,7 +1490,7 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         logged.iter().any(|l| l.contains("listening on")),
         "{logged:?}"
     );
-    let serving = format!("serving /v1/messages on {listen}");
+    let serving = format!("serving the HTTP fronts on {listen}");
     assert!(logged.iter().any(|l| l.contains(&serving)), "{logged:?}");
     assert!(
         logged
@@ -1707,10 +1707,16 @@ fn recorded(name: &str, sse: Option<&str>) -> Answer {
     Answer::Full(status, headers, body)
 }
 
-/// The `[messages]` table of the Messages front tests: client model `model-2025-01-01` runs on
-/// route `chat`.
-const MESSAGES_FRONT: &str =
-    "[messages]\nvendor = \"vendor-a\"\nmodels = { \"model-2025-01-01\" = \"chat\" }\n";
+/// The `[fronts]` table of the front tests with `keys` added: client model `model-2025-01-01`
+/// runs on route `chat`, the Messages front's vendor is `vendor-a`, the OpenAI fronts' `vendor-o`
+/// with a default output bound of 4096.
+fn fronts(keys: &str) -> String {
+    format!(
+        "[fronts]\nmodels = {{ \"model-2025-01-01\" = \"chat\" }}\n{keys}\n\
+         [fronts.messages]\nvendor = \"vendor-a\"\n\
+         [fronts.openai]\nvendor = \"vendor-o\"\nmax_tokens = 4096\n"
+    )
+}
 
 /// A rig whose gateway runs the Anthropic adapter against a scripted vendor and serves the
 /// Messages front; `logins` as in [`gateway_toml`], the credential files `files`.
@@ -1718,10 +1724,10 @@ fn vendor_rig(
     files: &[(&str, String, u32)],
     logins: impl Fn(&Vendor) -> [String; 2],
 ) -> (Rig, Vendor) {
-    vendor_rig_on(files, logins, MESSAGES_FRONT, None)
+    vendor_rig_on(files, logins, &fronts(""), None)
 }
 
-/// [`vendor_rig`] with the `[messages]` table `front` and the Messages front also on `loopback`.
+/// [`vendor_rig`] with the `[fronts]` table `front` and the HTTP fronts also on `loopback`.
 fn vendor_rig_on(
     files: &[(&str, String, u32)],
     logins: impl Fn(&Vendor) -> [String; 2],
@@ -2614,7 +2620,7 @@ fn an_exhausted_chain_answers_429_with_retry_after_until_the_reset() {
 
 #[test]
 fn messages_errors_use_the_messages_format_before_and_after_the_first_event() {
-    let r = rig_as(4, &key_files(), MESSAGES_FRONT, own_uid());
+    let r = rig_as(4, &key_files(), &fronts(""), own_uid());
     let resets = unix_now() + 3600;
     r.fake.script(
         "login-1",
@@ -2701,13 +2707,13 @@ const CLIENT_TOKEN: &str = "qb-local-test-token";
 const CLIENT_TOKEN_SHA256: &str =
     "d313474a473655cadbfe1cbb9e2314d155d497a6902d4c72a2fa8dee7fb42444";
 
-/// A loopback listener on a free port and the `[messages]` table that serves it, `keys` added.
+/// A loopback listener on a free port and the `[fronts]` table that serves it, `keys` added.
 fn loopback_front(keys: &str) -> (TcpListener, SocketAddr, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let front = format!(
-        "{MESSAGES_FRONT}listen = \"{addr}\"\ntoken_sha256 = \"{CLIENT_TOKEN_SHA256}\"\n{keys}\n"
-    );
+    let front = fronts(&format!(
+        "listen = \"{addr}\"\ntoken_sha256 = \"{CLIENT_TOKEN_SHA256}\"\n{keys}"
+    ));
     (listener, addr, front)
 }
 
@@ -2929,4 +2935,601 @@ fn a_silent_stream_gets_pings_after_message_start_only() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(leases, 0, "the lease is released");
+}
+
+/// The headers the official OpenAI Python SDK sends besides `Host` and `Content-Length`, with a
+/// synthetic key the unix socket ignores.
+const OPENAI_SDK_HEADERS: &str = "Accept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\n\
+Accept: application/json\r\nContent-Type: application/json\r\nUser-Agent: OpenAI/Python 1.109.1\r\n\
+X-Stainless-Lang: python\r\nX-Stainless-Package-Version: 1.109.1\r\nX-Stainless-OS: Linux\r\n\
+X-Stainless-Arch: x64\r\nX-Stainless-Runtime: CPython\r\nX-Stainless-Runtime-Version: 3.11.16\r\n\
+Authorization: Bearer test-client-key\r\nX-Stainless-Async: false\r\n\
+x-stainless-retry-count: 0\r\nx-stainless-read-timeout: 600\r\n";
+
+/// Sends `body` to `path` with the OpenAI SDK's headers.
+fn openai_send(sock: &Path, path: &str, body: &Value) -> UnixStream {
+    let mut s = UnixStream::connect(sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let body = body.to_string();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\n{OPENAI_SDK_HEADERS}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    s
+}
+
+/// Status, head and body of one OpenAI front call.
+fn openai_call(sock: &Path, path: &str, body: &Value) -> (u16, String, Vec<u8>) {
+    finish(openai_send(sock, path, body), Vec::new())
+}
+
+/// The read tool's JSON schema.
+fn read_schema() -> Value {
+    json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"],
+           "additionalProperties": false})
+}
+
+/// A first request as the SDK's `chat.completions.create` builds it: a developer prompt, a user
+/// message, a function tool and the client's `user`, without an output bound.
+fn chat_body(model: &str, stream: bool) -> Value {
+    let mut body = json!({
+        "messages": [
+            {"role": "developer", "content": "Be brief."},
+            {"role": "user", "content": [{"type": "text", "text": "What is in notes.txt?"}]},
+        ],
+        "model": model,
+        "stream": stream,
+        "tool_choice": "auto",
+        "tools": [{"type": "function", "function": {
+            "name": "read", "description": "Read a file.", "parameters": read_schema(),
+            "strict": true,
+        }}],
+        "user": "session-1",
+    });
+    if stream {
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    body
+}
+
+/// A first request as the SDK's `responses.create` builds it for a stateless client:
+/// instructions, input items, a function tool, encrypted reasoning asked for, `store: false`.
+fn responses_body(model: &str, stream: bool) -> Value {
+    json!({
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "What is in notes.txt?"}
+        ]}],
+        "model": model,
+        "include": ["reasoning.encrypted_content"],
+        "instructions": "Be brief.",
+        "prompt_cache_key": "session-1",
+        "store": false,
+        "stream": stream,
+        "tools": [{"type": "function", "name": "read", "description": "Read a file.",
+                   "parameters": read_schema(), "strict": true}],
+    })
+}
+
+/// The SSE events of an OpenAI stream; keep-alive comments are not events.
+fn openai_frames(body: &[u8]) -> Vec<qb_openai::sse::Frame> {
+    let mut out = Vec::new();
+    qb_openai::sse::Parser::default()
+        .feed(body, &mut out)
+        .unwrap();
+    out
+}
+
+/// The `data` of each Chat Completions stream event, `[DONE]` as a string.
+fn chat_chunks(sse: &[u8]) -> Vec<Value> {
+    openai_frames(sse)
+        .iter()
+        .map(|f| serde_json::from_str(&f.data).unwrap_or_else(|_| Value::from(f.data.clone())))
+        .collect()
+}
+
+/// The streamed text of Chat Completions chunks.
+fn chat_text(chunks: &[Value]) -> String {
+    chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect()
+}
+
+/// The text of `upstream_text.sse`.
+const FIXTURE_TEXT: &str = "Hello, world \u{2014} \u{fc}n\u{ef}code!";
+
+/// The canonical blocks of the second turn of a tool round trip, as the Anthropic adapter sent
+/// them: the assistant's text and two calls, then both results in one user message.
+fn assert_round_trip_reached_the_vendor(sent: &Value) {
+    let messages = sent["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "{sent}");
+    let assistant = messages[1]["content"].as_array().unwrap();
+    assert_eq!(assistant[0]["text"], "Reading the file first.");
+    assert_eq!(
+        (
+            &assistant[1]["id"],
+            &assistant[1]["name"],
+            &assistant[1]["input"]
+        ),
+        (
+            &json!("toolu_test_1"),
+            &json!("read"),
+            &json!({"path": "notes.txt", "lines": [1, 2]})
+        )
+    );
+    assert_eq!(assistant[2]["id"], "toolu_test_2");
+    let results = messages[2]["content"].as_array().unwrap();
+    assert_eq!(
+        (&results[0]["tool_use_id"], &results[0]["content"]),
+        (&json!("toolu_test_1"), &json!("line one"))
+    );
+    assert_eq!(
+        (&results[1]["tool_use_id"], &results[1]["content"]),
+        (&json!("toolu_test_2"), &json!("a.txt"))
+    );
+    assert_eq!(sent["system"][0]["text"], "Be brief.");
+    assert_eq!(sent["model"], "model-large");
+}
+
+/// The JSON object a function call's `arguments` string holds.
+fn arguments(call: &Value) -> Value {
+    serde_json::from_str(call.as_str().unwrap()).unwrap()
+}
+
+#[test]
+fn chat_completions_carries_a_tool_round_trip_without_and_with_streaming() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("200_allowed", Some("upstream_tool_use.sse")));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+
+    let mut body = chat_body("model-2025-01-01", false);
+    let (status, head, answer) = openai_call(&r.gw, paths::CHAT_COMPLETIONS, &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    assert!(head.contains("Content-Type: application/json"), "{head}");
+    let answer: Value = serde_json::from_slice(&answer).unwrap();
+    assert!(answer["id"].as_str().unwrap().starts_with("chatcmpl-"));
+    assert_eq!(
+        (&answer["object"], &answer["model"]),
+        (&json!("chat.completion"), &json!("model-2025-01-01"))
+    );
+    let choice = &answer["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    let message = choice["message"].clone();
+    assert_eq!(message["content"], "Reading the file first.");
+    let calls = message["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        (
+            &calls[0]["id"],
+            &calls[0]["type"],
+            &calls[0]["function"]["name"]
+        ),
+        (&json!("toolu_test_1"), &json!("function"), &json!("read"))
+    );
+    assert_eq!(
+        arguments(&calls[0]["function"]["arguments"]),
+        json!({"path": "notes.txt", "lines": [1, 2]})
+    );
+    assert_eq!(arguments(&calls[1]["function"]["arguments"]), json!({}));
+    assert_eq!(
+        answer["usage"],
+        json!({"prompt_tokens": 2125, "completion_tokens": 48, "total_tokens": 2173,
+               "prompt_tokens_details": {"cached_tokens": 2000},
+               "completion_tokens_details": {"reasoning_tokens": 0}})
+    );
+
+    let history = body["messages"].as_array_mut().unwrap();
+    history.push(message);
+    history.push(json!({"role": "tool", "tool_call_id": "toolu_test_1", "content": "line one"}));
+    history.push(json!({"role": "tool", "tool_call_id": "toolu_test_2",
+                        "content": [{"type": "text", "text": "a.txt"}]}));
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+    body["max_completion_tokens"] = json!(512);
+    let (status, head, sse) = openai_call(&r.gw, paths::CHAT_COMPLETIONS, &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+    let chunks = chat_chunks(&sse);
+    assert_eq!(chunks.last(), Some(&json!("[DONE]")));
+    let chunks = &chunks[..chunks.len() - 1];
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chat_text(chunks), FIXTURE_TEXT);
+    let id = &chunks[0]["id"];
+    assert!(
+        chunks
+            .iter()
+            .all(|c| &c["id"] == id && c["model"] == "model-2025-01-01")
+    );
+    let finish = &chunks[chunks.len() - 2];
+    assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+    let usage = &chunks[chunks.len() - 1];
+    assert_eq!(usage["choices"], json!([]));
+    assert_eq!(
+        (
+            &usage["usage"]["prompt_tokens"],
+            &usage["usage"]["completion_tokens"]
+        ),
+        (&json!(2125), &json!(12))
+    );
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[0].body["max_tokens"], 4096,
+        "the config's bound when the request names none"
+    );
+    assert_eq!(sent[1].body["max_tokens"], 512);
+    assert_eq!(sent[0].body["tools"][0]["name"], "read");
+    assert_round_trip_reached_the_vendor(&sent[1].body);
+}
+
+#[test]
+fn responses_carries_a_function_call_round_trip_without_and_with_streaming() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("200_allowed", Some("upstream_tool_use.sse")));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+
+    let mut body = responses_body("model-2025-01-01", false);
+    let (status, head, answer) = openai_call(&r.gw, paths::RESPONSES, &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    assert!(head.contains("Content-Type: application/json"), "{head}");
+    let answer: Value = serde_json::from_slice(&answer).unwrap();
+    assert!(answer["id"].as_str().unwrap().starts_with("resp_"));
+    assert_eq!(
+        (&answer["object"], &answer["status"], &answer["model"]),
+        (
+            &json!("response"),
+            &json!("completed"),
+            &json!("model-2025-01-01")
+        )
+    );
+    let output = answer["output"].as_array().unwrap().clone();
+    let kinds: Vec<&str> = output.iter().map(|i| i["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["message", "function_call", "function_call"]);
+    assert_eq!(output[0]["content"][0]["text"], "Reading the file first.");
+    assert_eq!(
+        (&output[1]["call_id"], &output[1]["name"]),
+        (&json!("toolu_test_1"), &json!("read"))
+    );
+    assert_eq!(
+        arguments(&output[1]["arguments"]),
+        json!({"path": "notes.txt", "lines": [1, 2]})
+    );
+    assert_eq!(output[2]["call_id"], "toolu_test_2");
+    assert_eq!(
+        (
+            &answer["usage"]["input_tokens"],
+            &answer["usage"]["output_tokens"]
+        ),
+        (&json!(2125), &json!(48))
+    );
+
+    let input = body["input"].as_array_mut().unwrap();
+    input.extend(output);
+    input.push(
+        json!({"type": "function_call_output", "call_id": "toolu_test_1",
+                      "output": "line one"}),
+    );
+    input.push(
+        json!({"type": "function_call_output", "call_id": "toolu_test_2",
+                      "output": [{"type": "input_text", "text": "a.txt"}]}),
+    );
+    body["stream"] = json!(true);
+    let (status, head, sse) = openai_call(&r.gw, paths::RESPONSES, &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+    let got = openai_frames(&sse);
+    let names: Vec<&str> = got.iter().map(|f| f.event.as_str()).collect();
+    assert_eq!(names[..2], ["response.created", "response.in_progress"]);
+    assert_eq!(names.last(), Some(&"response.completed"));
+    let deltas: String = got
+        .iter()
+        .filter(|f| f.event == "response.output_text.delta")
+        .map(|f| {
+            serde_json::from_str::<Value>(&f.data).unwrap()["delta"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(deltas, FIXTURE_TEXT);
+    let completed: Value = serde_json::from_str(&got.last().unwrap().data).unwrap();
+    assert_eq!(
+        completed["response"]["output"][0]["content"][0]["text"],
+        FIXTURE_TEXT
+    );
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 12);
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].body["max_tokens"], 4096);
+    assert_round_trip_reached_the_vendor(&sent[1].body);
+}
+
+#[test]
+fn a_usage_limit_rotation_is_invisible_to_openai_clients() {
+    for (path, body) in [
+        (paths::CHAT_COMPLETIONS, chat_body("model-2025-01-01", true)),
+        (paths::RESPONSES, responses_body("chat", false)),
+    ] {
+        let (r, vendor) = vendor_rig(&key_files(), two_keys);
+        vendor.answer(recorded("429_usage_limit", None));
+        vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+        let (status, _, answer) = openai_call(&r.gw, path, &body);
+        assert_eq!(status, 200, "{path}: {}", String::from_utf8_lossy(&answer));
+        if path == paths::CHAT_COMPLETIONS {
+            let chunks = chat_chunks(&answer);
+            assert!(
+                chunks.iter().all(|c| c.get("error").is_none()),
+                "{chunks:?}"
+            );
+            assert_eq!(chat_text(&chunks), FIXTURE_TEXT);
+        } else {
+            let answer: Value = serde_json::from_slice(&answer).unwrap();
+            assert_eq!(answer["status"], "completed");
+            assert_eq!(answer["output"][0]["content"][0]["text"], FIXTURE_TEXT);
+        }
+        let sent = vendor.received();
+        let keys: Vec<_> = sent.iter().map(|s| s.header("x-api-key")).collect();
+        assert_eq!(keys, [Some("test-token-1"), Some("test-token-2")], "{path}");
+        let s = state(&r.qbd);
+        assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+        assert_eq!(s.leases, Vec::new());
+    }
+}
+
+#[test]
+fn an_exhausted_chain_answers_openai_clients_429_with_retry_after_until_the_reset() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    for _ in 0..2 {
+        vendor.answer(recorded("429_usage_limit", None));
+    }
+    for (path, body) in [
+        (paths::CHAT_COMPLETIONS, chat_body("model-2025-01-01", true)),
+        (
+            paths::CHAT_COMPLETIONS,
+            chat_body("model-2025-01-01", false),
+        ),
+        (paths::RESPONSES, responses_body("model-2025-01-01", true)),
+        (paths::RESPONSES, responses_body("model-2025-01-01", false)),
+    ] {
+        let before = unix_now();
+        let (status, head, answer) = openai_call(&r.gw, path, &body);
+        assert_eq!(status, 429, "{path}: {}", String::from_utf8_lossy(&answer));
+        assert!(head.contains("Content-Type: application/json"), "{head}");
+        let answer: Value = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(
+            (&answer["error"]["type"], &answer["error"]["code"]),
+            (&json!("insufficient_quota"), &json!("insufficient_quota")),
+            "{path}: {answer}"
+        );
+        let (retry_after, should_retry) = retry_headers(&head);
+        let retry_after = retry_after.unwrap();
+        let reset = 1_800_018_000;
+        assert!(
+            (reset - unix_now()..=reset - before).contains(&retry_after),
+            "{head}"
+        );
+        assert_eq!(should_retry, Some("false"), "the reset is hours away");
+    }
+    assert_eq!(
+        vendor.received().len(),
+        2,
+        "the later turns need no attempt"
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn openai_errors_use_the_openai_format_before_and_after_the_first_event() {
+    let r = rig_as(4, &key_files(), &fronts(""), own_uid());
+    for login in ["login-1", "login-2"] {
+        for _ in 0..2 {
+            r.fake.script(
+                login,
+                Script::Fail(
+                    vec![text("partial")],
+                    FailureKind::Overloaded { retry_after: None },
+                    window(0.5, unix_now() + 3600),
+                ),
+            );
+        }
+    }
+    let (status, _, sse) = openai_call(&r.gw, paths::CHAT_COMPLETIONS, &chat_body("chat", true));
+    assert_eq!(status, 200);
+    let chunks = chat_chunks(&sse);
+    assert_eq!(chat_text(&chunks), "partial");
+    let last = chunks.last().unwrap();
+    assert_eq!(last["error"]["code"], "rate_limit_exceeded", "{chunks:?}");
+    assert!(!chunks.contains(&json!("[DONE]")));
+
+    let (status, _, sse) = openai_call(&r.gw, paths::RESPONSES, &responses_body("chat", true));
+    assert_eq!(status, 200);
+    let got = openai_frames(&sse);
+    let names: Vec<&str> = got.iter().map(|f| f.event.as_str()).collect();
+    assert_eq!(
+        names[names.len() - 2..],
+        ["error", "response.failed"],
+        "{names:?}"
+    );
+    let failed: Value = serde_json::from_str(&got.last().unwrap().data).unwrap();
+    assert_eq!(failed["response"]["status"], "failed");
+
+    let error_of = |status: u16, body: &[u8]| {
+        let body: Value = serde_json::from_slice(body)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(body)));
+        (
+            status,
+            body["error"]["type"].as_str().unwrap().to_owned(),
+            body,
+        )
+    };
+    for path in [paths::CHAT_COMPLETIONS, paths::RESPONSES] {
+        let unknown = match path {
+            paths::RESPONSES => responses_body("model-unknown", true),
+            _ => chat_body("model-unknown", true),
+        };
+        let (status, _, body) = openai_call(&r.gw, path, &unknown);
+        let (status, kind, body) = error_of(status, &body);
+        assert_eq!(
+            (status, kind.as_str()),
+            (400, "invalid_request_error"),
+            "{path}"
+        );
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("model-unknown"), "{body}");
+
+        let (status, body) = call(&r.gw, "GET", path, "");
+        assert_eq!(error_of(status, &body).0, 405, "{path}");
+        let (status, body) = call(&r.gw, "POST", path, &"x".repeat(131_073));
+        let (status, kind, _) = error_of(status, &body);
+        assert_eq!(
+            (status, kind.as_str()),
+            (413, "invalid_request_error"),
+            "{path}"
+        );
+
+        let body = chat_body("chat", true).to_string();
+        let (status, body) = call(&rig().gw, "POST", path, &body);
+        let (status, kind, _) = error_of(status, &body);
+        assert_eq!(
+            (status, kind.as_str()),
+            (404, "invalid_request_error"),
+            "{path}"
+        );
+    }
+}
+
+/// Reads `s` until its bytes hold `needle`; the bytes so far.
+fn until(s: &mut impl Read, needle: &str) -> Vec<u8> {
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !String::from_utf8_lossy(&seen).contains(needle) {
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "stream ended early");
+        seen.extend_from_slice(&chunk[..n]);
+    }
+    seen
+}
+
+#[test]
+fn the_loopback_listener_serves_openai_clients_with_the_client_token_only() {
+    let (listener, addr, front) = loopback_front("");
+    let (r, vendor) = vendor_rig_on(&key_files(), two_keys, &front, Some(listener));
+    for path in [paths::CHAT_COMPLETIONS, paths::RESPONSES] {
+        // Heads that announce a body they never send: the 401 does not wait for it.
+        for auth in [
+            String::new(),
+            "Authorization: Bearer qb-wrong-token\r\n".into(),
+        ] {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            write!(
+                s,
+                "POST {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Length: 60000\r\n\r\n"
+            )
+            .unwrap();
+            let (status, _, answer) = finish(s, Vec::new());
+            let answer: Value = serde_json::from_slice(&answer).unwrap();
+            assert_eq!(status, 401, "{path} {auth}");
+            assert_eq!(
+                (&answer["error"]["type"], &answer["error"]["code"]),
+                (&json!("invalid_request_error"), &json!("invalid_api_key"))
+            );
+        }
+        let s = tcp_send(
+            addr,
+            "GET",
+            path,
+            &format!("Authorization: Bearer {CLIENT_TOKEN}\r\n"),
+            "",
+        );
+        let (status, _, answer) = finish(s, Vec::new());
+        let answer: Value = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(
+            (status, &answer["error"]["code"]),
+            (404, &json!("unknown_url"))
+        );
+    }
+    assert_eq!(
+        vendor.received().len(),
+        0,
+        "a refused request reaches no vendor"
+    );
+
+    for (path, body, needle) in [
+        (
+            paths::CHAT_COMPLETIONS,
+            chat_body("model-2025-01-01", true),
+            "[DONE]",
+        ),
+        (
+            paths::RESPONSES,
+            responses_body("model-2025-01-01", true),
+            "response.completed",
+        ),
+    ] {
+        vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+        let auth = format!("Authorization: Bearer {CLIENT_TOKEN}\r\n");
+        let s = tcp_send(addr, "POST", path, &auth, &body.to_string());
+        let (status, head, sse) = finish(s, Vec::new());
+        assert_eq!(status, 200, "{path}: {}", String::from_utf8_lossy(&sse));
+        assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+        assert!(String::from_utf8_lossy(&sse).contains(needle), "{path}");
+    }
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent.iter()
+            .all(|s| s.headers.iter().all(|(_, v)| !v.contains(CLIENT_TOKEN))),
+        "the client token stays local"
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+#[test]
+fn a_silent_openai_stream_gets_keepalives_and_a_hang_up_cancels_it() {
+    let (listener, addr, front) = loopback_front("ping_interval_s = 1");
+    let (r, vendor) = vendor_rig_on(&key_files(), two_keys, &front, Some(listener));
+    let auth = format!("Authorization: Bearer {CLIENT_TOKEN}\r\n");
+    for (path, body, first) in [
+        (
+            paths::CHAT_COMPLETIONS,
+            chat_body("model-2025-01-01", true),
+            "Hello",
+        ),
+        (
+            paths::RESPONSES,
+            responses_body("model-2025-01-01", true),
+            "output_text.delta",
+        ),
+    ] {
+        vendor.answer(Answer::Hold(stream_start()));
+        let mut client = tcp_send(addr, "POST", path, &auth, &body.to_string());
+        until(&mut client, first);
+        let quiet = std::time::Instant::now();
+        until(&mut client, ": keep-alive\n\n");
+        let pinged = quiet.elapsed();
+        assert!(pinged >= Duration::from_millis(900), "{path}: {pinged:?}");
+        assert!(pinged < Duration::from_secs(3), "{path}: {pinged:?}");
+
+        let dropped = std::time::Instant::now();
+        drop(client);
+        let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            closed.duration_since(dropped) < Duration::from_secs(1),
+            "{path}"
+        );
+        let mut leases = 1;
+        for _ in 0..50 {
+            leases = state(&r.qbd).leases.len();
+            if leases == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(leases, 0, "{path}: the lease is released");
+    }
 }

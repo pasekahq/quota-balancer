@@ -198,6 +198,7 @@ dependencies = [
  "lexopt",
  "qb-anthropic",
  "qb-core",
+ "qb-openai",
  "qb-proto",
  "qb-vendors",
  "rustix",

@@ -220,22 +220,25 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/cancel` | `CancelRequest` | 200 `CancelAnswer`, 403 another caller's turn, 404 no such running turn |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
+| `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
+| `POST /v1/responses` | OpenAI Responses request | Responses SSE or one `response` object; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
 
 Framing is `qbd`'s: HTTP/1.1, one request per connection, head ≤ 8 KiB, `Content-Length`
-required, chunked request bodies refused. The body of `POST /v1/model/turn` and
-`POST /v1/messages` may be up to the config's `max_request_bytes` (default 8 MiB), every other
+required, chunked request bodies refused. The body of `POST /v1/model/turn` and of a `POST` to
+an HTTP front (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) may be up to the config's
+`max_request_bytes` (default 8 MiB), every other
 body up to 64 KiB; a request whose head and body have not arrived within 10 s is dropped
 without an answer. `/v1/model/*` requests reject unknown fields. Every non-200 answer of the
 gateway has the body `Error` below, whose `class` is authoritative and whose status is
-informative, except the answers of `/v1/messages` to a caller it serves, which use the Messages
-error format.
+informative, except the answers of an HTTP front to a caller it serves, which use the error
+format of that front's API.
 
 **Callers.** The peer's uid from `SO_PEERCRED` must be the gateway's own uid or the `uid` of a
 `[[clients]]` entry of the gateway config; any other peer gets 401 `auth` before its request
 is read. The socket file is
-0600, or 0660 with `socket_mode = 0o660`. The optional loopback listener (`messages.listen`)
-serves only `POST /v1/messages`, to requests with the local client token
-([anthropic.md](anthropic.md#the-v1messages-front)).
+0600, or 0660 with `socket_mode = 0o660`. The optional loopback listener (`fronts.listen`)
+serves only the HTTP fronts, to requests with the local client token
+([openai.md](openai.md#serving-the-fronts)).
 
 ### `POST /v1/model/turn`
 

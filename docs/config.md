@@ -217,7 +217,7 @@ it: [ADR 0001](adr/0001-model-gateway.md); its API: [api.md](api.md#model-gatewa
 Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml).
 
 Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`,
-`[messages]`):
+`[fronts]`):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -226,7 +226,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `qbd_socket` | string | Absolute path of `qbd`'s socket, default `/run/qb/qb.sock`. |
 | `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`; without it `qbd` identifies the gateway by uid. |
 | `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
-| `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and `POST /v1/messages`, default 8388608, at most 33554432; other requests take at most 64 KiB. |
+| `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Picks per turn, default 4. |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
@@ -287,20 +287,35 @@ directories and nowhere else.
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
 
-`[messages]`, optional: the `POST /v1/messages` front ([anthropic.md](anthropic.md#the-v1messages-front)).
-Without it that endpoint answers 404.
+`[fronts]`, optional: the HTTP fronts, `POST /v1/messages`
+([anthropic.md](anthropic.md#the-v1messages-front)), `POST /v1/chat/completions` and
+`POST /v1/responses` ([openai.md](openai.md#serving-the-fronts)). Its keys are shared by all of
+them; each front is served when its sub-table is present, and at least one must be. A front
+without its sub-table answers 404.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `models` | table of strings | Client `model` names, each mapped to a route alias, at most 256; for example `{ "claude-sonnet-4-5-20250929" = "chat", "gpt-5" = "chat" }`. A `model` equal to an alias needs no entry; a key may not be an alias, and a value must be one. Any other `model` is answered 400 `invalid_request_error`. |
+| `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves the HTTP fronts besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`. |
+| `token_sha256` | string | With `listen`, and only with it: SHA-256 of the local client token as 64 hex characters. Plaintext tokens are rejected. |
+| `ping_interval_s` | integer 1..=30 | Seconds a started stream may stay silent before the front writes an SSE keep-alive, default 10. |
+
+`[fronts.messages]`: the `POST /v1/messages` front.
 
 | Key | Type | Meaning |
 |---|---|---|
 | `vendor` | string | Required. The `qbd` vendor whose logins speak the Anthropic API: its thinking blocks reach clients as Anthropic blocks, and the thinking blocks clients send back count as its own. |
-| `models` | table of strings | Client `model` names, each mapped to a route alias, at most 256; for example `{ "claude-sonnet-4-5-20250929" = "chat" }`. A `model` equal to an alias needs no entry; a key may not be an alias, and a value must be one. Any other `model` is answered 400 `invalid_request_error`. |
-| `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves `POST /v1/messages` besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`. |
-| `token_sha256` | string | With `listen`, and only with it: SHA-256 of the local client token as 64 hex characters. Plaintext tokens are rejected. |
-| `ping_interval_s` | integer 1..=30 | Seconds a started stream may stay silent before the front writes an SSE `ping` event, default 10. |
+
+`[fronts.openai]`: the `POST /v1/chat/completions` and `POST /v1/responses` fronts.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `vendor` | string | Required. The `qbd` vendor whose logins speak the OpenAI API: its thinking reaches Responses clients as their reasoning items, and the reasoning items clients send back count as its own. |
+| `max_tokens` | integer ≥ 1 | Required. The output bound of a request that names none (`max_completion_tokens`, `max_tokens`, `max_output_tokens`). |
 
 Every request on `listen` carries the local client token in `x-api-key` or
-`Authorization: Bearer`, so a client switches to the gateway with its Anthropic base URL
-(`http://127.0.0.1:<port>`) and API key. Generate the token and its hash with:
+`Authorization: Bearer`, so a client switches to the gateway with its base URL and API key: an
+Anthropic SDK with `http://127.0.0.1:<port>`, an OpenAI SDK with `http://127.0.0.1:<port>/v1`. Generate the token and its hash with:
 
 ```sh
 TOKEN="qb-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -312,4 +327,4 @@ that shape for a subscription OAuth token and send it with another identity. The
 above avoids that. Anyone on the host who knows the token can spend the gateway's logins, so
 keep it as private as a vendor key.
 
-Switching a Hermes agent to this front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).
+Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).

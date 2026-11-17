@@ -49,6 +49,10 @@ pub mod paths {
     pub const MODEL_CANCEL: &str = "/v1/model/cancel";
     /// Gateway, `POST`: an Anthropic Messages request, answered in the Messages format.
     pub const MESSAGES: &str = "/v1/messages";
+    /// Gateway, `POST`: an OpenAI Chat Completions request, answered in that format.
+    pub const CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+    /// Gateway, `POST`: an OpenAI Responses request, answered in that format.
+    pub const RESPONSES: &str = "/v1/responses";
 }
 
 /// `POST /v1/pick` request.

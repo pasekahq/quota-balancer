@@ -43,7 +43,7 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
 /// truncate files, create regular files and remove files, so a refreshed token can be written
 /// back by a rename inside the directory; no `REFER`, so nothing moves across directories. TCP
-/// bind only on the port of `messages.listen`, whose listener must exist before. Call it before
+/// bind only on the port of `fronts.listen`, whose listener must exist before. Call it before
 /// starting any thread.
 ///
 /// # Errors
@@ -55,9 +55,9 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
         .map(|l| l.credentials.as_path())
         .collect();
     let bind = config
-        .messages
+        .fronts
         .as_ref()
-        .and_then(|m| m.listen)
+        .and_then(|f| f.listen)
         .map(|a| a.port());
     confine(&files, true, bind)
 }

@@ -25,15 +25,15 @@ pub const MAX_REQUEST_BYTES: u32 = 32 << 20;
 pub const MAX_ROUTES: usize = 64;
 /// Most attempts `max_attempts` may allow.
 pub const MAX_ATTEMPTS: u32 = 16;
-/// Most entries of `messages.models`.
+/// Most entries of `fronts.models`.
 pub const MAX_MODELS: usize = 256;
-/// Default of `messages.ping_interval_s`.
+/// Default of `fronts.ping_interval_s`.
 pub const PING_INTERVAL_S: u32 = 10;
-/// Largest `messages.ping_interval_s`.
+/// Largest `fronts.ping_interval_s`.
 pub const MAX_PING_INTERVAL_S: u32 = 30;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
-/// `[[routes]]` and `[messages]` tables.
+/// `[[routes]]` and `[fronts]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// Absolute path of the gateway's unix socket.
@@ -56,8 +56,25 @@ pub struct GatewayConfig {
     pub logins: Vec<GatewayLogin>,
     /// Route aliases.
     pub routes: Vec<Route>,
-    /// The `/v1/messages` front; without it the front answers 404.
+    /// The HTTP fronts; without it their endpoints answer 404.
+    pub fronts: Option<Fronts>,
+}
+
+/// The settings the HTTP fronts share and the fronts this gateway serves; at least one is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fronts {
+    /// Client `model` names and the route alias each runs on.
+    pub models: Vec<(String, String)>,
+    /// Loopback TCP address that serves the fronts besides the unix socket.
+    pub listen: Option<SocketAddr>,
+    /// SHA-256 of the local client token every TCP request carries; set exactly when `listen` is.
+    pub token_sha256: Option<BearerHash>,
+    /// Seconds of silence in a started stream before a keep-alive, 1 to [`MAX_PING_INTERVAL_S`].
+    pub ping_interval_s: u32,
+    /// `/v1/messages`; without it that endpoint answers 404.
     pub messages: Option<MessagesFront>,
+    /// `/v1/chat/completions` and `/v1/responses`; without it they answer 404.
+    pub openai: Option<OpenaiFront>,
 }
 
 /// The `/v1/messages` front's settings.
@@ -66,15 +83,16 @@ pub struct MessagesFront {
     /// `qbd` vendor whose thinking blocks are Anthropic blocks: they pass to clients as such, and
     /// clients' thinking blocks come back as this vendor's.
     pub vendor: String,
-    /// Client `model` names and the route alias each runs on.
-    pub models: Vec<(String, String)>,
-    /// Loopback TCP address that serves this front besides the unix socket.
-    pub listen: Option<SocketAddr>,
-    /// SHA-256 of the local client token every TCP request carries; set exactly when `listen` is.
-    pub token_sha256: Option<BearerHash>,
-    /// Seconds of silence in a started stream before a `ping` event, 1 to
-    /// [`MAX_PING_INTERVAL_S`].
-    pub ping_interval_s: u32,
+}
+
+/// The settings of the `/v1/chat/completions` and `/v1/responses` fronts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenaiFront {
+    /// `qbd` vendor whose thinking is an OpenAI reasoning item: it passes to Responses clients as
+    /// such, and their reasoning items come back as this vendor's.
+    pub vendor: String,
+    /// Output bound of a request that names none, at least 1.
+    pub max_tokens: u32,
 }
 
 /// A caller of the gateway by peer uid.
@@ -317,7 +335,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         clients: Vec::new(),
         logins: Vec::new(),
         routes: Vec::new(),
-        messages: None,
+        fronts: None,
     };
     let known = [
         "socket",
@@ -330,7 +348,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         "clients",
         "logins",
         "routes",
-        "messages",
+        "fronts",
     ];
     let required = ["socket", "logins", "routes"];
     fields("", doc, &known, &required, |key, at, v| {
@@ -357,7 +375,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
                     c.routes.push(walk_route(&at, t)?);
                 }
             }
-            _ => c.messages = Some(walk_messages(at, table(at, v)?)?),
+            _ => c.fronts = Some(walk_fronts(at, table(at, v)?)?),
         }
         Ok(())
     })?;
@@ -370,26 +388,27 @@ fn table<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<&'v DeTable<'i>, WalkErro
         .ok_or_else(|| wrong(at, v, "a table"))
 }
 
-fn walk_messages(at: &str, t: &DeTable<'_>) -> Result<MessagesFront, WalkError> {
-    let mut m = MessagesFront {
-        vendor: String::new(),
+fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
+    let mut f = Fronts {
         models: Vec::new(),
         listen: None,
         token_sha256: None,
         ping_interval_s: PING_INTERVAL_S,
+        messages: None,
+        openai: None,
     };
     let (mut listen_at, mut token_at) = (None, None);
     let keys = [
-        "vendor",
         "models",
         "listen",
         "token_sha256",
         "ping_interval_s",
+        "messages",
+        "openai",
     ];
-    fields(at, t, &keys, &["vendor"], |key, at, v| {
+    fields(at, t, &keys, &[], |key, at, v| {
         let bad = |reason: &str| (at.to_owned(), reason.to_owned(), Some(v.span().start));
         match key {
-            "vendor" => m.vendor = string(at, v)?,
             "listen" => {
                 let addr: SocketAddr = string(at, v)?
                     .parse()
@@ -400,25 +419,50 @@ fn walk_messages(at: &str, t: &DeTable<'_>) -> Result<MessagesFront, WalkError> 
                 if addr.port() == 0 {
                     return Err(bad("needs a port other than 0"));
                 }
-                m.listen = Some(addr);
+                f.listen = Some(addr);
                 listen_at = Some(v.span().start);
             }
             "token_sha256" => {
                 let hash = BearerHash::from_hex(&string(at, v)?);
-                m.token_sha256 = Some(hash.ok_or_else(|| bad(BEARER_HASH_EXPECTED))?);
+                f.token_sha256 = Some(hash.ok_or_else(|| bad(BEARER_HASH_EXPECTED))?);
                 token_at = Some(v.span().start);
             }
             "ping_interval_s" => {
-                m.ping_interval_s = integer(at, v)?;
-                if !(1..=MAX_PING_INTERVAL_S).contains(&m.ping_interval_s) {
+                f.ping_interval_s = integer(at, v)?;
+                if !(1..=MAX_PING_INTERVAL_S).contains(&f.ping_interval_s) {
                     return Err(bad(&format!("must be 1 to {MAX_PING_INTERVAL_S}")));
                 }
+            }
+            "messages" => {
+                let mut m = MessagesFront {
+                    vendor: String::new(),
+                };
+                fields(at, table(at, v)?, &["vendor"], &["vendor"], |_, at, v| {
+                    m.vendor = string(at, v)?;
+                    Ok(())
+                })?;
+                f.messages = Some(m);
+            }
+            "openai" => {
+                let mut o = OpenaiFront {
+                    vendor: String::new(),
+                    max_tokens: 0,
+                };
+                let keys = ["vendor", "max_tokens"];
+                fields(at, table(at, v)?, &keys, &keys, |key, at, v| {
+                    match key {
+                        "vendor" => o.vendor = string(at, v)?,
+                        _ => o.max_tokens = integer(at, v)?,
+                    }
+                    Ok(())
+                })?;
+                f.openai = Some(o);
             }
             _ => {
                 for (model, alias) in table(at, v)? {
                     let model = model.get_ref().as_ref();
                     let alias = string(&format!("{at}.\"{model}\""), alias)?;
-                    m.models.push((model.to_owned(), alias));
+                    f.models.push((model.to_owned(), alias));
                 }
             }
         }
@@ -435,7 +479,7 @@ fn walk_messages(at: &str, t: &DeTable<'_>) -> Result<MessagesFront, WalkError> 
             "belongs to a `listen` address".into(),
             Some(line),
         )),
-        _ => Ok(m),
+        _ => Ok(f),
     }
 }
 
@@ -648,25 +692,41 @@ impl GatewayConfig {
             absolute(&format!("logins[{i}].credentials"), &login.credentials)?;
         }
         self.validate_routes()?;
-        self.validate_messages()
+        self.validate_fronts()
     }
 
-    fn validate_messages(&self) -> Result<(), Fault> {
-        let Some(m) = &self.messages else {
+    fn validate_fronts(&self) -> Result<(), Fault> {
+        let Some(f) = &self.fronts else {
             return Ok(());
         };
-        if m.vendor.trim().is_empty() {
-            return Err(("messages.vendor".into(), "is empty".into()));
-        }
-        if m.models.len() > MAX_MODELS {
-            return Err(too_many(
-                "messages.models".into(),
-                m.models.len(),
-                MAX_MODELS,
+        if f.messages.is_none() && f.openai.is_none() {
+            return Err((
+                "fronts".into(),
+                "serves no front: needs `[fronts.messages]` or `[fronts.openai]`".into(),
             ));
         }
-        for (model, alias) in &m.models {
-            let at = format!("messages.models.\"{model}\"");
+        if f.messages
+            .as_ref()
+            .is_some_and(|m| m.vendor.trim().is_empty())
+        {
+            return Err(("fronts.messages.vendor".into(), "is empty".into()));
+        }
+        if let Some(o) = &f.openai {
+            if o.vendor.trim().is_empty() {
+                return Err(("fronts.openai.vendor".into(), "is empty".into()));
+            }
+            if o.max_tokens == 0 {
+                return Err((
+                    "fronts.openai.max_tokens".into(),
+                    "must be at least 1".into(),
+                ));
+            }
+        }
+        if f.models.len() > MAX_MODELS {
+            return Err(too_many("fronts.models".into(), f.models.len(), MAX_MODELS));
+        }
+        for (model, alias) in &f.models {
+            let at = format!("fronts.models.\"{model}\"");
             if model.is_empty() {
                 return Err((at, "an empty model name".into()));
             }
@@ -722,10 +782,10 @@ impl GatewayConfig {
         self.routes.iter().find(|r| r.alias == alias)
     }
 
-    /// The route a `/v1/messages` request for `model` runs on: the alias `messages.models` maps
-    /// it to, or the alias `model` itself.
+    /// The route a front request for `model` runs on: the alias `fronts.models` maps it to, or
+    /// the alias `model` itself.
     pub fn route_of_model(&self, model: &str) -> Option<&Route> {
-        let models = self.messages.as_ref().map_or(&[][..], |m| &m.models);
+        let models = self.fronts.as_ref().map_or(&[][..], |f| &f.models);
         match models.iter().find(|(name, _)| name == model) {
             Some((_, alias)) => self.route(alias),
             None => self.route(model),
@@ -916,44 +976,85 @@ difficulty = 1
     }
 
     #[test]
-    fn messages_models_map_client_model_names_to_route_aliases() {
+    fn front_models_map_client_model_names_to_route_aliases() {
         let c = check(
             "",
-            "[messages]\nvendor = \"vendor-a\"\nmodels = { \"model-2025-01-01\" = \"chat\" }\n",
+            "[fronts]\nmodels = { \"model-2025-01-01\" = \"chat\" }\n\
+             [fronts.messages]\nvendor = \"vendor-a\"\n\
+             [fronts.openai]\nvendor = \"vendor-b\"\nmax_tokens = 4096\n",
         )
         .unwrap();
         let alias = |model: &str| c.route_of_model(model).map(|r| r.alias.as_str());
         assert_eq!(alias("model-2025-01-01"), Some("chat"));
         assert_eq!(alias("chat"), Some("chat"), "an alias names itself");
         assert_eq!(alias("model-unknown"), None);
-        assert_eq!(c.messages.unwrap().vendor, "vendor-a");
+        let fronts = c.fronts.clone().unwrap();
+        assert_eq!(fronts.messages.unwrap().vendor, "vendor-a");
+        let openai = fronts.openai.unwrap();
+        assert_eq!(
+            (openai.vendor.as_str(), openai.max_tokens),
+            ("vendor-b", 4096)
+        );
         assert_eq!(
             check("", "").unwrap().route_of_model("chat").unwrap().alias,
             "chat"
         );
+        let only_openai = "[fronts.openai]\nvendor = \"v\"\nmax_tokens = 1\n";
+        assert_eq!(
+            check("", only_openai).unwrap().fronts.unwrap().messages,
+            None
+        );
 
+        let messages = "[fronts.messages]\nvendor = \"v\"\n";
         let cases = [
-            ("[messages]\nmodels = {}\n", "messages.vendor: is missing"),
+            ("[fronts]\nmodels = {}\n".into(), "fronts: serves no front"),
             (
-                "[messages]\nvendor = \"v\"\nmodels = { m = \"nope\" }\n",
-                "messages.models.\"m\": unknown route alias `nope`",
+                "[fronts.messages]\nmodels = {}\n".into(),
+                "fronts.messages.models: unknown field",
             ),
             (
-                "[messages]\nvendor = \"v\"\nmodels = { chat = \"chat\" }\n",
-                "messages.models.\"chat\": is a route alias",
+                "[fronts.messages]\n".into(),
+                "fronts.messages.vendor: is missing",
             ),
             (
-                "[messages]\nvendor = \"v\"\nmodels = { m = 1 }\n",
-                "messages.models.\"m\": expected a string, found integer (line 15)",
+                "[fronts.openai]\nvendor = \"v\"\n".into(),
+                "fronts.openai.max_tokens: is missing",
             ),
             (
-                "[messages]\nvendor = \"v\"\nmodels = [\"m\"]\n",
-                "messages.models: expected a table, found array",
+                "[fronts.openai]\nvendor = \"v\"\nmax_tokens = 0\n".into(),
+                "fronts.openai.max_tokens: must be at least 1",
             ),
-            ("[messages]\nvendor = \" \"\n", "messages.vendor: is empty"),
+            (
+                "[fronts.openai]\nvendor = \"v\"\nmax_tokens = -1\n".into(),
+                "fronts.openai.max_tokens: is out of range",
+            ),
+            (
+                "[fronts.openai]\nvendor = \"\"\nmax_tokens = 1\n".into(),
+                "fronts.openai.vendor: is empty",
+            ),
+            (
+                format!("[fronts]\nmodels = {{ m = \"nope\" }}\n{messages}"),
+                "fronts.models.\"m\": unknown route alias `nope`",
+            ),
+            (
+                format!("[fronts]\nmodels = {{ chat = \"chat\" }}\n{messages}"),
+                "fronts.models.\"chat\": is a route alias",
+            ),
+            (
+                format!("[fronts]\nmodels = {{ m = 1 }}\n{messages}"),
+                "fronts.models.\"m\": expected a string, found integer (line 14)",
+            ),
+            (
+                format!("[fronts]\nmodels = [\"m\"]\n{messages}"),
+                "fronts.models: expected a table, found array",
+            ),
+            (
+                "[fronts.messages]\nvendor = \" \"\n".into(),
+                "fronts.messages.vendor: is empty",
+            ),
         ];
         for (extra, want) in cases {
-            let err = check("", extra).unwrap_err();
+            let err = check("", &extra).unwrap_err();
             assert!(err.contains(want), "{extra}: {err}");
         }
     }
@@ -961,9 +1062,10 @@ difficulty = 1
     #[test]
     fn a_loopback_listener_needs_the_client_token_hash() {
         let hash = "ab".repeat(32);
-        let front = |keys: &str| format!("[messages]\nvendor = \"vendor-a\"\n{keys}\n");
+        let front =
+            |keys: &str| format!("[fronts]\n{keys}\n[fronts.messages]\nvendor = \"vendor-a\"\n");
         let listen = |addr: &str| format!("listen = \"{addr}\"\ntoken_sha256 = \"{hash}\"");
-        let m = check(
+        let f = check(
             "",
             &front(&format!(
                 "{}\nping_interval_s = 30",
@@ -971,56 +1073,56 @@ difficulty = 1
             )),
         )
         .unwrap()
-        .messages
+        .fronts
         .unwrap();
-        assert_eq!(m.listen, Some(SocketAddr::from(([127, 0, 0, 1], 8080))));
-        assert_eq!(m.token_sha256, Some(BearerHash([0xab; 32])));
-        assert_eq!(m.ping_interval_s, 30);
-        let m = check("", &front(&listen("[::1]:8080")))
+        assert_eq!(f.listen, Some(SocketAddr::from(([127, 0, 0, 1], 8080))));
+        assert_eq!(f.token_sha256, Some(BearerHash([0xab; 32])));
+        assert_eq!(f.ping_interval_s, 30);
+        let f = check("", &front(&listen("[::1]:8080")))
             .unwrap()
-            .messages
+            .fronts
             .unwrap();
-        assert_eq!(m.listen.map(|a| a.ip().is_loopback()), Some(true));
-        assert_eq!(m.ping_interval_s, 10, "the default");
-        let without = check("", &front("")).unwrap().messages.unwrap();
+        assert_eq!(f.listen.map(|a| a.ip().is_loopback()), Some(true));
+        assert_eq!(f.ping_interval_s, 10, "the default");
+        let without = check("", &front("")).unwrap().fronts.unwrap();
         assert_eq!((without.listen, without.token_sha256), (None, None));
 
         let cases = [
             (
                 listen("0.0.0.0:8080"),
-                "messages.listen: must be a loopback address (line 15)",
+                "fronts.listen: must be a loopback address (line 14)",
             ),
             (
                 listen("192.0.2.1:8080"),
-                "messages.listen: must be a loopback address",
+                "fronts.listen: must be a loopback address",
             ),
             (
                 listen("localhost:8080"),
-                "messages.listen: expected `127.0.0.1:<port>` or `[::1]:<port>`",
+                "fronts.listen: expected `127.0.0.1:<port>` or `[::1]:<port>`",
             ),
             (
                 listen("127.0.0.1:0"),
-                "messages.listen: needs a port other than 0",
+                "fronts.listen: needs a port other than 0",
             ),
             (
                 "listen = \"127.0.0.1:8080\"".into(),
-                "messages.token_sha256: is missing; `listen` needs the client token's hash (line 15)",
+                "fronts.token_sha256: is missing; `listen` needs the client token's hash (line 14)",
             ),
             (
                 listen("127.0.0.1:8080").replace(&hash, "qb-plaintext-token"),
-                "messages.token_sha256: expected the token's SHA-256 as 64 hex characters (line 16)",
+                "fronts.token_sha256: expected the token's SHA-256 as 64 hex characters (line 15)",
             ),
             (
                 format!("token_sha256 = \"{hash}\""),
-                "messages.token_sha256: belongs to a `listen` address",
+                "fronts.token_sha256: belongs to a `listen` address",
             ),
             (
                 "ping_interval_s = 31".into(),
-                "messages.ping_interval_s: must be 1 to 30 (line 15)",
+                "fronts.ping_interval_s: must be 1 to 30 (line 14)",
             ),
             (
                 "ping_interval_s = 0".into(),
-                "messages.ping_interval_s: must be 1 to 30",
+                "fronts.ping_interval_s: must be 1 to 30",
             ),
         ];
         for (keys, want) in cases {
