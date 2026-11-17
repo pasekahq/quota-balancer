@@ -102,6 +102,8 @@ jobs:
           CC_x86_64_unknown_linux_musl: gcc
       - name: Binary size and static linking
         run: ci/budgets.sh target/x86_64-unknown-linux-musl/release/qb
+      - name: Let the gateway cases bind the scripted vendor to loopback port 443
+        run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
       - name: Acceptance lane against the static binary
         run: cargo test --release --locked -p qb --test acceptance -- --ignored --test-threads=1 --nocapture
         env:

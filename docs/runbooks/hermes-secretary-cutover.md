@@ -162,7 +162,6 @@ token for an Anthropic OAuth token, which it would send with another identity.
 ```toml
 socket = "/run/user/<uid>/qb-gateway/gateway.sock"
 qbd_socket = "/run/qb/qb.sock"
-max_turns = 2
 max_attempts = 4
 
 [[logins]]
@@ -194,11 +193,10 @@ ping_interval_s = 10
 vendor = "<gateway-vendor>"
 ```
 
-`max_turns = 2` stays below the shipped unit's `TasksMax=8`: the gateway runs its main thread,
-up to `max_turns` + 2 connection threads and, while a turn connects upstream, one DNS resolver
-thread per turn. At `max_turns = 4` concurrent resolves exceed the limit and the turn whose
-thread cannot start fails. Raise `max_turns` only together with `TasksMax`. A request beyond the
-cap gets a 429 with `retry-after: 1`, which Hermes retries.
+`max_turns` keeps its default 4, which the shipped unit's `TasksMax=8` and `MemoryMax=96M` fit:
+the gateway runs its main thread and up to `max_turns` + 2 connection threads, and resolves the
+vendor's host name on the turn's own thread. Raise `max_turns` only together with `TasksMax` and
+`MemoryMax`. A request beyond the cap gets a 429 with `retry-after: 1`, which Hermes retries.
 
 Every route pins `<gateway-vendor>`, the vendor of `[fronts.messages]`, so Hermes' history holds
 only Anthropic blocks and stays valid after a rollback to direct Anthropic.

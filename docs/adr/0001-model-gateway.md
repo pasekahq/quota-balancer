@@ -153,7 +153,9 @@ There is no async runtime: the gateway uses std threads and blocking I/O.
   line on the C4 front, one SSE event on the Messages front. Only a non-streaming Messages
   request is assembled in memory, from the same events.
 - Each attempt is bounded by a 10 s connect timeout and a 10 min attempt timeout through ureq's
-  timeouts.
+  timeouts. Host names resolve on the turn's own thread, bounded by the system resolver's
+  timeouts: ureq's default resolver would start a thread per connect, and a thread that cannot
+  start aborts the process.
 - Cancel: turns in flight are registered by `request_id` with a cancel flag. Each attempt runs on
   its own ureq agent, and the flag's hook shuts that agent down (`Agent::shutdown`), which shuts
   its upstream TCP stream down. `POST /v1/model/cancel` sets the flag; the turn's blocked read
@@ -230,13 +232,14 @@ A G2 vendor type crate needs its own reason and measured cost under AGENTS.md ru
 |---|---|
 | binary | the same static binary within the existing ≤ 4 MiB (2.5 MiB until 2026-11-17); the gateway links no TLS or HTTP crate the agent does not already link |
 | gateway RSS | idle ≤ 4 MiB; per turn in flight ≲ 1 MiB plus twice its request body |
-| unit memory | `MemoryMax` ≥ `max_turns` × (2 × `max_request_bytes` + 1 MiB) + 4 MiB, 96 MiB for the defaults |
+| unit memory | `MemoryMax` ≥ `max_turns` × (2 × `max_request_bytes` + 1 MiB) + 4 MiB; the formula gives 72 MiB for the defaults and the unit sets 96 MiB, a third as headroom |
+| unit tasks | `TasksMax` ≥ 1 + `max_turns` + 2: the main thread and the connection threads, 8 for the defaults with one for a thread still exiting; upstream connects start no thread |
 | CPU | 0 wake-ups/s idle: no timers, refresh only on demand; p99 ≤ 5 ms from a turn's request to its upstream request, without refresh and TLS handshake |
 | network | 0 idle; one HTTPS request per attempt and one per refresh |
 
-The card that delivers the gateway enforces the binary limit through `ci/budgets.sh` as today,
-adds the RSS and idle wake-up checks to the acceptance lane, and gives `qb-gateway.service` its
-exposure threshold in the `systemd-units` job.
+`ci/budgets.sh` enforces the binary limit, the acceptance lane of the `budgets` job the gateway's
+RSS, idle wake-up and latency targets (`docs/design.md`, "Budgets"), and the `systemd-units` job
+the exposure threshold of `qb-gateway.service`.
 
 ### Terms of service
 
