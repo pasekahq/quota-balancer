@@ -47,6 +47,8 @@ pub mod paths {
     pub const MODEL_ROUTES: &str = "/v1/model/routes";
     /// Gateway, `POST`: stop a running turn of the caller.
     pub const MODEL_CANCEL: &str = "/v1/model/cancel";
+    /// Gateway, `POST`: an Anthropic Messages request, answered in the Messages format.
+    pub const MESSAGES: &str = "/v1/messages";
 }
 
 /// `POST /v1/pick` request.

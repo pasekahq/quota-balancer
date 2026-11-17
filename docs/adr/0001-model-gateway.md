@@ -200,8 +200,8 @@ are dropped by the core.
 - The C4 front, `POST /v1/model/turn`, `GET /v1/model/routes` and `POST /v1/model/cancel` on the
   unix socket, maps C4 requests to the canonical form and writes NDJSON events.
 - The Messages front, `POST /v1/messages` on the unix socket and on the optional loopback port,
-  maps an Anthropic Messages request to the canonical form, takes its `model` as a route alias,
-  and writes Messages SSE events or one JSON body for `stream: false`.
+  maps an Anthropic Messages request to the canonical form, maps its `model` to a route alias by
+  config, and writes Messages SSE events or one JSON body for `stream: false`.
 
 Neither front has pick, report, rotation or credential logic of its own.
 

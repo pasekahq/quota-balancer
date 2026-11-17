@@ -150,6 +150,8 @@ when it expires within 60 s or the vendor answered 401, through the vendor's OAu
 - `POST` to the login's `token_url`, else to `https://platform.claude.com/v1/oauth/token` and,
   when that fails in transport or with a 5xx, to `https://console.anthropic.com/v1/oauth/token`;
   ureq with rustls, no proxy, no redirects, 10 s to connect and 30 s per request;
+- `user-agent` `axios/1.7.9`, the vendor CLI's HTTP client (`identity::OAUTH_TOKEN_USER_AGENT`):
+  the token endpoint throttles the CLI's own inference user agent;
 - body `application/x-www-form-urlencoded`: `grant_type=refresh_token`, `refresh_token`, and
   `client_id` `9d1c250a-e61b-44d9-88ed-5944d1962f5e`, the vendor CLI's public OAuth client id
   (`identity::OAUTH_CLIENT_ID`; the endpoints are `identity::OAUTH_TOKEN_URLS`);
@@ -160,13 +162,30 @@ when it expires within 60 s or the vendor answered 401, through the vendor's OAu
 | Answer | Result |
 |---|---|
 | 2xx with the required fields | the new tokens, written back to the credential file |
-| 400, 401, or any answer with `"error": "invalid_grant"` | refused: the login is `auth_dead` until a new sign-in, the turn moves to the next login |
+| 400, 401, or another non-5xx answer with `"error": "invalid_grant"` | refused: the login is `auth_dead` until a new sign-in, the turn moves to the next login |
 | transport failure or 5xx at every endpoint, another status, a malformed 2xx | failed: the turn ends `unavailable`, retryable |
 
 A refresh error names the endpoint, the status and the OAuth `error` code, never a body, header
 or token.
 
 ## The `/v1/messages` front
+
+`qb gateway` serves `POST /v1/messages` on its unix socket to the peers of its C4 front, when its
+config has a `[messages]` table ([config.md](config.md#gateway-config)), in
+`crates/qb/src/gateway/messages.rs`. `model` is a client model name of `messages.models` or a
+route alias; `native_vendor` is `messages.vendor`. Request headers other than the framing are ignored: `anthropic-version`,
+`anthropic-beta`, `x-api-key` and the SDK's own leave the turn as it is. The decoded turn runs
+through the same core as a C4 turn, with the same rotation, and the answer is:
+
+- `stream: true`: `200` with `content-type: text/event-stream`, one chunk per canonical event
+  from `front::SseEncoder`; an error after the first event is an SSE `error` event;
+- `stream: false`: one `front::Assembler` body as `application/json` once the turn ended;
+- an error before the first event, an error of a non-streaming turn and a rejected request:
+  `front::error_response` as status, `retry-after`, `x-should-retry` and Messages error body;
+  a request the gateway cannot read is `invalid_request_error` with 400, 411 or 413, another
+  method than `POST` with 405, and without `[messages]` the endpoint answers 404.
+
+A client closing its connection cancels the turn and shuts the upstream connection down.
 
 `front::decode_request(body, request_id, native_vendor, route_of)`:
 

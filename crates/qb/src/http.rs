@@ -166,12 +166,14 @@ fn reason_phrase(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         411 => "Length Required",
         413 => "Content Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
+        529 => "Overloaded",
         _ => "Unknown",
     }
 }
@@ -181,13 +183,30 @@ fn reason_phrase(status: u16) -> &'static str {
 /// # Errors
 /// Socket errors.
 pub fn write_response<W: Write>(w: &mut W, status: u16, body: &[u8]) -> io::Result<()> {
+    write_response_with(w, status, &[], body)
+}
+
+/// [`write_response`] with the further headers `headers`.
+///
+/// # Errors
+/// Socket errors.
+pub fn write_response_with<W: Write>(
+    w: &mut W,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> io::Result<()> {
     let mut out = Vec::with_capacity(128 + body.len());
     write!(
         out,
-        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
         reason_phrase(status),
         body.len()
     )?;
+    for (name, value) in headers {
+        write!(out, "{name}: {value}\r\n")?;
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
     out.extend_from_slice(body);
     w.write_all(&out)?;
     w.flush()

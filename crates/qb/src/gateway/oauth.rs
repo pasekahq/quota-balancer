@@ -63,6 +63,7 @@ impl AnthropicOauth {
             .post(url)
             .header("content-type", "application/x-www-form-urlencoded")
             .header("accept", "application/json")
+            .header("user-agent", identity::OAUTH_TOKEN_USER_AGENT)
             .send(body)
             .map_err(|e| Failed::Next(format!("{url}: request failed: {e}")))?;
         let status = response.status().as_u16();

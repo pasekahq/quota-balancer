@@ -29,6 +29,9 @@ pub mod identity {
     pub const API_KEY_USER_AGENT: &str = "qb-gateway";
     /// The vendor CLI's public OAuth client id, sent with every token refresh.
     pub const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+    /// `user-agent` of token requests, the one the vendor CLI's HTTP client sends; the token
+    /// endpoint throttles [`OAUTH_USER_AGENT`].
+    pub const OAUTH_TOKEN_USER_AGENT: &str = "axios/1.7.9";
     /// OAuth token endpoints of the vendor, the primary first.
     pub const OAUTH_TOKEN_URLS: [&str; 2] = [
         "https://platform.claude.com/v1/oauth/token",

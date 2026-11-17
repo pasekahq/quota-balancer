@@ -216,7 +216,8 @@ with the same exit code 2 and one-line errors naming the field path and line. De
 it: [ADR 0001](adr/0001-model-gateway.md); its API: [api.md](api.md#model-gateway-v1model).
 Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml).
 
-Top-level keys come before the tables:
+Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`,
+`[messages]`):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -225,7 +226,7 @@ Top-level keys come before the tables:
 | `qbd_socket` | string | Absolute path of `qbd`'s socket, default `/run/qb/qb.sock`. |
 | `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`; without it `qbd` identifies the gateway by uid. |
 | `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
-| `max_request_bytes` | integer | Largest body of `POST /v1/model/turn`, default 8388608, at most 33554432; other requests take at most 64 KiB. |
+| `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and `POST /v1/messages`, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Picks per turn, default 4. |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
@@ -285,3 +286,11 @@ directories and nowhere else.
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
+
+`[messages]`, optional: the `POST /v1/messages` front ([anthropic.md](anthropic.md#the-v1messages-front)).
+Without it that endpoint answers 404.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `vendor` | string | Required. The `qbd` vendor whose logins speak the Anthropic API: its thinking blocks reach clients as Anthropic blocks, and the thinking blocks clients send back count as its own. |
+| `models` | table of strings | Client `model` names, each mapped to a route alias, at most 256; for example `{ "claude-sonnet-4-5-20250929" = "chat" }`. A `model` equal to an alias needs no entry; a key may not be an alias, and a value must be one. Any other `model` is answered 400 `invalid_request_error`. |

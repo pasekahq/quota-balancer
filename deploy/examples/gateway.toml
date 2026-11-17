@@ -11,6 +11,8 @@ max_attempts = 4
 name = "login-1"
 kind = "oauth_anthropic"
 credentials = "/var/lib/qb-gateway/credentials/login-1.json"
+# Refreshes go to the vendor's token endpoints; a token_url replaces them.
+# token_url = "https://auth.example.com/v1/oauth/token"
 
 [[logins]]
 name = "login-2"
@@ -36,3 +38,9 @@ alias = "compact"
 role = "gateway"
 vendor = "vendor-a"
 model = "model-small"
+
+# POST /v1/messages for Anthropic SDK clients: the qbd vendor of the logins above, and the model
+# names clients send mapped to route aliases; a model equal to an alias needs no entry.
+[messages]
+vendor = "vendor-a"
+models = { "model-large-2025-01-01" = "chat", "model-small-2025-01-01" = "compact" }
