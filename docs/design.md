@@ -178,10 +178,10 @@ refreshes the login for later picks.
 | disk | ≤ ~150 B per pick, or 0 with `journal = off`; the gateway writes only refreshed credential files |
 | network | 0 idle; agent ≤ 1 small HTTPS GET per login per TTL, only on demand; gateway one HTTPS request per attempt and one per token refresh |
 
-CI enforces the binary, daemon RSS, latency, wake-up and `journal = off` budgets in the
-`budgets` job; the gateway's RSS, latency and wake-up targets join it with the gateway itself.
-`ci/budgets.sh` checks the size and static linking of the musl release binary. The acceptance
-lane, `crates/qb/tests/acceptance.rs`, runs that binary as the daemon:
+CI enforces the binary budget, the daemon's RSS, latency, wake-up and `journal = off` budgets and
+the gateway's RSS, latency and wake-up budgets in the `budgets` job. `ci/budgets.sh` checks the
+size and static linking of the musl release binary. The acceptance lane,
+`crates/qb/tests/acceptance.rs`, runs that binary as the daemon and as `qb gateway`:
 
 - the three policy scenarios of the roadmap, with reports and picks over the socket;
 - 10⁴ picks, each released by a report, one connection per request, journal on: it prints the
@@ -189,13 +189,21 @@ lane, `crates/qb/tests/acceptance.rs`, runs that binary as the daemon:
   `VmHWM` above 4096 kB;
 - the same picks with `journal = off`: it fails unless the daemon's `write_bytes` is 0;
 - an idle daemon with a parked agent and hooks: it fails on any context switch over 10 s;
-- an agent's probe back-off after a failed probe.
+- an agent's probe back-off after a failed probe;
+- `qb gateway` with its default caps and loopback listener, a daemon, and a scripted vendor on
+  loopback port 443, the only port the gateway's sandbox connects to: it fails on an idle
+  gateway `VmHWM` above 4096 kB, on a `VmHWM` above 4096 kB + 1 MiB + twice the request body
+  after 20 turns of a 1 MiB body, on any context switch of an idle gateway over 10 s, and on a
+  p99 above 5 ms from the client's connect to the vendor holding the upstream request over 300
+  turns.
 
 These tests are timing-bound and `#[ignore]`d, so `cargo test --workspace` skips them. The binary
-comes from `QB_ACCEPTANCE_BIN`, an absolute path, or else the cargo-built one. On a shared host
-the timings measure the neighbours, so run the lane locally only on an idle machine:
+comes from `QB_ACCEPTANCE_BIN`, an absolute path, or else the cargo-built one. The gateway cases
+bind port 443, so the lane needs `net.ipv4.ip_unprivileged_port_start` at most 443. On a shared
+host the timings measure the neighbours, so run the lane locally only on an idle machine:
 
 ```sh
+sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
 QB_ACCEPTANCE_BIN="$PWD/target/x86_64-unknown-linux-musl/release/qb" \
   cargo test --release --locked -p qb --test acceptance -- --ignored --test-threads=1 --nocapture
 ```

@@ -37,9 +37,13 @@ MemoryDenyWriteExecute=yes
 #ProtectHome=read-only
 #PrivateTmp=yes
 UMask=0077
-# max_turns x (2 x max_request_bytes + 1 MiB) + 4 MiB, rounded up, for the defaults.
+# max_turns x (2 x max_request_bytes + 1 MiB) + 4 MiB is 72 MiB for the defaults; 96M adds a third
+# as headroom. Raise with max_turns or max_request_bytes.
 MemoryMax=96M
-# The main thread, max_turns turn threads and 2 for routes, cancel and health; raise with max_turns.
+# The main thread and up to max_turns + 2 connection threads (turns, then routes, cancel and
+# health), 7 for the defaults, plus one for a connection thread still exiting. Host names resolve
+# on the turn's own thread, so an upstream connect starts no thread; a connection whose thread
+# cannot start is dropped with a warning. Raise with max_turns.
 TasksMax=8
 
 [Install]

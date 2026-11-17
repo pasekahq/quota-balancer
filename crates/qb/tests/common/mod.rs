@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 use qb::client::call;
 use qb_proto::{LoginStatus, PickResponse, ReportResponse, StateResponse, paths};
 
+pub mod vendor;
+
 /// Room for the directory and file names a test adds under the base.
 const NAME_ROOM: usize = 40;
 

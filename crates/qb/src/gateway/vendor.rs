@@ -1,12 +1,14 @@
 //! What the vendor adapters share: one ureq agent with rustls per attempt, which the turn's
-//! cancel hook shuts down so a blocked connect, write or read returns at once; the secret header
-//! built in a zeroizing string; the bounded error body; the read loop that feeds a stream parser
-//! and hands its events to the sink.
+//! cancel hook shuts down so a blocked connect, write or read returns at once, and which resolves
+//! host names on the calling thread; the secret header built in a zeroizing string; the bounded
+//! error body; the read loop that feeds a stream parser and hands its events to the sink.
 
 use std::io::{self, Read};
 use std::time::Duration;
 
 use qb_proto::{StopReason, StreamEvent};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use zeroize::Zeroizing;
 
 use super::upstream::{CancelToken, Failure, FailureKind, Flow, Sink};
@@ -33,6 +35,32 @@ pub fn attempt_config() -> ureq::config::Config {
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(ATTEMPT_TIMEOUT))
         .build()
+}
+
+/// ureq's resolver with no deadline, so a lookup runs on the calling thread: given one, it
+/// spawns a thread per lookup, and a failed spawn aborts the process under `panic = "abort"`.
+/// The system resolver's own timeouts bound the lookup.
+#[derive(Debug, Default)]
+struct OnCaller(DefaultResolver);
+
+impl Resolver for OnCaller {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        self.0.resolve(uri, config, NextTimeout::default())
+    }
+}
+
+/// An agent of `config` that resolves host names on the calling thread.
+pub(super) fn agent(config: &ureq::config::Config) -> ureq::Agent {
+    ureq::Agent::with_parts(
+        config.clone(),
+        DefaultConnector::default(),
+        OnCaller::default(),
+    )
 }
 
 fn cancelled() -> Failure {
@@ -72,7 +100,7 @@ pub(super) fn send(
     secret: &str,
     cancel: &CancelToken,
 ) -> Result<Answer, Failure> {
-    let agent = ureq::Agent::new_with_config(config.clone());
+    let agent = agent(config);
     let stop = agent.clone();
     cancel.on_cancel(Box::new(move || stop.shutdown()));
     let (name, prefix) = req.secret_header;
@@ -156,5 +184,29 @@ impl Answer {
                 return Ok(stop);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use ureq::Timeout;
+    use ureq::unversioned::transport::time;
+
+    use super::*;
+
+    #[test]
+    fn a_lookup_ends_on_the_calling_thread_with_no_time_left() {
+        let uri: ureq::http::Uri = "http://127.0.0.1:443/v1/messages".parse().unwrap();
+        let spent = NextTimeout {
+            after: time::Duration::Exact(Duration::ZERO),
+            reason: Timeout::Resolve,
+            per_read: None,
+            per_write: None,
+        };
+        let found = OnCaller::default().resolve(&uri, &attempt_config(), spent);
+        let at = SocketAddr::from((Ipv4Addr::LOCALHOST, 443));
+        assert_eq!(found.unwrap().to_vec(), [at]);
     }
 }

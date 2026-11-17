@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use super::config::{CredentialKind, GatewayConfig};
 use super::creds::{RefreshError, Refreshed, Refresher, Secret};
-use super::vendor::CONNECT_TIMEOUT;
+use super::vendor::{self, CONNECT_TIMEOUT};
 use crate::server::unix_now;
 
 /// Bound of one token request, from connect to the end of the answer.
@@ -58,7 +58,7 @@ impl AnthropicOauth {
 
     /// One token request to `url` with the form `body`.
     fn post(&self, url: &str, body: &[u8]) -> Result<Refreshed, Failed> {
-        let agent = ureq::Agent::new_with_config(self.config.clone());
+        let agent = vendor::agent(&self.config);
         let mut response = agent
             .post(url)
             .header("content-type", "application/x-www-form-urlencoded")
