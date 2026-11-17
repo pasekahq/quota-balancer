@@ -12,8 +12,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
@@ -121,10 +121,11 @@ struct Written<'a> {
     expires_at: u64,
 }
 
-/// Loads credentials and refreshes expired OAuth tokens, one refresh at a time.
+/// Loads credentials and refreshes expired OAuth tokens, one refresh per login at a time.
 pub struct CredentialStore {
     refresher: Box<dyn Refresher>,
-    refreshing: Mutex<()>,
+    /// The refresh lock of each login that refreshed so far.
+    refreshing: Mutex<Vec<(String, Arc<Mutex<()>>)>>,
 }
 
 impl CredentialStore {
@@ -132,8 +133,21 @@ impl CredentialStore {
     pub fn new(refresher: Box<dyn Refresher>) -> Self {
         Self {
             refresher,
-            refreshing: Mutex::new(()),
+            refreshing: Mutex::new(Vec::new()),
         }
+    }
+
+    fn refresh_lock(&self, login: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .refreshing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, l)) = locks.iter().find(|(name, _)| name == login) {
+            return Arc::clone(l);
+        }
+        let l = Arc::new(Mutex::new(()));
+        locks.push((login.to_owned(), Arc::clone(&l)));
+        l
     }
 
     /// The credential of `login` in `file`, which must hold `kind`, at `now`. An OAuth token expiring within
@@ -180,10 +194,8 @@ impl CredentialStore {
                 access_token: token,
             });
         }
-        let _one = self
-            .refreshing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = self.refresh_lock(login);
+        let _one = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let again = read(file)?;
         let current = secret(file, "access_token", again.access_token.as_ref())?;
         let replaced = *current != *token
@@ -356,8 +368,9 @@ pub fn write_atomic(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::*;
 
@@ -559,6 +572,57 @@ mod tests {
             s.load("login-1", &f, KIND, NOW, true).unwrap();
         }
         reader.join().unwrap();
+    }
+
+    /// Blocks the refresh of `login-1` until `release` gets a message; others refresh at once.
+    struct Stuck {
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Refresher for Stuck {
+        fn refresh(&self, login: &str, _: &str) -> Result<Refreshed, RefreshError> {
+            if login == "login-1" {
+                self.entered.lock().unwrap().send(()).unwrap();
+                let release = self.release.lock().unwrap();
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            Ok(Refreshed {
+                access_token: Zeroizing::new(format!("access-{login}")),
+                refresh_token: None,
+                expires_at: NOW + 3600,
+            })
+        }
+    }
+
+    #[test]
+    fn a_hanging_refresh_blocks_only_its_own_login() {
+        let (entered, on_enter) = mpsc::channel();
+        let (release, on_release) = mpsc::channel();
+        let s = Arc::new(CredentialStore::new(Box::new(Stuck {
+            entered: Mutex::new(entered),
+            release: Mutex::new(on_release),
+        })));
+        let one = file("one", &oauth("access-0", NOW), 0o600);
+        let two = file("two", &oauth("access-0", NOW), 0o600);
+        let stuck = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.load("login-1", &one, KIND, NOW, true).unwrap())
+        };
+        on_enter.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (done, finished) = mpsc::channel();
+        let other = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || {
+                let c = s.load("login-2", &two, KIND, NOW, true).unwrap();
+                done.send(c.secret().to_owned()).unwrap();
+            })
+        };
+        let got = finished.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        assert_eq!(got.as_deref(), Ok("access-login-2"));
+        other.join().unwrap();
+        assert_eq!(stuck.join().unwrap().secret(), "access-login-1");
     }
 
     #[test]
