@@ -119,6 +119,8 @@ jobs:
               qbd.service) threshold=15 ;;
               # Measured 6.9: a user unit keeps namespace options off, unprivileged userns is often restricted.
               qb-agent.service) threshold=69 ;;
+              # Measured 6.2: a user unit like the agent's, with RestrictNamespaces on top.
+              qb-gateway.service) threshold=62 ;;
               *) echo "::error file=$unit::no exposure threshold for $unit"; status=1; continue ;;
             esac
             systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit" || status=1

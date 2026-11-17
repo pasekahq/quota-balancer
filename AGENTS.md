@@ -6,8 +6,8 @@ Read this before changing anything. `README.md` is for humans; this file is for 
 
 `qb` is a pre-flight quota scheduler for coding-agent subscriptions: one static Rust binary with
 the roles `qbd` daemon, `qb agent`, `qb` CLI and the optional `qb gateway` (model traffic for its
-credential owner, decided in `docs/adr/0001-model-gateway.md`, not built yet) and a JSON `/v1`
-API over HTTP/1.1 on a unix socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan:
+credential owner, decided in `docs/adr/0001-model-gateway.md`; no vendor adapter is linked yet)
+and a JSON `/v1` API over HTTP/1.1 on a unix socket. Design: `docs/design.md`. Contract: `docs/api.md`. Plan:
 `docs/roadmap.md`. Decisions: `docs/adr/`.
 
 ## Layout
@@ -17,7 +17,7 @@ API over HTTP/1.1 on a unix socket. Design: `docs/design.md`. Contract: `docs/ap
 | `crates/qb-core` | Pure policy: state, `pick`, `report`, leases. **No I/O, no clock, no `unsafe`.** The caller passes `now`. |
 | `crates/qb-proto` | Wire types of `/v1`. Every message is declared here exactly once. Fixtures in `tests/fixtures/`. |
 | `crates/qb-vendors` | Pure, total parsers of vendor quota data (stream-json, statusline, rollouts, usage endpoints) into `qb-proto` window reports. Rules in `docs/vendors.md`; fixtures in `tests/fixtures/`. |
-| `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs` (probe loop, HTTPS fetcher), `sandbox.rs` (agent hardening), `main.rs` (CLI). |
+| `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `agent.rs` (probe loop, HTTPS fetcher), `sandbox.rs` (agent and gateway hardening), `gateway/` (`qb gateway`: `config.rs`, `creds.rs` credential files and refresh, `upstream.rs` the adapter seam, `core.rs` pick/report/rotation, `front.rs` the C4 front), `main.rs` (CLI). |
 | `deploy/systemd/` | Unit templates with hardening. |
 | `ci/budgets.sh` | Binary size and static-link checks; the other budgets are the acceptance lane (`docs/design.md`, "Budgets"). |
 | `clients/python/` | `qb_client.py`: single-file stdlib client (Python ≥ 3.9) to copy in; `contract.rs` drives it through `contract_driver.py`, so `cargo test` needs `python3`. |
@@ -45,6 +45,7 @@ for unit in deploy/systemd/*.service; do
   case "${unit##*/}" in
     qbd.service) threshold=15 ;;
     qb-agent.service) threshold=69 ;;
+    qb-gateway.service) threshold=62 ;;
     *) echo "no exposure threshold for $unit"; continue ;;
   esac
   systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit"
