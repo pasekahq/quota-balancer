@@ -7,13 +7,16 @@
 //! loop, so leases and probes are consistent without locks.
 
 use std::convert::Infallible;
-use std::io::{self, Read};
+use std::io;
+use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qb_core::Core;
 use qb_proto::{ErrorCode, paths};
 use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::net::RecvFlags;
+use rustix::net::sockopt::{Timeout, set_socket_timeout};
 
 use crate::api::{self, Answer, Env, Reply};
 use crate::auth::{Denied, Gate};
@@ -214,7 +217,7 @@ impl Conn<'_> {
                     }
                 }
             }
-            Err(ReadError::Closed | ReadError::Io(_)) => return,
+            Err(ReadError::Closed | ReadError::Io(_) | ReadError::Refused { .. }) => return,
             Err(ReadError::Malformed) => {
                 api::error(ErrorCode::BadRequest, "malformed HTTP request")
             }
@@ -222,7 +225,7 @@ impl Conn<'_> {
                 api::error(ErrorCode::PayloadTooLarge, "request too large")
             }
             Err(ReadError::BodyTooLarge { unread }) => {
-                discard(&mut stream, unread);
+                discard(&stream, unread);
                 api::error(ErrorCode::PayloadTooLarge, "request too large")
             }
             Err(ReadError::LengthRequired) => {
@@ -263,7 +266,7 @@ fn park(
 
 fn send(stream: &mut UnixStream, reply: &Reply) {
     if reply.status >= 400 {
-        drain_pending(stream);
+        drain_pending(&*stream);
     }
     if let Err(e) = http::write_response(stream, reply.status, &reply.body) {
         log::warn(&format!("write of a {} reply failed: {e}", reply.status));
@@ -275,40 +278,36 @@ const DRAIN_CAP: usize = 1024 * 1024;
 
 /// Reads and drops up to `len` declared body bytes within one I/O timeout, so a client still
 /// writing an oversized body finishes its write and reads the 413 instead of `EPIPE`.
-pub(crate) fn discard(stream: &mut UnixStream, len: usize) {
+pub(crate) fn discard(stream: impl AsFd, len: usize) {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut left = len.min(DRAIN_CAP);
     let mut scratch = [0u8; 4096];
     while left > 0 {
         let wait = deadline.saturating_duration_since(Instant::now());
-        if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
+        if wait.is_zero() || set_socket_timeout(&stream, Timeout::Recv, Some(wait)).is_err() {
             break;
         }
         let take = left.min(scratch.len());
-        match stream.read(&mut scratch[..take]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => left -= n,
+        match rustix::net::recv(&stream, &mut scratch[..take], RecvFlags::empty()) {
+            Ok((0, _)) | Err(_) => break,
+            Ok((n, _)) => left -= n,
         }
     }
 }
 
 /// Reads whatever the peer already sent and we did not consume, without blocking.
 ///
-/// Closing a unix stream socket with unread input makes the peer's next read fail with
+/// Closing a stream socket with unread input makes the peer's next read fail with
 /// `ECONNRESET`, so a client that sent an oversized or rejected body would lose our error reply.
-pub(crate) fn drain_pending(stream: &mut UnixStream) {
-    if stream.set_nonblocking(true).is_err() {
-        return;
-    }
+pub(crate) fn drain_pending(stream: impl AsFd) {
     let mut scratch = [0u8; 4096];
     let mut total = 0;
     while total < DRAIN_CAP {
-        match stream.read(&mut scratch) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => total += n,
+        match rustix::net::recv(&stream, &mut scratch, RecvFlags::DONTWAIT) {
+            Ok((0, _)) | Err(_) => break,
+            Ok((n, _)) => total += n,
         }
     }
-    let _ = stream.set_nonblocking(false);
 }
 
 #[cfg(test)]

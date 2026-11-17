@@ -40,17 +40,21 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
     std::fs::write(&outside, "outside").unwrap();
     let qbd = dir.join("qb.sock");
     let _qbd = UnixListener::bind(&qbd).unwrap();
+    // The Messages front's listener, bound before the sandbox; a client waits in its backlog.
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = tcp.local_addr().unwrap().port();
+    let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let config = qb::gateway::config::parse(
         Path::new("gateway.toml"),
         &format!(
             "socket = \"{}\"\nqbd_socket = \"{}\"\n\
              [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\napi = \"anthropic\"\ncredentials = \"{}\"\n\
-             [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n",
+             [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n\
+             [messages]\nvendor = \"vendor-a\"\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\n",
             dir.join("gw.sock").display(),
             qbd.display(),
-            credential.display()
+            credential.display(),
+            "0".repeat(64)
         ),
     )
     .unwrap();
@@ -64,6 +68,12 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
         assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
         qb::gateway::creds::write_atomic(&written, br#"{"type":"api_key","key":"k2"}"#).unwrap();
         assert!(UnixStream::connect(&qbd).is_ok(), "qbd stays reachable");
+        let (accepted, _) = tcp.accept().unwrap();
+        assert_eq!(
+            accepted.peer_addr().unwrap(),
+            client.local_addr().unwrap(),
+            "the listener made before the sandbox still serves"
+        );
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
             assert_eq!(gaps, Vec::<String>::new());
@@ -82,7 +92,7 @@ fn gateway_may_rewrite_credentials_and_reach_qbd_only() {
             let denied = TcpStream::connect(("127.0.0.1", port)).unwrap_err();
             assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
             let denied = TcpListener::bind("127.0.0.1:0").unwrap_err();
-            assert_eq!(denied.kind(), ErrorKind::PermissionDenied, "no bind");
+            assert_eq!(denied.kind(), ErrorKind::PermissionDenied, "no other bind");
         } else {
             eprintln!("landlock {abi:?}: warning branch");
             assert!(gaps.iter().any(|g| g.contains("landlock")), "{gaps:?}");

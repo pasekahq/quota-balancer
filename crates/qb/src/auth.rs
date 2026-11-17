@@ -4,11 +4,16 @@
 use std::time::Instant;
 
 use crate::api::Caller;
-use crate::config::{Client, Limits};
+use crate::config::{BearerHash, Client, Limits};
 use crate::sha256;
 
 /// Most buckets kept when no clients are declared and callers are keyed by uid.
 pub const MAX_UID_BUCKETS: usize = 64;
+
+/// Whether `token` hashes to `hash`, compared in constant time.
+pub fn token_matches(token: &str, hash: &BearerHash) -> bool {
+    sha256::ct_eq(&sha256::digest(token.as_bytes()), &hash.0)
+}
 
 /// Why a request is refused before routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,12 +78,11 @@ impl Gate {
 
     fn identify(&self, uid: Option<u32>, bearer: Option<&str>) -> Option<Caller> {
         let name = if let Some(token) = bearer {
-            let hash = sha256::digest(token.as_bytes());
             // Every configured hash is compared so the time does not depend on which one matches.
             let mut found = None;
             for c in &self.clients {
                 if let Some(h) = &c.bearer_sha256 {
-                    if sha256::ct_eq(&hash, &h.0) {
+                    if token_matches(token, h) {
                         found = Some(&c.name);
                     }
                 }
@@ -143,7 +147,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::BearerHash;
 
     fn client(name: &str, uid: Option<u32>, token: Option<&str>) -> Client {
         Client {

@@ -44,3 +44,9 @@ model = "model-small"
 [messages]
 vendor = "vendor-a"
 models = { "model-large-2025-01-01" = "chat", "model-small-2025-01-01" = "compact" }
+# Also on loopback TCP, for clients with base URL http://127.0.0.1:8080 and the local client
+# token as their API key; the SHA-256 of the token (docs/config.md shows how to make one).
+listen = "127.0.0.1:8080"
+token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# Seconds of silence in a started stream before an SSE ping, at most 30.
+ping_interval_s = 10
