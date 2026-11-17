@@ -69,16 +69,20 @@ The optional `qb gateway` role as decided in [ADR 0001](adr/0001-model-gateway.m
 
 ## G2: model gateway, OpenAI and Codex, keys, OpenRouter, chains
 
-1. OpenAI Responses adapter: ChatGPT/Codex OAuth (account id, refresh) and API keys.
-2. Chat Completions adapter for OpenRouter and other API keys.
-3. Cross-vendor fallback: foreign thinking blocks dropped, tool call ids stable across
+1. OpenAI Responses upstream: ChatGPT subscription logins (`chatgpt_oauth`, access token and
+   account id) and OpenAI API keys, rotated like Anthropic logins.
+2. OpenAI fronts: `POST /v1/chat/completions` and `POST /v1/responses` on the same core, on the
+   unix socket and the loopback port, so OpenAI SDK clients run on any login.
+3. Chat Completions adapter for OpenRouter and other API keys.
+4. Cross-vendor fallback: foreign thinking blocks dropped, tool call ids stable across
    vendors, end-to-end test of a chain that falls from one vendor to the next.
-4. Chains across vendors in the route config, and a config reload (`qb reload` or `SIGHUP`)
+5. Chains across vendors in the route config, and a config reload (`qb reload` or `SIGHUP`)
    that does not cut streams in flight.
-5. Spend cap per API key, from the cost of reported usage.
-6. Login import and login: `qb login import` from existing credential files by path,
-   without printing values; `qb login` with PKCE for Anthropic and OpenAI.
-7. CI and budgets green, `docs/config.md` with neutral examples.
+6. Spend cap per API key, from the cost of reported usage.
+7. Login import and login: `qb login import` from existing credential files by path,
+   without printing values; `qb login` with PKCE for Anthropic and OpenAI; refresh of ChatGPT
+   tokens.
+8. CI and budgets green, `docs/config.md` with neutral examples.
 
 ## S2 — several hosts
 

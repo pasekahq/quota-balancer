@@ -245,9 +245,9 @@ or put the socket in a directory outside it.
 | Key | Type | Meaning |
 |---|---|---|
 | `name` | string | Login name as declared in `qbd`'s `[[logins]]`. |
-| `kind` | `"oauth_anthropic"` or `"api_key"` | Credential type; it selects the adapter's auth mode and must match the file's `type`. |
-| `api` | `"anthropic"` or `"openai"` | The vendor API family the login speaks; it selects the adapter, and a login whose family has no adapter in this build ends its turns `unavailable`. `"anthropic"` (the default) for an `oauth_anthropic` login; required for an `api_key` login. |
-| `base_url` | string | Base URL of the vendor API, default the family's public endpoint (`https://api.anthropic.com` for `anthropic`). `https://` on port 443, or `http://` with a loopback host (`localhost`, `127.0.0.0/8`, `::1`); an optional path, no user, query or fragment. |
+| `kind` | `"oauth_anthropic"`, `"chatgpt_oauth"` or `"api_key"` | Credential type; it selects the adapter's auth mode and must match the file's `type`. |
+| `api` | `"anthropic"` or `"openai"` | The vendor API family the login speaks; it selects the adapter. `"anthropic"` (the default) for an `oauth_anthropic` login, `"openai"` (the default) for a `chatgpt_oauth` login; required for an `api_key` login. |
+| `base_url` | string | Base URL of the vendor API, default the family's public endpoint: `https://api.anthropic.com` for `anthropic`, below which the gateway calls `/v1/messages`; for `openai` the URL below which it calls `/responses`, `https://api.openai.com/v1` for a key and `https://chatgpt.com/backend-api/codex` for a ChatGPT login. `https://` on port 443, or `http://` with a loopback host (`localhost`, `127.0.0.0/8`, `::1`); an optional path, no user, query or fragment. |
 | `token_url` | string | Only for an `oauth_anthropic` login: the full URL of the OAuth token endpoint its refreshes go to, instead of the vendor's endpoints ([anthropic.md](anthropic.md#oauth-token-refresh)). Same rules as `base_url`. |
 | `credentials` | string | Absolute path of the credential file. |
 
@@ -265,12 +265,17 @@ mode 0600; anything else is refused:
 
 ```json
 {"type": "oauth_anthropic", "access_token": "...", "refresh_token": "...", "expires_at": 1800000000}
+{"type": "chatgpt_oauth", "access_token": "...", "account_id": "..."}
 {"type": "api_key", "key": "..."}
 ```
 
-An OAuth token expiring within 60 s, or rejected by the vendor, is refreshed and the file
-replaced atomically (temporary 0600 file in the same directory, fsync, rename, fsync of the
-directory). The gateway may create, write and remove files in the credential files'
+An `oauth_anthropic` token expiring within 60 s, or rejected by the vendor, is refreshed and the
+file replaced atomically (temporary 0600 file in the same directory, fsync, rename, fsync of the
+directory). A `chatgpt_oauth` file holds the access token of a ChatGPT subscription login and
+its account id ([openai.md](openai.md#serving-the-upstream)); it may also hold `refresh_token`
+and `expires_at`, which the gateway does not read. The gateway does not refresh it: an expired or
+rejected token is an `auth` failure: the attempt is reported to `qbd` as `http_401` and the
+turn moves to the next login. Any other field is refused. The gateway may create, write and remove files in the credential files'
 directories and nowhere else.
 
 `[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to one `qbd` pick target.

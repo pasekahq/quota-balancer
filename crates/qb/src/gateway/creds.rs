@@ -1,10 +1,13 @@
 //! The gateway's credential files: one JSON file per login, mode 0600, owned by the gateway's
-//! user, read for one attempt and zeroized. An expired OAuth token is refreshed through a
-//! [`Refresher`] and written back atomically. No error message ever quotes a file's contents.
+//! user, read for one attempt and zeroized. An expired `oauth_anthropic` token is refreshed
+//! through a [`Refresher`] and written back atomically; a `chatgpt_oauth` token is used as it is
+//! and its `refresh_token` and `expires_at`, if present, are not read. No error message ever
+//! quotes a file's contents.
 //!
 //! ```json
 //! {"type": "oauth_anthropic", "access_token": "...", "refresh_token": "...", "expires_at": 1800000000}
 //! {"type": "api_key", "key": "..."}
+//! {"type": "chatgpt_oauth", "access_token": "...", "account_id": "...", "refresh_token": "..."}
 //! ```
 
 use std::fmt;
@@ -85,6 +88,7 @@ impl<'de> Deserialize<'de> for Secret {
 enum Kind {
     OauthAnthropic,
     ApiKey,
+    ChatgptOauth,
 }
 
 /// The file as stored; flat rather than tagged so no buffered copy of a secret is left behind.
@@ -97,6 +101,7 @@ struct Stored {
     refresh_token: Option<Secret>,
     expires_at: Option<u64>,
     key: Option<Secret>,
+    account_id: Option<Secret>,
 }
 
 #[derive(Serialize)]
@@ -137,9 +142,9 @@ impl CredentialStore {
         l
     }
 
-    /// The credential of `login` in `file`, which must hold `kind`, at `now`. An OAuth token expiring within
-    /// [`REFRESH_MARGIN_S`], or any token when `stale` (the vendor just rejected it), is
-    /// refreshed first unless another attempt already replaced it.
+    /// The credential of `login` in `file`, which must hold `kind`, at `now`. An `oauth_anthropic`
+    /// token expiring within [`REFRESH_MARGIN_S`], or any such token when `stale` (the vendor just
+    /// rejected it), is refreshed first unless another attempt already replaced it.
     ///
     /// # Errors
     /// The file is unreadable, too open, malformed, or the refresh failed.
@@ -155,6 +160,7 @@ impl CredentialStore {
         let found = match first.kind {
             Kind::OauthAnthropic => CredentialKind::OauthAnthropic,
             Kind::ApiKey => CredentialKind::ApiKey,
+            Kind::ChatgptOauth => CredentialKind::ChatgptOauth,
         };
         if found != kind {
             return Err(unusable(
@@ -170,6 +176,14 @@ impl CredentialStore {
             Kind::ApiKey => {
                 let key = secret(file, "key", first.key.as_ref())?;
                 return Ok(Credential::ApiKey { key });
+            }
+            Kind::ChatgptOauth => {
+                let access_token = secret(file, "access_token", first.access_token.as_ref())?;
+                let account_id = secret(file, "account_id", first.account_id.as_ref())?;
+                return Ok(Credential::ChatgptOauth {
+                    access_token,
+                    account_id,
+                });
             }
             Kind::OauthAnthropic => secret(file, "access_token", first.access_token.as_ref())?,
         };
@@ -434,6 +448,55 @@ mod tests {
         let c = s.load("login-1", &f, KIND, NOW, false).unwrap();
         assert_eq!((c.kind(), c.secret()), ("oauth_anthropic", "access-0"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_chatgpt_login_loads_its_token_and_account_as_they_are() {
+        const CHATGPT: CredentialKind = CredentialKind::ChatgptOauth;
+        let (s, calls) = store(None);
+        let body = format!(
+            r#"{{"type":"chatgpt_oauth","access_token":"access-0","account_id":"account-1","refresh_token":"refresh-{MARK}","expires_at":{}}}"#,
+            NOW - 600
+        );
+        let f = file("chatgpt", &body, 0o600);
+        for stale in [false, true] {
+            let c = s.load("login-1", &f, CHATGPT, NOW, stale).unwrap();
+            assert_eq!(
+                (c.kind(), c.secret(), c.account_id()),
+                ("chatgpt_oauth", "access-0", Some("account-1"))
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no refresh of its own");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), body);
+        for (body, want) in [
+            (
+                format!(r#"{{"type":"chatgpt_oauth","access_token":"{MARK}"}}"#),
+                "no `account_id`",
+            ),
+            (
+                format!(
+                    r#"{{"type":"chatgpt_oauth","account_id":"a\n{MARK}","access_token":"t"}}"#
+                ),
+                "`account_id` is not a non-empty visible ASCII",
+            ),
+            (
+                format!(
+                    r#"{{"type":"chatgpt_oauth","account_id":"a","access_token":"t","id":"{MARK}"}}"#
+                ),
+                "missing or invalid",
+            ),
+        ] {
+            let f = file("chatgpt-bad", &body, 0o600);
+            let e = s.load("login-1", &f, CHATGPT, NOW, false).unwrap_err();
+            assert!(e.unusable && e.message.contains(want), "{body}: {e}");
+            assert!(!e.message.contains(MARK), "{body}: {e}");
+        }
+        let e = s.load("login-1", &f, KIND, NOW, false).unwrap_err();
+        assert!(
+            e.message
+                .contains("has type `chatgpt_oauth`, the config says `oauth_anthropic`"),
+            "{e}"
+        );
     }
 
     #[test]

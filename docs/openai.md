@@ -148,6 +148,28 @@ duration after `try again in` in the message (`1.8s`, `6m0s`, `5 minutes`). The 
 the vendor's message, cut to 300 characters with control characters as spaces; it never carries a
 header value.
 
+## Serving the upstream
+
+`qb gateway` runs every login of `api = "openai"` through this crate's upstream half, in
+`crates/qb/src/gateway/openai_upstream.rs`, over the transport it shares with the Anthropic
+adapter (`crates/qb/src/gateway/vendor.rs`): one ureq agent with rustls per attempt, no proxy, no
+redirects, a 10 s connect bound and a 600 s attempt bound; a cancel or a client that hangs up
+shuts the agent down, and the attempt ends `cancelled`.
+
+The credential's kind ([config.md](config.md#gateway-config)) picks the header mode: `api_key`
+is the `api_key` mode; `chatgpt_oauth`, a ChatGPT login's access token and account id, is the
+`chatgpt_oauth` mode with the account id in `chatgpt-account-id`. The secret's header value is
+built in a zeroizing string and dropped once the request is sent. The gateway does not refresh a
+ChatGPT token: the vendor's 401 for an expired or revoked token is an `auth` failure, and the
+turn moves to the next login.
+
+The endpoint is the login's `base_url` followed by `/responses`, else `AuthMode::url()`. The body
+is `request::build` with `target.reasoning` on, and the stream's event bound is
+`stream::event_bound` of the body's size. A 200 streams through `stream::Reader` into the turn and
+ends with the stop reason and the windows of `limits::rate_limits`, read with the gateway's clock;
+any other status reads up to 64 KiB of the body and ends with `limits::classify_response`, whose
+usage limit already carries its limiting window at 1.0.
+
 ## Serving the fronts
 
 `qb gateway` serves `POST /v1/chat/completions` and `POST /v1/responses` on its unix socket to

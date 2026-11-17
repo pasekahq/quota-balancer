@@ -43,14 +43,31 @@ pub enum Credential {
         /// The key.
         key: Zeroizing<String>,
     },
+    /// An OAuth access token of a ChatGPT subscription login and the account it acts for.
+    ChatgptOauth {
+        /// Bearer access token.
+        access_token: Zeroizing<String>,
+        /// ChatGPT account id, sent in its own header.
+        account_id: Zeroizing<String>,
+    },
 }
 
 impl Credential {
     /// The secret to send: the access token or the key.
     pub fn secret(&self) -> &str {
         match self {
-            Self::OauthAnthropic { access_token } => access_token,
+            Self::OauthAnthropic { access_token } | Self::ChatgptOauth { access_token, .. } => {
+                access_token
+            }
             Self::ApiKey { key } => key,
+        }
+    }
+
+    /// The account id of a ChatGPT login; `None` for the other kinds.
+    pub fn account_id(&self) -> Option<&str> {
+        match self {
+            Self::ChatgptOauth { account_id, .. } => Some(account_id),
+            Self::OauthAnthropic { .. } | Self::ApiKey { .. } => None,
         }
     }
 
@@ -59,6 +76,7 @@ impl Credential {
         match self {
             Self::OauthAnthropic { .. } => "oauth_anthropic",
             Self::ApiKey { .. } => "api_key",
+            Self::ChatgptOauth { .. } => "chatgpt_oauth",
         }
     }
 }

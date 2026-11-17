@@ -32,7 +32,7 @@ systemd user unit, `qb-gateway.service`, installed for that user like `qb-agent.
 - Each peer on the socket is identified by `SO_PEERCRED`, as in `qbd`. A peer whose uid is the
   gateway's own or listed in the gateway config is a client; any other uid gets 401.
 - Optionally it also listens on a loopback TCP address (`127.0.0.1:<port>` or `[::1]:<port>`)
-  for the Messages front only. A non-loopback address is a config error. TCP carries no peer
+  for the HTTP fronts only. A non-loopback address is a config error. TCP carries no peer
   uid, so every request there needs the local client token (`x-api-key` or
   `Authorization: Bearer`); the config holds its SHA-256 and the gateway compares in constant
   time, as `qbd` compares bearers.
@@ -52,7 +52,7 @@ handles every file and network right of that ABI):
   `REFER` right: renames never cross directories.
 - read-only `/etc/resolv.conf` and `/etc/hosts`, the files the musl resolver reads.
 - TCP connect to port 443 only.
-- TCP bind only on the configured port of the Messages front, and no bind right without it.
+- TCP bind only on the configured port of the HTTP fronts, and no bind right without it.
   The listener exists before the restriction; handling the bind right keeps any other port
   from being bound later.
 
@@ -113,8 +113,8 @@ vendor failure. Stickiness serves the prompt cache and must not block a turn: a 
 a pick with `resume_of` is retried once without it.
 
 The gateway config has one credential entry per login it holds: the `qbd` login name, the kind
-(`oauth_anthropic` or `api_key` in G1), the vendor API family and the file. The `login` of a
-`run` answer selects the entry by exact name; the family selects the adapter and the kind its
+(`oauth_anthropic`, `chatgpt_oauth` or `api_key`), the vendor API family and the file. The
+`login` of a `run` answer selects the entry by exact name; the family selects the adapter and the kind its
 auth mode; the answer's `model` is the vendor model id; its `effort` becomes the adapter's
 reasoning parameter. A `run` naming a login without an entry is a configuration error: the gateway reports `error` with `release: true`,
 logs the login name and fails the turn without retry. Every login of a vendor that one of the
@@ -189,21 +189,32 @@ every attempt with vendor, model, login and outcome. On the Messages front the s
 HTTP error response in the Messages error format, 429 with `retry-after` for
 `quota_exhausted`.
 
-### One core, two fronts
+### One core, its fronts and upstreams
 
 A single core runs a turn: pick, credential read and refresh, the vendor identity, the upstream
-call, rotation, report and canonical events. For OAuth Anthropic logins the adapter adds the
-identity the subscription endpoint expects from the vendor's CLI (system prompt prefix, beta
-headers, user agent); clients never see or send it. Thinking blocks produced by another vendor
-are dropped by the core.
+call, rotation, report and canonical events. Thinking blocks produced by another vendor are
+dropped by the core.
+
+The upstream adapters, one per API family of a login:
+
+- the Anthropic Messages adapter, for `oauth_anthropic` logins and Anthropic API keys; for OAuth
+  logins it adds the identity the subscription endpoint expects from the vendor's CLI (system
+  prompt prefix, beta headers, user agent);
+- the OpenAI Responses adapter, for `chatgpt_oauth` logins and OpenAI API keys; for ChatGPT
+  logins it sends the account id and the identity headers of the vendor's CLI.
+
+Clients never see or send the vendor identity. The fronts:
 
 - The C4 front, `POST /v1/model/turn`, `GET /v1/model/routes` and `POST /v1/model/cancel` on the
   unix socket, maps C4 requests to the canonical form and writes NDJSON events.
-- The Messages front, `POST /v1/messages` on the unix socket and on the optional loopback port,
-  maps an Anthropic Messages request to the canonical form, maps its `model` to a route alias by
-  config, and writes Messages SSE events or one JSON body for `stream: false`.
+- The Messages front, `POST /v1/messages`, maps an Anthropic Messages request to the canonical
+  form and writes Messages SSE events or one JSON body for `stream: false`.
+- The OpenAI fronts, `POST /v1/chat/completions` and `POST /v1/responses`, do the same for the
+  OpenAI Chat Completions and Responses APIs.
 
-Neither front has pick, report, rotation or credential logic of its own.
+The HTTP fronts are served on the unix socket and on the optional loopback port and map a
+request's `model` to a route alias by config. Any front runs on any upstream. No front has pick,
+report, rotation or credential logic of its own.
 
 ### Dependencies
 
@@ -245,7 +256,7 @@ and `qbd` ladder, invisible to clients. The rules for users are in the README's
   and ports, not destinations.
 - Concurrency is bounded by threads, at most 16 turns per gateway; more owners run more
   gateways against one `qbd`.
-- Clients need one protocol, C4 or the Messages API, and no vendor knowledge.
+- Clients need one protocol, C4, the Messages API or an OpenAI API, and no vendor knowledge.
 - Windows observed by the gateway and by other clients of the same logins land in one `qbd`
   model.
 
