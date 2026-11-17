@@ -331,3 +331,16 @@ fn an_assistant_refusal_stays_in_the_history() {
         }]
     );
 }
+
+#[test]
+fn errors_that_a_retry_cannot_fix_stop_sdk_retries() {
+    for class in [ErrorClass::Auth, ErrorClass::Cancelled, ErrorClass::NoRoute] {
+        let r = error_response(&GatewayError::new(class, false, "x"), NOW);
+        assert_eq!(r.should_retry, Some(false), "{class:?}");
+        assert!(
+            r.headers()
+                .contains(&("x-should-retry", "false".to_owned())),
+            "{class:?}"
+        );
+    }
+}

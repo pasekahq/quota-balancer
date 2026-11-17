@@ -259,7 +259,8 @@ pub const NO_RETRY_AFTER_S: u64 = 300;
 ///   `x-should-retry: false` beyond [`NO_RETRY_AFTER_S`];
 /// - `overloaded`, `unavailable` and `no_route`: 503; `auth`, which is the vendor rejecting the
 ///   gateway's credential and not the client's, 502;
-/// - `bad_request`, `context_too_long` (`context_length_exceeded`): 400; `cancelled`: 409.
+/// - `bad_request`, `context_too_long` (`context_length_exceeded`): 400; `cancelled`: 409;
+/// - `auth`, `cancelled` and `no_route` also carry `x-should-retry: false`.
 pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
     let status = match e.class {
         ErrorClass::QuotaExhausted => 429,
@@ -277,7 +278,8 @@ pub fn error_response(e: &GatewayError, now: u64) -> ErrorResponse {
     };
     let should_retry = match e.class {
         ErrorClass::QuotaExhausted => retry_after.is_some_and(|s| s > NO_RETRY_AFTER_S),
-        ErrorClass::NoRoute => true,
+        // A retry hits the same rejected credentials, cancelled turn or empty route.
+        ErrorClass::Auth | ErrorClass::Cancelled | ErrorClass::NoRoute => true,
         _ => false,
     }
     .then_some(false);

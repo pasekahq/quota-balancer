@@ -243,15 +243,18 @@ and the body `{"error": {"message", "type", "param", "code"}}`:
 | `overloaded` | 503 | `server_error` | `server_is_overloaded` | `retry-after` when known |
 | `unavailable` | 503 | `server_error` | `upstream_unavailable` | `retry-after` when known |
 | `no_route` | 503 | `server_error` | `no_route` | `x-should-retry: false` |
-| `auth` | 502 | `server_error` | `upstream_auth_failed` | — |
+| `auth` | 502 | `server_error` | `upstream_auth_failed` | `x-should-retry: false` |
 | `bad_request` | 400 | `invalid_request_error` | `null` | — |
 | `context_too_long` | 400 | `invalid_request_error` | `context_length_exceeded` | — |
-| `cancelled` | 409 | `server_error` | `cancelled` | — |
+| `cancelled` | 409 | `server_error` | `cancelled` | `x-should-retry: false` |
 
 `quota_exhausted` uses `insufficient_quota` rather than `rate_limit_exceeded`: every login of the
 route is spent until a reset, which is what OpenAI clients understand by that code, and they stop
 hammering it; OpenAI SDKs still honour `retry-after` and `x-should-retry`. A vendor rejecting the
 gateway's credential is `502`, not `401`: to an SDK a `401` means the client's own key is wrong.
+`auth`, `cancelled` and `no_route` say `x-should-retry: false`, as OpenAI SDKs otherwise retry
+502, 409 and 503 and a retry would only meet the same rejected credentials, cancelled turn or
+empty route.
 
 `SseEncoder::started()` tells the front whether bytes went out; before that an error is an HTTP
 error answer. After it the error is in the stream: on the Chat front one
