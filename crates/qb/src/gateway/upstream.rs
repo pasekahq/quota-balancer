@@ -25,6 +25,9 @@ pub struct Picked<'a> {
     pub effort: Option<&'a str>,
     /// Login name; for logs and errors, never a credential.
     pub login: &'a str,
+    /// Base URL of the vendor API from the login's config; `None` for the adapter's public
+    /// endpoint.
+    pub base_url: Option<&'a str>,
 }
 
 /// What the adapter authenticates with, read from the login's credential file for one attempt

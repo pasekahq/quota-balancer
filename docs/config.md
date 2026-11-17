@@ -244,7 +244,9 @@ or put the socket in a directory outside it.
 | Key | Type | Meaning |
 |---|---|---|
 | `name` | string | Login name as declared in `qbd`'s `[[logins]]`. |
-| `kind` | `"oauth_anthropic"` or `"api_key"` | Credential type; it selects the vendor adapter and its auth mode, and must match the file's `type`. |
+| `kind` | `"oauth_anthropic"` or `"api_key"` | Credential type; it selects the adapter's auth mode and must match the file's `type`. |
+| `api` | `"anthropic"` or `"openai"` | The vendor API family the login speaks; it selects the adapter, and a login whose family has no adapter in this build ends its turns `unavailable`. `"anthropic"` (the default) for an `oauth_anthropic` login; required for an `api_key` login. |
+| `base_url` | string | Base URL of the vendor API, default the family's public endpoint (`https://api.anthropic.com` for `anthropic`). `https://` on port 443, the only port the sandbox connects to, or `http://` with a loopback host (`localhost`, `127.0.0.0/8`, `::1`); an optional path, no user, query or fragment. |
 | `credentials` | string | Absolute path of the credential file. |
 
 Every login `qbd` can pick for a route of this gateway needs an entry here: a pick of a login

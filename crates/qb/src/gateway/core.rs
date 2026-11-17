@@ -16,7 +16,7 @@ use qb_proto::{
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::config::{CredentialKind, GatewayConfig, GatewayLogin, Route};
+use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::creds::{CredentialStore, Refresher};
 use super::upstream::{CancelToken, Failure, FailureKind, Finished, Flow, Picked, Upstream};
 use crate::server::unix_now;
@@ -25,8 +25,8 @@ use crate::{client, log};
 /// How long `cancel` waits for the cancelled turn to end.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
-/// Vendor adapters by the credential kind they serve.
-pub type Upstreams = Vec<(CredentialKind, Box<dyn Upstream>)>;
+/// Vendor adapters by the API family they serve.
+pub type Upstreams = Vec<(Api, Box<dyn Upstream>)>;
 
 /// What `cancel` found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,9 +462,9 @@ impl Gateway {
             let error = GatewayError::new(ErrorClass::Unavailable, false, message);
             return Err(fail(emit, error, progress, "login without credentials"));
         };
-        let Some((_, upstream)) = self.upstreams.iter().find(|(k, _)| *k == entry.kind) else {
+        let Some((_, upstream)) = self.upstreams.iter().find(|(a, _)| *a == entry.api) else {
             self.report(&lease, Outcome::Error, Vec::new());
-            let message = format!("no adapter serves `{}` logins", entry.kind.as_str());
+            let message = format!("no adapter serves `{}` logins", entry.api.as_str());
             let error = GatewayError::new(ErrorClass::Unavailable, false, message);
             return Err(fail(emit, error, progress, "no adapter"));
         };
@@ -531,6 +531,7 @@ impl Gateway {
                 model: &attempt.model,
                 effort: pick.effort.as_deref(),
                 login: &login,
+                base_url: entry.base_url.as_deref(),
             };
             let mut relay = Relay {
                 route: Some(StreamEvent::Route {

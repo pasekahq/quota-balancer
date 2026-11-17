@@ -1,9 +1,11 @@
 //! Contract tests of the model gateway: `/v1/model/*` over a real unix socket, with a real qbd
-//! in-process and a scripted fake vendor adapter.
+//! in-process and a scripted fake vendor adapter, or the Anthropic adapter against a scripted
+//! vendor endpoint on loopback TCP.
 
 #![allow(clippy::unwrap_used)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -14,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use qb::auth::Gate;
-use qb::gateway::config::CredentialKind;
-use qb::gateway::core::{Cancel, Gateway};
+use qb::gateway::anthropic::Anthropic;
+use qb::gateway::config::Api;
+use qb::gateway::core::{Cancel, Gateway, Upstreams};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
 use qb::gateway::front;
 use qb::gateway::upstream::{
@@ -24,6 +27,7 @@ use qb::gateway::upstream::{
 use qb::hooks::Runner;
 use qb::journal::Journal;
 use qb::server::unix_now;
+use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_proto::{
     Block, CancelAnswer, ErrorClass, GatewayError, LoginStatus, RouteState, RoutesAnswer,
@@ -247,9 +251,12 @@ fn start_qbd(dir: &Path) -> PathBuf {
     sock
 }
 
-/// The gateway config for `dir` with credential kinds `kinds` of login-1 and login-2, and
-/// `extra` appended.
-fn gateway_toml(dir: &Path, qbd: &Path, max_turns: u32, kinds: [&str; 2], extra: &str) -> String {
+/// The keys of an `api_key` login of the `anthropic` API family.
+const ANTHROPIC_KEY: &str = "kind = \"api_key\"\napi = \"anthropic\"";
+
+/// The gateway config for `dir` with the keys `logins` of login-1 and login-2 besides `name` and
+/// `credentials`, and `extra` appended.
+fn gateway_toml(dir: &Path, qbd: &Path, max_turns: u32, logins: [&str; 2], extra: &str) -> String {
     format!(
         r#"socket = "{dir}/gw.sock"
 qbd_socket = "{qbd}"
@@ -258,12 +265,12 @@ max_request_bytes = 131072
 
 [[logins]]
 name = "login-1"
-kind = "{k1}"
+{k1}
 credentials = "{dir}/creds/login-1.json"
 
 [[logins]]
 name = "login-2"
-kind = "{k2}"
+{k2}
 credentials = "{dir}/creds/login-2.json"
 
 [[routes]]
@@ -279,8 +286,8 @@ model = "model-b"
 {extra}"#,
         dir = dir.display(),
         qbd = qbd.display(),
-        k1 = kinds[0],
-        k2 = kinds[1],
+        k1 = logins[0],
+        k2 = logins[1],
     )
 }
 
@@ -295,12 +302,12 @@ fn credentials(dir: &Path, files: &[(&str, String, u32)]) {
     }
 }
 
-/// The kind a credential file's contents declare.
-fn kind_of(contents: &str) -> &'static str {
+/// The login keys of the kind a credential file's contents declare, of the `anthropic` family.
+fn keys_of(contents: &str) -> &'static str {
     if contents.contains("oauth_anthropic") {
-        "oauth_anthropic"
+        "kind = \"oauth_anthropic\""
     } else {
-        "api_key"
+        ANTHROPIC_KEY
     }
 }
 
@@ -318,31 +325,21 @@ fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_ui
     let dir = temp_dir("gw");
     credentials(&dir, files);
     let qbd = start_qbd(&dir);
-    let kind = |i: usize| files.get(i).map_or("api_key", |f| kind_of(&f.1));
+    let keys = |i: usize| files.get(i).map_or(ANTHROPIC_KEY, |f| keys_of(&f.1));
     let text = if extra.trim_start().starts_with('[') {
-        gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], extra)
+        gateway_toml(&dir, &qbd, max_turns, [keys(0), keys(1)], extra)
     } else {
-        let toml = gateway_toml(&dir, &qbd, max_turns, [kind(0), kind(1)], "");
+        let toml = gateway_toml(&dir, &qbd, max_turns, [keys(0), keys(1)], "");
         format!("{extra}\n{toml}")
     };
-    let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
-    let gw = config.socket.clone();
     let fake = Arc::new(Fake::default());
     let refreshes = Arc::new(AtomicUsize::new(0));
-    let gateway = Gateway::new(
-        config,
-        vec![
-            (CredentialKind::ApiKey, Box::new(Shared(Arc::clone(&fake)))),
-            (
-                CredentialKind::OauthAnthropic,
-                Box::new(Shared(Arc::clone(&fake))),
-            ),
-        ],
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
         Box::new(Counting(Arc::clone(&refreshes))),
-        None,
+        gateway_uid,
     );
-    let listener = UnixListener::bind(&gw).unwrap();
-    std::thread::spawn(move || front::serve(&listener, &Arc::new(gateway), gateway_uid));
     Rig {
         dir,
         qbd,
@@ -350,6 +347,21 @@ fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_ui
         fake,
         refreshes,
     }
+}
+
+/// Serves a gateway of config `text` with `upstreams` as `gateway_uid`; its socket.
+fn serve_gateway(
+    text: &str,
+    upstreams: Upstreams,
+    refresher: Box<dyn Refresher>,
+    gateway_uid: u32,
+) -> PathBuf {
+    let config = qb::gateway::config::parse(Path::new("gateway.toml"), text).unwrap();
+    let gw = config.socket.clone();
+    let gateway = Gateway::new(config, upstreams, refresher, None);
+    let listener = UnixListener::bind(&gw).unwrap();
+    std::thread::spawn(move || front::serve(&listener, &Arc::new(gateway), gateway_uid));
+    gw
 }
 
 fn rig() -> Rig {
@@ -1002,7 +1014,7 @@ fn health_answers_and_only_the_starting_caller_may_cancel() {
 
     let config = qb::gateway::config::parse(
         Path::new("gateway.toml"),
-        &gateway_toml(&r.dir, &r.qbd, 4, ["api_key", "api_key"], ""),
+        &gateway_toml(&r.dir, &r.qbd, 4, [ANTHROPIC_KEY; 2], ""),
     )
     .unwrap();
     let gateway = Gateway::new(config, Vec::new(), Box::new(Counting(Arc::default())), None);
@@ -1026,14 +1038,14 @@ fn a_turn_that_sent_its_last_event_can_no_longer_be_cancelled() {
     let r = rig();
     let config = qb::gateway::config::parse(
         Path::new("gateway.toml"),
-        &gateway_toml(&r.dir, &r.qbd, 1, ["api_key", "api_key"], ""),
+        &gateway_toml(&r.dir, &r.qbd, 1, [ANTHROPIC_KEY; 2], ""),
     )
     .unwrap();
     let fake = Arc::new(Fake::default());
     let upstream: Box<dyn Upstream> = Box::new(Shared(Arc::clone(&fake)));
     let gateway = Gateway::new(
         config,
-        vec![(CredentialKind::ApiKey, upstream)],
+        vec![(Api::Anthropic, upstream)],
         Box::new(Counting(Arc::default())),
         None,
     );
@@ -1379,20 +1391,20 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         &dir,
         &[
             ("login-1", api_key(MARK), 0o644),
-            (
-                "login-2",
-                format!(r#"{{"type":"api_key","key":"{MARK}","x":1}}"#),
-                0o600,
-            ),
+            ("login-2", api_key(MARK), 0o600),
         ],
     );
     let qbd_config = dir.join("qbd.toml");
     std::fs::write(&qbd_config, QBD).unwrap();
     let qbd = dir.join("qb.sock");
     let _qbd = start_daemon(Path::new(exe), &qbd_config, &qbd, Stdio::null());
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let keys = format!("{ANTHROPIC_KEY}\nbase_url = \"http://{closed}\"");
     let config = dir.join("gateway.toml");
-    let kinds = ["api_key", "api_key"];
-    std::fs::write(&config, gateway_toml(&dir, &qbd, 2, kinds, "")).unwrap();
+    std::fs::write(&config, gateway_toml(&dir, &qbd, 2, [&keys, &keys], "")).unwrap();
     let mut child = Command::new(exe)
         .args(["gateway", "--config"])
         .arg(&config)
@@ -1406,8 +1418,8 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     let mode = std::fs::metadata(&gw).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the socket is the owner's only by default");
 
-    // This build links no vendor adapter: a turn picks, finds none for the login's kind,
-    // releases the lease and ends with `unavailable`, before any credential is read.
+    // login-1's open file is never used; login-2's key goes to the linked Anthropic adapter,
+    // whose connect to a closed port (or one the sandbox refuses) ends the turn `unavailable`.
     let (status, _, body) = finish(
         send(
             &gw,
@@ -1421,9 +1433,17 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     let events = events(&body);
     let e = last_error(&events);
     assert_eq!(e.class, ErrorClass::Unavailable, "{e:?}");
-    assert!(
-        e.message.as_deref().unwrap().contains("no adapter"),
-        "{e:?}"
+    let tried: Vec<(Option<&str>, ErrorClass)> = e
+        .tried
+        .iter()
+        .map(|a| (a.login_label.as_deref(), a.class))
+        .collect();
+    assert_eq!(
+        tried,
+        [
+            (Some("login-1"), ErrorClass::Auth),
+            (Some("login-2"), ErrorClass::Unavailable)
+        ]
     );
     assert!(!String::from_utf8_lossy(&body).contains(MARK));
     let (status, body) = call(&gw, "GET", paths::MODEL_ROUTES, "");
@@ -1437,7 +1457,9 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         "{logged:?}"
     );
     assert!(
-        logged.iter().any(|l| l.contains("no adapter")),
+        logged
+            .iter()
+            .any(|l| l.contains("login-2: unavailable: vendor request failed")),
         "{logged:?}"
     );
     assert!(logged.iter().all(|l| !l.contains(MARK)), "{logged:?}");
@@ -1446,5 +1468,487 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
         assert_eq!(status, 200);
         serde_json::from_slice(&body).unwrap()
     };
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
     assert_eq!(s.leases, Vec::new());
+}
+
+/// What the scripted vendor answers to one request.
+enum Answer {
+    /// A complete answer: status, headers and body.
+    Full(u16, Vec<(String, String)>, Vec<u8>),
+    /// A 200 stream that sends these bytes and then stays silent until the gateway closes it.
+    Hold(Vec<u8>),
+}
+
+/// One request the scripted vendor received.
+struct Received {
+    path: String,
+    /// Header names in lowercase.
+    headers: Vec<(String, String)>,
+    body: Value,
+}
+
+impl Received {
+    fn header(&self, name: &str) -> Option<&str> {
+        let found = self.headers.iter().find(|(n, _)| n == name);
+        found.map(|(_, v)| v.as_str())
+    }
+}
+
+/// An Anthropic-compatible endpoint on a loopback TCP port that replays [`Answer`]s in order.
+struct Vendor {
+    base_url: String,
+    answers: Arc<Mutex<Vec<Answer>>>,
+    received: Arc<Mutex<Vec<Received>>>,
+    /// Receives the time the gateway closed a held stream.
+    closed: std::sync::mpsc::Receiver<std::time::Instant>,
+}
+
+impl Vendor {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let answers = Arc::new(Mutex::new(Vec::<Answer>::new()));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (tx, closed) = std::sync::mpsc::channel();
+        let (queue, log) = (Arc::clone(&answers), Arc::clone(&received));
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let (queue, log, tx) = (Arc::clone(&queue), Arc::clone(&log), tx.clone());
+                std::thread::spawn(move || {
+                    let mut conn = conn.unwrap();
+                    let req = read_http(&mut conn);
+                    log.lock().unwrap().push(req);
+                    let answer = queue.lock().unwrap().remove(0);
+                    answer_with(&mut conn, answer, &tx);
+                });
+            }
+        });
+        Self {
+            base_url,
+            answers,
+            received,
+            closed,
+        }
+    }
+
+    fn answer(&self, answer: Answer) {
+        self.answers.lock().unwrap().push(answer);
+    }
+
+    fn received(&self) -> std::sync::MutexGuard<'_, Vec<Received>> {
+        self.received.lock().unwrap()
+    }
+
+    /// Login keys besides `name` and `credentials` that send the login here.
+    fn login(&self, kind: &str) -> String {
+        format!("{kind}\nbase_url = \"{}\"", self.base_url)
+    }
+}
+
+fn read_http(conn: &mut std::net::TcpStream) -> Received {
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    while !raw.ends_with(b"\r\n\r\n") {
+        assert_eq!(conn.read(&mut byte).unwrap(), 1, "request head cut");
+        raw.push(byte[0]);
+    }
+    let head = String::from_utf8(raw).unwrap();
+    let mut lines = head.lines();
+    let path = lines.next().unwrap().split(' ').nth(1).unwrap().to_owned();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.to_ascii_lowercase(), v.trim().to_owned()))
+        .collect();
+    let length: usize = headers
+        .iter()
+        .find(|(n, _)| n == "content-length")
+        .map(|(_, v)| v.parse().unwrap())
+        .unwrap();
+    let mut body = vec![0u8; length];
+    conn.read_exact(&mut body).unwrap();
+    Received {
+        path,
+        headers,
+        body: serde_json::from_slice(&body).unwrap(),
+    }
+}
+
+fn answer_with(
+    conn: &mut std::net::TcpStream,
+    answer: Answer,
+    closed: &std::sync::mpsc::Sender<std::time::Instant>,
+) {
+    match answer {
+        Answer::Full(status, headers, body) => {
+            let mut out = format!("HTTP/1.1 {status} X\r\n");
+            for (n, v) in headers {
+                write!(out, "{n}: {v}\r\n").unwrap();
+            }
+            write!(
+                out,
+                "content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            let mut bytes = out.into_bytes();
+            bytes.extend_from_slice(&body);
+            // The gateway may stop reading once the stream finished.
+            let _ = conn.write_all(&bytes);
+        }
+        Answer::Hold(prefix) => {
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            let chunk = format!("{:x}\r\n", prefix.len());
+            conn.write_all(head.as_bytes()).unwrap();
+            conn.write_all(chunk.as_bytes()).unwrap();
+            conn.write_all(&prefix).unwrap();
+            conn.write_all(b"\r\n").unwrap();
+            let mut rest = Vec::new();
+            let _ = conn.read_to_end(&mut rest);
+            let _ = closed.send(std::time::Instant::now());
+        }
+    }
+}
+
+/// A file of `crates/qb-anthropic/tests/fixtures`.
+fn vendor_fixture(name: &str) -> Vec<u8> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../qb-anthropic/tests/fixtures");
+    std::fs::read(dir.join(name)).unwrap()
+}
+
+/// The recorded answer `answer_<name>.json`; `sse`, a stream fixture, as the body of a 200.
+fn recorded(name: &str, sse: Option<&str>) -> Answer {
+    let v: Value = serde_json::from_slice(&vendor_fixture(&format!("answer_{name}.json"))).unwrap();
+    let status = u16::try_from(v["status"].as_u64().unwrap()).unwrap();
+    let headers = v["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            let pair = |i: usize| h[i].as_str().unwrap().to_owned();
+            (pair(0), pair(1))
+        })
+        .collect();
+    let body = match sse {
+        Some(file) => vendor_fixture(file),
+        None => serde_json::to_vec(&v["body"]).unwrap(),
+    };
+    Answer::Full(status, headers, body)
+}
+
+/// A rig whose gateway runs the Anthropic adapter against a scripted vendor; `logins` as in
+/// [`gateway_toml`], the credential files `files`.
+fn vendor_rig(
+    files: &[(&str, String, u32)],
+    logins: impl Fn(&Vendor) -> [String; 2],
+) -> (Rig, Vendor) {
+    let vendor = Vendor::start();
+    let dir = temp_dir("gwv");
+    credentials(&dir, files);
+    let qbd = start_qbd(&dir);
+    let keys = logins(&vendor);
+    let text = gateway_toml(&dir, &qbd, 4, [&keys[0], &keys[1]], "");
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Anthropic, Box::new(Anthropic::new()))],
+        Box::new(Counting(Arc::clone(&refreshes))),
+        own_uid(),
+    );
+    let rig = Rig {
+        dir,
+        qbd,
+        gw,
+        fake: Arc::default(),
+        refreshes,
+    };
+    (rig, vendor)
+}
+
+fn two_keys(v: &Vendor) -> [String; 2] {
+    [v.login(ANTHROPIC_KEY), v.login(ANTHROPIC_KEY)]
+}
+
+fn key_files() -> [(&'static str, String, u32); 2] {
+    [
+        ("login-1", api_key("test-token-1"), 0o600),
+        ("login-2", api_key("test-token-2"), 0o600),
+    ]
+}
+
+/// The text of the `text_delta` events, joined.
+fn text_of(events: &[StreamEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_anthropic_adapter_streams_signed_thinking_text_and_tool_calls_to_stop() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("200_allowed", Some("upstream_thinking.sse")));
+    vendor.answer(recorded("200_allowed", Some("upstream_tool_use.sse")));
+
+    let (_, _, first) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(
+        kinds(&first),
+        [
+            "route login-1",
+            "usage",
+            "thinking",
+            "thinking",
+            "text_delta",
+            "usage",
+            "stop End"
+        ]
+    );
+    let StreamEvent::Thinking { thinking } = &first[2] else {
+        panic!("{first:?}");
+    };
+    assert_eq!(thinking.vendor, "vendor-a");
+    let block: Value = serde_json::from_str(&thinking.opaque).unwrap();
+    assert_eq!(
+        block,
+        json!({"type": "thinking", "thinking": "The user wants a greeting.", "signature": "c2lnbmF0dXJlLXRlc3QtMQ=="})
+    );
+
+    let (_, _, second) = turn(&r.gw, &turn_body("turn-2"));
+    assert_eq!(
+        kinds(&second)[1..],
+        [
+            "usage",
+            "text_delta",
+            "tool_call",
+            "tool_call",
+            "usage",
+            "stop ToolUse"
+        ]
+    );
+    let StreamEvent::ToolCall { tool_call } = &second[3] else {
+        panic!("{second:?}");
+    };
+    assert_eq!(tool_call.name, "read");
+    assert_eq!(
+        Value::Object(tool_call.input.clone()),
+        json!({"path": "notes.txt", "lines": [1, 2]})
+    );
+    let StreamEvent::Usage { usage } = &second[5] else {
+        panic!("{second:?}");
+    };
+    assert_eq!(
+        *usage,
+        Usage {
+            input: 25,
+            output: 48,
+            cache_read: 2000,
+            cache_write: 100
+        }
+    );
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].path, "/v1/messages");
+    assert_eq!(sent[0].body["model"], "model-large");
+    assert_eq!(sent[0].body["stream"], true);
+    assert_eq!(sent[0].body["messages"][0]["content"][0]["text"], "Hi");
+}
+
+#[test]
+fn rate_limit_headers_of_a_success_reach_qbd_as_a_report() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Ok);
+    assert!((used(&s, "login-1") - 0.42).abs() < 1e-9, "{s:?}");
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_usage_limit_moves_the_turn_on_and_each_login_sends_its_own_auth() {
+    const OAUTH: &str = "test-oauth-7f3a";
+    const KEY: &str = "test-key-2b9d";
+    let oauth = format!(
+        r#"{{"type":"oauth_anthropic","access_token":"{OAUTH}","refresh_token":"refresh-0","expires_at":{}}}"#,
+        unix_now() + 3600
+    );
+    let files = [("login-1", oauth, 0o600), ("login-2", api_key(KEY), 0o600)];
+    let (r, vendor) = vendor_rig(&files, |v| {
+        [
+            v.login("kind = \"oauth_anthropic\""),
+            v.login(ANTHROPIC_KEY),
+        ]
+    });
+    vendor.answer(recorded("429_usage_limit", None));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let mut events = Vec::new();
+    let logged = stderr_of(|| events = turn(&r.gw, &turn_body("turn-1")).2);
+
+    assert_eq!(
+        kinds(&events),
+        [
+            "route login-2",
+            "usage",
+            "text_delta",
+            "text_delta",
+            "text_delta",
+            "usage",
+            "stop End"
+        ]
+    );
+    assert_eq!(text_of(&events), "Hello, world — ünïcode!");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+    assert_eq!(s.leases, Vec::new());
+
+    let sent = vendor.received();
+    assert_eq!(sent.len(), 2);
+    let (oauth, key) = (&sent[0], &sent[1]);
+    assert_eq!(
+        oauth.header("authorization"),
+        Some(format!("Bearer {OAUTH}").as_str())
+    );
+    assert_eq!(oauth.header("x-api-key"), None);
+    assert_eq!(
+        oauth.header("anthropic-beta"),
+        Some(identity::OAUTH_BETAS.join(",").as_str())
+    );
+    assert_eq!(oauth.header("user-agent"), Some(identity::OAUTH_USER_AGENT));
+    assert_eq!(oauth.header("x-app"), Some(identity::OAUTH_X_APP));
+    assert_eq!(
+        oauth.body["system"][0]["text"],
+        identity::OAUTH_SYSTEM_PREFIX
+    );
+    assert_eq!(key.header("x-api-key"), Some(KEY));
+    assert_eq!(key.header("authorization"), None);
+    assert_eq!(key.header("anthropic-beta"), None);
+    assert_eq!(key.header("user-agent"), Some(identity::API_KEY_USER_AGENT));
+    assert_eq!(key.body.get("system"), None);
+    for both in [oauth, key] {
+        assert_eq!(
+            both.header("anthropic-version"),
+            Some(identity::ANTHROPIC_VERSION)
+        );
+    }
+    assert!(logged.contains("login-1: usage_limit"), "{logged}");
+    assert!(!logged.contains(OAUTH) && !logged.contains(KEY), "{logged}");
+}
+
+#[test]
+fn a_401_from_the_vendor_kills_a_key_login_and_the_turn_moves_on() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(recorded("401", None));
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
+    assert_eq!(
+        r.refreshes.load(Ordering::SeqCst),
+        0,
+        "a key is not refreshed"
+    );
+}
+
+#[test]
+fn a_key_login_of_another_api_family_is_never_sent_to_anthropic() {
+    let openai = "kind = \"api_key\"\napi = \"openai\"";
+    let (r, vendor) = vendor_rig(&key_files(), |v| [v.login(openai), v.login(openai)]);
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    let e = last_error(&events);
+    assert_eq!(e.class, ErrorClass::Unavailable);
+    assert!(
+        e.message
+            .as_deref()
+            .unwrap()
+            .contains("no adapter serves `openai` logins"),
+        "{e:?}"
+    );
+    assert_eq!(vendor.received().len(), 0);
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+}
+
+/// The first two events of `upstream_text.sse`: `message_start` and a text block's start and
+/// first delta, with nothing after.
+fn stream_start() -> Vec<u8> {
+    let sse = String::from_utf8(vendor_fixture("upstream_text.sse")).unwrap();
+    let cut = sse.find("event: content_block_delta").unwrap();
+    let rest = &sse[cut..];
+    let end = cut + rest.find("\n\n").unwrap() + 2;
+    sse.as_bytes()[..end].to_vec()
+}
+
+/// Reads `s` until its stream holds a `text_delta`; the bytes so far.
+fn until_text(s: &mut UnixStream) -> Vec<u8> {
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !String::from_utf8_lossy(&seen).contains("text_delta") {
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "stream ended early");
+        seen.extend_from_slice(&chunk[..n]);
+    }
+    seen
+}
+
+#[test]
+fn cancel_and_a_closed_client_shut_a_silent_vendor_stream_down_at_once() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    vendor.answer(Answer::Hold(stream_start()));
+    vendor.answer(Answer::Hold(stream_start()));
+
+    let mut client = send(
+        &r.gw,
+        "POST",
+        paths::MODEL_TURN,
+        &turn_body("turn-1").to_string(),
+    );
+    let seen = until_text(&mut client);
+    let asked = std::time::Instant::now();
+    let (status, body) = call(
+        &r.gw,
+        "POST",
+        paths::MODEL_CANCEL,
+        r#"{"request_id":"turn-1"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        asked.elapsed()
+    );
+    let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(closed.duration_since(asked) < Duration::from_secs(1));
+    let (_, _, body) = finish(client, seen);
+    let events = events(&body);
+    assert_eq!(last_error(&events).class, ErrorClass::Cancelled);
+    assert_eq!(text_of(&events), "Hello");
+
+    let mut client = send(
+        &r.gw,
+        "POST",
+        paths::MODEL_TURN,
+        &turn_body("turn-2").to_string(),
+    );
+    until_text(&mut client);
+    let dropped = std::time::Instant::now();
+    drop(client);
+    let closed = vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(closed.duration_since(dropped) < Duration::from_secs(1));
+    let mut leases = 1;
+    for _ in 0..50 {
+        leases = state(&r.qbd).leases.len();
+        if leases == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(leases, 0, "the lease is released");
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::Unknown);
 }

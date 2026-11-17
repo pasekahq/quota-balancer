@@ -5,9 +5,11 @@
 //! - [`config`]: the gateway's TOML config;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
 //! - [`upstream`]: the seam vendor adapters implement;
+//! - [`anthropic`]: the adapter of the `anthropic` API family;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`front`]: the C4 front over the unix socket.
 
+pub mod anthropic;
 pub mod config;
 pub mod core;
 pub mod creds;

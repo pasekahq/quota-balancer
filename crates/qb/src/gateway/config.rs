@@ -5,6 +5,7 @@
 //! The file is read by walking toml's parsed tree rather than through serde: per-type serde code
 //! would not fit the binary budget. Errors still name the field path and the line.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use qb_core::MAX_LOGINS;
@@ -58,7 +59,7 @@ pub struct GatewayClient {
     pub uid: u32,
 }
 
-/// The type of a credential file; it selects the vendor adapter and its auth mode.
+/// The type of a credential file; it selects the adapter's auth mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
     /// Anthropic subscription OAuth tokens.
@@ -77,6 +78,25 @@ impl CredentialKind {
     }
 }
 
+/// The vendor API family a login speaks; it selects the adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Api {
+    /// The Anthropic Messages API.
+    Anthropic,
+    /// The OpenAI APIs.
+    Openai,
+}
+
+impl Api {
+    /// The name in the config, e.g. `anthropic`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+        }
+    }
+}
+
 /// A login and its credential file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayLogin {
@@ -84,6 +104,11 @@ pub struct GatewayLogin {
     pub name: String,
     /// Credential type.
     pub kind: CredentialKind,
+    /// API family; `anthropic` for an `oauth_anthropic` login.
+    pub api: Api,
+    /// Base URL of the vendor API without a trailing `/`; `None` for the adapter's public
+    /// endpoint.
+    pub base_url: Option<String>,
     /// Absolute path of the credential file, mode 0600.
     pub credentials: PathBuf,
 }
@@ -326,12 +351,28 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
     let mut l = GatewayLogin {
         name: String::new(),
         kind: CredentialKind::ApiKey,
+        api: Api::Anthropic,
+        base_url: None,
         credentials: PathBuf::new(),
     };
-    let keys = ["name", "kind", "credentials"];
-    fields(at, t, &keys, &keys, |key, at, v| {
+    let mut api = None;
+    let keys = ["name", "kind", "api", "base_url", "credentials"];
+    let required = ["name", "kind", "credentials"];
+    fields(at, t, &keys, &required, |key, at, v| {
         match key {
             "name" => l.name = string(at, v)?,
+            "api" => {
+                let family = match string(at, v)?.as_str() {
+                    "anthropic" => Api::Anthropic,
+                    "openai" => Api::Openai,
+                    _ => {
+                        let reason = "expected `anthropic` or `openai`".into();
+                        return Err((at.to_owned(), reason, Some(v.span().start)));
+                    }
+                };
+                api = Some((family, v.span().start));
+            }
+            "base_url" => l.base_url = Some(base_url(at, v)?),
             "kind" => {
                 l.kind = match string(at, v)?.as_str() {
                     "oauth_anthropic" => CredentialKind::OauthAnthropic,
@@ -346,7 +387,58 @@ fn walk_login(at: &str, t: &DeTable<'_>) -> Result<GatewayLogin, WalkError> {
         }
         Ok(())
     })?;
+    l.api = match (l.kind, api) {
+        (CredentialKind::OauthAnthropic, None | Some((Api::Anthropic, _))) => Api::Anthropic,
+        (CredentialKind::OauthAnthropic, Some((_, span))) => {
+            let reason = "an `oauth_anthropic` login is `anthropic`".into();
+            return Err((format!("{at}.api"), reason, Some(span)));
+        }
+        (CredentialKind::ApiKey, Some((family, _))) => family,
+        (CredentialKind::ApiKey, None) => {
+            let reason = "is missing; an `api_key` login names its API".into();
+            return Err((format!("{at}.api"), reason, None));
+        }
+    };
     Ok(l)
+}
+
+/// A base URL without its trailing `/`: `https://` with port 443, or `http://` with a loopback
+/// host, then an optional path; no user, query or fragment.
+fn base_url(at: &str, v: &Value<'_>) -> Result<String, WalkError> {
+    let url = string(at, v)?;
+    let bad = |reason: &str| (at.to_owned(), reason.to_owned(), Some(v.span().start));
+    let (https, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => return Err(bad("must start with `https://` or `http://`")),
+    };
+    if rest.contains(['@', '?', '#']) || rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(bad("must have no user, query, fragment or blank"));
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.contains(']') => (host, Some(port)),
+        _ => (authority, None),
+    };
+    if host.is_empty() {
+        return Err(bad("has no host"));
+    }
+    let port = match port.map(str::parse::<u16>) {
+        None => None,
+        Some(Ok(p)) => Some(p),
+        Some(Err(_)) => return Err(bad("has an invalid port")),
+    };
+    if https && port.is_some_and(|p| p != 443) {
+        return Err(bad(
+            "an `https` base URL uses port 443, the only one the sandbox connects to",
+        ));
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = bare == "localhost" || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if !https && !loopback {
+        return Err(bad("plain `http` is accepted only for a loopback host"));
+    }
+    Ok(url.trim_end_matches('/').to_owned())
 }
 
 fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
@@ -490,6 +582,7 @@ socket = "/run/qb-gateway/gateway.sock"
 [[logins]]
 name = "login-1"
 kind = "api_key"
+api = "anthropic"
 credentials = "/var/lib/qb-gateway/login-1.json"
 [[routes]]
 alias = "chat"
@@ -515,12 +608,33 @@ difficulty = 1
             (0o600, 4, 8 << 20, 4)
         );
         let login = c.login("login-1").unwrap();
-        assert_eq!(login.kind, CredentialKind::ApiKey);
+        assert_eq!(
+            (login.kind, login.api, login.base_url.as_deref()),
+            (CredentialKind::ApiKey, Api::Anthropic, None)
+        );
         assert_eq!(
             login.credentials,
             Path::new("/var/lib/qb-gateway/login-1.json")
         );
         assert_eq!(c.route("chat").and_then(|r| r.difficulty), Some(1));
+        for (url, want) in [
+            ("https://api.example.com/", "https://api.example.com"),
+            (
+                "https://api.example.com:443/proxy",
+                "https://api.example.com:443/proxy",
+            ),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080"),
+            ("http://[::1]:9", "http://[::1]:9"),
+            ("http://localhost", "http://localhost"),
+        ] {
+            let extra = format!(
+                "[[logins]]\nname = \"login-2\"\nkind = \"oauth_anthropic\"\nbase_url = \"{url}\"\ncredentials = \"/c.json\"\n"
+            );
+            let c = check("", &extra).unwrap();
+            let login = c.login("login-2").unwrap();
+            assert_eq!(login.api, Api::Anthropic, "the default of an OAuth login");
+            assert_eq!(login.base_url.as_deref(), Some(want));
+        }
         let pinned = check(
             "",
             "[[routes]]\nalias = \"fast\"\nrole = \"r\"\nvendor = \"v\"\nmodel = \"m\"\neffort = \"low\"\n",
@@ -563,13 +677,23 @@ difficulty = 1
             ),
             (
                 "",
-                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\ncredentials = \"rel.json\"\n",
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\napi = \"openai\"\ncredentials = \"rel.json\"\n",
                 "logins[1].credentials: must be an absolute path",
             ),
             (
                 "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\ncredentials = \"/c.json\"\n",
+                "logins[1].api: is missing; an `api_key` login names its API",
+            ),
+            (
+                "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"oauth_anthropic\"\napi = \"openai\"\ncredentials = \"/c.json\"\n",
+                "logins[1].api: an `oauth_anthropic` login is `anthropic` (line 16)",
+            ),
+            (
+                "",
                 "[[logins]]\nname = \"login-2\"\nkind = \"oauth\"\ncredentials = \"/c.json\"\n",
-                "logins[1].kind: expected `oauth_anthropic` or `api_key` (line 14)",
+                "logins[1].kind: expected `oauth_anthropic` or `api_key` (line 15)",
             ),
             (
                 "",
@@ -580,6 +704,26 @@ difficulty = 1
                 "",
                 "[[clients]]\nname = \"c\"\nuid = \"1000\"\n",
                 "clients[0].uid: expected an integer, found string",
+            ),
+            (
+                "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\napi = \"openai\"\nbase_url = \"http://example.com\"\ncredentials = \"/c.json\"\n",
+                "logins[1].base_url: plain `http` is accepted only for a loopback host",
+            ),
+            (
+                "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\napi = \"openai\"\nbase_url = \"https://example.com:8443\"\ncredentials = \"/c.json\"\n",
+                "logins[1].base_url: an `https` base URL uses port 443",
+            ),
+            (
+                "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\napi = \"openai\"\nbase_url = \"https://u@example.com\"\ncredentials = \"/c.json\"\n",
+                "logins[1].base_url: must have no user",
+            ),
+            (
+                "",
+                "[[logins]]\nname = \"login-2\"\nkind = \"api_key\"\napi = \"openai\"\nbase_url = \"example.com\"\ncredentials = \"/c.json\"\n",
+                "logins[1].base_url: must start with `https://` or `http://`",
             ),
             ("max_turns = 17", "", "max_turns: must be 1 to 16"),
             ("max_attempts = 0", "", "max_attempts: must be 1 to 16"),

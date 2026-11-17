@@ -196,6 +196,7 @@ dependencies = [
  "httparse",
  "landlock",
  "lexopt",
+ "qb-anthropic",
  "qb-core",
  "qb-proto",
  "qb-vendors",
