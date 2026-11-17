@@ -222,6 +222,16 @@ name = "qb-core"
 version = "0.0.1"
 
 [[package]]
+name = "qb-openai"
+version = "0.0.1"
+dependencies = [
+ "qb-proto",
+ "qb-vendors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qb-proto"
 version = "0.0.1"
 dependencies = [

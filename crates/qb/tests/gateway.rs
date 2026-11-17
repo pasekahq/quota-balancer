@@ -917,22 +917,37 @@ fn a_foreign_peer_is_refused_before_its_body_is_read() {
     let files = [("login-1", api_key("test-token-1"), 0o600)];
     let r = rig_as(4, &files, "", own_uid() + 1);
     // A head that announces a body it never sends: the answer must not wait for it.
-    let mut s = UnixStream::connect(&r.gw).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-    write!(
-        s,
-        "POST {} HTTP/1.1\r\nHost: qb\r\nContent-Length: 60000\r\n\r\n",
-        paths::MODEL_TURN
-    )
-    .unwrap();
-    let mut answer = Vec::new();
-    let _ = s.read_to_end(&mut answer);
-    let answer = String::from_utf8_lossy(&answer);
+    let answer = refused(
+        &r.gw,
+        &format!(
+            "POST {} HTTP/1.1\r\nHost: qb\r\nContent-Length: 60000\r\n\r\n",
+            paths::MODEL_TURN
+        ),
+    );
     assert!(answer.starts_with("HTTP/1.1 401"), "{answer:?}");
     assert!(answer.contains(r#""class":"auth""#), "{answer}");
-    let (status, e) = rejection(&r.gw, "GET", paths::HEALTH, "");
+    let answer = refused(
+        &r.gw,
+        &format!(
+            "GET {} HTTP/1.1\r\nHost: qb\r\nContent-Length: 0\r\n\r\n",
+            paths::HEALTH
+        ),
+    );
+    let (status, body) = finish_raw(answer.as_bytes());
+    let e: GatewayError = serde_json::from_slice(&body).unwrap();
     assert_eq!((status, e.class), (401, ErrorClass::Auth));
     assert_eq!(r.fake.calls(), Vec::new());
+}
+
+/// The whole answer to `head` from a gateway that refuses the peer at accept. The gateway may
+/// answer and close before the head is fully written, so a failed write (EPIPE) is expected.
+fn refused(sock: &Path, head: &str) -> String {
+    let mut s = UnixStream::connect(sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let _ = s.write_all(head.as_bytes());
+    let mut answer = Vec::new();
+    let _ = s.read_to_end(&mut answer);
+    String::from_utf8_lossy(&answer).into_owned()
 }
 
 #[test]

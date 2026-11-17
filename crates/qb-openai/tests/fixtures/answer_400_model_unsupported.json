@@ -1,0 +1,12 @@
+{
+  "status": 400,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "detail": "The 'model-x' model is not supported when using Codex with a ChatGPT account."
+  }
+}

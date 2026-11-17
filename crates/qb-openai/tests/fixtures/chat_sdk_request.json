@@ -1,0 +1,117 @@
+{
+  "messages": [
+    {
+      "role": "developer",
+      "content": "Be brief."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What is in notes.txt?"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgo=",
+            "detail": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": "Reading both.",
+      "tool_calls": [
+        {
+          "id": "call_a1",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"notes.txt\"}"
+          }
+        },
+        {
+          "id": "call_b2",
+          "type": "function",
+          "function": {
+            "name": "list_dir",
+            "arguments": "{\"dir\": \"src\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_a1",
+      "content": "hello"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_b2",
+      "content": [
+        {
+          "type": "text",
+          "text": "main.rs"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "Thanks. Summarise."
+    }
+  ],
+  "model": "gpt-chat",
+  "max_completion_tokens": 2048,
+  "parallel_tool_calls": true,
+  "reasoning_effort": "high",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "temperature": 0.2,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        "strict": true
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_dir",
+        "description": "List a directory.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "dir": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dir"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "user": "session-1"
+}

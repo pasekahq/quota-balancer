@@ -1,0 +1,12 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_5","object":"response","created_at":1800000000,"status":"in_progress","model":"model-o","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_test_5","type":"message","status":"in_progress","content":[],"role":"assistant"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_test_5","output_index":0,"content_index":0,"delta":"Partial"}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":3,"response":{"id":"resp_test_5","object":"response","created_at":1800000000,"status":"failed","model":"model-o","output":[],"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for model-o. Please try again in 20s."}}}
+

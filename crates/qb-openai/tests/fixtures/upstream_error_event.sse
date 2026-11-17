@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_6","object":"response","created_at":1800000000,"status":"in_progress","model":"model-o","output":[]}}
+
+event: error
+data: {"type":"error","sequence_number":1,"code":"server_is_overloaded","message":"The server is overloaded.\nTry later.","param":null}
+

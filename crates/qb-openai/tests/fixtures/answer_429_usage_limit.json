@@ -1,0 +1,42 @@
+{
+  "status": 429,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "x-codex-primary-used-percent",
+      "100"
+    ],
+    [
+      "x-codex-primary-window-minutes",
+      "300"
+    ],
+    [
+      "x-codex-primary-reset-at",
+      "1800018000"
+    ],
+    [
+      "x-codex-secondary-used-percent",
+      "61"
+    ],
+    [
+      "x-codex-secondary-window-minutes",
+      "10080"
+    ],
+    [
+      "x-codex-secondary-reset-at",
+      "1800500000"
+    ]
+  ],
+  "body": {
+    "error": {
+      "type": "usage_limit_reached",
+      "message": "The usage limit has been reached",
+      "plan_type": "plus",
+      "resets_at": 1800018000,
+      "resets_in_seconds": 18000
+    }
+  }
+}

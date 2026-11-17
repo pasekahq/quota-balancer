@@ -1,0 +1,34 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "text/event-stream"
+    ],
+    [
+      "x-ratelimit-limit-requests",
+      "500"
+    ],
+    [
+      "x-ratelimit-remaining-requests",
+      "499"
+    ],
+    [
+      "x-ratelimit-reset-requests",
+      "120ms"
+    ],
+    [
+      "x-ratelimit-limit-tokens",
+      "30000"
+    ],
+    [
+      "x-ratelimit-remaining-tokens",
+      "27000"
+    ],
+    [
+      "x-ratelimit-reset-tokens",
+      "6m0s"
+    ]
+  ],
+  "body": null
+}
