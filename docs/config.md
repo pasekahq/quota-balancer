@@ -436,14 +436,15 @@ qb login import --config /etc/qb/gateway.toml --from env --source /path/to/vendo
 ```
 
 It reads the source and the gateway config only, makes no network call and leaves the source as
-it was. It writes the login's `credentials` file in the format above, atomically with mode 0600,
+it was; it confines itself before reading the source
+([design.md](design.md#roles-and-privilege-separation)). It writes the login's `credentials` file in the format above, atomically with mode 0600,
 and refuses a file that exists unless `--force` is given. It refuses a source whose credential
 type differs from the login's `kind`. No output and no error carries a value: an error names
 the file, the field and the problem. A refused import exits 1, a usage error 2.
 
 | `--from` | Source file | Type | Fields |
 |---|---|---|---|
-| `hermes` | Hermes `auth.json`, the entry of `credential_pool.<provider>` named by `--entry` (its `id`, else its one `label`); `--entry` may be left out when the provider has one entry | `--provider anthropic`: `oauth_anthropic` when the entry's `auth_type` is `oauth`, else `api_key`; `--provider openai-codex`: `chatgpt_oauth` | `access_token` → `access_token` (`key` for `api_key`); `refresh_token` → `refresh_token`; `expires_at_ms` (ms) or else `expires_at` (ISO 8601 with a time zone) → `expires_at` in Unix seconds; `chatgpt_account_id` claim of the access token (a JWT) → `account_id` |
+| `hermes` | Hermes `auth.json`, the entry of `credential_pool.<provider>` named by `--entry` (its `id`, else its one `label`); `--entry` may be left out when the provider has one entry | `--provider anthropic`: `oauth_anthropic` when the entry's `auth_type` is `oauth` or its access token starts with `sk-ant-oat`, else `api_key`; `--provider openai-codex`: `chatgpt_oauth` | `access_token` → `access_token` (`key` for `api_key`); `refresh_token` → `refresh_token`; `expires_at_ms` (ms) or else `expires_at` (ISO 8601 with a time zone) → `expires_at` in Unix seconds; `chatgpt_account_id` claim of the access token (a JWT) → `account_id` |
 | `claude-code` | Claude Code's `.credentials.json` | `oauth_anthropic` | `claudeAiOauth.accessToken` → `access_token`; `claudeAiOauth.refreshToken` → `refresh_token`; `claudeAiOauth.expiresAt` (ms) → `expires_at` in Unix seconds |
 | `codex` | The Codex CLI's `auth.json` | `chatgpt_oauth` | `tokens.access_token` → `access_token`; `tokens.refresh_token` → `refresh_token`; `tokens.account_id`, else the `chatgpt_account_id` claim of `tokens.id_token` → `account_id`; no `expires_at`, so the gateway refreshes after the vendor rejects the token |
 | `env` | An env file of `NAME=value` lines; `export ` and one pair of quotes around the value are dropped, the last line of the name counts | `api_key` | the value of `--var NAME` → `key` |

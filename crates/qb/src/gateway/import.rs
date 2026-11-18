@@ -9,16 +9,21 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::config::CredentialKind;
+use super::config::{CredentialKind, GatewayLogin};
 use super::creds::{self, CredError, Secret, Written};
 
 /// Largest source file read.
 const MAX_SOURCE: u64 = 1024 * 1024;
 
+/// Start of an Anthropic OAuth access token; Hermes takes such a token for OAuth whatever its
+/// entry's `auth_type` says.
+const ANTHROPIC_OAUTH_PREFIX: &str = "sk-ant-oat";
+
 /// A provider of a Hermes credential pool that can be imported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HermesProvider {
-    /// `anthropic`: an OAuth token (`auth_type = "oauth"`) or an API key.
+    /// `anthropic`: an OAuth token (`auth_type = "oauth"` or the `sk-ant-oat` prefix) or an API
+    /// key.
     Anthropic,
     /// `openai-codex`: a ChatGPT login.
     OpenaiCodex,
@@ -96,25 +101,31 @@ struct Found {
     expires_at: Option<u64>,
 }
 
-/// Copies the credential of `source` in the file `from` into the credential file of `login` in
-/// the gateway config `config`, which must not exist unless `force`.
+/// The entry of `login` in the gateway config `config`.
 ///
 /// # Errors
-/// The config or the source is unreadable or malformed, the source holds no usable credential
-/// or one of another kind than the login's, the target exists, or the write failed.
+/// The config is unreadable or invalid, or has no such login.
+pub fn login(config: &Path, login: &str) -> Result<GatewayLogin, String> {
+    super::config::load(config)
+        .map_err(|e| e.to_string())?
+        .logins
+        .into_iter()
+        .find(|l| l.name == login)
+        .ok_or_else(|| format!("login `{login}` is not in the gateway config"))
+}
+
+/// Copies the credential of `source` in the file `from` into the credential file of `entry`,
+/// which must not exist unless `force`.
+///
+/// # Errors
+/// The source is unreadable or malformed, holds no usable credential or one of another kind
+/// than the login's, the target exists, or the write failed.
 pub fn import(
-    config: &Path,
-    login: &str,
+    entry: &GatewayLogin,
     source: &Source,
     from: &Path,
     force: bool,
 ) -> Result<Imported, String> {
-    let config = super::config::load(config).map_err(|e| e.to_string())?;
-    let entry = config
-        .logins
-        .iter()
-        .find(|l| l.name == login)
-        .ok_or_else(|| format!("login `{login}` is not in the gateway config"))?;
     let target = entry.credentials.as_path();
     if !force && std::fs::symlink_metadata(target).is_ok() {
         return Err(format!(
@@ -133,9 +144,10 @@ pub fn import(
     drop(bytes);
     if found.kind != entry.kind {
         return Err(format!(
-            "{}: holds a `{}` credential, login `{login}` has kind `{}`",
+            "{}: holds a `{}` credential, login `{}` has kind `{}`",
             from.display(),
             found.kind.as_str(),
+            entry.name,
             entry.kind.as_str()
         ));
     }
@@ -173,20 +185,6 @@ fn read_source(file: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
         return Err(format!("{}: is larger than 1 MiB", file.display()));
     }
     Ok(bytes)
-}
-
-fn invalid(file: &Path, what: impl std::fmt::Display) -> CredError {
-    CredError {
-        unusable: true,
-        message: format!("{}: {what}", file.display()),
-    }
-}
-
-/// `s` of `field` copied out when it is present and a non-empty run of visible ASCII.
-fn required(file: &Path, field: &str, s: Option<&Secret>) -> Result<Zeroizing<String>, CredError> {
-    let s = s.ok_or_else(|| invalid(file, format_args!("no `{field}`")))?;
-    creds::visible(file, field, &s.0)?;
-    Ok(s.0.clone())
 }
 
 /// `s` of `field` copied out when present; empty counts as absent.
@@ -242,10 +240,15 @@ fn hermes(
     .unwrap_or_default();
     let field = |i: usize, f: &str| format!("credential_pool.{key}[{i}].{f}");
     let (i, entry) = pool_entry(file, key, &entries, name)?;
-    let secret = required(file, &field(i, "access_token"), entry.access_token.as_ref())?;
+    let secret = creds::secret(file, &field(i, "access_token"), entry.access_token.as_ref())?;
     let kind = match (provider, entry.auth_type.as_deref()) {
         (HermesProvider::OpenaiCodex, _) => CredentialKind::ChatgptOauth,
-        (HermesProvider::Anthropic, Some("oauth")) => CredentialKind::OauthAnthropic,
+        (HermesProvider::Anthropic, _)
+            if entry.auth_type.as_deref() == Some("oauth")
+                || secret.starts_with(ANTHROPIC_OAUTH_PREFIX) =>
+        {
+            CredentialKind::OauthAnthropic
+        }
         (HermesProvider::Anthropic, _) => CredentialKind::ApiKey,
     };
     if kind == CredentialKind::ApiKey {
@@ -266,7 +269,7 @@ fn hermes(
         (Some(ms), _) => Some(ms / 1000),
         (None, Some(iso)) if !iso.is_empty() => {
             Some(qb_vendors::rfc3339::parse(iso).map_err(|_| {
-                invalid(
+                creds::unusable(
                     file,
                     format_args!(
                         "`{}` is not an ISO 8601 timestamp with a time zone",
@@ -279,7 +282,7 @@ fn hermes(
     };
     let account_id = if kind == CredentialKind::ChatgptOauth {
         let id = claimed_account(&secret).ok_or_else(|| {
-            invalid(
+            creds::unusable(
                 file,
                 format_args!(
                     "no `chatgpt_account_id` claim in `{}`",
@@ -322,7 +325,7 @@ fn pool_entry<'a>(
             match (by_id, by_label.next(), by_label.next()) {
                 (Some(found), _, _) | (None, Some(found), None) => found,
                 (None, Some(_), Some(_)) => {
-                    return Err(invalid(
+                    return Err(creds::unusable(
                         file,
                         format_args!(
                             "several `credential_pool.{key}` entries have the label `{name}`; name one by id"
@@ -330,7 +333,7 @@ fn pool_entry<'a>(
                     ));
                 }
                 (None, None, _) => {
-                    return Err(invalid(
+                    return Err(creds::unusable(
                         file,
                         format_args!(
                             "no `credential_pool.{key}` entry has the id or label `{name}`"
@@ -342,13 +345,13 @@ fn pool_entry<'a>(
         None => match entries {
             [only] => (0, only),
             [] => {
-                return Err(invalid(
+                return Err(creds::unusable(
                     file,
                     format_args!("no `credential_pool.{key}` entry"),
                 ));
             }
             more => {
-                return Err(invalid(
+                return Err(creds::unusable(
                     file,
                     format_args!(
                         "{} `credential_pool.{key}` entries; name one with --entry",
@@ -382,7 +385,7 @@ fn claude_code(file: &Path, bytes: &[u8]) -> Result<Found, CredError> {
     let o = doc.oauth;
     Ok(Found {
         kind: CredentialKind::OauthAnthropic,
-        secret: required(file, "claudeAiOauth.accessToken", o.access_token.as_ref())?,
+        secret: creds::secret(file, "claudeAiOauth.accessToken", o.access_token.as_ref())?,
         refresh_token: optional(file, "claudeAiOauth.refreshToken", o.refresh_token.as_ref())?,
         account_id: None,
         expires_at: o.expires_at.map(|ms| ms / 1000),
@@ -413,7 +416,7 @@ fn codex(file: &Path, bytes: &[u8]) -> Result<Found, CredError> {
             .as_ref()
             .and_then(|jwt| claimed_account(&jwt.0))
             .ok_or_else(|| {
-                invalid(
+                creds::unusable(
                     file,
                     "no `tokens.account_id` and no `chatgpt_account_id` claim in `tokens.id_token`",
                 )
@@ -423,7 +426,7 @@ fn codex(file: &Path, bytes: &[u8]) -> Result<Found, CredError> {
     };
     Ok(Found {
         kind: CredentialKind::ChatgptOauth,
-        secret: required(file, "tokens.access_token", t.access_token.as_ref())?,
+        secret: creds::secret(file, "tokens.access_token", t.access_token.as_ref())?,
         refresh_token: optional(file, "tokens.refresh_token", t.refresh_token.as_ref())?,
         account_id: Some(account_id),
         expires_at: None,
@@ -446,9 +449,9 @@ fn env(file: &Path, bytes: &[u8], var: &str) -> Result<Found, CredError> {
             value = Some(unquote(line[eq + 1..].trim_ascii()));
         }
     }
-    let value = value.ok_or_else(|| invalid(file, format_args!("no variable `{var}`")))?;
+    let value = value.ok_or_else(|| creds::unusable(file, format_args!("no variable `{var}`")))?;
     if value.is_empty() || !value.iter().all(u8::is_ascii_graphic) {
-        return Err(invalid(
+        return Err(creds::unusable(
             file,
             format_args!("`{var}` is not a non-empty visible ASCII string"),
         ));

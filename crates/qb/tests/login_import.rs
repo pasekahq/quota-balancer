@@ -148,6 +148,10 @@ fn hermes_pool() -> String {
                 {
                     "id": "070809", "label": "spare", "auth_type": "api_key",
                     "access_token": format!("sk-ant-api2-{MARK}")
+                },
+                {
+                    "id": "0a0b0c", "label": "unhealed", "auth_type": "api_key",
+                    "access_token": format!("sk-ant-oat01-{MARK}")
                 }
             ],
             "openai-codex": [
@@ -190,7 +194,7 @@ fn a_hermes_anthropic_oauth_entry_becomes_an_oauth_anthropic_file_with_a_warning
             "expires_at": 1_800_000_123_u64,
         })
     );
-    assert_eq!(out.matches("warn:").count(), 1, "{out}");
+    assert_eq!(out.matches("single-use refresh token").count(), 1, "{out}");
     assert!(
         out.contains("Hermes and the gateway now share one single-use refresh token"),
         "{out}"
@@ -213,7 +217,7 @@ fn a_hermes_codex_entry_takes_its_account_from_the_token_claims_and_its_iso_expi
     assert_eq!(written["account_id"], format!("acct-{MARK}"));
     assert_eq!(written["refresh_token"], format!("rt-{MARK}"));
     assert_eq!(written["expires_at"], 1_800_000_000_u64);
-    assert!(out.contains("warn: qb: Hermes and the gateway"), "{out}");
+    assert!(out.contains("qb: Hermes and the gateway"), "{out}");
 }
 
 #[test]
@@ -237,7 +241,7 @@ fn a_hermes_api_key_entry_becomes_an_api_key_file_without_a_warning() {
         s.written("login-key"),
         json!({"type": "api_key", "key": format!("sk-ant-api-{MARK}")})
     );
-    assert!(!out.contains("warn"), "{out}");
+    assert!(!out.contains("refresh token"), "{out}");
 }
 
 #[test]
@@ -319,7 +323,7 @@ fn an_env_variable_becomes_an_api_key_file() {
         s.written("login-key"),
         json!({"type": "api_key", "key": format!("sk-{MARK}")})
     );
-    assert!(!out.contains("warn"), "{out}");
+    assert!(!out.contains("refresh token"), "{out}");
 }
 
 #[test]
@@ -342,13 +346,13 @@ fn an_existing_file_is_replaced_only_with_force() {
 /// output.
 type Refusal<'a> = (&'a str, PathBuf, Vec<&'a str>, i32, &'a str);
 
-/// Runs every refusal of `cases` and checks that none wrote a file or warned.
+/// Runs every refusal of `cases` and checks that none wrote a file or warned of a refresh token.
 fn refused(s: &Setup, cases: Vec<Refusal<'_>>) {
     for (login, source, args, want_code, want) in cases {
         let (code, out) = s.import(login, &source, &args);
         assert_eq!(code, want_code, "{args:?}: {out}");
         assert!(out.contains(want), "{args:?}: {out}");
-        assert!(!out.contains("warn"), "{args:?}: {out}");
+        assert!(!out.contains("refresh token"), "{args:?}: {out}");
     }
     let left: Vec<_> = std::fs::read_dir(s.dir.join("creds")).unwrap().collect();
     assert!(left.is_empty(), "a refused import wrote {left:?}");
@@ -378,6 +382,20 @@ fn a_source_of_another_kind_an_unknown_login_or_a_missing_file_is_refused() {
                 vec!["--from", "env", "--var", "VENDOR_KEY"],
                 1,
                 "holds a `api_key` credential, login `login-oauth` has kind `oauth_anthropic`",
+            ),
+            (
+                "login-key",
+                pool.clone(),
+                vec![
+                    "--from",
+                    "hermes",
+                    "--provider",
+                    "anthropic",
+                    "--entry",
+                    "unhealed",
+                ],
+                1,
+                "holds a `oauth_anthropic` credential, login `login-key` has kind `api_key`",
             ),
             (
                 "login-none",
@@ -484,7 +502,7 @@ fn hermes_and_env_sources_without_a_usable_entry_are_refused() {
                 pool.clone(),
                 vec!["--from", "hermes", "--provider", "anthropic"],
                 1,
-                "3 `credential_pool.anthropic` entries; name one with --entry",
+                "4 `credential_pool.anthropic` entries; name one with --entry",
             ),
             (
                 "login-key",

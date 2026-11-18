@@ -321,7 +321,8 @@ fn oauth(access_token: Zeroizing<String>, account_id: Option<Zeroizing<String>>)
     }
 }
 
-fn unusable(file: &Path, what: impl fmt::Display) -> CredError {
+/// The error of `file` that leaves its login unusable: `<file>: <what>`.
+pub(super) fn unusable(file: &Path, what: impl fmt::Display) -> CredError {
     CredError {
         unusable: true,
         message: format!("{}: {what}", file.display()),
@@ -406,7 +407,11 @@ fn open_regular(file: &Path) -> Result<(File, std::fs::Metadata), CredError> {
 }
 
 /// `secret` copied out, if it is a non-empty run of visible ASCII (safe in a header).
-fn secret(file: &Path, field: &str, s: Option<&Secret>) -> Result<Zeroizing<String>, CredError> {
+pub(super) fn secret(
+    file: &Path,
+    field: &str,
+    s: Option<&Secret>,
+) -> Result<Zeroizing<String>, CredError> {
     let Some(s) = s else {
         return Err(unusable(file, format_args!("no `{field}`")));
     };

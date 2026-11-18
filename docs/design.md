@@ -61,8 +61,8 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   enforce part of this gets one warning in the log. DNS over TCP (port 53) is not allowed, so a
   truncated UDP answer fails the probe as `error`. On 401 it reports `auth_stale`; the vendor
   CLI refreshes its own token on next use.
-- `qb gateway` (optional) carries model traffic for its own credential owner and is the
-  only component that writes credentials. It serves its own unix socket, identifies peers by
+- `qb gateway` (optional) carries model traffic for its own credential owner and is the only
+  long-running component that writes credentials. It serves its own unix socket, identifies peers by
   `SO_PEERCRED`, and for each request picks a login from `qbd` as an ordinary client, calls the
   vendor with that login's token or API key, rotates to another login before the first event
   when one fails, and reports the outcome and the windows it saw. It refreshes OAuth tokens on
@@ -71,6 +71,14 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   credential directories (read-write), the resolver files, TCP connections to port 443 and a
   bind on the optional loopback port; gaps on older kernels are logged as for the agent.
   Decisions and limits: [ADR 0001](adr/0001-model-gateway.md).
+- `qb login import` is run by the operator as the gateway's user to write a login's credential
+  file from a credential another client holds ([config.md](config.md#importing-credentials)).
+  It makes itself non-dumpable before it reads the gateway config, then restricts itself with
+  landlock before it opens the source: it may read the files of the config's and the source's
+  directories, and read, write, create and remove regular files in the directory of the login's
+  credential file; no other file and no TCP. Gaps on older kernels get one warning, as for the
+  gateway. It zeroizes the secrets it read and writes the file atomically (0600, rename in the
+  same directory).
 - **Clients** of `qbd` send no secrets: only outcome classes and window numbers.
 
 ## Transport

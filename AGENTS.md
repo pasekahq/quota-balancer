@@ -73,12 +73,16 @@ Release builds are CPU-heavy (fat LTO). Run one cargo build at a time on shared 
    dependencies ≤ 12 and the tree ≲ 50 crates (`cargo tree`).
 5. **Budgets are part of the contract**: binary ≤ 4 MiB, daemon RSS ≤ 4 MiB after 10⁴ picks,
    `qbd.service` exposure ≤ 1.5. Do not raise a limit to make CI green; fix the cause or ask.
-6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only two
-   components touch credential files, both as the credential owner, non-dumpable, under
+6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only three
+   components touch credential files, all as the credential owner, non-dumpable, under
    landlock and with `zeroize` after use: `qb agent` reads them read-only for the duration of
-   one request; `qb gateway` reads them for each upstream request and is the only component
-   that writes them, and only to store refreshed OAuth tokens (0600, temporary file renamed in
-   the same directory). Neither puts a secret into a log, an error, a response or a report.
+   one request; `qb gateway` reads them for each upstream request and writes them only to
+   store refreshed OAuth tokens; `qb login import`, run by the operator, reads one source file
+   and writes one login's credential file, non-dumpable before it reads the gateway config and
+   under landlock (read the config's and the source's directories, read-write the target's
+   directory, no TCP) before it opens the source. Both writers write 0600, a temporary file
+   renamed in the same directory. None puts a secret into a log, an error, a response or a
+   report.
 7. **`unsafe`** is forbidden in `qb-core` and `qb-proto` and denied in `qb`; the exceptions
    (`listen.rs`, fd ownership from systemd; `hangup.rs`, the SIGHUP mask and signalfd) carry a
    `SAFETY:` comment. New exceptions need the same and a test.

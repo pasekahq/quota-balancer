@@ -415,7 +415,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
         }
         Cmd::Gateway(file) => gateway(&file),
         Cmd::Simulate(sim) => simulate(sim),
-        Cmd::LoginImport(req) => Ok(login_import(&req)),
+        Cmd::LoginImport(req) => login_import(&req),
         Cmd::Call(call) => {
             let bearer = bearer(args.bearer_file)?;
             let send = |method, path: &str, body: Option<&[u8]>| {
@@ -533,13 +533,25 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
 }
 
 /// Writes the credential of `req` and says what it wrote, warning when the source client keeps
-/// using the imported refresh token; exit 1 with the reason if refused.
-fn login_import(req: &LoginImport) -> ExitCode {
-    let done = match import::import(&req.config, &req.login, &req.source, &req.from, req.force) {
+/// using the imported refresh token; exit 1 with the reason if refused. The process is
+/// non-dumpable before it reads the config and under landlock before it opens the source.
+fn login_import(req: &LoginImport) -> Result<ExitCode, String> {
+    sandbox::non_dumpable()?;
+    let done = import::login(&req.config, &req.login).and_then(|entry| {
+        let gaps = sandbox::harden_import(&req.config, &req.from, &entry.credentials)?;
+        if !gaps.is_empty() {
+            log::warn(&format!(
+                "qb login import: sandbox incomplete: {}",
+                gaps.join("; ")
+            ));
+        }
+        import::import(&entry, &req.source, &req.from, req.force)
+    });
+    let done = match done {
         Ok(done) => done,
         Err(e) => {
             log::error(&format!("qb: login import refused: {e}"));
-            return ExitCode::from(1);
+            return Ok(ExitCode::from(1));
         }
     };
     let _ = writeln!(
@@ -557,7 +569,7 @@ fn login_import(req: &LoginImport) -> ExitCode {
             req.login
         ));
     }
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Runs the model gateway of the config in `file` with the adapters of the `anthropic`, `openai`
