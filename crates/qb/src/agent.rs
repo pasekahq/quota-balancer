@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use qb_proto::{AgentJob, AgentNextRequest, AgentResultRequest, ProbeOutcome, paths};
 use serde::Deserialize;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{AgentConfig, Kind};
@@ -209,8 +211,30 @@ impl Https {
             .timeout_global(Some(TOTAL_TIMEOUT))
             .build();
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: ureq::Agent::with_parts(
+                config,
+                DefaultConnector::default(),
+                OnCaller::default(),
+            ),
         }
+    }
+}
+
+/// ureq's resolver with no deadline, so a lookup runs on the calling thread: given one, it
+/// spawns a thread per lookup, which `TasksMax=4` of `qb-agent.service` may refuse, and a failed
+/// spawn aborts the process under `panic = "abort"`. The system resolver's own timeouts bound
+/// the lookup. The gateway's adapters use the same resolver (`gateway/vendor.rs`).
+#[derive(Debug, Default)]
+struct OnCaller(DefaultResolver);
+
+impl Resolver for OnCaller {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        self.0.resolve(uri, config, NextTimeout::default())
     }
 }
 
@@ -363,9 +387,29 @@ fn answer_one(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use ureq::Timeout;
+    use ureq::unversioned::transport::time;
+
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_lookup_ends_on_the_calling_thread_with_no_time_left() {
+        let uri: ureq::http::Uri = "https://127.0.0.1:443/api/oauth/usage".parse().unwrap();
+        let spent = NextTimeout {
+            after: time::Duration::Exact(Duration::ZERO),
+            reason: Timeout::Resolve,
+            per_read: None,
+            per_write: None,
+        };
+        let config = ureq::Agent::config_builder().build();
+        let found = OnCaller::default().resolve(&uri, &config, spent);
+        let at = SocketAddr::from((Ipv4Addr::LOCALHOST, 443));
+        assert_eq!(found.unwrap().to_vec(), [at]);
+    }
 
     fn job() -> AgentJob {
         AgentJob {

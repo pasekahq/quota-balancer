@@ -59,7 +59,9 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   non-dumpable and restricts itself with landlock to reading the credential directories,
   `/etc/resolv.conf` and `/etc/hosts`, and to TCP connections to port 443; a kernel that cannot
   enforce part of this gets one warning in the log. DNS over TCP (port 53) is not allowed, so a
-  truncated UDP answer fails the probe as `error`. On 401 it reports `auth_stale`; the vendor
+  truncated UDP answer fails the probe as `error`. Host names resolve on the probe's own thread,
+  bounded by the system resolver's timeouts rather than the probe's, since `TasksMax=4` leaves
+  no room for a resolver thread per probe. On 401 it reports `auth_stale`; the vendor
   CLI refreshes its own token on next use.
 - `qb gateway` (optional) carries model traffic for its own credential owner and is the only
   long-running component that writes credentials. It serves its own unix socket, identifies peers by
@@ -191,7 +193,7 @@ refreshes the login for later picks.
 | daemon RSS idle / after 10⁴ picks | ≲ 2 MiB / ≤ 4 MiB (`MemoryMax=16M`) |
 | agent RSS idle / during probe | ≲ 2 MiB / ≲ 6 MiB |
 | gateway RSS idle / per turn in flight | ≤ 4 MiB / ≲ 1 MiB plus twice the request body |
-| binary | static musl, ≤ 4 MiB with TLS and the gateway (raised from 2.5 MiB on 2026-11-17 by owner decision to fit both gateway fronts) |
+| binary | static musl, ≤ 4 MiB with TLS, the gateway and both of its fronts (owner decision) |
 | dependencies | ≤ 12 direct, ≲ 50 total |
 | CPU | 0 wake-ups/s idle (daemon, agent and gateway); pick ≤ 50 µs server-side, p99 ≤ 1 ms over UDS from connect to response; gateway p99 ≤ 5 ms from a request to its upstream request |
 | disk | ≤ ~150 B per pick, or 0 with `journal = off`; the gateway writes only refreshed credential files |
