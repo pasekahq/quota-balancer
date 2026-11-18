@@ -456,6 +456,8 @@ fn unknown_tool_types_are_kept_and_refused_elsewhere() {
         {"type": "function", "name": "lookup", "defer_loading": true, "parameters": {"type": "object"}},
         {"type": "mcp", "server_label": "docs", "server_url": "https://example.invalid/mcp"},
         {"type": "mcp", "server_label": "docs", "server_url": "https://example.invalid/mcp2"},
+        {"type": "namespace", "name": "multi_agent_v1", "description": "Sub-agents.",
+         "tools": [{"type": "function", "name": "close_agent", "parameters": {"type": "object"}}]},
     ]});
     let req = decode(&body).expect("decodes");
     let tools: Vec<(&str, Option<Elsewhere>)> = req
@@ -471,6 +473,7 @@ fn unknown_tool_types_are_kept_and_refused_elsewhere() {
             ("lookup", Some(Elsewhere::Function)),
             ("docs", Some(Elsewhere::Omit)),
             ("docs_2", Some(Elsewhere::Omit)),
+            ("multi_agent_v1", Some(Elsewhere::Omit)),
         ]
     );
 }

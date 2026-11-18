@@ -254,8 +254,8 @@ const HOSTED_CALLS: &[&str] = &[
     "mcp_list_tools",
 ];
 
-/// Tool types the vendor runs itself, or that only extend the toolset; another vendor leaves
-/// them out.
+/// Tool types the vendor runs itself, or that only extend the toolset (a client tool search, a
+/// `namespace` of functions such as Codex's sub-agent tools); another vendor leaves them out.
 const OMIT_ELSEWHERE: &[&str] = &[
     "web_search",
     "web_search_preview",
@@ -266,6 +266,7 @@ const OMIT_ELSEWHERE: &[&str] = &[
     "image_generation",
     "mcp",
     "tool_search",
+    "namespace",
 ];
 
 /// Fields of a function tool that the canonical tool carries; a function tool with any other
