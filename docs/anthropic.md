@@ -27,8 +27,8 @@ value.
 | `text` | `text`; an empty text block is dropped |
 | `image` (`base64`) | `image` with a `base64` source |
 | `image` (`path`) | the same, with the bytes from the caller's loader; a load failure is a `BuildError` |
-| `tool_use{id,name,input}` | `tool_use` with the same id |
-| `tool_result{id,content,is_error}` | `tool_result{tool_use_id,content,is_error}` |
+| `tool_use{id,name,input}` | `tool_use` with the same id (below) |
+| `tool_result{id,content,is_error}` | `tool_result{tool_use_id,content,is_error}` (below) |
 | `thinking{vendor,opaque}` of the picked vendor | the block whose JSON `opaque` holds (`thinking` with `signature`, or `redacted_thinking`) |
 | `thinking` of another vendor, or an `opaque` that is not such a block | dropped |
 | `tools[]` | `tools[]{name,description,input_schema}`; a tool with `native` follows its `elsewhere`: `function` goes out like any tool, `omit` is left out, `refuse` is a `BuildError` |
@@ -37,6 +37,12 @@ value.
 | — | `stream: true`; `thinking: {type: adaptive}` unless the target turns it off or the history lost its thinking (below) |
 
 A message left without blocks is dropped. The model id comes from `qbd`'s pick.
+
+The vendor accepts a tool id only when it matches `^[a-zA-Z0-9_-]+$`. Such an id goes out
+unchanged; any other (some Chat Completions providers issue `functions.read:0`, and a chain turn
+may bring it back to Anthropic) goes out as `qbx_` and the lowercase hex of its bytes, in both
+`tool_use` and `tool_result`, so the pair still matches and two ids never merge. The vendor answers
+with ids of its own, so the client never sees the rewritten form.
 
 A canonical `system` message is the vendor's mid-conversation system message
 (`{role: system, content: [text blocks]}`, stable in the Messages API, no beta header). The vendor

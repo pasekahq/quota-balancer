@@ -1,6 +1,7 @@
 //! Upstream direction, request side: a canonical [`TurnRequest`] becomes an Anthropic
 //! [`CreateMessage`] body and a set of request headers for one of two [`AuthMode`]s.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use qb_proto::{Block, CacheMode, Effort, Elsewhere, MediaType, Role, TurnRequest};
@@ -358,7 +359,7 @@ fn block(
             }
         }
         Block::ToolUse { id, name, input } => ContentBlock::ToolUse {
-            id: id.clone(),
+            id: tool_id(id).into_owned(),
             name: name.clone(),
             input: Value::Object(input.clone()),
             cache_control: None,
@@ -368,7 +369,7 @@ fn block(
             content,
             is_error,
         } => ContentBlock::ToolResult {
-            tool_use_id: id.clone(),
+            tool_use_id: tool_id(id).into_owned(),
             content: Some(ToolResultContent::Text(content.clone())),
             is_error: *is_error,
             cache_control: None,
@@ -387,6 +388,30 @@ fn block(
         }
     }))
 }
+
+/// Prefix of a tool id outside the vendor's pattern, rewritten by [`tool_id`].
+pub const MAPPED_TOOL_ID_PREFIX: &str = "qbx_";
+
+/// `id` as the vendor accepts it: unchanged when it matches `^[a-zA-Z0-9_-]+$`, else
+/// [`MAPPED_TOOL_ID_PREFIX`] and the lowercase hex of its bytes. The map is deterministic, so a
+/// `tool_use` and its `tool_result` still pair, and injective, so two ids never merge; ids of
+/// another vendor (`functions.read:0` of some Chat Completions providers) then reach Anthropic
+/// instead of a 400.
+pub fn tool_id(id: &str) -> Cow<'_, str> {
+    let fits = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    if !id.is_empty() && id.bytes().all(fits) {
+        return Cow::Borrowed(id);
+    }
+    let mut out = String::with_capacity(MAPPED_TOOL_ID_PREFIX.len() + 2 * id.len());
+    out.push_str(MAPPED_TOOL_ID_PREFIX);
+    for b in id.bytes() {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    Cow::Owned(out)
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// The Anthropic thinking block an opaque payload of this adapter holds: the block's own JSON.
 pub fn thinking_from_opaque(opaque: &str) -> Option<ContentBlock> {
