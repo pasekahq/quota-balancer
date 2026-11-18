@@ -94,7 +94,7 @@ enum Script {
     Held(Vec<StreamEvent>, std::sync::mpsc::Receiver<()>),
     /// Emit a text event every 20 ms until the sink stops it; at most 10 s.
     Drip,
-    /// Fail as a refused request with a message that quotes the credential.
+    /// Fail as a refused request with a message that quotes the secret and the account id.
     Leak,
 }
 
@@ -194,7 +194,11 @@ impl Upstream for Shared {
             }
             Script::Leak => Err(Failure::new(
                 FailureKind::BadRequest,
-                format!("vendor refused key {}", credential.secret()),
+                format!(
+                    "vendor refused key {} of account {}",
+                    credential.secret(),
+                    credential.account_id().unwrap_or("none")
+                ),
             )),
             Script::Drip => {
                 for _ in 0..500 {
@@ -351,10 +355,13 @@ fn credentials(dir: &Path, files: &[(&str, String, u32)]) {
     }
 }
 
-/// The login keys of the kind a credential file's contents declare, of the `anthropic` family.
+/// The login keys of the kind a credential file's contents declare, of the `anthropic` family
+/// unless it is a ChatGPT login.
 fn keys_of(contents: &str) -> &'static str {
     if contents.contains("oauth_anthropic") {
         "kind = \"oauth_anthropic\""
+    } else if contents.contains("chatgpt_oauth") {
+        CHATGPT
     } else {
         ANTHROPIC_KEY
     }
@@ -396,7 +403,10 @@ fn rig_on(
     let refreshes = Arc::new(AtomicUsize::new(0));
     let gw = serve_gateway(
         &text,
-        vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
+        vec![
+            (Api::Anthropic, Box::new(Shared(Arc::clone(&fake)))),
+            (Api::Openai, Box::new(Shared(Arc::clone(&fake)))),
+        ],
         Box::new(Counting(Arc::clone(&refreshes))),
         gateway_uid,
         loopback,
@@ -2261,6 +2271,23 @@ fn a_credential_an_adapter_quotes_reaches_neither_the_log_nor_the_client() {
     assert!(logged.contains("vendor refused key"), "{logged}");
     assert!(!logged.contains(MARK), "{logged}");
     assert_eq!(r.fake.calls()[0].1, MARK, "the adapter got the credential");
+}
+
+#[test]
+fn a_chatgpt_account_id_an_adapter_quotes_is_redacted_like_the_token() {
+    const TOKEN: &str = "test-token-3e7a";
+    const ACCOUNT: &str = "test-account-8d1f";
+    let r = rig_with(4, &[("login-1", chatgpt(TOKEN, ACCOUNT), 0o600)]);
+    r.fake.script("login-1", Script::Leak);
+    let mut events = Vec::new();
+    let logged = stderr_of(|| events = turn(&r.gw, &turn_body("turn-1")).2);
+    assert_eq!(kinds(&events), ["error BadRequest"]);
+    let message = last_error(&events).message.clone().unwrap();
+    assert!(message.contains("of account [redacted]"), "{message}");
+    for mark in [TOKEN, ACCOUNT] {
+        assert!(!message.contains(mark), "{message}");
+        assert!(!logged.contains(mark), "{logged}");
+    }
 }
 
 #[test]

@@ -19,7 +19,7 @@ and a JSON `/v1` API over HTTP/1.1 on a unix socket. Design: `docs/design.md`. C
 | `crates/qb-vendors` | Pure, total parsers of vendor quota data (stream-json, statusline, rollouts, usage endpoints) into `qb-proto` window reports. Rules in `docs/vendors.md`; fixtures in `tests/fixtures/`. |
 | `crates/qb-anthropic` | Pure translation between canonical C4 turns and the Anthropic Messages API, both directions: request body and header modes, SSE parser and event translator, rate-limit headers and error classification, and the `/v1/messages` front's decoder and encoders. Rules in `docs/anthropic.md`; fixtures in `tests/fixtures/`. |
 | `crates/qb-openai` | Pure translation between canonical C4 turns and the OpenAI Chat Completions and Responses APIs, both directions: Responses request body and header modes (API key, ChatGPT login), the Chat Completions upstream for OpenAI-compatible API keys, SSE parser and event translators, rate-limit headers and error classification, and the `/v1/chat/completions` and `/v1/responses` fronts' decoders and encoders. Rules in `docs/openai.md`; fixtures in `tests/fixtures/`. |
-| `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `hangup.rs` (SIGHUP as a signalfd for the gateway's reload), `agent.rs` (probe loop, HTTPS fetcher), `sandbox.rs` (agent and gateway hardening), `gateway/` (`qb gateway`: `config.rs`, `creds.rs` credential files and refresh, `upstream.rs` the adapter seam, `vendor.rs` the ureq transport the adapters share, `anthropic.rs` the Anthropic adapter, `openai_upstream.rs` the OpenAI Responses adapter, `chat_upstream.rs` the Chat Completions adapter, `oauth.rs` the OAuth token refresher, `core.rs` pick/report/rotation, `spend.rs` the monthly spend count of capped logins, `front.rs` the unix socket, the loopback listener and the C4 front, `answer.rs` the HTTP fronts' SSE or body answer, `messages.rs` the `/v1/messages` front, `openai.rs` the `/v1/chat/completions` and `/v1/responses` fronts), `main.rs` (CLI). |
+| `crates/qb` | The binary: `http.rs` (framing), `server.rs` (`poll()` loop), `api.rs` (routing), `journal.rs` (journal lines, rotation, replay), `client.rs`, `listen.rs` (systemd socket activation), `hangup.rs` (SIGHUP as a signalfd for the gateway's reload), `agent.rs` (probe loop, HTTPS fetcher), `sandbox.rs` (agent and gateway hardening), `gateway/` (`qb gateway`: `config.rs`, `creds.rs` credential files and refresh, `import.rs` `qb login import`, `upstream.rs` the adapter seam, `vendor.rs` the ureq transport the adapters share, `anthropic.rs` the Anthropic adapter, `openai_upstream.rs` the OpenAI Responses adapter, `chat_upstream.rs` the Chat Completions adapter, `oauth.rs` the OAuth token refresher, `core.rs` pick/report/rotation, `spend.rs` the monthly spend count of capped logins, `front.rs` the unix socket, the loopback listener and the C4 front, `answer.rs` the HTTP fronts' SSE or body answer, `messages.rs` the `/v1/messages` front, `openai.rs` the `/v1/chat/completions` and `/v1/responses` fronts), `main.rs` (CLI). |
 | `deploy/systemd/` | Unit templates with hardening. |
 | `ci/budgets.sh` | Binary size and static-link checks; the other budgets are the acceptance lane (`docs/design.md`, "Budgets"). |
 | `clients/python/` | `qb_client.py`: single-file stdlib client (Python ≥ 3.9) to copy in; `contract.rs` drives it through `contract_driver.py`, so `cargo test` needs `python3`. |
@@ -73,12 +73,16 @@ Release builds are CPU-heavy (fat LTO). Run one cargo build at a time on shared 
    dependencies ≤ 12 and the tree ≲ 50 crates (`cargo tree`).
 5. **Budgets are part of the contract**: binary ≤ 4 MiB, daemon RSS ≤ 4 MiB after 10⁴ picks,
    `qbd.service` exposure ≤ 1.5. Do not raise a limit to make CI green; fix the cause or ask.
-6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only two
-   components touch credential files, both as the credential owner, non-dumpable, under
+6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only three
+   components touch credential files, all as the credential owner, non-dumpable, under
    landlock and with `zeroize` after use: `qb agent` reads them read-only for the duration of
-   one request; `qb gateway` reads them for each upstream request and is the only component
-   that writes them, and only to store refreshed OAuth tokens (0600, temporary file renamed in
-   the same directory). Neither puts a secret into a log, an error, a response or a report.
+   one request; `qb gateway` reads them for each upstream request and writes them only to
+   store refreshed OAuth tokens; `qb login import`, run by the operator, reads one source file
+   and writes one login's credential file, non-dumpable before it reads the gateway config and
+   under landlock (read the config's and the source's directories, read-write the target's
+   directory, no TCP) before it opens the source. Both writers write 0600, a temporary file
+   renamed in the same directory. None puts a secret into a log, an error, a response or a
+   report.
 7. **`unsafe`** is forbidden in `qb-core` and `qb-proto` and denied in `qb`; the exceptions
    (`listen.rs`, fd ownership from systemd; `hangup.rs`, the SIGHUP mask and signalfd) carry a
    `SAFETY:` comment. New exceptions need the same and a test.

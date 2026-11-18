@@ -13,6 +13,7 @@ use qb::gateway::chat_upstream::ChatCompletions;
 use qb::gateway::config::Api;
 use qb::gateway::core::{Gateway, Upstreams};
 use qb::gateway::front;
+use qb::gateway::import::{self, HermesProvider, Source};
 use qb::gateway::oauth::OauthRefresher;
 use qb::gateway::openai_upstream::Openai;
 use qb::hangup::Hangup;
@@ -48,6 +49,15 @@ COMMANDS:
     spend                               GET /v1/model/spend: the month's spend, cap and period
                                         end of each capped login of the gateway on --socket
     spend reset <LOGIN>                 POST /v1/model/spend/reset: set LOGIN's count to zero
+    login import --config PATH --from FORMAT --source PATH [--provider P] [--entry E]
+         [--var NAME] [--force] <LOGIN>
+                                        copy the credential in the file --source into the
+                                        credential file of LOGIN in the gateway config PATH,
+                                        printing no value; FORMAT: `hermes` (with --provider
+                                        `anthropic` or `openai-codex` and, among several
+                                        entries, --entry id or label), `claude-code`, `codex`,
+                                        `env` (with --var NAME); the file must not exist
+                                        unless --force; exit 1 if refused
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -85,6 +95,7 @@ enum Cmd {
     Agent(PathBuf),
     Gateway(PathBuf),
     Simulate(Simulate),
+    LoginImport(LoginImport),
     Call(Call),
     Version,
     Help,
@@ -109,6 +120,14 @@ struct Simulate {
     journal: PathBuf,
     at: Option<u64>,
     pick: Option<PickRequest>,
+}
+
+struct LoginImport {
+    config: PathBuf,
+    login: String,
+    source: Source,
+    from: PathBuf,
+    force: bool,
 }
 
 /// The client name a simulated pick runs as.
@@ -155,6 +174,10 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
     let mut spend_args: Vec<OsString> = Vec::new();
     let (mut at, mut sim_pick) = (None, None);
     let mut from_stream = None;
+    let mut login_args: Vec<OsString> = Vec::new();
+    let (mut format, mut source_file, mut provider, mut entry, mut var) =
+        (None, None, None, None, None);
+    let mut force = false;
     let mut name: Option<String> = if as_qbd {
         Some("daemon".to_owned())
     } else {
@@ -198,7 +221,13 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
                 operand = Some(v);
             }
             Value(v) if sub == Some("spend") && spend_args.len() < 2 => spend_args.push(v),
-            Long("config") if matches!(sub, Some("daemon" | "simulate" | "agent" | "gateway")) => {
+            Value(v) if sub == Some("login") && login_args.len() < 2 => login_args.push(v),
+            Long("config")
+                if matches!(
+                    sub,
+                    Some("daemon" | "simulate" | "agent" | "gateway" | "login")
+                ) =>
+            {
                 config = Some(PathBuf::from(p.value()?));
             }
             Long("at") if sub == Some("simulate") => at = Some(p.value()?.parse()?),
@@ -208,6 +237,12 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
                     .map_err(|e| lexopt::Error::from(format!("--pick: {e}")))?;
                 sim_pick = Some(req);
             }
+            Long("from") if sub == Some("login") => format = Some(string(p.value()?)?),
+            Long("source") if sub == Some("login") => source_file = Some(PathBuf::from(p.value()?)),
+            Long("provider") if sub == Some("login") => provider = Some(string(p.value()?)?),
+            Long("entry") if sub == Some("login") => entry = Some(string(p.value()?)?),
+            Long("var") if sub == Some("login") => var = Some(string(p.value()?)?),
+            Long("force") if sub == Some("login") => force = true,
             Long("from-stream-json") if sub == Some("report") => {
                 from_stream = Some(PathBuf::from(p.value()?));
             }
@@ -257,6 +292,46 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             [verb, login] if verb == "reset" => Cmd::Call(Call::SpendReset(string(login.clone())?)),
             _ => return Err("expected `spend` or `spend reset <LOGIN>`".into()),
         },
+        Some("login") => {
+            let [verb, login] = <[OsString; 2]>::try_from(login_args)
+                .map_err(|_| "expected `login import <LOGIN>`")?;
+            if verb != "import" {
+                return Err("expected `login import <LOGIN>`".into());
+            }
+            let source = match (format.as_deref(), provider, entry, var) {
+                (Some("hermes"), Some(provider), entry, None) => Source::Hermes {
+                    provider: HermesProvider::parse(&provider).ok_or_else(|| {
+                        format!("--provider `{provider}`: expected `anthropic` or `openai-codex`")
+                    })?,
+                    entry,
+                },
+                (Some("hermes"), None, _, _) => return Err("--from hermes needs --provider".into()),
+                (Some("claude-code"), None, None, None) => Source::ClaudeCode,
+                (Some("codex"), None, None, None) => Source::Codex,
+                (Some("env"), None, None, Some(var)) => Source::Env { var },
+                (Some("env"), _, _, None) => return Err("--from env needs --var".into()),
+                (Some("hermes" | "claude-code" | "codex" | "env"), _, _, _) => {
+                    return Err(
+                        "--provider and --entry go with --from hermes, --var with --from env"
+                            .into(),
+                    );
+                }
+                (Some(other), _, _, _) => {
+                    return Err(format!(
+                        "--from `{other}`: expected `hermes`, `claude-code`, `codex` or `env`"
+                    )
+                    .into());
+                }
+                (None, _, _, _) => return Err("--from is required".into()),
+            };
+            Cmd::LoginImport(LoginImport {
+                config: config.ok_or("--config is required")?,
+                login: string(login)?,
+                source,
+                from: source_file.ok_or("--source is required")?,
+                force,
+            })
+        }
         Some("version") => Cmd::Version,
         Some("why") => {
             let lease = operand.ok_or("a lease id is required")?;
@@ -340,6 +415,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
         }
         Cmd::Gateway(file) => gateway(&file),
         Cmd::Simulate(sim) => simulate(sim),
+        Cmd::LoginImport(req) => login_import(&req),
         Cmd::Call(call) => {
             let bearer = bearer(args.bearer_file)?;
             let send = |method, path: &str, body: Option<&[u8]>| {
@@ -452,6 +528,46 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
             .map_err(|e| format!("--pick: {}", e.message()))?;
         let _ = out.write_all(&encode(&resp)?);
         let _ = out.write_all(b"\n");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Writes the credential of `req` and says what it wrote, warning when the source client keeps
+/// using the imported refresh token; exit 1 with the reason if refused. The process is
+/// non-dumpable before it reads the config and under landlock before it opens the source.
+fn login_import(req: &LoginImport) -> Result<ExitCode, String> {
+    sandbox::non_dumpable()?;
+    let done = import::login(&req.config, &req.login).and_then(|entry| {
+        let gaps = sandbox::harden_import(&req.config, &req.from, &entry.credentials)?;
+        if !gaps.is_empty() {
+            log::warn(&format!(
+                "qb login import: sandbox incomplete: {}",
+                gaps.join("; ")
+            ));
+        }
+        import::import(&entry, &req.source, &req.from, req.force)
+    });
+    let done = match done {
+        Ok(done) => done,
+        Err(e) => {
+            log::error(&format!("qb: login import refused: {e}"));
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let _ = writeln!(
+        std::io::stdout().lock(),
+        "{}: wrote the `{}` credential of login `{}`",
+        done.file.display(),
+        done.kind.as_str(),
+        req.login
+    );
+    if let Some(client) = done.shared_with {
+        log::warn(&format!(
+            "qb: {client} and the gateway now share one single-use refresh token: the first \
+             refresh by either invalidates the other's copy. Sign login `{}` in on its own with \
+             `qb login`, or stop using {client} with this account.",
+            req.login
+        ));
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -1,10 +1,12 @@
-//! Self-restriction of `qb agent` and `qb gateway` before their first connection: the process
-//! becomes non-dumpable, and landlock limits it to the credential directories (read-only for the
-//! agent; for the gateway also writing, creating and removing regular files, as a refreshed
-//! token is written back by rename, and the same in the directory of its spend file), the
-//! resolver files and TCP connections to port 443. The gateway may also read the files of its
-//! config's directory, for a reload. The only TCP bind allowed is the gateway's on the port of
-//! its loopback Messages listener.
+//! Self-restriction of `qb agent`, `qb gateway` and `qb login import` before they touch a
+//! secret: the process becomes non-dumpable, and landlock limits it to the credential
+//! directories (read-only for the agent; for the gateway and the import also writing, creating
+//! and removing regular files, as a credential file is written by rename, and the same in the
+//! directory of the gateway's spend file). The agent and the gateway may also read the resolver
+//! files and connect over TCP to port 443; the import has no network. The gateway may read the
+//! files of its config's directory, for a reload, and the import those of its config's and its
+//! source's directories. The only TCP bind allowed is the gateway's on the port of its loopback
+//! Messages listener.
 
 use std::path::{Path, PathBuf};
 
@@ -39,7 +41,7 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, false, None, None)
+    confine(&files, false, &[], None, true)
 }
 
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
@@ -64,26 +66,46 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
         .as_ref()
         .and_then(|f| f.listen)
         .map(|a| a.port());
-    confine(&files, true, Some(&config.file), bind)
+    confine(&files, true, &[&config.file], bind, true)
 }
 
+/// [`harden`] for `qb login import`: read files beneath the directories of `config_file` and
+/// `source`; beneath the directory of `target`, the login's credential file, also write and
+/// truncate files, create regular files and remove files, so the file is written by rename. No
+/// resolver files and no TCP at all. Call it before the source is opened.
+///
+/// # Errors
+/// The dumpable flag cannot be cleared.
+pub fn harden_import(
+    config_file: &Path,
+    source: &Path,
+    target: &Path,
+) -> Result<Vec<String>, String> {
+    confine(&[target], true, &[config_file, source], None, false)
+}
+
+/// Makes the process non-dumpable: no core dump, no same-uid ptrace or `/proc/<pid>/mem` read.
+///
+/// # Errors
+/// The flag cannot be cleared.
+pub fn non_dumpable() -> Result<(), String> {
+    set_dumpable_behavior(DumpableBehavior::NotDumpable)
+        .map_err(|e| format!("PR_SET_DUMPABLE: {e}"))
+}
+
+/// [`non_dumpable`], then landlock: `owned_files`' directories readable (and writable when
+/// `writable`), the files of `read_files`' directories readable, TCP bind on `bind`, and with
+/// `https` the resolver files and TCP connect to [`HTTPS_PORT`].
 fn confine(
     owned_files: &[&Path],
     writable: bool,
-    config_file: Option<&Path>,
+    read_files: &[&Path],
     bind: Option<u16>,
+    https: bool,
 ) -> Result<Vec<String>, String> {
-    set_dumpable_behavior(DumpableBehavior::NotDumpable)
-        .map_err(|e| format!("PR_SET_DUMPABLE: {e}"))?;
+    non_dumpable()?;
     let mut gaps = Vec::new();
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for file in owned_files {
-        match file_dir(file) {
-            Ok(dir) if !dirs.contains(&dir) => dirs.push(dir),
-            Ok(_) => {}
-            Err(e) => gaps.push(format!("{} stays unreadable: {e}", file.display())),
-        }
-    }
+    let dirs = dirs_of(owned_files, &mut gaps);
     let read_dir = AccessFs::from_read(TARGET_ABI);
     let read_file = read_dir & AccessFs::from_file(TARGET_ABI);
     let credential_access = if writable {
@@ -95,18 +117,13 @@ fn confine(
     } else {
         read_dir
     };
-    let config_dir = match config_file.map(file_dir).transpose() {
-        Ok(dir) => dir,
-        Err(e) => {
-            gaps.push(format!("the config stays unreadable for a reload: {e}"));
-            None
-        }
-    };
+    let read_dirs = dirs_of(read_files, &mut gaps);
+    let resolver: &[&str] = if https { &RESOLVER_FILES } else { &[] };
     let readable = dirs
         .iter()
         .map(|d| (d.as_path(), credential_access))
-        .chain(config_dir.as_deref().map(|d| (d, read_file)))
-        .chain(RESOLVER_FILES.map(|f| (Path::new(f), read_file)));
+        .chain(read_dirs.iter().map(|d| (d.as_path(), read_file)))
+        .chain(resolver.iter().map(|f| (Path::new(*f), read_file)));
     let mut rules = Vec::new();
     for (path, access) in readable {
         match PathFd::new(path) {
@@ -114,7 +131,7 @@ fn confine(
             Err(e) => gaps.push(format!("{} stays unreadable: {e}", path.display())),
         }
     }
-    match restrict(rules, bind) {
+    match restrict(rules, bind, https) {
         Ok((RulesetStatus::FullyEnforced, _)) => {}
         Ok((RulesetStatus::PartiallyEnforced, LandlockStatus::Available { effective_abi, .. })) => {
             gaps.push(format!(
@@ -130,6 +147,19 @@ fn confine(
         )),
     }
     Ok(gaps)
+}
+
+/// The distinct directories of `files`; a file without one is added to `gaps`.
+fn dirs_of(files: &[&Path], gaps: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for file in files {
+        match file_dir(file) {
+            Ok(dir) if !dirs.contains(&dir) => dirs.push(dir),
+            Ok(_) => {}
+            Err(e) => gaps.push(format!("{} stays unreadable: {e}", file.display())),
+        }
+    }
+    dirs
 }
 
 /// The absolute directory of the credential or config file `file`, resolved against the working
@@ -150,16 +180,19 @@ pub fn file_dir(file: &Path) -> std::io::Result<PathBuf> {
 fn restrict(
     rules: Vec<PathBeneath<PathFd>>,
     bind: Option<u16>,
+    https: bool,
 ) -> Result<(RulesetStatus, LandlockStatus), landlock::RulesetError> {
-    let bind =
-        bind.map(|port| Ok::<_, landlock::RulesetError>(NetPort::new(port, AccessNet::BindTcp)));
+    let ports = bind
+        .map(|port| NetPort::new(port, AccessNet::BindTcp))
+        .into_iter()
+        .chain(https.then(|| NetPort::new(HTTPS_PORT, AccessNet::ConnectTcp)))
+        .map(Ok::<_, landlock::RulesetError>);
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(TARGET_ABI))?
         .handle_access(AccessNet::from_all(TARGET_ABI))?
         .create()?
         .add_rules(rules.into_iter().map(Ok::<_, landlock::RulesetError>))?
-        .add_rule(NetPort::new(HTTPS_PORT, AccessNet::ConnectTcp))?
-        .add_rules(bind)?
+        .add_rules(ports)?
         .restrict_self()?;
     Ok((status.ruleset, status.landlock))
 }

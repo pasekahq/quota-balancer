@@ -7,6 +7,7 @@
 //!
 //! - [`config`]: the gateway's TOML config;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
+//! - [`import`]: `qb login import`, a credential of another client copied into a login's file;
 //! - [`upstream`]: the seam vendor adapters implement;
 //! - [`vendor`]: the transport the adapters share;
 //! - [`anthropic`]: the adapter of the `anthropic` API family;
@@ -27,6 +28,7 @@ pub mod config;
 pub mod core;
 pub mod creds;
 pub mod front;
+pub mod import;
 pub mod messages;
 pub mod oauth;
 pub mod openai;
