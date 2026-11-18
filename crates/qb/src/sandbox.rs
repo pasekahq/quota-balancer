@@ -35,6 +35,9 @@ pub struct Confined {
     pub gaps: Vec<String>,
     /// One line on what is enforced, for the startup log.
     pub summary: String,
+    /// The directories of the owned files that the process may use: those landlock opened, or
+    /// all of them when landlock restricts nothing.
+    pub opened: Vec<PathBuf>,
 }
 
 /// Makes the process non-dumpable, then restricts the calling thread and the threads it starts
@@ -145,14 +148,19 @@ fn confine(
         .chain(read_dirs.iter().map(|d| (d.as_path(), read_file)))
         .chain(resolver.iter().map(|f| (Path::new(*f), read_file)));
     let mut rules = Vec::new();
+    let mut opened = Vec::new();
     for (path, access) in readable {
         match PathFd::new(path) {
-            Ok(fd) => rules.push(PathBeneath::new(fd, access)),
+            Ok(fd) => {
+                if dirs.iter().any(|d| d == path) {
+                    opened.push(path.to_path_buf());
+                }
+                rules.push(PathBeneath::new(fd, access));
+            }
             Err(e) => gaps.push(format!("{} stays unreadable: {e}", path.display())),
         }
     }
-    let opened = rules.len();
-    let summary = summary(opened, bind, https);
+    let summary = summary(rules.len(), bind, https);
     match restrict(rules, bind, https) {
         Ok((RulesetStatus::FullyEnforced, _)) => {}
         Ok((RulesetStatus::PartiallyEnforced, LandlockStatus::Available { effective_abi, .. })) => {
@@ -161,14 +169,32 @@ fn confine(
                  including the TCP port rule of V4, are not enforced"
             ));
         }
-        Ok((_, status)) => gaps.push(format!(
-            "landlock {status:?}: file and network access are not restricted"
-        )),
-        Err(e) => gaps.push(format!(
-            "landlock failed ({e}): file and network access are not restricted"
-        )),
+        Ok((_, status)) => {
+            gaps.push(format!(
+                "landlock {status:?}: file and network access are not restricted"
+            ));
+            opened.clone_from(&dirs);
+        }
+        Err(e) => {
+            gaps.push(format!(
+                "landlock failed ({e}): file and network access are not restricted"
+            ));
+            opened.clone_from(&dirs);
+        }
     }
-    Ok(Confined { gaps, summary })
+    Ok(Confined {
+        gaps,
+        summary,
+        opened,
+    })
+}
+
+/// The directory of the config file `file` when the sandbox opening it to reads would open much
+/// more: the root, or `home` or a directory above it.
+pub fn broad_config_dir(file: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let dir = file_dir(file).ok()?;
+    let broad = dir.parent().is_none() || home.is_some_and(|h| h.starts_with(&dir));
+    broad.then_some(dir)
 }
 
 /// The startup line of a ruleset of `paths` path rules, TCP bind on `bind` and with `https` TCP
@@ -237,4 +263,34 @@ fn restrict(
         .add_rules(ports)?
         .restrict_self()?;
     Ok((status.ruleset, status.landlock))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_config_in_home_or_above_it_opens_a_broad_directory() {
+        let home = Some(Path::new("/home/user-1"));
+        let cases = [
+            ("/home/user-1/.config/qb/gateway.toml", None),
+            ("/etc/qb/gateway.toml", None),
+            ("/home/user-1/gateway.toml", Some("/home/user-1")),
+            ("/home/gateway.toml", Some("/home")),
+            ("/gateway.toml", Some("/")),
+            ("/home/user-10/gateway.toml", None),
+        ];
+        for (file, broad) in cases {
+            let got = broad_config_dir(Path::new(file), home);
+            assert_eq!(got, broad.map(PathBuf::from), "{file}");
+        }
+        assert_eq!(
+            broad_config_dir(Path::new("/gateway.toml"), None),
+            Some(PathBuf::from("/"))
+        );
+        assert_eq!(
+            broad_config_dir(Path::new("/srv/qb/gateway.toml"), None),
+            None
+        );
+    }
 }

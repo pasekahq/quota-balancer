@@ -5,6 +5,7 @@
 //! left, the turn ends with `error`.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -121,6 +122,8 @@ pub struct Gateway {
     running: Arc<Running>,
     /// The counts of the startup `spend_file`; every snapshot with a `spend_cap` has that file.
     spend: Option<Mutex<Ledger>>,
+    /// The credential directories the sandbox opened; without a sandbox, those of `startup`.
+    opened: Vec<PathBuf>,
 }
 
 fn bad_request(message: impl Into<String>) -> GatewayError {
@@ -303,6 +306,11 @@ impl Gateway {
             None => None,
         };
         let startup = Arc::new(sorted(config));
+        let opened = startup
+            .logins
+            .iter()
+            .filter_map(|l| file_dir(&l.credentials).ok())
+            .collect();
         Ok(Self {
             config: Mutex::new(Arc::clone(&startup)),
             startup,
@@ -316,7 +324,16 @@ impl Gateway {
                 ended: Condvar::new(),
             }),
             spend,
+            opened,
         })
+    }
+
+    /// The gateway under a sandbox that opened the credential directories `opened`: a reload
+    /// may add credential files in these only.
+    #[must_use]
+    pub fn sandboxed(mut self, opened: Vec<PathBuf>) -> Self {
+        self.opened = opened;
+        self
     }
 
     /// The current config snapshot.
@@ -335,7 +352,7 @@ impl Gateway {
         let _one = lock(&self.reloading);
         let loaded = super::config::load(&self.startup.file)
             .map_err(|e| e.to_string())
-            .and_then(|c| restart_only(&self.startup, &c).map_or(Ok(c), Err));
+            .and_then(|c| restart_only(&self.startup, &c, &self.opened).map_or(Ok(c), Err));
         let config = match loaded {
             Ok(c) => sorted(c),
             Err(e) => {
@@ -1134,8 +1151,8 @@ fn sorted(mut config: GatewayConfig) -> GatewayConfig {
 
 /// The first restart-only change of `new` against the startup config `old`, naming its file
 /// and field: the listeners, the qbd connection, the spend file, and a credential file outside
-/// the directories the sandbox opened at startup.
-fn restart_only(old: &GatewayConfig, new: &GatewayConfig) -> Option<String> {
+/// the directories `opened` the sandbox opened at startup.
+fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) -> Option<String> {
     let fail = |field: String, reason: &str| {
         let e = Error {
             file: new.file.clone(),
@@ -1159,11 +1176,6 @@ fn restart_only(old: &GatewayConfig, new: &GatewayConfig) -> Option<String> {
     if let Some((field, _)) = changed.into_iter().find(|(_, c)| *c) {
         return fail(field.to_owned(), "changed");
     }
-    let opened: Vec<_> = old
-        .logins
-        .iter()
-        .filter_map(|l| file_dir(&l.credentials).ok())
-        .collect();
     for (i, login) in new.logins.iter().enumerate() {
         if !file_dir(&login.credentials).is_ok_and(|d| opened.contains(&d)) {
             let reason = "lies outside the credential directories the sandbox opened";
@@ -1262,4 +1274,41 @@ fn redact(mut f: Failure, credential: &Credential) -> Failure {
         }
     }
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write as _;
+    use std::path::Path;
+
+    use super::*;
+
+    fn config(logins: &[&str]) -> GatewayConfig {
+        let mut text = String::from(
+            "socket = \"/run/qb/gw.sock\"\nqbd_socket = \"/run/qb/qb.sock\"\n\
+             [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n",
+        );
+        for (i, file) in logins.iter().enumerate() {
+            let _ = write!(
+                text,
+                "[[logins]]\nname = \"login-{i}\"\nkind = \"api_key\"\napi = \"anthropic\"\n\
+                 credentials = \"{file}\"\n"
+            );
+        }
+        super::super::config::parse(Path::new("/etc/qb/gateway.toml"), &text).unwrap()
+    }
+
+    #[test]
+    fn a_reload_may_add_credentials_only_in_a_directory_the_sandbox_opened() {
+        let startup = config(&["/srv/a/login-0.json", "/srv/gap/login-1.json"]);
+        let opened = [PathBuf::from("/srv/a")];
+        let in_opened = config(&["/srv/a/login-0.json", "/srv/a/login-1.json"]);
+        assert_eq!(restart_only(&startup, &in_opened, &opened), None);
+        let in_gap = config(&["/srv/a/login-0.json", "/srv/gap/login-2.json"]);
+        let refused = restart_only(&startup, &in_gap, &opened).unwrap();
+        assert!(
+            refused.contains("logins[1].credentials: lies outside"),
+            "{refused}"
+        );
+    }
 }

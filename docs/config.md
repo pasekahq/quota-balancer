@@ -682,9 +682,13 @@ included; its stream is not cut. Refresh locks of the credential files carry ove
 These keys need a restart: `socket`, `socket_mode`, `fronts.listen` (the listeners exist before
 the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup),
 `spend_file` (the sandbox opens its directory once), and a
-login whose `credentials` lies in a directory no login of the startup config uses (the sandbox
-opens the credential directories once). A file that cannot be read, does not validate or
+login whose `credentials` lies in a directory the sandbox did not open at startup (it opens the
+directories of the startup config's credential files and `spend_file` once; one missing then
+stays closed until a restart). A file that cannot be read, does not validate or
 changes one of them is refused: the running config stays, the gateway logs one line
 `gateway: reload refused: <file>: <field>: <reason>` with the line where the file has one, and
 `qb reload` exits 1 with the same reason. The sandbox lets the gateway read the files of its
-config file's directory, so an editor may replace the file by rename.
+config file's directory, so an editor may replace the file by rename; give the config a
+directory of its own (the shipped unit's is one). The gateway warns at startup when that
+directory is the root, its user's `$HOME` or a directory above it, where every file beneath it
+would be readable.
