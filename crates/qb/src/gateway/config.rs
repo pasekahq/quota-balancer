@@ -200,8 +200,8 @@ pub struct GatewayLogin {
     pub referer: Option<String>,
     /// `x-title` header of a `chat_completions` login; non-empty printable ASCII.
     pub title: Option<String>,
-    /// URL of the OAuth token endpoint of an `oauth_anthropic` login; `None` for the vendor's
-    /// endpoints.
+    /// URL of the OAuth token endpoint of an `oauth_anthropic` or `chatgpt_oauth` login, for its
+    /// refreshes and `qb login` sign-ins; `None` for the vendor's endpoints.
     pub token_url: Option<String>,
     /// Absolute path of the credential file, mode 0600.
     pub credentials: PathBuf,
@@ -1118,6 +1118,18 @@ impl GatewayConfig {
     pub fn login(&self, login: &str) -> Option<&GatewayLogin> {
         self.logins.iter().find(|l| l.name == login)
     }
+}
+
+/// The entry of `login` in the gateway config `file`.
+///
+/// # Errors
+/// The config is unreadable or invalid, or has no such login.
+pub fn load_login(file: &Path, login: &str) -> Result<GatewayLogin, String> {
+    load(file)
+        .map_err(|e| e.to_string())?
+        .login(login)
+        .cloned()
+        .ok_or_else(|| format!("login `{login}` is not in the gateway config"))
 }
 
 #[cfg(test)]

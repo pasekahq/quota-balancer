@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use super::base64url;
 use super::config::{CredentialKind, GatewayLogin};
 use super::creds::{self, CredError, Secret, Written};
 
@@ -101,19 +102,6 @@ struct Found {
     expires_at: Option<u64>,
 }
 
-/// The entry of `login` in the gateway config `config`.
-///
-/// # Errors
-/// The config is unreadable or invalid, or has no such login.
-pub fn login(config: &Path, login: &str) -> Result<GatewayLogin, String> {
-    super::config::load(config)
-        .map_err(|e| e.to_string())?
-        .logins
-        .into_iter()
-        .find(|l| l.name == login)
-        .ok_or_else(|| format!("login `{login}` is not in the gateway config"))
-}
-
 /// Copies the credential of `source` in the file `from` into the credential file of `entry`,
 /// which must not exist unless `force`.
 ///
@@ -127,12 +115,7 @@ pub fn import(
     force: bool,
 ) -> Result<Imported, String> {
     let target = entry.credentials.as_path();
-    if !force && std::fs::symlink_metadata(target).is_ok() {
-        return Err(format!(
-            "{}: exists; pass --force to replace it",
-            target.display()
-        ));
-    }
+    creds::vacant(target, force)?;
     let bytes = read_source(from)?;
     let found = match source {
         Source::Hermes { provider, entry } => hermes(from, &bytes, *provider, entry.as_deref()),
@@ -486,33 +469,9 @@ struct AuthClaims {
 }
 
 /// The `chatgpt_account_id` claim of the JWT `jwt`, unverified: the vendor checks the token.
-fn claimed_account(jwt: &str) -> Option<Zeroizing<String>> {
+pub(super) fn claimed_account(jwt: &str) -> Option<Zeroizing<String>> {
     let payload = jwt.split('.').nth(1)?;
-    let json = base64url(payload)?;
+    let json = base64url::decode(payload)?;
     let claims: Claims = serde_json::from_slice(&json).ok()?;
     claims.auth?.chatgpt_account_id.map(|s| s.0)
-}
-
-/// Decodes unpadded or padded base64url.
-fn base64url(text: &str) -> Option<Zeroizing<Vec<u8>>> {
-    let digits = text.trim_end_matches('=').as_bytes();
-    let mut out = Zeroizing::new(Vec::with_capacity(digits.len() * 3 / 4));
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &c in digits {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(u8::try_from((acc >> bits) & 0xff).ok()?);
-        }
-    }
-    Some(out)
 }

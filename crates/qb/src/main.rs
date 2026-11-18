@@ -2,7 +2,8 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -10,12 +11,13 @@ use qb::auth::Gate;
 use qb::config::Config;
 use qb::gateway::anthropic::Anthropic;
 use qb::gateway::chat_upstream::ChatCompletions;
-use qb::gateway::config::Api;
+use qb::gateway::config::{self as gateway_config, Api};
 use qb::gateway::core::{Gateway, Upstreams};
 use qb::gateway::front;
 use qb::gateway::import::{self, HermesProvider, Source};
 use qb::gateway::oauth::OauthRefresher;
 use qb::gateway::openai_upstream::Openai;
+use qb::gateway::signin::SignIn;
 use qb::hangup::Hangup;
 use qb::hooks::Runner;
 use qb::journal::{self, Journal};
@@ -26,6 +28,7 @@ use qb::{
 use qb_core::Core;
 use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, SpendReset, paths};
 use qb_vendors::claude::Event;
+use zeroize::Zeroizing;
 
 const HELP: &str = "\
 qb - pre-flight quota balancer for coding-agent subscriptions
@@ -58,6 +61,14 @@ COMMANDS:
                                         entries, --entry id or label), `claude-code`, `codex`,
                                         `env` (with --var NAME); the file must not exist
                                         unless --force; exit 1 if refused
+    login --config PATH [--force] <LOGIN>
+                                        sign the `oauth_anthropic` or `chatgpt_oauth` LOGIN of
+                                        the gateway config PATH in with OAuth PKCE: print an
+                                        authorize URL, read the `code#state` (Anthropic) or
+                                        the redirect URL (OpenAI) pasted on stdin, exchange the
+                                        code and write the credential file, printing no value;
+                                        the file must not exist unless --force; exit 1 if
+                                        refused
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -96,6 +107,7 @@ enum Cmd {
     Gateway(PathBuf),
     Simulate(Simulate),
     LoginImport(LoginImport),
+    Login(LoginSignIn),
     Call(Call),
     Version,
     Help,
@@ -129,6 +141,15 @@ struct LoginImport {
     from: PathBuf,
     force: bool,
 }
+
+struct LoginSignIn {
+    config: PathBuf,
+    login: String,
+    force: bool,
+}
+
+/// Largest pasted line read by `qb login`.
+const MAX_PASTE: usize = 16 * 1024;
 
 /// The client name a simulated pick runs as.
 const SIMULATE_CLIENT: &str = "simulate";
@@ -292,11 +313,29 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             [verb, login] if verb == "reset" => Cmd::Call(Call::SpendReset(string(login.clone())?)),
             _ => return Err("expected `spend` or `spend reset <LOGIN>`".into()),
         },
+        Some("login") if login_args.len() == 1 && login_args[0] != "import" => {
+            if format.is_some()
+                || source_file.is_some()
+                || provider.is_some()
+                || entry.is_some()
+                || var.is_some()
+            {
+                return Err(
+                    "--from, --source, --provider, --entry and --var go with `login import`".into(),
+                );
+            }
+            let login = login_args.pop().ok_or("a login is required")?;
+            Cmd::Login(LoginSignIn {
+                config: config.ok_or("--config is required")?,
+                login: string(login)?,
+                force,
+            })
+        }
         Some("login") => {
             let [verb, login] = <[OsString; 2]>::try_from(login_args)
-                .map_err(|_| "expected `login import <LOGIN>`")?;
+                .map_err(|_| "expected `login <LOGIN>` or `login import <LOGIN>`")?;
             if verb != "import" {
-                return Err("expected `login import <LOGIN>`".into());
+                return Err("expected `login <LOGIN>` or `login import <LOGIN>`".into());
             }
             let source = match (format.as_deref(), provider, entry, var) {
                 (Some("hermes"), Some(provider), entry, None) => Source::Hermes {
@@ -416,6 +455,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
         Cmd::Gateway(file) => gateway(&file),
         Cmd::Simulate(sim) => simulate(sim),
         Cmd::LoginImport(req) => login_import(&req),
+        Cmd::Login(req) => login(&req),
         Cmd::Call(call) => {
             let bearer = bearer(args.bearer_file)?;
             let send = |method, path: &str, body: Option<&[u8]>| {
@@ -537,7 +577,7 @@ fn simulate(sim: Simulate) -> Result<ExitCode, String> {
 /// non-dumpable before it reads the config and under landlock before it opens the source.
 fn login_import(req: &LoginImport) -> Result<ExitCode, String> {
     sandbox::non_dumpable()?;
-    let done = import::login(&req.config, &req.login).and_then(|entry| {
+    let done = gateway_config::load_login(&req.config, &req.login).and_then(|entry| {
         let gaps = sandbox::harden_import(&req.config, &req.from, &entry.credentials)?;
         if !gaps.is_empty() {
             log::warn(&format!(
@@ -572,13 +612,74 @@ fn login_import(req: &LoginImport) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Signs the login of `req` in and says what it wrote; exit 1 with the reason if refused. The
+/// process is non-dumpable before it reads the config and under landlock before it reads stdin.
+fn login(req: &LoginSignIn) -> Result<ExitCode, String> {
+    sandbox::non_dumpable()?;
+    let done = gateway_config::load_login(&req.config, &req.login).and_then(|entry| {
+        let gaps = sandbox::harden_login(&req.config, &entry.credentials)?;
+        if !gaps.is_empty() {
+            log::warn(&format!(
+                "qb login: sandbox incomplete: {}",
+                gaps.join("; ")
+            ));
+        }
+        let signin = SignIn::start(entry, req.force)?;
+        log::info(&format!("qb login: {}", signin.prompt()));
+        let _ = writeln!(std::io::stdout().lock(), "{}", signin.url());
+        let pasted = read_paste()?;
+        signin.finish(&pasted)
+    });
+    match done {
+        Ok(done) => {
+            let _ = writeln!(std::io::stdout().lock(), "{done}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            log::error(&format!("qb: login refused: {e}"));
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// One line of stdin without its line end, at most [`MAX_PASTE`] bytes, read without the
+/// standard library's stdin buffer into a buffer zeroized on drop.
+fn read_paste() -> Result<Zeroizing<String>, String> {
+    let fail = |e: std::io::Error| format!("stdin: {e}");
+    let mut stdin = File::from(
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(fail)?,
+    );
+    let mut buf = Zeroizing::new(vec![0u8; MAX_PASTE + 1]);
+    let mut len = 0;
+    while len <= MAX_PASTE && !buf[..len].contains(&b'\n') {
+        match stdin.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(fail(e)),
+        }
+    }
+    let line = buf[..len].split(|&b| b == b'\n').next().unwrap_or_default();
+    if line.len() > MAX_PASTE {
+        return Err("stdin: the pasted line is longer than 16 KiB".into());
+    }
+    if line.trim_ascii().is_empty() {
+        return Err("stdin: no line was pasted".into());
+    }
+    let text = std::str::from_utf8(line).map_err(|_| "stdin: the pasted line is not UTF-8")?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
 /// Runs the model gateway of the config in `file` with the adapters of the `anthropic`, `openai`
 /// and `chat_completions` API families.
 fn gateway(file: &Path) -> Result<ExitCode, String> {
     // First, so a SIGHUP during startup waits for the loop instead of ending the process.
     let hangup = Hangup::new().map_err(|e| format!("SIGHUP: {e}"))?;
     let config = qb::gateway::config::load(file).map_err(|e| e.to_string())?;
-    let qbd_bearer = bearer(config.qbd_bearer_file.clone())?.map(zeroize::Zeroizing::new);
+    let qbd_bearer = bearer(config.qbd_bearer_file.clone())?.map(Zeroizing::new);
     let listener = if let Some(l) = listen::from_systemd().map_err(|e| e.to_string())? {
         log::info("qb gateway: using the socket passed by systemd");
         l

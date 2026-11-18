@@ -37,6 +37,12 @@ pub mod identity {
         "https://platform.claude.com/v1/oauth/token",
         "https://console.anthropic.com/v1/oauth/token",
     ];
+    /// The vendor's OAuth authorize page of a sign-in.
+    pub const OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+    /// Redirect URI of a sign-in: a vendor page that shows the code to paste as `code#state`.
+    pub const OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+    /// Scopes a sign-in asks for.
+    pub const OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
 }
 
 /// How the gateway authenticates to the vendor.

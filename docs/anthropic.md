@@ -178,6 +178,31 @@ when it expires within 60 s or the vendor answered 401, through the vendor's OAu
 A refresh error names the endpoint, the status and the OAuth `error` code, never a body, header
 or token.
 
+## OAuth sign-in
+
+`qb login` (`crates/qb/src/gateway/signin.rs`, [config.md](config.md#signing-in)) signs an
+`oauth_anthropic` login in with the authorization code grant and PKCE (RFC 7636, S256), the
+vendor CLI's flow for a host without a browser:
+
+- the authorize URL is `https://claude.ai/oauth/authorize` (`identity::OAUTH_AUTHORIZE_URL`)
+  with `code=true`, `client_id`, `response_type=code`, `redirect_uri`
+  `https://console.anthropic.com/oauth/code/callback` (`identity::OAUTH_REDIRECT_URI`), `scope`
+  `org:create_api_key user:profile user:inference` (`identity::OAUTH_SCOPES`), `code_challenge`,
+  `code_challenge_method=S256` and `state`. The verifier and the state are each 32 bytes of the
+  kernel's random source in unpadded base64url; the challenge is the unpadded base64url SHA-256
+  of the verifier;
+- the redirect page shows `code#state`, which the operator pastes; a `state` other than the one
+  sent is refused before any request;
+- `POST` to the endpoints of the refresh above, in the same order, with the same transport and
+  `user-agent`; body `application/json`: `grant_type` `authorization_code`, `code`, `state`,
+  `client_id`, `redirect_uri` and `code_verifier`;
+- a 2xx answer needs `access_token`, `refresh_token` and `expires_in`; `expires_at` is the clock
+  plus `expires_in`.
+
+A 4xx answer is a refusal and a transport failure or 5xx at every endpoint, or a 2xx without the
+required fields, a failure; neither writes a file. The error names the endpoint, the status and
+the OAuth `error` code, never the code, the verifier or a token.
+
 ## The `/v1/messages` front
 
 `qb gateway` serves `POST /v1/messages` on its unix socket to the peers of its C4 front, when its

@@ -430,6 +430,17 @@ pub(super) fn visible(file: &Path, field: &str, value: &str) -> Result<(), CredE
     Ok(())
 }
 
+/// Refuses to replace the credential file `target` when it exists, unless `force`.
+pub(super) fn vacant(target: &Path, force: bool) -> Result<(), String> {
+    if !force && std::fs::symlink_metadata(target).is_ok() {
+        return Err(format!(
+            "{}: exists; pass --force to replace it",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Replaces `file` with `bytes` so that a reader sees the old or the new file, never a part:
 /// a 0600 temporary file in the same directory, fsync, rename, fsync of the directory.
 ///
