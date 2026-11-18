@@ -588,7 +588,9 @@ name = "login-2"
 vendor = "vendor-a"
 ```
 
-Each step's vendor serves only logins of this gateway, or a pick of another login fails the turn.
+Each step's vendor serves only logins of this gateway: when `qbd` answers a step's pick with a
+login the gateway config has no credential entry for, the turn moves to the next step, and on a
+ladder or pin route such a pick ends the turn.
 `[fronts.messages] vendor = "vendor-a"` gives the Anthropic logins' thinking blocks to
 `/v1/messages` clients.
 
