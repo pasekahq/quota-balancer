@@ -323,17 +323,34 @@ with an `error` event. A turn is bounded by `max_attempts` attempts (default 4),
 login is tried. A 401 that the
 one refresh did not cure, or an unusable credential file, does not pass by itself: after the
 lease report the gateway also sends `POST /v1/report {"login", "outcome": "http_401"}`, which
-makes the login `auth_dead` in `qbd`, so the next pick of the same turn skips it. When a pick
-still returns a login that already failed in the turn, the lease is released with `error` and
-the turn ends with the last failure's class.
+makes the login `auth_dead` in `qbd`, so the next pick of the same turn skips it. A login that
+failed in a turn is never called again in that turn: when a pick still returns it, the lease is
+released with `error`, and on a ladder or pin route the turn ends with the last failure's class,
+as it does when the pick after a failure answers `dead`. So a key login that answers 401 gets
+one call per turn, an OAuth login two (before and after its one refresh).
 
 A chain route walks its steps in order, starting with the first. Until an event has reached
 the client, the turn moves to the next step without an adapter call when `qbd` answers the
-step's pick with `wait` or `dead`, or with a login that already failed in the turn, and after
-a vendor failure of the step; after a login failure it picks the same step again, so another
-login of that vendor may run. When no step is left the turn ends with `error`: `tried` lists
+step's pick with `wait` or `dead`, with a login that already failed in the turn, or with a login
+the gateway config has no credential entry or adapter for, and after a vendor failure of the
+step; after a login failure it picks the same step again, so another login of that vendor may
+run. When no step is left the turn ends with `error`: `tried` lists
 every attempt, and the class is `quota_exhausted` with the nearest `resets_at` of the steps
 when every step was spent (a usage limit) or waiting, else the class of the last step's end.
+
+Across vendors, on a chain step or a re-pick with `avoid_vendor`, a turn keeps these guarantees:
+
+- Thinking of another vendor than the picked one is dropped from the request before every
+  adapter call; the picked vendor's own thinking goes back to it.
+- Tool ids pass unchanged in both directions: a `tool_use` or `tool_result` id reaches every
+  vendor as the client sent it, and a vendor's tool call id reaches the client as the vendor
+  sent it. No adapter rewrites or maps them. Anthropic accepts a tool id only when it matches
+  `^[a-zA-Z0-9_-]+$`; the adapters rely on every vendor of a route issuing ids within that set,
+  as Anthropic's `toolu_…` and OpenAI's `call_…` ids do. A history with another id makes the
+  Anthropic vendor refuse the turn as `bad_request`.
+- A fallback happens only before the first event reached the client; after it a failure ends
+  the turn with `error`, `tried` lists every attempt of the turn, and no later step is called.
+- A login that failed in the turn is not picked again in it (above).
 
 #### Errors
 
@@ -349,10 +366,10 @@ and `class`) and `message` (never a credential).
 | `class` | When | `retryable` |
 |---|---|---|
 | `quota_exhausted` | `qbd` answered `wait`: every candidate waits for a reset or back-off; `resets_at` is the `wait`'s `retry_after`, the nearest time one becomes usable. On a chain route: every step was spent or waiting, `resets_at` the nearest of them | true |
-| `no_route` | `qbd` answered `dead` | false |
+| `no_route` | `qbd` answered `dead`; on a ladder or pin route only before an attempt of the turn failed | false |
 | `auth` | the last login's credential was rejected or unusable; or, as a 401 answer, the caller is not allowed | false |
 | `overloaded` | the vendor asked to back off (`retry_after`), a 429 of the last login, or the gateway's caps | true |
-| `unavailable` | the vendor failed, `qbd` is unreachable, a token refresh could not reach the vendor, or the picked login has no credential entry or adapter | true, false for a configuration error |
+| `unavailable` | the vendor failed, `qbd` is unreachable, a token refresh could not reach the vendor, or the picked login has no credential entry or adapter (on a chain route only when it is the last step) | true, false for a configuration error |
 | `bad_request` | the vendor or the gateway refused the request | false |
 | `context_too_long` | the conversation does not fit the model | false |
 | `cancelled` | `POST /v1/model/cancel` stopped the turn | false |

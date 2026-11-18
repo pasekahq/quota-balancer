@@ -5730,3 +5730,552 @@ fn the_chat_completions_adapter_refuses_a_credential_of_another_kind_without_quo
     assert_eq!(failure.kind, FailureKind::Auth);
     assert!(!failure.message.contains(TOKEN), "{}", failure.message);
 }
+
+/// qbd of the cross-vendor tests: vendor-a served by the Anthropic adapter, vendor-o by the
+/// OpenAI Responses adapter and vendor-r by the Chat Completions adapter, one login each, with
+/// `login_a` the login of vendor-a.
+fn cross_qbd(login_a: &str) -> String {
+    format!(
+        r#"
+[journal]
+mode = "off"
+
+[[vendors]]
+name = "vendor-a"
+windows = [{{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }}]
+
+[[vendors]]
+name = "vendor-o"
+windows = [
+  {{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }},
+  {{ name = "seven_day", length_s = 604800, t_burn_s = 43200 }},
+]
+
+[[vendors]]
+name = "vendor-r"
+windows = [{{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }}]
+
+[[logins]]
+name = "{login_a}"
+vendor = "vendor-a"
+
+[[logins]]
+name = "login-2"
+vendor = "vendor-o"
+
+[[logins]]
+name = "login-3"
+vendor = "vendor-r"
+
+[[roles]]
+name = "gateway"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [{{ vendor = "vendor-a", model = "model-a", tier = 1 }}]
+
+[limits]
+rate_per_s = 1000.0
+burst = 1000
+"#
+    )
+}
+
+/// A gateway with the real adapters, each login on its own scripted vendor, and the OAuth
+/// token endpoint of login-1.
+struct Cross {
+    rig: Rig,
+    anthropic: Vendor,
+    openai: Vendor,
+    chat: Vendor,
+    tokens: Vendor,
+}
+
+fn every_adapter() -> Upstreams {
+    vec![
+        (Api::Anthropic, Box::new(Anthropic::new())),
+        (Api::Openai, Box::new(Openai::new())),
+        (Api::ChatCompletions, Box::new(ChatCompletions::new())),
+    ]
+}
+
+/// [`cross_rig_with`] with every adapter, login-1 an Anthropic key login known to qbd.
+fn cross_rig() -> Cross {
+    cross_rig_with("login-1", false, every_adapter())
+}
+
+/// A rig whose route `chat` is the chain vendor-a (Anthropic), vendor-o (OpenAI Responses),
+/// vendor-r (Chat Completions) and whose route `solo` pins vendor-a: login-1 an Anthropic login,
+/// OAuth when `oauth`, login-2 an OpenAI key login and login-3 a Chat Completions key login.
+/// qbd runs [`cross_qbd`]`(login_a)`; the gateway has the adapters `upstreams` and the shipped
+/// OAuth refresher.
+fn cross_rig_with(login_a: &str, oauth: bool, upstreams: Upstreams) -> Cross {
+    let (anthropic, openai, chat, tokens) = (
+        Vendor::start(),
+        Vendor::start(),
+        Vendor::start(),
+        Vendor::start(),
+    );
+    let dir = temp_dir("cross");
+    let login_1 = if oauth {
+        old_oauth(unix_now() + 3600)
+    } else {
+        api_key("test-key-a")
+    };
+    credentials(
+        &dir,
+        &[
+            ("login-1", login_1, 0o600),
+            ("login-2", api_key("test-key-o"), 0o600),
+            ("login-3", api_key("test-key-r"), 0o600),
+        ],
+    );
+    let qbd = start_qbd(&dir, &cross_qbd(login_a));
+    let keys_1 = if oauth {
+        format!(
+            "{}\ntoken_url = \"{}/v1/oauth/token\"",
+            anthropic.login("kind = \"oauth_anthropic\""),
+            tokens.base_url
+        )
+    } else {
+        anthropic.login(ANTHROPIC_KEY)
+    };
+    let text = format!(
+        r#"socket = "{dir}/gw.sock"
+qbd_socket = "{qbd}"
+
+[[logins]]
+name = "login-1"
+{keys_1}
+credentials = "{dir}/creds/login-1.json"
+
+[[logins]]
+name = "login-2"
+{keys_2}
+credentials = "{dir}/creds/login-2.json"
+
+[[logins]]
+name = "login-3"
+{keys_3}
+credentials = "{dir}/creds/login-3.json"
+
+[[routes]]
+alias = "chat"
+role = "gateway"
+chain = [
+  {{ vendor = "vendor-a", model = "model-a" }},
+  {{ vendor = "vendor-o", model = "model-o" }},
+  {{ vendor = "vendor-r", model = "model-r" }},
+]
+
+[[routes]]
+alias = "solo"
+role = "gateway"
+vendor = "vendor-a"
+model = "model-a"
+
+{fronts}"#,
+        dir = dir.display(),
+        qbd = qbd.display(),
+        keys_2 = openai.login(OPENAI_KEY),
+        keys_3 = chat_login(&chat, ""),
+        fronts = fronts(""),
+    );
+    let gw = serve_gateway(
+        &text,
+        upstreams,
+        Box::new(OauthRefresher::new()),
+        own_uid(),
+        None,
+    );
+    let rig = Rig {
+        dir,
+        qbd,
+        gw,
+        fake: Arc::default(),
+        refreshes: Arc::default(),
+    };
+    Cross {
+        rig,
+        anthropic,
+        openai,
+        chat,
+        tokens,
+    }
+}
+
+/// An Anthropic stream of signed thinking, then the two tool calls `toolu_test_1` and
+/// `toolu_test_2`: the thinking block of `upstream_thinking.sse` spliced before the tool blocks
+/// of `upstream_tool_use.sse`.
+fn thinking_then_tools() -> Answer {
+    let second_block =
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1";
+    let thinking = String::from_utf8(vendor_fixture("upstream_thinking.sse")).unwrap();
+    let tools = String::from_utf8(vendor_fixture("upstream_tool_use.sse")).unwrap();
+    let head = &thinking[..thinking.find(second_block).unwrap()];
+    let tail = &tools[tools.find(second_block).unwrap()..];
+    let mut answer = recorded("200_allowed", None);
+    if let Answer::Full(_, _, body) = &mut answer {
+        *body = format!("{head}{tail}").into_bytes();
+    }
+    answer
+}
+
+/// The `route` event's `(vendor, login)`.
+fn answered_by(events: &[StreamEvent]) -> (String, String) {
+    match events.first() {
+        Some(StreamEvent::Route { route }) => (route.vendor.clone(), route.login_label.clone()),
+        other => panic!("not a route event: {other:?}"),
+    }
+}
+
+/// `body` with the assistant message of `events` and a user message of `results`, each
+/// `(tool id, output)`, appended to its history.
+fn next_turn(
+    body: &Value,
+    request_id: &str,
+    events: &[StreamEvent],
+    results: &[(&str, &str)],
+) -> Value {
+    let mut next = body.clone();
+    next["request_id"] = json!(request_id);
+    let results: Vec<Block> = results
+        .iter()
+        .map(|(id, content)| Block::ToolResult {
+            id: (*id).to_owned(),
+            content: (*content).to_owned(),
+            is_error: None,
+        })
+        .collect();
+    let history = next["messages"].as_array_mut().unwrap();
+    history.push(json!({"role": "assistant", "content": blocks_of(events)}));
+    history.push(json!({"role": "user", "content": results}));
+    next
+}
+
+/// The thinking payloads of the turns in the cross-vendor loop; none may reach another vendor.
+const ANTHROPIC_THINKING: [&str; 2] = ["c2lnbmF0dXJlLXRlc3QtMQ==", "The user wants a greeting."];
+const OPENAI_REASONING: [&str; 2] = ["Z0FBQUFBQnN5bnRoZXRpYy1lbmNyeXB0ZWQ=", "Checking the file"];
+
+fn assert_absent(body: &Value, payloads: &[&str]) {
+    let text = body.to_string();
+    for p in payloads {
+        assert!(!text.contains(p), "{p} sent: {text}");
+    }
+}
+
+/// `(type, call_id)` of each input item of a Responses request body; `call_id` empty when absent.
+fn input_items(body: &Value) -> Vec<(&str, &str)> {
+    let input = body["input"].as_array().unwrap();
+    input
+        .iter()
+        .map(|i| {
+            let id = i["call_id"].as_str().unwrap_or_default();
+            (i["type"].as_str().unwrap(), id)
+        })
+        .collect()
+}
+
+/// `(role, tool ids)` of each message of a Chat Completions request body: an assistant
+/// message's `tool_calls[].id`, a tool message's `tool_call_id`.
+fn chat_tool_ids(body: &Value) -> Vec<(&str, Vec<&str>)> {
+    let messages = body["messages"].as_array().unwrap();
+    messages
+        .iter()
+        .map(|m| {
+            let ids = match m["role"].as_str().unwrap() {
+                "assistant" => m["tool_calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["id"].as_str().unwrap())
+                    .collect(),
+                "tool" => vec![m["tool_call_id"].as_str().unwrap()],
+                _ => Vec::new(),
+            };
+            (m["role"].as_str().unwrap(), ids)
+        })
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // the three turns of one tool loop read best in order
+fn a_tool_loop_falls_from_anthropic_to_openai_to_chat_completions_keeping_its_tool_ids() {
+    let c = cross_rig();
+    let r = &c.rig;
+
+    c.anthropic.answer(thinking_then_tools());
+    let first_body = turn_body("turn-1");
+    let (_, _, first) = turn(&r.gw, &first_body);
+    assert_eq!(answered_by(&first), ("vendor-a".into(), "login-1".into()));
+    assert_eq!(
+        kinds(&first),
+        [
+            "route login-1",
+            "usage",
+            "thinking",
+            "tool_call",
+            "tool_call",
+            "usage",
+            "stop ToolUse"
+        ]
+    );
+    let first_calls: Vec<String> = tool_calls(&first).into_iter().map(|c| c.0).collect();
+    assert_eq!(first_calls, ["toolu_test_1", "toolu_test_2"]);
+
+    c.anthropic.answer(recorded("529", None));
+    c.openai.answer(openai_recorded(
+        "200_api_key",
+        Some("upstream_reasoning.sse"),
+    ));
+    let second_body = next_turn(
+        &first_body,
+        "turn-2",
+        &first,
+        &[("toolu_test_1", "line one"), ("toolu_test_2", "notes.txt")],
+    );
+    let (_, _, second) = turn(&r.gw, &second_body);
+    assert_eq!(answered_by(&second), ("vendor-o".into(), "login-2".into()));
+    assert_eq!(
+        kinds(&second),
+        [
+            "route login-2",
+            "thinking",
+            "text_delta",
+            "tool_call",
+            "usage",
+            "stop ToolUse"
+        ]
+    );
+    assert_eq!(
+        tool_calls(&second),
+        [(
+            "call_c3".to_owned(),
+            "read_file".to_owned(),
+            json!({"path": "a.txt"})
+        )]
+    );
+    {
+        let sent = c.openai.received();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            input_items(&sent[0].body),
+            [
+                ("message", ""),
+                ("function_call", "toolu_test_1"),
+                ("function_call", "toolu_test_2"),
+                ("function_call_output", "toolu_test_1"),
+                ("function_call_output", "toolu_test_2"),
+            ]
+        );
+        assert_absent(&sent[0].body, &ANTHROPIC_THINKING);
+    }
+
+    c.anthropic.answer(recorded("529", None));
+    c.openai
+        .answer(openai_recorded("429_insufficient_quota", None));
+    c.chat.answer(chat_text_answer("All read."));
+    let third_body = next_turn(
+        &second_body,
+        "turn-3",
+        &second,
+        &[("call_c3", "a.txt line")],
+    );
+    let (_, _, third) = turn(&r.gw, &third_body);
+    assert_eq!(answered_by(&third), ("vendor-r".into(), "login-3".into()));
+    assert_eq!(
+        kinds(&third),
+        ["route login-3", "text_delta", "usage", "stop End"]
+    );
+    assert_eq!(text_of(&third), "All read.");
+
+    let chat = c.chat.received();
+    assert_eq!(chat.len(), 1);
+    assert_eq!(
+        chat_tool_ids(&chat[0].body),
+        [
+            ("user", vec![]),
+            ("assistant", vec!["toolu_test_1", "toolu_test_2"]),
+            ("tool", vec!["toolu_test_1"]),
+            ("tool", vec!["toolu_test_2"]),
+            ("assistant", vec!["call_c3"]),
+            ("tool", vec!["call_c3"]),
+        ]
+    );
+    assert_absent(&chat[0].body, &ANTHROPIC_THINKING);
+    assert_absent(&chat[0].body, &OPENAI_REASONING);
+
+    let anthropic = c.anthropic.received();
+    assert_eq!(anthropic.len(), 3, "one call per turn");
+    assert_absent(&anthropic[2].body, &OPENAI_REASONING);
+    assert!(
+        anthropic[2]
+            .body
+            .to_string()
+            .contains(ANTHROPIC_THINKING[0]),
+        "its own signed thinking goes back to Anthropic: {}",
+        anthropic[2].body
+    );
+    assert_eq!(c.openai.received().len(), 2);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-2"), LoginStatus::Exhausted);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_stream_that_breaks_after_content_ends_the_turn_and_the_next_step_is_never_called() {
+    let c = cross_rig();
+    c.anthropic.answer(recorded("529", None));
+    c.openai
+        .answer(openai_recorded("200_api_key", Some("upstream_cut.sse")));
+    c.chat.answer(chat_text_answer("never"));
+    let (_, _, events) = turn(&c.rig.gw, &turn_body("turn-1"));
+    assert_eq!(
+        kinds(&events),
+        ["route login-2", "text_delta", "error Unavailable"]
+    );
+    assert_eq!(text_of(&events), "Cut here");
+    assert_eq!(
+        tried(last_error(&events)),
+        [
+            ("login-1".to_owned(), ErrorClass::Overloaded),
+            ("login-2".to_owned(), ErrorClass::Unavailable),
+        ]
+    );
+    assert_eq!(c.chat.received().len(), 0, "no step after content");
+    assert_eq!(state(&c.rig.qbd).leases, Vec::new());
+}
+
+/// A turn on route `alias`.
+fn turn_on(alias: &str, request_id: &str) -> Value {
+    let mut body = turn_body(request_id);
+    body["route"] = json!(alias);
+    body
+}
+
+#[test]
+fn a_key_login_that_answers_401_is_called_once_in_the_turn() {
+    let c = cross_rig();
+    for _ in 0..4 {
+        c.anthropic.answer(recorded("401", None));
+    }
+    let (_, _, pinned) = turn(&c.rig.gw, &turn_on("solo", "turn-1"));
+    assert_eq!(kinds(&pinned), ["error Auth"]);
+    let e = last_error(&pinned);
+    assert!(!e.retryable);
+    assert_eq!(tried(e), [("login-1".to_owned(), ErrorClass::Auth)]);
+    assert_eq!(c.anthropic.received().len(), 1, "one vendor request");
+    assert_eq!(
+        status_of(&state(&c.rig.qbd), "login-1"),
+        LoginStatus::AuthDead
+    );
+
+    let c = cross_rig();
+    for _ in 0..4 {
+        c.anthropic.answer(recorded("401", None));
+    }
+    c.openai
+        .answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
+    let (_, _, chained) = turn(&c.rig.gw, &turn_body("turn-1"));
+    assert_eq!(answered_by(&chained), ("vendor-o".into(), "login-2".into()));
+    assert_eq!(kinds(&chained).last().unwrap(), "stop End");
+    assert_eq!(c.anthropic.received().len(), 1, "one vendor request");
+    assert_eq!(c.tokens.received().len(), 0, "a key is not refreshed");
+    let s = state(&c.rig.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn an_oauth_login_that_answers_401_is_refreshed_and_retried_once_then_left_in_the_turn() {
+    let c = cross_rig_with("login-1", true, every_adapter());
+    for _ in 0..4 {
+        c.anthropic.answer(recorded("401", None));
+    }
+    c.tokens.answer(grant());
+    c.tokens.answer(grant());
+    c.openai
+        .answer(openai_recorded("200_api_key", Some("upstream_text.sse")));
+    let events = turn_without_leaks(&c.rig, "turn-1");
+    assert_eq!(answered_by(&events), ("vendor-o".into(), "login-2".into()));
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    let bearers: Vec<Option<String>> = c
+        .anthropic
+        .received()
+        .iter()
+        .map(|s| s.header("authorization").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        bearers,
+        [Some(bearer(OLD_ACCESS)), Some(bearer(NEW_ACCESS))],
+        "one call, one refresh, one retry"
+    );
+    assert_eq!(c.tokens.received().len(), 1);
+    let s = state(&c.rig.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::AuthDead);
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn a_chain_step_whose_login_has_no_credential_entry_or_adapter_moves_to_the_next_step() {
+    let c = cross_rig_with(
+        "login-0",
+        false,
+        vec![
+            (Api::Anthropic, Box::new(Anthropic::new())),
+            (Api::ChatCompletions, Box::new(ChatCompletions::new())),
+        ],
+    );
+    c.chat.answer(chat_text_answer("Third step."));
+    let (_, _, events) = turn(&c.rig.gw, &turn_body("turn-1"));
+    assert_eq!(answered_by(&events), ("vendor-r".into(), "login-3".into()));
+    assert_eq!(text_of(&events), "Third step.");
+    assert_eq!(kinds(&events).last().unwrap(), "stop End");
+    assert_eq!(c.anthropic.received().len(), 0);
+    assert_eq!(c.openai.received().len(), 0);
+    assert_eq!(state(&c.rig.qbd).leases, Vec::new());
+}
+
+#[test]
+fn a_messages_client_sees_its_tool_ids_kept_across_a_fallback_to_openai() {
+    let c = cross_rig();
+    c.anthropic.answer(recorded("529", None));
+    c.openai.answer(openai_recorded(
+        "200_api_key",
+        Some("upstream_reasoning.sse"),
+    ));
+    let mut body = sdk_body("model-2025-01-01", true);
+    let history = body["messages"].as_array_mut().unwrap();
+    history.push(json!({"role": "assistant", "content": [
+        {"type": "thinking", "thinking": ANTHROPIC_THINKING[1], "signature": ANTHROPIC_THINKING[0]},
+        {"type": "tool_use", "id": "toolu_test_1", "name": "read", "input": {"path": "notes.txt"}},
+    ]}));
+    history.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_test_1", "content": "line one"},
+    ]}));
+    let (status, _, sse) = sdk_call(&c.rig.gw, &body, None);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&sse));
+    let (events, stop) = content_of(&sse);
+    assert_eq!(stop, StopReason::ToolUse);
+    assert_eq!(
+        tool_calls(&events),
+        [(
+            "call_c3".to_owned(),
+            "read_file".to_owned(),
+            json!({"path": "a.txt"})
+        )]
+    );
+
+    let sent = c.openai.received();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        input_items(&sent[0].body),
+        [
+            ("message", ""),
+            ("function_call", "toolu_test_1"),
+            ("function_call_output", "toolu_test_1")
+        ]
+    );
+    assert_absent(&sent[0].body, &ANTHROPIC_THINKING);
+    assert_eq!(c.anthropic.received().len(), 1);
+}

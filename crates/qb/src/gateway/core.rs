@@ -518,9 +518,15 @@ impl Gateway {
                 return Err(next_step(&turn.route, progress, error, emit));
             }
             let error = match progress.tried.last() {
-                // The re-pick after a vendor failure found nothing else: that failure stands.
-                Some(last) if progress.avoid.is_some() => {
-                    let message = format!("no other vendor for route `{}`", turn.route.alias);
+                // The re-pick after a failure of this turn found nothing else: that failure
+                // stands. A `wait` keeps its reset.
+                Some(last) if progress.avoid.is_some() || pick.decision == Decision::Dead => {
+                    let other = if progress.avoid.is_some() {
+                        "vendor"
+                    } else {
+                        "login"
+                    };
+                    let message = format!("no other {other} for route `{}`", turn.route.alias);
                     GatewayError::new(last.class, retryable(last.class), message)
                 }
                 _ => unpickable(&pick, &turn.route.alias),
@@ -541,20 +547,26 @@ impl Gateway {
             }
             return Err(fail(emit, error, progress, "no login left"));
         }
-        let Some(entry) = turn.config.login(&login) else {
+        // A config mismatch: a chain moves to its next step, other routes end the turn.
+        let mut mismatch = |message: String, what: &str| {
             self.report(&lease, Outcome::Error, Vec::new());
+            let error = GatewayError::new(ErrorClass::Unavailable, false, message);
+            if turn.route.chain.is_empty() {
+                fail(emit, error, progress, what)
+            } else {
+                next_step(&turn.route, progress, error, emit)
+            }
+        };
+        let Some(entry) = turn.config.login(&login) else {
             log::error(&format!(
                 "gateway: qbd picked login `{login}`, which has no credential entry"
             ));
             let message = format!("login `{login}` has no credential entry in the gateway config");
-            let error = GatewayError::new(ErrorClass::Unavailable, false, message);
-            return Err(fail(emit, error, progress, "login without credentials"));
+            return Err(mismatch(message, "login without credentials"));
         };
         let Some((_, upstream)) = self.upstreams.iter().find(|(a, _)| *a == entry.api) else {
-            self.report(&lease, Outcome::Error, Vec::new());
             let message = format!("no adapter serves `{}` logins", entry.api.as_str());
-            let error = GatewayError::new(ErrorClass::Unavailable, false, message);
-            return Err(fail(emit, error, progress, "no adapter"));
+            return Err(mismatch(message, "no adapter"));
         };
         let attempt = Attempt {
             vendor,
