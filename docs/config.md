@@ -214,7 +214,9 @@ The agent connects as a client of the daemon, so it needs a `[[clients]]` entry 
 `qb gateway --config PATH` reads its own TOML file, under the same rules for the whole file and
 with the same exit code 2 and one-line errors naming the field path and line. Decisions behind
 it: [ADR 0001](adr/0001-model-gateway.md); its API: [api.md](api.md#model-gateway-v1model).
-Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml).
+Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml), with its `qbd` side in
+[`deploy/examples/qbd.toml`](../deploy/examples/qbd.toml); [Examples](#examples) takes the login
+and route shapes out of them one at a time.
 
 Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`,
 `[openai_models]`, `[prices]`, `[fronts]`):
@@ -302,16 +304,7 @@ ladder step, a pin, or a chain of pins.
 | `chain` | array of tables | Instead of `difficulty`, `vendor`, `model` and `effort`: 1 to 8 steps `{ vendor, model, effort }`, each a pin (`vendor` and `model` required), which a turn tries in order ([api.md](api.md#attempts-and-rotation)). |
 | `expected_minutes` | integer | Expected length of a turn, for the lease's cost. |
 
-```toml
-[[routes]]
-alias = "chat"
-role = "gateway"
-chain = [
-  { vendor = "vendor-a", model = "model-large" },
-  { vendor = "vendor-c", model = "model-large", effort = "medium" },
-  { vendor = "vendor-d", model = "vendor-x/model-large" },
-]
-```
+A chain across vendors: [Examples](#a-route-chaining-subscription-key-and-openrouter).
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
@@ -423,6 +416,183 @@ above avoids that. Anyone on the host who knows the token can spend the gateway'
 keep it as private as a vendor key.
 
 Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).
+
+### Examples
+
+Each shape below is a part of [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml)
+and the lines of [`deploy/examples/qbd.toml`](../deploy/examples/qbd.toml) it needs; the two files
+together are one working installation. Every route of that gateway runs on the `qbd` role
+`gateway`, which `qbd.toml` declares with a ladder and grants to the gateway's uid:
+
+```toml
+# qbd.toml
+[[clients]]
+name = "gateway"
+uid = 1003
+role = "gateway"
+```
+
+#### An OpenAI API key
+
+A key of the `openai` API family, capped at 50 USD a month. Its vendor reports no cost, so the
+models it runs need a `[prices]` entry, and the cap needs `spend_file`:
+
+```toml
+# gateway.toml
+spend_file = "/var/lib/qb-gateway/spend.json"
+
+[[logins]]
+name = "key-2"
+kind = "api_key"
+api = "openai"
+spend_cap = 50.0
+credentials = "/var/lib/qb-gateway/credentials/key-2.json"
+
+[prices."model-large"]
+input = 2.0
+output = 8.0
+cache_read = 0.5
+cache_write = 0.0
+```
+
+```toml
+# qbd.toml: a vendor of its own with the spend window and no uncapped login
+[[vendors]]
+name = "vendor-c"
+windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
+
+[[logins]]
+name = "key-2"
+vendor = "vendor-c"
+```
+
+Without `spend_cap`, the key needs neither `spend_file` nor a price, and its vendor declares
+`windows = []`, as `vendor-e` does for the Anthropic key `key-1`. The credential file comes from
+an env file ([Importing credentials](#importing-credentials)):
+
+```sh
+qb login import --config /etc/qb/gateway.toml --from env --source /path/to/vendor.env \
+  --var VENDOR_KEY key-2
+```
+
+#### A ChatGPT subscription login
+
+The `openai` API family over the ChatGPT backend. Its vendor is the one the OpenAI fronts name:
+
+```toml
+# gateway.toml
+[[logins]]
+name = "login-3"
+kind = "chatgpt_oauth"
+credentials = "/var/lib/qb-gateway/credentials/login-3.json"
+
+[fronts.openai]
+vendor = "vendor-b"
+max_tokens = 8192
+```
+
+```toml
+# qbd.toml
+[[vendors]]
+name = "vendor-b"
+windows = [{ name = "five_hour", length_s = 18000, t_burn_s = 1800 }]
+
+[[logins]]
+name = "login-3"
+vendor = "vendor-b"
+```
+
+Fill its credential file with a sign-in of its own ([Signing in](#signing-in)), or import the
+Codex CLI's ([Importing credentials](#importing-credentials)):
+
+```sh
+qb login --config /etc/qb/gateway.toml login-3
+qb login import --config /etc/qb/gateway.toml --from codex --source /path/to/codex/auth.json login-3
+```
+
+#### An OpenRouter-style key
+
+A key of an OpenAI-compatible vendor over Chat Completions, with OpenRouter's app attribution and
+a cap of 20 USD a month. OpenRouter reports each call's cost, so it needs no price:
+
+```toml
+# gateway.toml
+[[logins]]
+name = "key-3"
+kind = "api_key"
+api = "chat_completions"
+base_url = "https://openrouter.ai/api/v1"
+referer = "https://app.example.com"
+title = "example-app"
+spend_cap = 20.0
+credentials = "/var/lib/qb-gateway/credentials/key-3.json"
+```
+
+```toml
+# qbd.toml
+[[vendors]]
+name = "vendor-d"
+windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
+
+[[logins]]
+name = "key-3"
+vendor = "vendor-d"
+```
+
+Its model ids are the vendor's own, such as `vendor-x/model-large`. The credential file comes
+from `qb login import --from env`, as for the OpenAI key.
+
+#### A route chaining subscription, key and OpenRouter
+
+The route `chat` tries the Anthropic subscription logins first, then the OpenAI key, then the
+OpenRouter-style key; a turn moves to the next step only before the client has seen an event:
+
+```toml
+# gateway.toml
+[[logins]]
+name = "login-1"
+kind = "oauth_anthropic"
+credentials = "/var/lib/qb-gateway/credentials/login-1.json"
+
+[[logins]]
+name = "login-2"
+kind = "oauth_anthropic"
+credentials = "/var/lib/qb-gateway/credentials/login-2.json"
+
+[[routes]]
+alias = "chat"
+role = "gateway"
+chain = [
+  { vendor = "vendor-a", model = "model-large" },
+  { vendor = "vendor-c", model = "model-large", effort = "medium" },
+  { vendor = "vendor-d", model = "vendor-x/model-large" },
+]
+expected_minutes = 2
+```
+
+```toml
+# qbd.toml: vendor-c and vendor-d with their keys as above
+[[vendors]]
+name = "vendor-a"
+windows = [
+  { name = "five_hour", length_s = 18000, t_burn_s = 1800 },
+  { name = "seven_day", length_s = 604800, t_burn_s = 43200 },
+]
+
+[[logins]]
+name = "login-1"
+vendor = "vendor-a"
+
+[[logins]]
+name = "login-2"
+vendor = "vendor-a"
+```
+
+Each step's vendor serves only logins of this gateway: when `qbd` answers a step's pick with a
+login the gateway config has no credential entry for, the turn moves to the next step, and on a
+ladder or pin route such a pick ends the turn.
+`[fronts.messages] vendor = "vendor-a"` gives the Anthropic logins' thinking blocks to
+`/v1/messages` clients.
 
 ### Importing credentials
 

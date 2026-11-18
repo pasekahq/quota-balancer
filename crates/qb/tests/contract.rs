@@ -1483,7 +1483,7 @@ fn with_probes_off_a_parked_agent_gets_no_job_and_others_are_served() {
         let p = pick_worker(&sock);
         assert_eq!(p.decision, Decision::Run, "{p:?}");
         assert!(p.stale, "the pick relied on a stale login");
-        assert_eq!(state(&sock).logins.len(), 3);
+        assert_eq!(state(&sock).logins.len(), 6);
     }
     assert_eq!(answer(&mut parked, Duration::from_millis(500)), None);
 }
@@ -1706,7 +1706,7 @@ fn parked_connections_are_bounded_per_agent_and_in_total() {
     let (status, resp) = next_now(&sock, Some(BOTS[2].0), &logins);
     assert_eq!(status, 429, "at most 4 parked in total");
     assert_eq!(error_of(&resp), ErrorCode::TooManyRequests);
-    assert_eq!(state(&sock).logins.len(), 3, "others are still served");
+    assert_eq!(state(&sock).logins.len(), 6, "others are still served");
 
     drop(waiting.pop());
     let _last = park_when_free(&sock, BOTS[2].0, &logins);
