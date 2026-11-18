@@ -217,7 +217,8 @@ pub struct Failure {
     /// Quota windows the vendor reported with the failure, for qbd's `report`.
     pub windows: Vec<WindowReport>,
     /// Detail for the log and the client's `error.message`; never a credential or a header
-    /// value. The core still replaces the attempt's credential by `[redacted]` if it appears.
+    /// value. The core still replaces the attempt's secret and ChatGPT account id by
+    /// `[redacted]` if one appears.
     pub message: String,
     /// USD the vendor reported the call cost before it failed; `None` when it reports none.
     pub cost: Option<f64>,

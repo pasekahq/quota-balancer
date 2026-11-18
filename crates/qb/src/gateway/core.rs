@@ -20,7 +20,9 @@ use zeroize::Zeroizing;
 use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::creds::{CredentialStore, Refresher};
 use super::spend::{self, Ledger};
-use super::upstream::{CancelToken, Failure, FailureKind, Finished, Flow, Picked, Upstream};
+use super::upstream::{
+    CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Upstream,
+};
 use crate::config::Error;
 use crate::sandbox::file_dir;
 use crate::server::unix_now;
@@ -655,14 +657,7 @@ impl Gateway {
                 &mut |e| relay.pass(e, at.vendor, &turn.cancel),
                 &turn.cancel,
             );
-            // The adapter must never quote the credential; if it does, the copy stops here.
-            let result = result.map_err(|mut f| {
-                let secret = credential.secret();
-                if f.message.contains(secret) {
-                    f.message = f.message.replace(secret, "[redacted]");
-                }
-                f
-            });
+            let result = result.map_err(|f| redact(f, &credential));
             drop(credential);
             turn.cancel.clear();
             let refresh = matches!(&result, Err(f) if f.kind == FailureKind::Auth)
@@ -1211,4 +1206,18 @@ fn unpickable(p: &PickResponse, alias: &str) -> GatewayError {
     }
     let message = format!("qbd has no candidate for route `{alias}` ({})", p.reason);
     GatewayError::new(ErrorClass::NoRoute, false, message)
+}
+
+/// `f` with the credential's secret and account id replaced by `[redacted]`: the adapter must
+/// never quote them, and if it does, the copy stops here.
+fn redact(mut f: Failure, credential: &Credential) -> Failure {
+    for value in [Some(credential.secret()), credential.account_id()]
+        .into_iter()
+        .flatten()
+    {
+        if f.message.contains(value) {
+            f.message = f.message.replace(value, "[redacted]");
+        }
+    }
+    f
 }

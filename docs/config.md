@@ -264,8 +264,9 @@ without one fails the turn as a configuration error. Give the gateway's logins t
 vendor and role to keep them apart from logins used elsewhere.
 
 A credential file is the gateway's own copy, never a vendor CLI's file (two refreshers would race
-for one rotating refresh token). It is JSON, a regular file owned by the gateway's user with
-mode 0600; anything else is refused:
+for one rotating refresh token); `qb login import` makes one from an existing credential
+([Importing credentials](#importing-credentials)). It is JSON, a regular file owned by the
+gateway's user with mode 0600; anything else is refused:
 
 ```json
 {"type": "oauth_anthropic", "access_token": "...", "refresh_token": "...", "expires_at": 1800000000}
@@ -281,8 +282,11 @@ access token of a ChatGPT subscription login and its account id
 ([openai.md](openai.md#serving-the-upstream)), which a refresh keeps; `refresh_token` and
 `expires_at` are optional. Without `refresh_token` the token is used as it is, and a token the
 vendor rejects makes the login unusable: the attempt is reported to `qbd` as `http_401` and the
-turn moves to the next login. Any other field is refused. The gateway may create, write and remove files in the credential files'
-directories and the directory of `spend_file`, and nowhere else.
+turn moves to the next login. A field of another type (`key` in an OAuth file, `account_id` in
+an `oauth_anthropic` or `api_key` file, an OAuth field in an `api_key` file) or any other field
+is refused, and the error names the field, never a value. The gateway may create, write and
+remove files in the credential files' directories and the directory of `spend_file`, and
+nowhere else.
 
 `[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to a `qbd` pick target: a
 ladder step, a pin, or a chain of pins.
@@ -418,6 +422,37 @@ above avoids that. Anyone on the host who knows the token can spend the gateway'
 keep it as private as a vendor key.
 
 Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).
+
+### Importing credentials
+
+`qb login import` copies a credential another client already holds into a login's credential
+file, as the gateway's user:
+
+```sh
+qb login import --config /etc/qb/gateway.toml --from hermes --source /path/to/hermes/auth.json \
+  --provider anthropic --entry work login-1
+qb login import --config /etc/qb/gateway.toml --from env --source /path/to/vendor.env \
+  --var VENDOR_KEY key-1
+```
+
+It reads the source and the gateway config only, makes no network call and leaves the source as
+it was. It writes the login's `credentials` file in the format above, atomically with mode 0600,
+and refuses a file that exists unless `--force` is given. It refuses a source whose credential
+type differs from the login's `kind`. No output and no error carries a value: an error names
+the file, the field and the problem. A refused import exits 1, a usage error 2.
+
+| `--from` | Source file | Type | Fields |
+|---|---|---|---|
+| `hermes` | Hermes `auth.json`, the entry of `credential_pool.<provider>` named by `--entry` (its `id`, else its one `label`); `--entry` may be left out when the provider has one entry | `--provider anthropic`: `oauth_anthropic` when the entry's `auth_type` is `oauth`, else `api_key`; `--provider openai-codex`: `chatgpt_oauth` | `access_token` → `access_token` (`key` for `api_key`); `refresh_token` → `refresh_token`; `expires_at_ms` (ms) or else `expires_at` (ISO 8601 with a time zone) → `expires_at` in Unix seconds; `chatgpt_account_id` claim of the access token (a JWT) → `account_id` |
+| `claude-code` | Claude Code's `.credentials.json` | `oauth_anthropic` | `claudeAiOauth.accessToken` → `access_token`; `claudeAiOauth.refreshToken` → `refresh_token`; `claudeAiOauth.expiresAt` (ms) → `expires_at` in Unix seconds |
+| `codex` | The Codex CLI's `auth.json` | `chatgpt_oauth` | `tokens.access_token` → `access_token`; `tokens.refresh_token` → `refresh_token`; `tokens.account_id`, else the `chatgpt_account_id` claim of `tokens.id_token` → `account_id`; no `expires_at`, so the gateway refreshes after the vendor rejects the token |
+| `env` | An env file of `NAME=value` lines; `export ` and one pair of quotes around the value are dropped, the last line of the name counts | `api_key` | the value of `--var NAME` → `key` |
+
+A refresh token is single-use: each refresh returns a new one and invalidates the old. When the
+imported credential has one, the source client and the gateway share it, and the first refresh
+by either leaves the other with a dead token. The command still writes the file, then prints one
+warning naming the source client, recommending a dedicated sign-in of the login (`qb login`) or
+no further use of the source client with that account.
 
 ### Reload
 

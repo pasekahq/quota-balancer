@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
@@ -86,10 +87,30 @@ impl<'de> Deserialize<'de> for Secret {
 
 #[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum Kind {
+pub(super) enum Kind {
     OauthAnthropic,
     ApiKey,
     ChatgptOauth,
+}
+
+impl From<CredentialKind> for Kind {
+    fn from(kind: CredentialKind) -> Self {
+        match kind {
+            CredentialKind::OauthAnthropic => Self::OauthAnthropic,
+            CredentialKind::ApiKey => Self::ApiKey,
+            CredentialKind::ChatgptOauth => Self::ChatgptOauth,
+        }
+    }
+}
+
+impl From<Kind> for CredentialKind {
+    fn from(kind: Kind) -> Self {
+        match kind {
+            Kind::OauthAnthropic => Self::OauthAnthropic,
+            Kind::ApiKey => Self::ApiKey,
+            Kind::ChatgptOauth => Self::ChatgptOauth,
+        }
+    }
 }
 
 /// The file as stored; flat rather than tagged so no buffered copy of a secret is left behind.
@@ -105,15 +126,43 @@ struct Stored {
     account_id: Option<Secret>,
 }
 
+/// A credential file's contents as the gateway writes them.
 #[derive(Serialize)]
-struct Written<'a> {
+pub(super) struct Written<'a> {
     #[serde(rename = "type")]
-    kind: Kind,
-    access_token: &'a str,
-    refresh_token: &'a str,
+    pub(super) kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    account_id: Option<&'a str>,
-    expires_at: u64,
+    pub(super) access_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) refresh_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) account_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) key: Option<&'a str>,
+}
+
+impl Written<'_> {
+    /// The JSON of the file `file`, in a buffer zeroized on drop.
+    pub(super) fn encode(&self, file: &Path) -> Result<Zeroizing<Vec<u8>>, CredError> {
+        let len = [
+            self.access_token,
+            self.refresh_token,
+            self.account_id,
+            self.key,
+        ]
+        .iter()
+        .flatten()
+        .map(|s| s.len())
+        .sum::<usize>();
+        let mut body = Zeroizing::new(Vec::with_capacity(160 + len));
+        serde_json::to_writer(&mut *body, self).map_err(|e| CredError {
+            unusable: false,
+            message: format!("{}: encode failed: {e}", file.display()),
+        })?;
+        Ok(body)
+    }
 }
 
 /// Loads credentials and refreshes expired OAuth tokens, one refresh per credential file at a
@@ -161,11 +210,7 @@ impl CredentialStore {
     ) -> Result<Credential, CredError> {
         let (file, kind) = (login.credentials.as_path(), login.kind);
         let first = read(file)?;
-        let found = match first.kind {
-            Kind::OauthAnthropic => CredentialKind::OauthAnthropic,
-            Kind::ApiKey => CredentialKind::ApiKey,
-            Kind::ChatgptOauth => CredentialKind::ChatgptOauth,
-        };
+        let found = CredentialKind::from(first.kind);
         if found != kind {
             return Err(unusable(
                 file,
@@ -178,10 +223,12 @@ impl CredentialStore {
         }
         if first.kind == Kind::ApiKey {
             let key = secret(file, "key", first.key.as_ref())?;
+            own_fields(file, &first)?;
             return Ok(Credential::ApiKey { key });
         }
         let token = secret(file, "access_token", first.access_token.as_ref())?;
         let account_id = account(file, &first)?;
+        own_fields(file, &first)?;
         let expiring = first
             .expires_at
             .is_some_and(|at| at <= now.saturating_add(REFRESH_MARGIN_S));
@@ -194,6 +241,7 @@ impl CredentialStore {
         let again = read(file)?;
         let current = secret(file, "access_token", again.access_token.as_ref())?;
         let account_id = account(file, &again)?;
+        own_fields(file, &again)?;
         let replaced = *current != *token
             && again
                 .expires_at
@@ -212,22 +260,15 @@ impl CredentialStore {
         visible(file, "access_token", &fresh.access_token)?;
         let kept = fresh.refresh_token.as_ref().unwrap_or(&refresh_token);
         visible(file, "refresh_token", kept)?;
-        let mut body = Zeroizing::new(Vec::with_capacity(
-            160 + fresh.access_token.len()
-                + kept.len()
-                + account_id.as_ref().map_or(0, |a| a.len()),
-        ));
-        let written = Written {
+        let body = Written {
             kind: first.kind,
-            access_token: &fresh.access_token,
-            refresh_token: kept,
+            access_token: Some(&fresh.access_token),
+            refresh_token: Some(kept),
             account_id: account_id.as_deref().map(String::as_str),
-            expires_at: fresh.expires_at,
-        };
-        serde_json::to_writer(&mut *body, &written).map_err(|e| CredError {
-            unusable: false,
-            message: format!("{}: encode failed: {e}", file.display()),
-        })?;
+            expires_at: Some(fresh.expires_at),
+            key: None,
+        }
+        .encode(file)?;
         write_atomic(file, &body).map_err(|e| CredError {
             unusable: false,
             message: format!("{}: cannot write the refreshed token: {e}", file.display()),
@@ -241,6 +282,31 @@ fn account(file: &Path, stored: &Stored) -> Result<Option<Zeroizing<String>>, Cr
     match stored.kind {
         Kind::ChatgptOauth => secret(file, "account_id", stored.account_id.as_ref()).map(Some),
         Kind::OauthAnthropic | Kind::ApiKey => Ok(None),
+    }
+}
+
+/// Refuses a field `stored` holds that its kind does not take, naming the field.
+fn own_fields(file: &Path, stored: &Stored) -> Result<(), CredError> {
+    let oauth = stored.kind != Kind::ApiKey;
+    let foreign = [
+        ("access_token", stored.access_token.is_some() && !oauth),
+        ("refresh_token", stored.refresh_token.is_some() && !oauth),
+        ("expires_at", stored.expires_at.is_some() && !oauth),
+        (
+            "account_id",
+            stored.account_id.is_some() && stored.kind != Kind::ChatgptOauth,
+        ),
+        ("key", stored.key.is_some() && oauth),
+    ];
+    match foreign.iter().find(|(_, held)| *held) {
+        Some((field, _)) => Err(unusable(
+            file,
+            format_args!(
+                "`{field}` is not a field of type `{}`",
+                CredentialKind::from(stored.kind).as_str()
+            ),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -285,10 +351,27 @@ fn read(file: &Path) -> Result<Stored, CredError> {
     if bytes.len() as u64 > MAX_FILE {
         return Err(unusable(file, "is larger than 64 KiB"));
     }
-    let mut de = serde_json::Deserializer::from_slice(&bytes);
-    let stored = serde_path_to_error::deserialize(&mut de).map_err(|e| {
+    decode(file, &bytes)
+}
+
+/// `bytes`, the contents of `file`, decoded as one JSON document; an error names the field
+/// path or the position, never a value.
+pub(super) fn decode<T: DeserializeOwned>(file: &Path, bytes: &[u8]) -> Result<T, CredError> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let value = serde_path_to_error::deserialize(&mut de).map_err(|e| {
         if e.inner().is_data() {
-            unusable(file, format_args!("`{}` is missing or invalid", e.path()))
+            // serde's "missing field `name`" holds a field name only; other data errors may
+            // quote the value, so they are reduced to the path.
+            let inner = e.inner().to_string();
+            let missing = inner
+                .strip_prefix("missing field `")
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(field, _)| field);
+            match (missing, e.path().to_string()) {
+                (Some(field), path) if path == "." => unusable(file, format_args!("no `{field}`")),
+                (Some(field), path) => unusable(file, format_args!("no `{path}.{field}`")),
+                (None, path) => unusable(file, format_args!("`{path}` is missing or invalid")),
+            }
         } else {
             unusable(
                 file,
@@ -302,7 +385,7 @@ fn read(file: &Path) -> Result<Stored, CredError> {
     })?;
     de.end()
         .map_err(|_| unusable(file, "trailing data after the JSON object"))?;
-    Ok(stored)
+    Ok(value)
 }
 
 /// `file` opened, when the path itself (not a symlink) names a regular file. A refresh may
@@ -331,7 +414,8 @@ fn secret(file: &Path, field: &str, s: Option<&Secret>) -> Result<Zeroizing<Stri
     Ok(s.0.clone())
 }
 
-fn visible(file: &Path, field: &str, value: &str) -> Result<(), CredError> {
+/// Refuses `value` of `field` unless it is a non-empty run of visible ASCII.
+pub(super) fn visible(file: &Path, field: &str, value: &str) -> Result<(), CredError> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(unusable(
             file,
@@ -577,6 +661,57 @@ mod tests {
                 .contains("has type `chatgpt_oauth`, the config says `oauth_anthropic`"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_field_of_another_type_is_refused_by_name() {
+        let (s, _) = store(None);
+        for (body, kind, field, of) in [
+            (
+                format!(
+                    r#"{{"type":"oauth_anthropic","access_token":"a","refresh_token":"r","key":"{MARK}"}}"#
+                ),
+                KIND,
+                "key",
+                "oauth_anthropic",
+            ),
+            (
+                format!(r#"{{"type":"oauth_anthropic","access_token":"a","account_id":"{MARK}"}}"#),
+                KIND,
+                "account_id",
+                "oauth_anthropic",
+            ),
+            (
+                format!(
+                    r#"{{"type":"chatgpt_oauth","access_token":"a","account_id":"b","key":"{MARK}"}}"#
+                ),
+                CHATGPT,
+                "key",
+                "chatgpt_oauth",
+            ),
+            (
+                format!(r#"{{"type":"api_key","key":"k","account_id":"{MARK}"}}"#),
+                KEY,
+                "account_id",
+                "api_key",
+            ),
+            (
+                format!(r#"{{"type":"api_key","key":"k","refresh_token":"{MARK}"}}"#),
+                KEY,
+                "refresh_token",
+                "api_key",
+            ),
+        ] {
+            let f = file("foreign", &body, 0o600);
+            let e = s.load(&entry("login-1", &f, kind), NOW, false).unwrap_err();
+            assert!(e.unusable, "{e}");
+            assert!(
+                e.message
+                    .contains(&format!("`{field}` is not a field of type `{of}`")),
+                "{body}: {e}"
+            );
+            assert!(!e.message.contains(MARK), "{body}: {e}");
+        }
     }
 
     #[test]
