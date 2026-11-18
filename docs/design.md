@@ -69,7 +69,8 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   demand and replaces the credential file atomically (0600, rename in the same directory).
   Before serving it makes itself non-dumpable and restricts itself with landlock to its
   credential directories (read-write), the resolver files, TCP connections to port 443 and a
-  bind on the optional loopback port; gaps on older kernels are logged as for the agent.
+  bind on the optional loopback port; gaps on older kernels are logged as for the agent, and a
+  fully applied sandbox gets one info line at startup (`sandbox: non-dumpable; landlock V4: …`).
   Decisions and limits: [ADR 0001](adr/0001-model-gateway.md).
 - `qb login import` is run by the operator as the gateway's user to write a login's credential
   file from a credential another client holds ([config.md](config.md#importing-credentials)).

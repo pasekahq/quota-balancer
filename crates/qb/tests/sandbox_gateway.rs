@@ -29,6 +29,15 @@ fn kernel_abi() -> Option<ABI> {
     .unwrap()
 }
 
+/// The startup line of the enforced ruleset: credential, spend and config directories and the
+/// two resolver files; TCP connect to 443 and bind on `port`.
+fn assert_summary(summary: &str, port: u16) {
+    let want = format!(
+        "non-dumpable; landlock V4: files beneath 5 paths only, TCP connect 443, bind {port} only"
+    );
+    assert_eq!(summary, want);
+}
+
 #[test]
 fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_qbd_only() {
     let dir = Path::new("/tmp").join(format!("qb-gw-sandbox-{}", std::process::id()));
@@ -74,7 +83,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
     let (edited, reload) = std::sync::mpsc::channel();
     let reread = file.clone();
     let gateway = std::thread::spawn(move || {
-        let gaps = qb::sandbox::harden_gateway(&config).unwrap();
+        let qb::sandbox::Confined { gaps, summary } = qb::sandbox::harden_gateway(&config).unwrap();
         hardened.send(()).unwrap();
         reload.recv().unwrap();
         assert_eq!(
@@ -97,6 +106,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
             assert_eq!(gaps, Vec::<String>::new());
+            assert_summary(&summary, port);
             let denied = std::fs::read(&unreadable).unwrap_err();
             assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
             let denied = std::fs::write(unreadable.with_extension("new"), "x").unwrap_err();

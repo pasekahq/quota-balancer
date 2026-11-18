@@ -28,6 +28,15 @@ pub const HTTPS_PORT: u16 = 443;
 /// The landlock ABI whose rights the ruleset handles; 4 is the first with TCP port rules.
 const TARGET_ABI: ABI = ABI::V4;
 
+/// What [`confine`] applied.
+#[derive(Debug)]
+pub struct Confined {
+    /// What differs from the ruleset described; empty when it is enforced as described.
+    pub gaps: Vec<String>,
+    /// One line on what is enforced, for the startup log.
+    pub summary: String,
+}
+
 /// Makes the process non-dumpable, then restricts the calling thread and the threads it starts
 /// with landlock: read-only beneath each login's credential directory and
 /// [`RESOLVER_FILES`], and TCP connect to [`HTTPS_PORT`] only.
@@ -41,7 +50,7 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, false, &[], None, true)
+    confine(&files, false, &[], None, true).map(|c| c.gaps)
 }
 
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
@@ -54,7 +63,7 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
 ///
 /// # Errors
 /// The dumpable flag cannot be cleared.
-pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
+pub fn harden_gateway(config: &GatewayConfig) -> Result<Confined, String> {
     let files: Vec<&Path> = config
         .logins
         .iter()
@@ -81,7 +90,7 @@ pub fn harden_import(
     source: &Path,
     target: &Path,
 ) -> Result<Vec<String>, String> {
-    confine(&[target], true, &[config_file, source], None, false)
+    confine(&[target], true, &[config_file, source], None, false).map(|c| c.gaps)
 }
 
 /// [`harden`] for `qb login`: read files beneath the directory of `config_file`; beneath the
@@ -92,7 +101,7 @@ pub fn harden_import(
 /// # Errors
 /// The dumpable flag cannot be cleared.
 pub fn harden_login(config_file: &Path, target: &Path) -> Result<Vec<String>, String> {
-    confine(&[target], true, &[config_file], None, true)
+    confine(&[target], true, &[config_file], None, true).map(|c| c.gaps)
 }
 
 /// Makes the process non-dumpable: no core dump, no same-uid ptrace or `/proc/<pid>/mem` read.
@@ -113,7 +122,7 @@ fn confine(
     read_files: &[&Path],
     bind: Option<u16>,
     https: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<Confined, String> {
     non_dumpable()?;
     let mut gaps = Vec::new();
     let dirs = dirs_of(owned_files, &mut gaps);
@@ -142,6 +151,8 @@ fn confine(
             Err(e) => gaps.push(format!("{} stays unreadable: {e}", path.display())),
         }
     }
+    let opened = rules.len();
+    let summary = summary(opened, bind, https);
     match restrict(rules, bind, https) {
         Ok((RulesetStatus::FullyEnforced, _)) => {}
         Ok((RulesetStatus::PartiallyEnforced, LandlockStatus::Available { effective_abi, .. })) => {
@@ -157,7 +168,27 @@ fn confine(
             "landlock failed ({e}): file and network access are not restricted"
         )),
     }
-    Ok(gaps)
+    Ok(Confined { gaps, summary })
+}
+
+/// The startup line of a ruleset of `paths` path rules, TCP bind on `bind` and with `https` TCP
+/// connect to [`HTTPS_PORT`].
+fn summary(paths: usize, bind: Option<u16>, https: bool) -> String {
+    let mut net = Vec::new();
+    if https {
+        net.push(format!("connect {HTTPS_PORT}"));
+    }
+    if let Some(port) = bind {
+        net.push(format!("bind {port}"));
+    }
+    let net = if net.is_empty() {
+        "none".to_owned()
+    } else {
+        net.join(", ")
+    };
+    format!(
+        "non-dumpable; landlock {TARGET_ABI:?}: files beneath {paths} paths only, TCP {net} only"
+    )
 }
 
 /// The distinct directories of `files`; a file without one is added to `gaps`.

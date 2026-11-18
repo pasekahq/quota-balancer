@@ -2432,6 +2432,12 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     );
     let serving = format!("serving the HTTP fronts on {listen}");
     assert!(logged.iter().any(|l| l.contains(&serving)), "{logged:?}");
+    // Either the applied sandbox or its gaps, never silence.
+    let sandboxed = logged.iter().any(|l| {
+        l.contains("qb gateway: sandbox: non-dumpable; landlock")
+            || l.contains("qb gateway: sandbox incomplete: ")
+    });
+    assert!(sandboxed, "{logged:?}");
     assert!(
         logged
             .iter()

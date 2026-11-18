@@ -700,11 +700,13 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         }
         None => None,
     };
-    let gaps = sandbox::harden_gateway(&config)?;
-    if !gaps.is_empty() {
+    let confined = sandbox::harden_gateway(&config)?;
+    if confined.gaps.is_empty() {
+        log::info(&format!("qb gateway: sandbox: {}", confined.summary));
+    } else {
         log::warn(&format!(
             "qb gateway: sandbox incomplete: {}",
-            gaps.join("; ")
+            confined.gaps.join("; ")
         ));
     }
     let upstreams: Upstreams = vec![
