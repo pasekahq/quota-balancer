@@ -251,7 +251,7 @@ or put the socket in a directory outside it.
 | `base_url` | string | Base URL of the vendor API, default the family's public endpoint: `https://api.anthropic.com` for `anthropic`, below which the gateway calls `/v1/messages`; for `openai` the URL below which it calls `/responses`, `https://api.openai.com/v1` for a key and `https://chatgpt.com/backend-api/codex` for a ChatGPT login. Required for `chat_completions`: the URL below which the gateway calls `/chat/completions`, e.g. `https://openrouter.ai/api/v1`. `https://` on port 443, or `http://` with a loopback host (`localhost`, `127.0.0.0/8`, `::1`); an optional path, no user, query or fragment. |
 | `referer` | string | Only for a `chat_completions` login: sent as `http-referer`, OpenRouter's app attribution. Non-empty printable ASCII. |
 | `title` | string | Only for a `chat_completions` login: sent as `x-title`, OpenRouter's app name. Non-empty printable ASCII. |
-| `token_url` | string | Only for an `oauth_anthropic` or `chatgpt_oauth` login: the full URL of the OAuth token endpoint its refreshes go to, instead of the vendor's endpoints ([anthropic.md](anthropic.md#oauth-token-refresh), [openai.md](openai.md#serving-the-upstream)). Same rules as `base_url`. |
+| `token_url` | string | Only for an `oauth_anthropic` or `chatgpt_oauth` login: the full URL of the OAuth token endpoint its refreshes and `qb login` sign-ins go to, instead of the vendor's endpoints ([anthropic.md](anthropic.md#oauth-token-refresh), [openai.md](openai.md#serving-the-upstream)). Same rules as `base_url`. |
 | `credentials` | string | Absolute path of the credential file. |
 | `spend_cap` | number > 0 | Only for an `api_key` login: USD it may spend per UTC calendar month ([Spend caps](#spend-caps)). |
 
@@ -264,7 +264,8 @@ without one fails the turn as a configuration error. Give the gateway's logins t
 vendor and role to keep them apart from logins used elsewhere.
 
 A credential file is the gateway's own copy, never a vendor CLI's file (two refreshers would race
-for one rotating refresh token); `qb login import` makes one from an existing credential
+for one rotating refresh token); `qb login` makes one from a new sign-in of an OAuth login
+([Signing in](#signing-in)), `qb login import` from an existing credential
 ([Importing credentials](#importing-credentials)). It is JSON, a regular file owned by the
 gateway's user with mode 0600; anything else is refused:
 
@@ -426,7 +427,8 @@ Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secre
 ### Importing credentials
 
 `qb login import` copies a credential another client already holds into a login's credential
-file, as the gateway's user:
+file, as the gateway's user. An OAuth login is better signed in on its own with `qb login`
+([Signing in](#signing-in)), which gives the gateway a refresh token no other client holds:
 
 ```sh
 qb login import --config /etc/qb/gateway.toml --from hermes --source /path/to/hermes/auth.json \
@@ -452,8 +454,45 @@ the file, the field and the problem. A refused import exits 1, a usage error 2.
 A refresh token is single-use: each refresh returns a new one and invalidates the old. When the
 imported credential has one, the source client and the gateway share it, and the first refresh
 by either leaves the other with a dead token. The command still writes the file, then prints one
-warning naming the source client, recommending a dedicated sign-in of the login (`qb login`) or
-no further use of the source client with that account.
+warning naming the source client, recommending a dedicated sign-in of the login (`qb login`,
+[Signing in](#signing-in)) or no further use of the source client with that account.
+
+### Signing in
+
+`qb login` signs an `oauth_anthropic` or `chatgpt_oauth` login in from scratch with OAuth PKCE,
+as the gateway's user, on a host without a browser:
+
+```sh
+qb login --config /etc/qb/gateway.toml login-1
+```
+
+1. It prints what to do on stderr and one authorize URL on stdout. The URL carries the vendor's
+   public client id, redirect URI and scopes, a fresh S256 code challenge and a random `state`;
+   the verifier never leaves the process.
+2. Open the URL in a browser on any device and sign in with the account of the login.
+3. Paste one line on stdin:
+   - `oauth_anthropic`: the vendor's page shows a code of the form `code#state`; paste it whole.
+   - `chatgpt_oauth`: the browser is sent to `http://localhost:1455/auth/callback?code=...`,
+     which fails to load where no Codex CLI listens; paste the full address from the address
+     bar.
+4. A `state` other than the one sent is refused before any request. The code and the verifier
+   go to the login's `token_url`, else the vendor's token endpoint
+   ([anthropic.md](anthropic.md#oauth-sign-in), [openai.md](openai.md#oauth-sign-in)), and the
+   answer's tokens are written to the login's `credentials` file in the format above,
+   atomically with mode 0600: the access token, the refresh token and `expires_at`, and for
+   `chatgpt_oauth` the `account_id` from the `chatgpt_account_id` claim of the answer's
+   `id_token`. One line on stdout names the file, the type and the login.
+
+The refresh token is the gateway's own: no other client holds it, so no other client's refresh
+invalidates it, as one can after `qb login import`.
+
+It refuses an `api_key` login (`qb login import --from env` writes one) and a file that exists
+unless `--force` is given, before it prints the URL. A vendor refusal names the status and the
+OAuth error code; a refused or failed sign-in writes nothing and is started again. No output and
+no error carries the code, the verifier, a token or the account id. It confines itself before it
+reads stdin ([design.md](design.md#roles-and-privilege-separation)): like the gateway, it
+connects to TCP port 443 only, so a loopback `token_url` must name port 443. A refused sign-in
+exits 1, a usage error 2.
 
 ### Reload
 

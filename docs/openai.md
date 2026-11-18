@@ -290,6 +290,37 @@ runbook [openai-live-smoke.md](runbooks/openai-live-smoke.md) checks the usage, 
 the 402 answer against OpenRouter with one short turn per key, and names what a short turn
 cannot show: the `usage.cost` field and the in-stream error chunk.
 
+## OAuth sign-in
+
+`qb login` (`crates/qb/src/gateway/signin.rs`, [config.md](config.md#signing-in)) signs a
+`chatgpt_oauth` login in with the Codex CLI's authorization code grant and PKCE (RFC 7636, S256),
+without its local callback listener:
+
+- the authorize URL is `identity::OAUTH_AUTHORIZE_URL` (`https://auth.openai.com/oauth/authorize`)
+  with `response_type=code`, `client_id` `identity::OAUTH_CLIENT_ID`, `redirect_uri`
+  `identity::OAUTH_REDIRECT_URI` (`http://localhost:1455/auth/callback`), `scope`
+  `identity::OAUTH_SCOPES` (`openid profile email offline_access`), the Codex CLI's
+  `identity::OAUTH_AUTHORIZE_EXTRA` (`id_token_add_organizations=true`, which puts the account
+  claims into the `id_token`, `codex_cli_simplified_flow=true`, `originator`), `code_challenge`,
+  `code_challenge_method=S256` and `state`. The verifier and the state are each 32 bytes of the
+  kernel's random source in unpadded base64url; the challenge is the unpadded base64url SHA-256
+  of the verifier;
+- the vendor redirects the browser to the redirect URI with `code` and `state` in the query,
+  which fails to load where no Codex CLI listens; the operator pastes that address. A `state`
+  other than the one sent is refused before any request, and so is a redirect with `error`;
+- `POST` to the login's `token_url`, else `identity::OAUTH_TOKEN_URL`, with the transport and
+  `user-agent` of the refresh above; body `application/x-www-form-urlencoded`: `grant_type`
+  `authorization_code`, `code`, `redirect_uri`, `client_id` and `code_verifier`;
+- a 2xx answer needs `access_token`, `refresh_token` and an `id_token` whose payload carries
+  `https://api.openai.com/auth`.`chatgpt_account_id`, the file's `account_id`; `expires_at`
+  follows the refresh's rules.
+
+A 4xx answer is a refusal and a transport failure, a 5xx or a 2xx without the required fields a
+failure; neither writes a file. The error names the endpoint, the status and the error code,
+never the code, the verifier, a token or the account id. These field names come from the Codex
+CLI's flow, not from captured answers; [openai-live-smoke.md](runbooks/openai-live-smoke.md)
+signs its ChatGPT login in this way.
+
 ## Serving the fronts
 
 `qb gateway` serves `POST /v1/chat/completions` and `POST /v1/responses` on its unix socket to

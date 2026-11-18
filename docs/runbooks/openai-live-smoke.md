@@ -20,7 +20,6 @@ Placeholders:
 | `<smoke-dir>` | An absolute directory owned by `<user>`, mode 0700: configs, sockets, turn output. |
 | `<credentials-dir>` | An absolute directory owned by `<user>`, mode 0700, holding only this run's credential files. |
 | `<backup-dir>` | An absolute directory owned by `<user>`, mode 0700, outside `<credentials-dir>`. |
-| `<codex-home>` | An empty directory for a dedicated Codex CLI sign-in (`CODEX_HOME`). |
 | `<smoke-role>` | The `qbd` role of the gateway in this run. |
 | `<chatgpt-vendor>`, `<openai-vendor>`, `<openrouter-vendor>` | `qbd` vendor names, one per part. |
 | `<chatgpt-login>`, `<openai-key-login>`, `<openrouter-login>` | `qbd` login names, one per part; each credential file is `<credentials-dir>/<login>.json`. |
@@ -43,9 +42,9 @@ Placeholders:
 2. `qb` built for `x86_64-unknown-linux-musl` from this repository and installed as `qb` on
    `<user>`'s `PATH` on `<host>`; `python3` and `curl` on `<host>`.
 3. The vendor terms allow each credential mode ([README](../../README.md#terms-of-service)).
-4. For the subscription part: the Codex CLI on a machine with a browser, to sign in once under
-   `CODEX_HOME=<codex-home>`. That sign-in belongs to the gateway alone: no Codex CLI or other
-   client keeps using it, because the refresh in this run rotates its refresh token.
+4. For the subscription part: a browser on any device, to sign the ChatGPT account in once with
+   `qb login`, the dedicated sign-in of the ChatGPT login. That sign-in belongs to the gateway
+   alone: no other client holds its refresh token, which the refresh in this run rotates.
 5. For each key part: a key made for this run, so it can be revoked afterwards.
 
 ## Setup
@@ -122,32 +121,8 @@ status `unknown`.
 
 ### Credential files
 
-`<chatgpt-login>`, from the dedicated Codex sign-in. On the machine with the browser:
-
-```sh
-CODEX_HOME=<codex-home> codex login
-```
-
-Copy `<codex-home>/auth.json` to `<host>` with mode 0600, then build the gateway's file from it.
-The script prints nothing; the expiry is the access token's own `exp`:
-
-```sh
-python3 - <codex-home>/auth.json <credentials-dir>/<chatgpt-login>.json <<'EOF'
-import base64, json, os, sys
-tokens = json.load(open(sys.argv[1]))["tokens"]
-claims = tokens["access_token"].split(".")[1]
-exp = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))["exp"]
-out = {"type": "chatgpt_oauth", "access_token": tokens["access_token"],
-       "account_id": tokens["account_id"], "refresh_token": tokens["refresh_token"],
-       "expires_at": exp}
-with os.fdopen(os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
-    json.dump(out, f)
-EOF
-rm -r <codex-home>
-```
-
-Removing `<codex-home>` on both machines leaves the gateway's file the only holder of the
-refresh token.
+`<chatgpt-login>` is signed in with `qb login` once the gateway config exists
+([Gateway](#gateway)).
 
 `<openai-key-login>` and `<openrouter-login>`, once their part is commanded, each
 `{"type": "api_key", "key": "..."}`:
@@ -215,6 +190,23 @@ its entry, or the vendor answers 400:
 [openai_models."<openai-model>"]
 reasoning = false
 ```
+
+Sign `<chatgpt-login>` in, once its part runs ([config.md](../config.md#signing-in)):
+
+```sh
+qb login --config <smoke-dir>/gateway.toml <chatgpt-login>
+```
+
+Open the URL it prints in a browser on any device and sign in to the ChatGPT account. The
+browser then fails to load a `http://localhost:1455/auth/callback?...` page: paste that page's
+full address into `qb login`. Expected on stdout, after the URL:
+
+```text
+<credentials-dir>/<chatgpt-login>.json: wrote the `chatgpt_oauth` credential of login `<chatgpt-login>`
+```
+
+and `ls -l <credentials-dir>` shows the file `-rw-------`. The gateway's file is the only holder
+of the refresh token.
 
 In a second terminal of its own:
 
@@ -400,6 +392,7 @@ Expected: an `error` event of class `quota_exhausted`, the log line
 
 | Assumption in the code | Confirmed when | Refuted when |
 |---|---|---|
+| The ChatGPT sign-in takes the Codex CLI's authorize parameters, its form-encoded `grant_type=authorization_code` exchange answers `access_token`, `refresh_token` and an `id_token` with the `chatgpt_account_id` claim (`signin.rs`, [openai.md](../openai.md#oauth-sign-in)). | `qb login` prints the line naming `<chatgpt-login>.json` and the turn of the ChatGPT part passes. | The authorize page shows an error instead of the sign-in, or `qb login` exits 1 with `the token endpoint refused the code: <token-url>: HTTP <status> <code>` or `the token answer has no ...`. |
 | The ChatGPT refresh is a form-encoded `grant_type=refresh_token` with the Codex client id, and its 2xx answer has `access_token`, an optional rotated `refresh_token` and an optional `id_token` (`oauth.rs`, [openai.md](../openai.md#serving-the-upstream)). | The forced refresh's turn passes and step 4 shows a new access token, the same account id and mode 600. | The turn fails with a log line `gateway: <credentials-dir>/<chatgpt-login>.json: refresh failed: <token-url>: ...`: `HTTP 400 <code>` or `HTTP 401` means the grant or client id is refused (the login turns `auth_dead` in this run's `qbd` only); `answer has no access_token` or `malformed answer` means other field names. |
 | The token endpoint refuses a spent refresh token with 400 or 401, or with another non-5xx status other than 429 whose `error` (a string, or an object with `code`) is `invalid_grant`, `refresh_token_expired`, `refresh_token_reused` or `refresh_token_invalidated`. | The refusal request answers 400 or 401, or another such status with one of those codes in either form. | Any other answer: 429 or 5xx (the gateway would retry a spent token and never mark the login), or another status with a code outside the list or in a third shape. |
 | Without `expires_in`, the `id_token`'s `exp` is a usable expiry for the access token. | Step 5 shows `expires_at` at most `access_exp` and at least a few minutes after `now`: the gateway refreshes before the token lapses and not on every turn. `expires_at` equal to `access_exp` means both JWTs carry the same `exp` or the access token's was used. | `expires_at` above `access_exp`: the gateway would send an expired token until a 401 forces the refresh. `expires_at` within about 60 s of `now`: every turn refreshes and rotates the token. The gateway does not log which source it took; an `expires_at` of `now` plus a round lifetime suggests `expires_in` was present and the `id_token` was not needed. |

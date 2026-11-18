@@ -79,6 +79,15 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   credential file; no other file and no TCP. Gaps on older kernels get one warning, as for the
   gateway. It zeroizes the secrets it read and writes the file atomically (0600, rename in the
   same directory).
+- `qb login` is run by the operator as the gateway's user to sign an OAuth login in from
+  scratch with PKCE ([config.md](config.md#signing-in)): it prints an authorize URL, reads the
+  pasted code from stdin, exchanges it at the vendor's token endpoint and writes the login's
+  credential file. It makes itself non-dumpable before it reads the gateway config, then
+  restricts itself with landlock before it reads stdin: it may read the files of the config's
+  directory and the resolver files, read, write, create and remove regular files in the
+  directory of the login's credential file, and connect over TCP to port 443 only. Gaps on
+  older kernels get one warning, as for the gateway. It zeroizes the code, the verifier and the
+  tokens and writes the file atomically (0600, rename in the same directory).
 - **Clients** of `qbd` send no secrets: only outcome classes and window numbers.
 
 ## Transport

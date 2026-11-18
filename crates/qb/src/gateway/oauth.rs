@@ -1,14 +1,16 @@
-//! The [`Refresher`] of OAuth logins: the refresh grant, form-encoded, over ureq with rustls to
-//! the login's `token_url`, else the vendor's token endpoints in order. The protocols are in
-//! `docs/anthropic.md`, "OAuth token refresh", and `docs/openai.md`, "Serving the upstream".
+//! The token endpoint client of OAuth logins: the [`Refresher`]'s refresh grant and the
+//! authorization code grant of `qb login`, over ureq with rustls to the login's `token_url`, else
+//! the vendor's token endpoints in order. The protocols are in `docs/anthropic.md`, "OAuth token
+//! refresh" and "OAuth sign-in", and `docs/openai.md`, "Serving the upstream" and "OAuth sign-in".
 
 use std::time::Duration;
 
 use qb_anthropic::request::identity as anthropic;
 use qb_openai::request::identity as openai;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use super::base64url;
 use super::config::{CredentialKind, GatewayLogin};
 use super::creds::{RefreshError, Refreshed, Refresher, Secret};
 use super::vendor::{self, CONNECT_TIMEOUT};
@@ -59,6 +61,39 @@ struct Grant {
     urls: Vec<String>,
 }
 
+/// The tokens of a 2xx token answer, zeroized on drop.
+pub(super) struct Tokens {
+    pub(super) access_token: Zeroizing<String>,
+    pub(super) refresh_token: Option<Zeroizing<String>>,
+    pub(super) id_token: Option<Zeroizing<String>>,
+    /// Unix time the access token expires.
+    pub(super) expires_at: u64,
+}
+
+/// Why a token request failed. `message` names the endpoint, the status and the OAuth error
+/// code, never a value.
+pub(super) struct GrantError {
+    /// The status of a non-2xx answer below 500, which ends the request; `None` for a transport
+    /// failure or 5xx at every endpoint, or a 2xx without the required fields.
+    pub(super) status: Option<u16>,
+    /// The OAuth error code of that answer.
+    code: Option<String>,
+    pub(super) message: String,
+}
+
+impl GrantError {
+    fn failed(message: String) -> Self {
+        Self {
+            status: None,
+            code: None,
+            message,
+        }
+    }
+}
+
+/// `application/x-www-form-urlencoded`.
+const FORM: &str = "application/x-www-form-urlencoded";
+
 impl Grant {
     /// The grant of `login`: its `token_url`, else the vendor's endpoints; `None` for an API key.
     fn of(login: &GatewayLogin) -> Option<Self> {
@@ -102,27 +137,104 @@ impl OauthRefresher {
 
     /// The refresh grant of `refresh_token` at each endpoint of `grant` until one answers.
     fn exchange(&self, grant: &Grant, refresh_token: &str) -> Result<Refreshed, RefreshError> {
-        let body = form(refresh_token, grant.issuer.client_id());
+        let body = form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", grant.issuer.client_id()),
+        ]);
+        let tokens = self
+            .request(grant, FORM, body.as_bytes())
+            .map_err(|e| RefreshError {
+                rejected: e.status.is_some_and(|s| {
+                    s != 429
+                        && (matches!(s, 400 | 401)
+                            || e.code.as_deref().is_some_and(|c| SPENT.contains(&c)))
+                }),
+                message: e.message,
+            })?;
+        Ok(Refreshed {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        })
+    }
+
+    /// The authorization code grant of a sign-in of `login`: `code`, the `state` sent and the
+    /// PKCE `verifier`, as JSON to Anthropic and as a form to OpenAI, at each endpoint of the
+    /// login until one answers.
+    pub(super) fn exchange_code(
+        &self,
+        login: &GatewayLogin,
+        code: &str,
+        state: &str,
+        verifier: &str,
+    ) -> Result<Tokens, GrantError> {
+        let Some(grant) = Grant::of(login) else {
+            return Err(GrantError::failed(format!(
+                "`{}` is not an OAuth login",
+                login.name
+            )));
+        };
+        match grant.issuer {
+            Issuer::Anthropic => {
+                let fields = CodeGrant {
+                    grant_type: "authorization_code",
+                    code,
+                    state,
+                    client_id: anthropic::OAUTH_CLIENT_ID,
+                    redirect_uri: anthropic::OAUTH_REDIRECT_URI,
+                    code_verifier: verifier,
+                };
+                let mut body = Zeroizing::new(Vec::with_capacity(
+                    256 + code.len() + state.len() + verifier.len(),
+                ));
+                serde_json::to_writer(&mut *body, &fields)
+                    .map_err(|e| GrantError::failed(format!("encode failed: {e}")))?;
+                self.request(&grant, "application/json", &body)
+            }
+            Issuer::Openai => {
+                let body = form(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", code),
+                    ("redirect_uri", openai::OAUTH_REDIRECT_URI),
+                    ("client_id", openai::OAUTH_CLIENT_ID),
+                    ("code_verifier", verifier),
+                ]);
+                self.request(&grant, FORM, body.as_bytes())
+            }
+        }
+    }
+
+    /// One token request with `body` at each endpoint of `grant` until one answers.
+    fn request(
+        &self,
+        grant: &Grant,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<Tokens, GrantError> {
         let mut failures = Vec::new();
         for url in &grant.urls {
-            match self.post(grant.issuer, url, body.as_bytes()) {
-                Ok(fresh) => return Ok(fresh),
+            match self.post(grant.issuer, url, content_type, body) {
+                Ok(tokens) => return Ok(tokens),
                 Err(Failed::Next(why)) => failures.push(why),
                 Err(Failed::Last(e)) => return Err(e),
             }
         }
-        Err(RefreshError {
-            rejected: false,
-            message: failures.join("; "),
-        })
+        Err(GrantError::failed(failures.join("; ")))
     }
 
-    /// One token request of `issuer` to `url` with the form `body`.
-    fn post(&self, issuer: Issuer, url: &str, body: &[u8]) -> Result<Refreshed, Failed> {
+    /// One token request of `issuer` to `url` with `body`.
+    fn post(
+        &self,
+        issuer: Issuer,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<Tokens, Failed> {
         let agent = vendor::agent(&self.config);
         let mut response = agent
             .post(url)
-            .header("content-type", "application/x-www-form-urlencoded")
+            .header("content-type", content_type)
             .header("accept", "application/json")
             .header("user-agent", issuer.user_agent())
             .send(body)
@@ -138,22 +250,18 @@ impl OauthRefresher {
             .read_to_vec()
             .map_err(|e| Failed::Next(format!("{url}: answer cut: {e}")))?;
         let bytes = Zeroizing::new(bytes);
-        let last = |rejected: bool, what: &str| {
-            Failed::Last(RefreshError {
-                rejected,
-                message: format!("{url}: {what}"),
-            })
-        };
+        let last = |what: &str| Failed::Last(GrantError::failed(format!("{url}: {what}")));
         if !(200..300).contains(&status) {
             let code = refusal_code(&bytes);
-            let rejected = status != 429
-                && (matches!(status, 400 | 401)
-                    || code.as_deref().is_some_and(|c| SPENT.contains(&c)));
-            let what = match code {
-                Some(code) => format!("HTTP {status} {code}"),
-                None => format!("HTTP {status}"),
+            let message = match &code {
+                Some(code) => format!("{url}: HTTP {status} {code}"),
+                None => format!("{url}: HTTP {status}"),
             };
-            return Err(last(rejected, &what));
+            return Err(Failed::Last(GrantError {
+                status: Some(status),
+                code,
+                message,
+            }));
         }
         let answer: Answer = serde_json::from_slice(&bytes).map_err(|e| {
             let what = format!(
@@ -161,35 +269,48 @@ impl OauthRefresher {
                 e.line(),
                 e.column()
             );
-            last(false, &what)
+            last(&what)
         })?;
         let Some(access_token) = answer.access_token else {
-            return Err(last(false, "answer has no `access_token`"));
+            return Err(last("answer has no `access_token`"));
         };
         let expires_at = match (answer.expires_in, issuer) {
             (Some(expires_in), _) => unix_now().saturating_add(expires_in),
-            (None, Issuer::Anthropic) => return Err(last(false, "answer has no `expires_in`")),
+            (None, Issuer::Anthropic) => return Err(last("answer has no `expires_in`")),
             (None, Issuer::Openai) => {
                 let id_token = answer.id_token.as_ref().and_then(|t| jwt_exp(&t.0));
                 let Some(exp) = id_token.or_else(|| jwt_exp(&access_token.0)) else {
-                    let what = "answer has no `expires_in` and no token with an `exp` claim";
-                    return Err(last(false, what));
+                    return Err(last(
+                        "answer has no `expires_in` and no token with an `exp` claim",
+                    ));
                 };
                 exp
             }
         };
-        Ok(Refreshed {
+        Ok(Tokens {
             access_token: access_token.0,
             refresh_token: answer.refresh_token.map(|s| s.0),
+            id_token: answer.id_token.map(|s| s.0),
             expires_at,
         })
     }
 }
 
-/// Why one token request failed: try the next endpoint, or end the refresh with this error.
+/// Why one token request failed: try the next endpoint, or end the request with this error.
 enum Failed {
     Next(String),
-    Last(RefreshError),
+    Last(GrantError),
+}
+
+/// The JSON body of Anthropic's authorization code grant.
+#[derive(Serialize)]
+struct CodeGrant<'a> {
+    grant_type: &'static str,
+    code: &'a str,
+    state: &'a str,
+    client_id: &'static str,
+    redirect_uri: &'static str,
+    code_verifier: &'a str,
 }
 
 /// The fields of a token answer the gateway uses; others are ignored.
@@ -220,8 +341,13 @@ fn refusal_code(body: &[u8]) -> Option<String> {
         RefusalError::Code(code) => code,
         RefusalError::Object { code } => code?,
     };
-    let plain = code.len() <= 64 && code.bytes().all(|b| b == b'_' || b.is_ascii_lowercase());
-    plain.then_some(code)
+    plain_code(&code).then_some(code)
+}
+
+/// Whether `code` is an OAuth error code safe to log: lowercase letters and `_`, at most 64
+/// bytes.
+pub(super) fn plain_code(code: &str) -> bool {
+    code.len() <= 64 && code.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
 }
 
 /// The `exp` claim of a JWT's payload, read as base64url JSON without a signature check.
@@ -230,33 +356,8 @@ fn jwt_exp(token: &str) -> Option<u64> {
     struct Claims {
         exp: Option<u64>,
     }
-    let payload = Zeroizing::new(base64url(token.split('.').nth(1)?)?);
+    let payload = base64url::decode(token.split('.').nth(1)?)?;
     serde_json::from_slice::<Claims>(&payload).ok()?.exp
-}
-
-/// `s` decoded from base64url, padded or not.
-fn base64url(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim_end_matches('=');
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for b in s.bytes() {
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits).to_le_bytes()[0]);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
 }
 
 impl Refresher for OauthRefresher {
@@ -275,20 +376,23 @@ impl Refresher for OauthRefresher {
     }
 }
 
-/// The form body of the refresh grant for `refresh_token` and `client_id`.
-fn form(refresh_token: &str, client_id: &str) -> Zeroizing<String> {
-    let mut out = Zeroizing::new(String::with_capacity(
-        96 + 3 * refresh_token.len() + client_id.len(),
-    ));
-    out.push_str("grant_type=refresh_token&refresh_token=");
-    encode(refresh_token, &mut out);
-    out.push_str("&client_id=");
-    encode(client_id, &mut out);
+/// The form body of `fields`, each value percent-encoded.
+fn form(fields: &[(&str, &str)]) -> Zeroizing<String> {
+    let len: usize = fields.iter().map(|(k, v)| k.len() + 3 * v.len() + 2).sum();
+    let mut out = Zeroizing::new(String::with_capacity(len));
+    for (i, (key, value)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        out.push_str(key);
+        out.push('=');
+        percent_encode(value, &mut out);
+    }
     out
 }
 
 /// Appends `s` percent-encoded, every byte but the unreserved ones of RFC 3986.
-fn encode(s: &str, out: &mut String) {
+pub(super) fn percent_encode(s: &str, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {

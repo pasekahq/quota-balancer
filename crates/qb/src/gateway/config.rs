@@ -1120,6 +1120,18 @@ impl GatewayConfig {
     }
 }
 
+/// The entry of `login` in the gateway config `file`.
+///
+/// # Errors
+/// The config is unreadable or invalid, or has no such login.
+pub fn load_login(file: &Path, login: &str) -> Result<GatewayLogin, String> {
+    load(file)
+        .map_err(|e| e.to_string())?
+        .login(login)
+        .cloned()
+        .ok_or_else(|| format!("login `{login}` is not in the gateway config"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

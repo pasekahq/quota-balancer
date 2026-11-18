@@ -8,12 +8,14 @@
 //! - [`config`]: the gateway's TOML config;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
 //! - [`import`]: `qb login import`, a credential of another client copied into a login's file;
+//! - [`signin`]: `qb login`, an OAuth login signed in from scratch with PKCE;
 //! - [`upstream`]: the seam vendor adapters implement;
 //! - [`vendor`]: the transport the adapters share;
 //! - [`anthropic`]: the adapter of the `anthropic` API family;
 //! - [`openai_upstream`]: the adapter of the `openai` API family;
 //! - [`chat_upstream`]: the adapter of the `chat_completions` API family;
-//! - [`oauth`]: the token refresher of `oauth_anthropic` and `chatgpt_oauth` logins;
+//! - [`oauth`]: the token endpoint client of `oauth_anthropic` and `chatgpt_oauth` logins, for
+//!   refreshes and sign-ins;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`spend`]: the monthly spend count of capped logins;
 //! - [`front`]: the listeners and the C4 front;
@@ -23,6 +25,7 @@
 
 pub mod answer;
 pub mod anthropic;
+mod base64url;
 pub mod chat_upstream;
 pub mod config;
 pub mod core;
@@ -33,6 +36,7 @@ pub mod messages;
 pub mod oauth;
 pub mod openai;
 pub mod openai_upstream;
+pub mod signin;
 pub mod spend;
 pub mod upstream;
 pub mod vendor;

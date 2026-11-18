@@ -30,6 +30,20 @@ pub mod identity {
     pub const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
     /// The Codex CLI's public OAuth client id, sent with every token refresh.
     pub const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+    /// The OAuth authorize page of a ChatGPT sign-in.
+    pub const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+    /// Redirect URI of a sign-in: the Codex CLI's local callback, which a host without a browser
+    /// does not serve; the operator pastes the address the browser fails to load.
+    pub const OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+    /// Scopes a sign-in asks for.
+    pub const OAUTH_SCOPES: &str = "openid profile email offline_access";
+    /// Further authorize parameters of the Codex CLI's sign-in; the first puts the ChatGPT
+    /// account claims into the `id_token`.
+    pub const OAUTH_AUTHORIZE_EXTRA: [(&str, &str); 3] = [
+        ("id_token_add_organizations", "true"),
+        ("codex_cli_simplified_flow", "true"),
+        ("originator", ORIGINATOR),
+    ];
     /// Header that names the ChatGPT account of the subscription mode.
     pub const ACCOUNT_HEADER: &str = "chatgpt-account-id";
     /// Header that carries the session of the subscription mode.

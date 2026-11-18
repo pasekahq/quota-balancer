@@ -1,12 +1,12 @@
-//! Self-restriction of `qb agent`, `qb gateway` and `qb login import` before they touch a
-//! secret: the process becomes non-dumpable, and landlock limits it to the credential
-//! directories (read-only for the agent; for the gateway and the import also writing, creating
-//! and removing regular files, as a credential file is written by rename, and the same in the
-//! directory of the gateway's spend file). The agent and the gateway may also read the resolver
-//! files and connect over TCP to port 443; the import has no network. The gateway may read the
-//! files of its config's directory, for a reload, and the import those of its config's and its
-//! source's directories. The only TCP bind allowed is the gateway's on the port of its loopback
-//! Messages listener.
+//! Self-restriction of `qb agent`, `qb gateway`, `qb login import` and `qb login` before they
+//! touch a secret: the process becomes non-dumpable, and landlock limits it to the credential
+//! directories (read-only for the agent; for the others also writing, creating and removing
+//! regular files, as a credential file is written by rename, and the same in the directory of the
+//! gateway's spend file). The agent, the gateway and `qb login` may also read the resolver files
+//! and connect over TCP to port 443; the import has no network. The gateway and `qb login` may
+//! read the files of their config's directory, the gateway for a reload, and the import those of
+//! its config's and its source's directories. The only TCP bind allowed is the gateway's on the
+//! port of its loopback Messages listener.
 
 use std::path::{Path, PathBuf};
 
@@ -82,6 +82,17 @@ pub fn harden_import(
     target: &Path,
 ) -> Result<Vec<String>, String> {
     confine(&[target], true, &[config_file, source], None, false)
+}
+
+/// [`harden`] for `qb login`: read files beneath the directory of `config_file`; beneath the
+/// directory of `target`, the login's credential file, also write and truncate files, create
+/// regular files and remove files, so the file is written by rename; the resolver files and TCP
+/// connect to [`HTTPS_PORT`] for the token endpoint. Call it before reading the pasted code.
+///
+/// # Errors
+/// The dumpable flag cannot be cleared.
+pub fn harden_login(config_file: &Path, target: &Path) -> Result<Vec<String>, String> {
+    confine(&[target], true, &[config_file], None, true)
 }
 
 /// Makes the process non-dumpable: no core dump, no same-uid ptrace or `/proc/<pid>/mem` read.
