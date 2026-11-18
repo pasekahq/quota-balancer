@@ -700,11 +700,21 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         }
         None => None,
     };
-    let gaps = sandbox::harden_gateway(&config)?;
-    if !gaps.is_empty() {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(dir) = sandbox::broad_config_dir(&config.file, home.as_deref()) {
+        log::warn(&format!(
+            "qb gateway: the sandbox lets a reload read every file beneath {}, the config's \
+             directory; give the config a directory of its own",
+            dir.display()
+        ));
+    }
+    let confined = sandbox::harden_gateway(&config)?;
+    if confined.gaps.is_empty() {
+        log::info(&format!("qb gateway: sandbox: {}", confined.summary));
+    } else {
         log::warn(&format!(
             "qb gateway: sandbox incomplete: {}",
-            gaps.join("; ")
+            confined.gaps.join("; ")
         ));
     }
     let upstreams: Upstreams = vec![
@@ -713,7 +723,8 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         (Api::ChatCompletions, Box::new(ChatCompletions::new())),
     ];
     let refresher = Box::new(OauthRefresher::new());
-    let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer)?;
+    let gateway =
+        Gateway::new(config, upstreams, refresher, qbd_bearer)?.sandboxed(confined.opened);
     let Err(e) = front::serve(
         &listener,
         loopback.as_ref(),

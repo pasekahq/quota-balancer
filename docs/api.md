@@ -243,6 +243,13 @@ is read. The socket file is
 serves only the HTTP fronts, to requests with the local client token
 ([openai.md](openai.md#serving-the-fronts)).
 
+**Connections.** The gateway serves at most `max_turns` + 2 connections at once; one more gets
+429 `overloaded` with `retry_after: 1` before its request is read. A loopback peer counts against
+that cap only once its head showed the client token (429 in its front's format when the cap is
+full then); before that it holds one of 4 slots of its own, also answered 429 when full, and must
+send its head within 2 s or is dropped without an answer. Peers without the token never hold the
+slots of the unix socket's clients.
+
 ### `POST /v1/model/turn`
 
 ```json
@@ -356,10 +363,11 @@ Across vendors, on a chain step or a re-pick with `avoid_vendor`, a turn keeps t
   adapter call; the picked vendor's own thinking goes back to it.
 - Tool ids pass unchanged in both directions: a `tool_use` or `tool_result` id reaches every
   vendor as the client sent it, and a vendor's tool call id reaches the client as the vendor
-  sent it. No adapter rewrites or maps them. Anthropic accepts a tool id only when it matches
-  `^[a-zA-Z0-9_-]+$`; the adapters rely on every vendor of a route issuing ids within that set,
-  as Anthropic's `toolu_…` and OpenAI's `call_…` ids do. A history with another id makes the
-  Anthropic vendor refuse the turn as `bad_request`.
+  sent it. The one exception: Anthropic accepts a tool id only when it matches
+  `^[a-zA-Z0-9_-]+$`, so its adapter sends any other id (some Chat Completions providers issue
+  ids like `functions.read:0`) as `qbx_` and the lowercase hex of its bytes, the same in the
+  `tool_use` and its `tool_result`. Anthropic answers with ids of its own, so a client never
+  sees the rewritten form.
 - A fallback happens only before the first event reached the client; after it a failure ends
   the turn with `error`, `tried` lists every attempt of the turn, and no later step is called.
 - A login that failed in the turn is not picked again in it (above).
@@ -374,6 +382,11 @@ Across vendors, on a chain step or a re-pick with `avoid_vendor`, a turn keeps t
 `Error` has `class`, `retryable` and optionally `retry_after` (seconds), `resets_at` (Unix
 time), `tried` (the attempts of the turn in order, each with `vendor`, `model`, `login_label`
 and `class`) and `message` (never a credential).
+
+A login's 429 with a `retry-after` before the first event moves the turn to the next login, and
+qbd hears only the outcome. When the turn then ends with a retryable error that has no
+`retry_after` of its own, it carries the soonest such wait as `retry_after` (seconds left, at
+least 1), and its `resets_at`, if any, is no earlier than the end of that wait.
 
 | `class` | When | `retryable` |
 |---|---|---|

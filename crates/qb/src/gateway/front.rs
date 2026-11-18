@@ -3,7 +3,9 @@
 //! `/v1/model/spend/reset` and `/v1/health`, and the HTTP fronts: `/v1/messages`
 //! ([`super::messages`]), `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the
 //! optional loopback TCP listener serves only the HTTP fronts, to clients with the client token.
-//! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once. On the C4
+//! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
+//! peer takes one of these slots only once its head showed the client token, and before that one
+//! of [`LOOPBACK_UNCHECKED`] slots of its own, for at most [`LOOPBACK_HEAD_DEADLINE`]. On the C4
 //! front every rejection is a non-200 [`GatewayError`], every admitted turn a `200` with a chunked
 //! NDJSON stream whose head goes out with its first event; an HTTP front answers its errors in
 //! its own format. The main thread accepts, cancels a turn whose client hangs up, pings silent
@@ -49,6 +51,13 @@ pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long reading one request, head and body, may take.
 pub const READ_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Loopback connections whose head has not shown the client token yet, served at once; they never
+/// hold the slots of the unix socket's clients.
+pub const LOOPBACK_UNCHECKED: usize = 4;
+
+/// How long a loopback peer may take to send the head that shows the client token.
+pub const LOOPBACK_HEAD_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Content type of the turn stream.
 pub const NDJSON: &str = "application/x-ndjson";
@@ -298,6 +307,7 @@ pub fn serve(
 ) -> io::Result<Infallible> {
     let started = Instant::now();
     let live = Arc::new(AtomicUsize::new(0));
+    let unchecked = Arc::new(AtomicUsize::new(0));
     let watch = Arc::new(Watch::new()?);
     loop {
         let ready = watch.wait(listener, loopback, hangup);
@@ -322,32 +332,72 @@ pub fn serve(
                     continue;
                 }
             };
-            let cap = gateway.config().max_turns as usize + EXTRA_CONNECTIONS;
-            if live.load(Ordering::SeqCst) >= cap {
+            let slot = match conn {
+                Conn::Unix(_) => Slot::take(&live, connection_cap(gateway)),
+                Conn::Tcp(_) => Slot::take(&unchecked, LOOPBACK_UNCHECKED),
+            };
+            let Some(slot) = slot else {
                 let _ = conn.set_write_timeout(Some(IO_TIMEOUT));
-                let mut e = GatewayError::new(ErrorClass::Overloaded, true, "too many connections");
-                e.retry_after = Some(1);
+                let e = too_many();
                 match conn {
                     Conn::Unix(_) => reply(&mut conn, 429, &e),
                     Conn::Tcp(_) => messages::reject(&mut conn, Some(429), &e),
                 }
                 continue;
-            }
-            live.fetch_add(1, Ordering::SeqCst);
-            let (gateway, done, watch) =
-                (Arc::clone(gateway), Arc::clone(&live), Arc::clone(&watch));
+            };
+            let (gateway, watch, live) =
+                (Arc::clone(gateway), Arc::clone(&watch), Arc::clone(&live));
             let spawned = std::thread::Builder::new()
                 .name("qb-gateway".into())
                 .stack_size(STACK_BYTES)
-                .spawn(move || {
-                    handle(conn, &gateway, &watch, own_uid, started);
-                    done.fetch_sub(1, Ordering::SeqCst);
+                .spawn(move || match conn {
+                    Conn::Unix(_) => {
+                        handle(conn, &gateway, &watch, own_uid, started);
+                        drop(slot);
+                    }
+                    Conn::Tcp(_) => serve_loopback(conn, &gateway, &watch, slot, &live),
                 });
             if let Err(e) = spawned {
-                live.fetch_sub(1, Ordering::SeqCst);
                 log::warn(&format!("gateway: cannot start a connection thread: {e}"));
             }
         }
+    }
+}
+
+/// Connections served at once besides the loopback peers not yet checked.
+fn connection_cap(gateway: &Gateway) -> usize {
+    gateway.config().max_turns as usize + EXTRA_CONNECTIONS
+}
+
+/// The answer to a connection beyond its cap.
+fn too_many() -> GatewayError {
+    let mut e = GatewayError::new(ErrorClass::Overloaded, true, "too many connections");
+    e.retry_after = Some(1);
+    e
+}
+
+/// One taken connection slot of a count; dropping it gives the slot back.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    /// A slot of `count` when fewer than `cap` are taken.
+    fn take(count: &Arc<AtomicUsize>, cap: usize) -> Option<Self> {
+        let mut n = count.load(Ordering::SeqCst);
+        loop {
+            if n >= cap {
+                return None;
+            }
+            match count.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(Self(Arc::clone(count))),
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -383,12 +433,12 @@ fn caller(gateway: &Gateway, uid: Option<u32>, own_uid: u32) -> Option<String> {
 /// Reads `stream` until `until`, each read bounded by [`IO_TIMEOUT`] and the time left.
 struct Deadline<'a> {
     stream: &'a Conn,
-    until: Instant,
+    until: &'a Cell<Instant>,
 }
 
 impl io::Read for Deadline<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let left = self.until.saturating_duration_since(Instant::now());
+        let left = self.until.get().saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -405,7 +455,8 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         Conn::Unix(s) => rustix::net::sockopt::socket_peercred(s)
             .ok()
             .map(|c| c.uid.as_raw()),
-        Conn::Tcp(_) => return loopback(stream, gateway, watch),
+        // `serve` hands loopback peers to `serve_loopback`.
+        Conn::Tcp(_) => return,
     };
     // Checked before reading, so a foreign peer cannot make the gateway buffer a body.
     let Some(caller) = caller(gateway, uid, own_uid) else {
@@ -584,18 +635,38 @@ enum Refusal {
     Token,
     /// Not `POST` to one of [`HTTP_FRONTS`].
     Path,
+    /// Every connection slot is taken.
+    Busy,
 }
 
 /// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] with the
 /// client token in `x-api-key` or `Authorization: Bearer`, checked before the body is read. Every
 /// answer is in the OpenAI format for the OpenAI endpoints, else in the Messages format.
-fn loopback(mut stream: Conn, gateway: &Gateway, watch: &Watch) {
+///
+/// The connection holds `unchecked` until its head is read, which must happen within
+/// [`LOOPBACK_HEAD_DEADLINE`]; a head with the token then takes a slot of `live`, and the body
+/// may take the rest of [`READ_DEADLINE`].
+fn serve_loopback(
+    mut stream: Conn,
+    gateway: &Gateway,
+    watch: &Watch,
+    unchecked: Slot,
+    live: &Arc<AtomicUsize>,
+) {
+    if stream.set_write_timeout(Some(IO_TIMEOUT)).is_err() {
+        return;
+    }
     let config = gateway.config();
     let token = config.fronts.as_ref().and_then(|f| f.token_sha256);
     let max_turn = config.max_request_bytes as usize;
     let refusal = Cell::new(None);
     let dialect = Cell::new(Dialect::Messages);
+    let started = Instant::now();
+    let until = Cell::new(started + LOOPBACK_HEAD_DEADLINE);
+    let unchecked = Cell::new(Some(unchecked));
+    let slot = Cell::new(None);
     let check = |head: &Head<'_>| {
+        drop(unchecked.take());
         if let Dialect::Openai = Dialect::of(head.path) {
             dialect.set(Dialect::Openai);
         }
@@ -608,9 +679,18 @@ fn loopback(mut stream: Conn, gateway: &Gateway, watch: &Watch) {
             refusal.set(Some(Refusal::Path));
             return None;
         }
+        let Some(held) = Slot::take(live, connection_cap(gateway)) else {
+            refusal.set(Some(Refusal::Busy));
+            return None;
+        };
+        slot.set(Some(held));
+        until.set(started + READ_DEADLINE);
         Some(max_turn)
     };
-    let refused = match (read(&stream, &check), refusal.get()) {
+    let read = read_until(&stream, &until, &check);
+    drop(unchecked.take());
+    let _slot = slot.take();
+    let refused = match (read, refusal.get()) {
         (Ok(req), _) => return front_turn(stream, gateway, watch, TOKEN_CALLER, req),
         (Err(ReadError::Refused { .. }), Some(refusal)) => refusal,
         (Err(e), _) => return unreadable(&mut stream, &e, max_turn, dialect.get()),
@@ -641,6 +721,7 @@ fn loopback(mut stream: Conn, gateway: &Gateway, watch: &Watch) {
             );
         }
         (Refusal::Path, _) => messages::refuse(&mut stream, 404, "not_found_error", served),
+        (Refusal::Busy, dialect) => dialect.reject(&mut stream, 429, &too_many()),
     }
 }
 
@@ -649,11 +730,17 @@ fn read(
     stream: &Conn,
     max_body: &dyn Fn(&Head<'_>) -> Option<usize>,
 ) -> Result<http::Request, ReadError> {
+    read_until(stream, &Cell::new(Instant::now() + READ_DEADLINE), max_body)
+}
+
+/// [`read`] by the time `until` holds, which `max_body` may move.
+fn read_until(
+    stream: &Conn,
+    until: &Cell<Instant>,
+    max_body: &dyn Fn(&Head<'_>) -> Option<usize>,
+) -> Result<http::Request, ReadError> {
     let mut buf = Vec::new();
-    let mut reader = Deadline {
-        stream,
-        until: Instant::now() + READ_DEADLINE,
-    };
+    let mut reader = Deadline { stream, until };
     http::read_request_limited(&mut reader, &mut buf, max_body)
 }
 

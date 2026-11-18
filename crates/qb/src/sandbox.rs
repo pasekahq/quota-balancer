@@ -28,6 +28,18 @@ pub const HTTPS_PORT: u16 = 443;
 /// The landlock ABI whose rights the ruleset handles; 4 is the first with TCP port rules.
 const TARGET_ABI: ABI = ABI::V4;
 
+/// What [`confine`] applied.
+#[derive(Debug)]
+pub struct Confined {
+    /// What differs from the ruleset described; empty when it is enforced as described.
+    pub gaps: Vec<String>,
+    /// One line on what is enforced, for the startup log.
+    pub summary: String,
+    /// The directories of the owned files that the process may use: those landlock opened, or
+    /// all of them when landlock restricts nothing.
+    pub opened: Vec<PathBuf>,
+}
+
 /// Makes the process non-dumpable, then restricts the calling thread and the threads it starts
 /// with landlock: read-only beneath each login's credential directory and
 /// [`RESOLVER_FILES`], and TCP connect to [`HTTPS_PORT`] only.
@@ -41,7 +53,7 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .collect();
-    confine(&files, false, &[], None, true)
+    confine(&files, false, &[], None, true).map(|c| c.gaps)
 }
 
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
@@ -54,7 +66,7 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
 ///
 /// # Errors
 /// The dumpable flag cannot be cleared.
-pub fn harden_gateway(config: &GatewayConfig) -> Result<Vec<String>, String> {
+pub fn harden_gateway(config: &GatewayConfig) -> Result<Confined, String> {
     let files: Vec<&Path> = config
         .logins
         .iter()
@@ -81,7 +93,7 @@ pub fn harden_import(
     source: &Path,
     target: &Path,
 ) -> Result<Vec<String>, String> {
-    confine(&[target], true, &[config_file, source], None, false)
+    confine(&[target], true, &[config_file, source], None, false).map(|c| c.gaps)
 }
 
 /// [`harden`] for `qb login`: read files beneath the directory of `config_file`; beneath the
@@ -92,7 +104,7 @@ pub fn harden_import(
 /// # Errors
 /// The dumpable flag cannot be cleared.
 pub fn harden_login(config_file: &Path, target: &Path) -> Result<Vec<String>, String> {
-    confine(&[target], true, &[config_file], None, true)
+    confine(&[target], true, &[config_file], None, true).map(|c| c.gaps)
 }
 
 /// Makes the process non-dumpable: no core dump, no same-uid ptrace or `/proc/<pid>/mem` read.
@@ -113,7 +125,7 @@ fn confine(
     read_files: &[&Path],
     bind: Option<u16>,
     https: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<Confined, String> {
     non_dumpable()?;
     let mut gaps = Vec::new();
     let dirs = dirs_of(owned_files, &mut gaps);
@@ -136,12 +148,19 @@ fn confine(
         .chain(read_dirs.iter().map(|d| (d.as_path(), read_file)))
         .chain(resolver.iter().map(|f| (Path::new(*f), read_file)));
     let mut rules = Vec::new();
+    let mut opened = Vec::new();
     for (path, access) in readable {
         match PathFd::new(path) {
-            Ok(fd) => rules.push(PathBeneath::new(fd, access)),
+            Ok(fd) => {
+                if dirs.iter().any(|d| d == path) {
+                    opened.push(path.to_path_buf());
+                }
+                rules.push(PathBeneath::new(fd, access));
+            }
             Err(e) => gaps.push(format!("{} stays unreadable: {e}", path.display())),
         }
     }
+    let summary = summary(rules.len(), bind, https);
     match restrict(rules, bind, https) {
         Ok((RulesetStatus::FullyEnforced, _)) => {}
         Ok((RulesetStatus::PartiallyEnforced, LandlockStatus::Available { effective_abi, .. })) => {
@@ -150,14 +169,52 @@ fn confine(
                  including the TCP port rule of V4, are not enforced"
             ));
         }
-        Ok((_, status)) => gaps.push(format!(
-            "landlock {status:?}: file and network access are not restricted"
-        )),
-        Err(e) => gaps.push(format!(
-            "landlock failed ({e}): file and network access are not restricted"
-        )),
+        Ok((_, status)) => {
+            gaps.push(format!(
+                "landlock {status:?}: file and network access are not restricted"
+            ));
+            opened.clone_from(&dirs);
+        }
+        Err(e) => {
+            gaps.push(format!(
+                "landlock failed ({e}): file and network access are not restricted"
+            ));
+            opened.clone_from(&dirs);
+        }
     }
-    Ok(gaps)
+    Ok(Confined {
+        gaps,
+        summary,
+        opened,
+    })
+}
+
+/// The directory of the config file `file` when the sandbox opening it to reads would open much
+/// more: the root, or `home` or a directory above it.
+pub fn broad_config_dir(file: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let dir = file_dir(file).ok()?;
+    let broad = dir.parent().is_none() || home.is_some_and(|h| h.starts_with(&dir));
+    broad.then_some(dir)
+}
+
+/// The startup line of a ruleset of `paths` path rules, TCP bind on `bind` and with `https` TCP
+/// connect to [`HTTPS_PORT`].
+fn summary(paths: usize, bind: Option<u16>, https: bool) -> String {
+    let mut net = Vec::new();
+    if https {
+        net.push(format!("connect {HTTPS_PORT}"));
+    }
+    if let Some(port) = bind {
+        net.push(format!("bind {port}"));
+    }
+    let net = if net.is_empty() {
+        "none".to_owned()
+    } else {
+        net.join(", ")
+    };
+    format!(
+        "non-dumpable; landlock {TARGET_ABI:?}: files beneath {paths} paths only, TCP {net} only"
+    )
 }
 
 /// The distinct directories of `files`; a file without one is added to `gaps`.
@@ -206,4 +263,34 @@ fn restrict(
         .add_rules(ports)?
         .restrict_self()?;
     Ok((status.ruleset, status.landlock))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_config_in_home_or_above_it_opens_a_broad_directory() {
+        let home = Some(Path::new("/home/user-1"));
+        let cases = [
+            ("/home/user-1/.config/qb/gateway.toml", None),
+            ("/etc/qb/gateway.toml", None),
+            ("/home/user-1/gateway.toml", Some("/home/user-1")),
+            ("/home/gateway.toml", Some("/home")),
+            ("/gateway.toml", Some("/")),
+            ("/home/user-10/gateway.toml", None),
+        ];
+        for (file, broad) in cases {
+            let got = broad_config_dir(Path::new(file), home);
+            assert_eq!(got, broad.map(PathBuf::from), "{file}");
+        }
+        assert_eq!(
+            broad_config_dir(Path::new("/gateway.toml"), None),
+            Some(PathBuf::from("/"))
+        );
+        assert_eq!(
+            broad_config_dir(Path::new("/srv/qb/gateway.toml"), None),
+            None
+        );
+    }
 }

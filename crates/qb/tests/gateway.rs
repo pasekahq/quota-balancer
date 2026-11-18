@@ -1199,6 +1199,62 @@ fn connections_beyond_the_cap_get_429_from_the_main_thread() {
 }
 
 #[test]
+fn silent_loopback_peers_neither_hold_the_unix_socket_s_slots_nor_stay_long() {
+    let (listener, addr, front) = loopback_front("");
+    let files = [
+        ("login-1", api_key("test-token-1"), 0o600),
+        ("login-2", api_key("test-token-2"), 0o600),
+    ];
+    // max_turns 1: three slots, fewer than the silent loopback peers below.
+    let r = rig_on(1, &files, &front, own_uid(), Some(listener));
+    let opened = std::time::Instant::now();
+    let silent: Vec<TcpStream> = (0..front::LOOPBACK_UNCHECKED)
+        .map(|_| TcpStream::connect(addr).unwrap())
+        .collect();
+    // The main thread refuses one more at once, before any byte of it.
+    let mut refused = None;
+    for _ in 0..50 {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut raw = Vec::new();
+        if s.read_to_end(&mut raw).is_ok() && !raw.is_empty() {
+            refused = Some(finish_raw(&raw));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (status, body) = refused.expect("an answer");
+    assert_eq!(status, 429, "{}", String::from_utf8_lossy(&body));
+    assert!(opened.elapsed() < front::LOOPBACK_HEAD_DEADLINE);
+
+    let (status, body) = call(&r.gw, "GET", paths::HEALTH, "");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(opened.elapsed() < front::LOOPBACK_HEAD_DEADLINE);
+
+    for mut s in silent {
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+    }
+    let held = opened.elapsed();
+    assert!(held >= front::LOOPBACK_HEAD_DEADLINE, "{held:?}");
+    assert!(held < front::READ_DEADLINE, "{held:?}");
+    let s = tcp_send(addr, "GET", paths::HEALTH, "", "");
+    assert_eq!(error_type(s), (401, "authentication_error".into()));
+
+    // A peer with the token shares the slots: with all three held it gets 429 after its head.
+    let idle: Vec<UnixStream> = (0..3)
+        .map(|_| UnixStream::connect(&r.gw).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+    let body = sdk_body("model-2025-01-01", true).to_string();
+    let s = tcp_send(addr, "POST", paths::MESSAGES, &auth, &body);
+    assert_eq!(error_type(s).0, 429);
+    drop(idle);
+}
+
+#[test]
 fn a_turn_ends_after_max_attempts_picks() {
     let files = [
         ("login-1", api_key("test-token-1"), 0o600),
@@ -2376,6 +2432,12 @@ fn the_binary_serves_the_gateway_and_never_logs_a_secret() {
     );
     let serving = format!("serving the HTTP fronts on {listen}");
     assert!(logged.iter().any(|l| l.contains(&serving)), "{logged:?}");
+    // Either the applied sandbox or its gaps, never silence.
+    let sandboxed = logged.iter().any(|l| {
+        l.contains("qb gateway: sandbox: non-dumpable; landlock")
+            || l.contains("qb gateway: sandbox incomplete: ")
+    });
+    assert!(sandboxed, "{logged:?}");
     assert!(
         logged
             .iter()
@@ -3696,6 +3758,45 @@ fn a_silent_stream_gets_pings_after_message_start_only() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(leases, 0, "the lease is released");
+}
+
+#[test]
+fn messages_sends_message_start_with_the_input_usage_before_the_vendor_s_content() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    let start = through_first(&vendor_fixture("upstream_text.sse"), "event: message_start");
+    vendor.answer(Answer::Hold(start));
+    let body = sdk_body("model-2025-01-01", true);
+    let mut client = sdk_send(&r.gw, &body, None);
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let event = loop {
+        let text = String::from_utf8_lossy(&seen).into_owned();
+        if let Some(at) = text.find("event: message_start") {
+            if let Some(end) = text[at..].find("\n\n") {
+                break text[at..at + end].to_owned();
+            }
+        }
+        let n = client
+            .read(&mut chunk)
+            .expect("message_start arrives while the vendor still holds its content");
+        assert!(n > 0, "stream ended early");
+        seen.extend_from_slice(&chunk[..n]);
+    };
+    let text = String::from_utf8_lossy(&seen);
+    assert!(!text.contains("content_block"), "{text}");
+    let data = event.split_once("data: ").unwrap().1;
+    let start: Value = serde_json::from_str(data.lines().next().unwrap()).unwrap();
+    let usage = &start["message"]["usage"];
+    assert_eq!(usage["input_tokens"], 25, "{start}");
+    assert_eq!(
+        usage["output_tokens"], 1,
+        "the vendor's start, not a final count: {start}"
+    );
+    drop(client);
+    vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
 }
 
 /// The headers the official OpenAI Python SDK sends besides `Host` and `Content-Length`, with a
@@ -5679,6 +5780,14 @@ fn a_429_with_retry_after_on_a_chat_completions_login_is_rate_limited() {
     let events = events(&answer);
     let error = last_error(&events);
     assert!(error.retryable, "{error:?}");
+    // qbd's own 60 s back-off is the later reset; the vendor's 12 s still reaches the client.
+    let now = unix_now();
+    assert_eq!(error.class, ErrorClass::QuotaExhausted, "{error:?}");
+    assert!(matches!(error.retry_after, Some(11..=12)), "{error:?}");
+    assert!(
+        error.resets_at.is_some_and(|at| at >= now + 50),
+        "{error:?}"
+    );
     let tried: Vec<(Option<&str>, ErrorClass)> = error
         .tried
         .iter()
@@ -5704,6 +5813,39 @@ fn a_429_with_retry_after_on_a_chat_completions_login_is_rate_limited() {
         assert!(!logged.contains(key), "{key}: {logged}");
         assert!(!answer.contains(key), "{key}: {answer}");
     }
+}
+
+/// `answer` with its `retry-after` header set to `seconds`.
+fn retry_after(answer: Answer, seconds: &str) -> Answer {
+    let Answer::Full(status, mut headers, body) = answer else {
+        panic!("a full answer");
+    };
+    for (name, value) in &mut headers {
+        if name.eq_ignore_ascii_case("retry-after") {
+            seconds.clone_into(value);
+        }
+    }
+    Answer::Full(status, headers, body)
+}
+
+#[test]
+fn a_vendor_wait_longer_than_qbd_s_back_off_moves_the_messages_retry_after() {
+    let (r, vendor) = chat_rig(&key_files());
+    vendor.answer(retry_after(chat_recorded("429_retry"), "200"));
+    vendor.answer(retry_after(chat_recorded("429_retry"), "250"));
+    let asked = unix_now();
+    let (status, head, body) = sdk_call(&r.gw, &sdk_body("model-2025-01-01", false), None);
+    assert_eq!(status, 429, "{}", String::from_utf8_lossy(&body));
+    let (wait, should_retry) = retry_headers(&head);
+    assert!(
+        wait.is_some_and(|s| (195..=200).contains(&s)),
+        "the soonest vendor wait, not qbd's 60 s: {head}"
+    );
+    assert_eq!(should_retry, None, "{head}");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::RateLimited);
+    assert_eq!(status_of(&s, "login-2"), LoginStatus::RateLimited);
+    assert!(unix_now() - asked < 5);
 }
 
 #[test]

@@ -6,7 +6,7 @@
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, LandlockStatus, Ruleset, RulesetAttr};
 use rustix::process::{DumpableBehavior, dumpable_behavior};
@@ -27,6 +27,18 @@ fn kernel_abi() -> Option<ABI> {
     })
     .join()
     .unwrap()
+}
+
+/// The enforced ruleset: no gaps; its startup line names the credential, spend and config
+/// directories and the two resolver files, TCP connect to 443 and bind on `port`; `opened` are
+/// the credential and spend directories.
+fn assert_applied(applied: &qb::sandbox::Confined, port: u16, opened: &[PathBuf]) {
+    assert_eq!(applied.gaps, Vec::<String>::new());
+    let want = format!(
+        "non-dumpable; landlock V4: files beneath 5 paths only, TCP connect 443, bind {port} only"
+    );
+    assert_eq!(applied.summary, want);
+    assert_eq!(applied.opened, opened);
 }
 
 #[test]
@@ -74,7 +86,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
     let (edited, reload) = std::sync::mpsc::channel();
     let reread = file.clone();
     let gateway = std::thread::spawn(move || {
-        let gaps = qb::sandbox::harden_gateway(&config).unwrap();
+        let applied = qb::sandbox::harden_gateway(&config).unwrap();
         hardened.send(()).unwrap();
         reload.recv().unwrap();
         assert_eq!(
@@ -96,7 +108,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
         );
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
-            assert_eq!(gaps, Vec::<String>::new());
+            assert_applied(&applied, port, &[creds, state]);
             let denied = std::fs::read(&unreadable).unwrap_err();
             assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
             let denied = std::fs::write(unreadable.with_extension("new"), "x").unwrap_err();
@@ -115,6 +127,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
             assert_eq!(denied.kind(), ErrorKind::PermissionDenied, "no other bind");
         } else {
             eprintln!("landlock {abi:?}: warning branch");
+            let gaps = &applied.gaps;
             assert!(gaps.iter().any(|g| g.contains("landlock")), "{gaps:?}");
         }
     });

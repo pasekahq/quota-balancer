@@ -27,8 +27,8 @@ value.
 | `text` | `text`; an empty text block is dropped |
 | `image` (`base64`) | `image` with a `base64` source |
 | `image` (`path`) | the same, with the bytes from the caller's loader; a load failure is a `BuildError` |
-| `tool_use{id,name,input}` | `tool_use` with the same id |
-| `tool_result{id,content,is_error}` | `tool_result{tool_use_id,content,is_error}` |
+| `tool_use{id,name,input}` | `tool_use` with the same id (below) |
+| `tool_result{id,content,is_error}` | `tool_result{tool_use_id,content,is_error}` (below) |
 | `thinking{vendor,opaque}` of the picked vendor | the block whose JSON `opaque` holds (`thinking` with `signature`, or `redacted_thinking`) |
 | `thinking` of another vendor, or an `opaque` that is not such a block | dropped |
 | `tools[]` | `tools[]{name,description,input_schema}`; a tool with `native` follows its `elsewhere`: `function` goes out like any tool, `omit` is left out, `refuse` is a `BuildError` |
@@ -37,6 +37,12 @@ value.
 | — | `stream: true`; `thinking: {type: adaptive}` unless the target turns it off or the history lost its thinking (below) |
 
 A message left without blocks is dropped. The model id comes from `qbd`'s pick.
+
+The vendor accepts a tool id only when it matches `^[a-zA-Z0-9_-]+$`. Such an id goes out
+unchanged; any other (some Chat Completions providers issue `functions.read:0`, and a chain turn
+may bring it back to Anthropic) goes out as `qbx_` and the lowercase hex of its bytes, in both
+`tool_use` and `tool_result`, so the pair still matches and two ids never merge. The vendor answers
+with ids of its own, so the client never sees the rewritten form.
 
 A canonical `system` message is the vendor's mid-conversation system message
 (`{role: system, content: [text blocks]}`, stable in the Messages API, no beta header). The vendor
@@ -49,11 +55,11 @@ leaves `messages` and its text joins the system prompt as further text blocks, a
 client's `system`, which is what a client that knows no mid-conversation messages does with it.
 
 With thinking on, the vendor refuses (400 `invalid_request_error`) a request whose last assistant
-message calls a tool without its thinking block; earlier assistant messages may lack thinking.
-Clients that strip thinking from their history send exactly that in every tool loop, so when the
-last assistant message of the built request holds a `tool_use` but no `thinking` or
-`redacted_thinking` block (none of the picked vendor survived the table above), the request goes
-without `thinking`. The model then answers that turn without thinking.
+message calls a tool and does not start with a thinking block; earlier assistant messages may lack
+thinking. Clients that strip thinking from their history send exactly that in every tool loop, so
+when the last assistant message of the built request holds a `tool_use` and its first block is not
+`thinking` or `redacted_thinking` (none of the picked vendor survived the table above, or the
+history put text before it), the request goes without `thinking`. The model then answers that turn without thinking.
 
 ### Prompt cache (`cache: auto`)
 
@@ -274,7 +280,8 @@ A client closing its connection cancels the turn and shuts the upstream connecti
   that fails `TurnRequest::validate` are `bad_request`.
 
 `front::SseEncoder` writes canonical events as Messages SSE: `message_start` (deferred to the
-first event after `route`, so it carries the input usage), one `content_block_*` group per text
+first event after `route`, so it carries the input usage; on an Anthropic login that event is
+the vendor's own `message_start`, relayed as it arrives, before any content), one `content_block_*` group per text
 run, thinking block and tool call with indices from 0, then `message_delta` with the stop reason
 and cumulative usage, and `message_stop`. A tool call is one `input_json_delta` with the whole
 input. `route` writes nothing; an `error` writes an `error` event and ends the stream.

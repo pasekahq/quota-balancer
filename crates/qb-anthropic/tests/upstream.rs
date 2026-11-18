@@ -5,7 +5,7 @@ mod common;
 
 use common::{Answer, NOW, VENDOR, fixture, run};
 use qb_anthropic::limits::{FailureKind, classify_response, rate_limits};
-use qb_anthropic::request::{AuthMode, BuildError, Target, build, identity};
+use qb_anthropic::request::{AuthMode, BuildError, Target, build, identity, tool_id};
 use qb_proto::{
     Block, CacheMode, Effort, Elsewhere, ErrorClass, Message, NativeApi, NativeTool, Object,
     Outcome, Role, StopReason, StreamEvent, Thinking, Tool, ToolCall, TurnRequest, Usage,
@@ -415,6 +415,14 @@ fn thinking_is_requested_unless_the_last_assistant_tool_call_lost_its_thinking()
             false,
         ),
         (
+            "last assistant with thinking after its text",
+            history(vec![(
+                vec![says("Let me look."), signed_thinking(VENDOR), call("c1")],
+                result("c1"),
+            )]),
+            false,
+        ),
+        (
             "stripped earlier assistant only",
             history(vec![
                 (vec![call("c1")], result("c1")),
@@ -433,6 +441,42 @@ fn thinking_is_requested_unless_the_last_assistant_tool_call_lost_its_thinking()
         assert_eq!(body.thinking.is_some(), kept, "{name}");
         assert_eq!(body.messages.len(), req.messages.len(), "{name}");
     }
+}
+
+#[test]
+fn tool_ids_outside_the_vendor_pattern_are_rewritten_alike_in_call_and_result() {
+    let req = history(vec![
+        (vec![call("toolu_01-ok")], result("toolu_01-ok")),
+        (vec![call("functions.read:0")], result("functions.read:0")),
+        (vec![call("functions.read_0")], result("functions.read_0")),
+    ]);
+    let body = build(&req, &target(AuthMode::ApiKey), &mut load).expect("builds");
+    let body = serde_json::to_value(&body).unwrap();
+    let ids: Vec<(&str, &str)> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().unwrap())
+        .filter_map(|b| match b["type"].as_str()? {
+            "tool_use" => Some(("call", b["id"].as_str()?)),
+            "tool_result" => Some(("result", b["tool_use_id"].as_str()?)),
+            _ => None,
+        })
+        .collect();
+    let mapped = "qbx_66756e6374696f6e732e726561643a30";
+    let other = "qbx_66756e6374696f6e732e726561645f30";
+    assert_eq!(
+        ids,
+        [
+            ("call", "toolu_01-ok"),
+            ("result", "toolu_01-ok"),
+            ("call", mapped),
+            ("result", mapped),
+            ("call", other),
+            ("result", other),
+        ]
+    );
+    assert_eq!(tool_id(""), "qbx_");
 }
 
 #[test]
