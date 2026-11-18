@@ -12,7 +12,7 @@ use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use qb_core::Core;
+use qb_core::{Core, ProbeOutcome};
 use qb_proto::{ErrorCode, paths};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::net::RecvFlags;
@@ -134,7 +134,9 @@ pub fn serve(
     }
 }
 
-/// Answers every parked agent that has a due probe among its logins, oldest first.
+/// Answers every parked agent that has a due probe among its logins, oldest first. A job that
+/// cannot be written fails at once, as an `error` result would, instead of waiting out its
+/// [`qb_core::PROBE_TIMEOUT_S`].
 fn dispatch(core: &mut Core, parked: &mut Vec<Parked>, now: u64) {
     let mut i = 0;
     while i < parked.len() {
@@ -146,7 +148,12 @@ fn dispatch(core: &mut Core, parked: &mut Vec<Parked>, now: u64) {
         let mut p = parked.remove(i);
         let reply = api::job(&job);
         if let Err(e) = http::write_response(&mut p.stream, reply.status, &reply.body) {
-            log::warn(&format!("write of probe job to {} failed: {e}", p.client));
+            log::warn(&format!(
+                "write of probe job for {} to {} failed: {e}",
+                job.login, p.client
+            ));
+            // The job was just handed to this client, so the core cannot refuse its result.
+            let _ = core.probe_result(job.id, &p.client, &ProbeOutcome::Error, now);
         }
     }
 }
@@ -313,7 +320,8 @@ pub(crate) fn drain_pending(stream: impl AsFd) {
 #[cfg(test)]
 mod tests {
     use qb_core::{
-        LoginSpec, LoginStatus, OutcomeClass, ReportInput, ReportSubject, Spec, VendorSpec,
+        CandidateSpec, LoginSpec, LoginStatus, OutcomeClass, PickInput, ProbeSpec, ReportInput,
+        ReportSubject, RoleSpec, Spec, StepSpec, Target, VendorSpec, WindowSpec,
     };
 
     use super::*;
@@ -387,5 +395,81 @@ mod tests {
             statuses(&core),
             [LoginStatus::Unknown, LoginStatus::Unknown]
         );
+    }
+
+    /// Probes on with a 30 s back-off and a `worker` role on `vendor-a`, whose one window makes
+    /// a login without a report stale; a pick has made `login-1` due.
+    fn probing() -> Core {
+        let mut core = Core::new(Spec {
+            vendors: vec![VendorSpec {
+                name: "vendor-a".into(),
+                windows: vec![WindowSpec {
+                    name: "five_hour".into(),
+                    length_s: 5 * 3600,
+                    t_burn_s: 1800,
+                }],
+            }],
+            logins: vec![LoginSpec {
+                name: "login-1".into(),
+                vendor: "vendor-a".into(),
+            }],
+            roles: vec![RoleSpec {
+                name: "worker".into(),
+                ladder: vec![StepSpec {
+                    difficulty: 1,
+                    candidates: vec![CandidateSpec {
+                        vendor: "vendor-a".into(),
+                        model: "model-small".into(),
+                        effort: None,
+                        tier: 1,
+                        cost_per_minute: None,
+                    }],
+                }],
+                reserves: Vec::new(),
+            }],
+            snapshot_ttl_s: 300,
+            lease_ttl_s: 3600,
+            probe: Some(ProbeSpec {
+                backoff_initial_s: 30,
+                backoff_max_s: 120,
+            }),
+            ..Spec::default()
+        })
+        .expect("valid spec");
+        core.pick(
+            &PickInput {
+                role: "worker".into(),
+                target: Target::Difficulty(1),
+                resume_of: None,
+                avoid_vendor: None,
+                client: "client-a".into(),
+                expected_minutes: None,
+                run_id: None,
+            },
+            NOW,
+        );
+        core
+    }
+
+    #[test]
+    fn a_job_that_cannot_be_written_fails_at_once() {
+        let mut core = probing();
+        let (stream, peer) = UnixStream::pair().expect("socket pair");
+        drop(peer);
+        let mut parked = vec![Parked {
+            stream,
+            client: "agent-1".into(),
+            logins: vec!["login-1".into()],
+        }];
+        dispatch(&mut core, &mut parked, NOW);
+        assert!(parked.is_empty(), "the hung-up agent is no longer parked");
+        assert_eq!(core.probe_login(1), None, "the probe is not in flight");
+        assert_eq!(
+            poll_timeout(&mut core, NOW),
+            Some(Duration::from_secs(30)),
+            "the back-off ends before the probe timeout would have"
+        );
+        let logins = ["login-1".to_owned()];
+        assert_eq!(core.probe_next("agent-2", &logins, NOW), None, "backing off");
     }
 }
