@@ -34,8 +34,8 @@ kind = "chatgpt_oauth"
 credentials = "/var/lib/qb-gateway/credentials/login-3.json"
 
 # At most 50 USD per UTC calendar month; at the cap the login is not called until the next
-# month, a raised cap or `qb spend reset key-2`. qbd's vendor of the key declares the window
-# { name = "spend", length_s = 2678400, t_burn_s = 0 }.
+# month, a raised cap or `qb spend reset key-2`. The key's own qbd vendor ("vendor-c", with no
+# uncapped login) declares the window { name = "spend", length_s = 2678400, t_burn_s = 0 }.
 [[logins]]
 name = "key-2"
 kind = "api_key"

@@ -1,8 +1,8 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
-//! `/v1/model/spend/reset` and `/v1/health`, and the HTTP fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
-//! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
-//! clients with the client token.
+//! `/v1/model/spend/reset` and `/v1/health`, and the HTTP fronts: `/v1/messages`
+//! ([`super::messages`]), `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the
+//! optional loopback TCP listener serves only the HTTP fronts, to clients with the client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once. On the C4
 //! front every rejection is a non-200 [`GatewayError`], every admitted turn a `200` with a chunked
 //! NDJSON stream whose head goes out with its first event; an HTTP front answers its errors in

@@ -918,7 +918,7 @@
       },
       "RouteState": {
         "type": "string",
-        "description": "State of a route alias from the logins it can run on in qbd's state: `ready` one of them is usable, `exhausted` all usable ones wait for a reset or back-off (`resets_at`), `unavailable` none is usable or qbd is unreachable. `degraded` is reserved and not sent.",
+        "description": "State of a route alias from the logins it can run on in qbd's state: `ready` one of them is usable, `exhausted` all usable ones wait (`resets_at`), `unavailable` none is usable or qbd is unreachable. A chain route is `ready` when one step is, else `exhausted` when one step is, else `unavailable`. A login waits when it is `exhausted` or `rate_limited`, until its `dead_until`, or when it is `ok`, `unknown` or `auth_stale` with a window at `used` >= 1.0 and a reset, until the latest such reset. `degraded` is reserved and not sent.",
         "enum": [
           "ready",
           "degraded",
@@ -950,7 +950,7 @@
           },
           "resets_at": {
             "type": "integer",
-            "description": "Nearest end of the marks of its logins (`exhausted`).",
+            "description": "Earliest end of the waits of its logins, over every step of a chain route (`exhausted`): a `dead_until`, or the reset of a full window.",
             "minimum": 0
           }
         },

@@ -3,8 +3,8 @@
 //! agent; for the gateway also writing, creating and removing regular files, as a refreshed
 //! token is written back by rename, and the same in the directory of its spend file), the
 //! resolver files and TCP connections to port 443. The gateway may also read the files of its
-//! config's directory, for a reload. The only TCP bind
-//! allowed is the gateway's on the port of its loopback Messages listener.
+//! config's directory, for a reload. The only TCP bind allowed is the gateway's on the port of
+//! its loopback Messages listener.
 
 use std::path::{Path, PathBuf};
 

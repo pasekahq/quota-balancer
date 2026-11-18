@@ -366,13 +366,17 @@ and `class`) and `message` (never a credential).
 ```
 
 Aliases sorted, each with the state of the logins it can run on in `qbd`'s `GET /v1/state`: the
-gateway's logins of the pinned vendor, or every login of the gateway for a ladder route.
-`ready` when one is `ok`, `unknown` or `auth_stale`; else `exhausted` when one is `exhausted`
-or `rate_limited`, with `resets_at` the earliest `dead_until`; else `unavailable` (all
-`auth_dead`, none, or `qbd` unreachable). `vendor` and `model` are a pinned route's. A chain
-route is `ready` with the `vendor` and `model` of its first step whose vendor has a `ready`
-login; else `exhausted` with the earliest `resets_at` over its steps when one waits, else
-`unavailable`, without `vendor` and `model`. It takes no lease.
+gateway's logins of the pinned vendor, or every login of the gateway for a ladder route. A login
+waits when its status is `exhausted` or `rate_limited`, until its `dead_until`, or when its
+status is `ok`, `unknown` or `auth_stale` but a window of it is at `used` ≥ 1.0 with a
+`resets_at`, until the latest such reset, since `qbd` does not pick it before (a capped login's
+`spend` window, [config.md](config.md#spend-caps)). The route is `ready` when one login is
+`ok`, `unknown` or `auth_stale` and does not wait; else `exhausted` when one waits, with
+`resets_at` the earliest end of the waits; else `unavailable` (all `auth_dead`, none, or `qbd`
+unreachable). `vendor` and `model` are a pinned route's. A chain route applies the same rule to
+the logins of each step's vendor: it is `ready` with the `vendor` and `model` of its first
+step that is `ready`; else `exhausted` with the earliest `resets_at` over its `exhausted`
+steps when one is, else `unavailable`, without `vendor` and `model`. It takes no lease.
 
 ### `POST /v1/model/cancel`
 

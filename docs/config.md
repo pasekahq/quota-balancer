@@ -359,14 +359,18 @@ another login or the next chain step, else ends `quota_exhausted` with `resets_a
 month's start. The gateway reports the count to `qbd` as the login's window `spend`
 (`utilization` = spent / cap, `resets_at` = the next month's start) after every call on the
 login, so `qbd` stops picking it and `GET /v1/model/routes` shows the route `exhausted` with that
-reset. `qbd` keeps only windows its vendor declares, so declare it on the vendor of each capped
-login, at most 4 windows per vendor:
+reset. `qbd` keeps only windows its vendor declares, so give the capped API-key logins a `qbd`
+vendor of their own that declares `spend`, and no uncapped login:
 
 ```toml
 [[vendors]]
 name = "vendor-d"
 windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
 ```
+
+On a vendor that also serves uncapped logins, `spend` would be their longest window and never
+observed: a usage limit on one of them would mark it exhausted until that window's reset, up to
+31 days, and its snapshot would stay stale.
 
 `qb --socket <gateway socket> spend` prints each capped login's `spent_usd`, `cap_usd` and
 `period_end`; `qb --socket <gateway socket> spend reset <login>` sets its count to zero
