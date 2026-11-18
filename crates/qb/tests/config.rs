@@ -666,8 +666,8 @@ fn a_broken_installation_rule_is_found_in_either_example() {
         ),
         (
             qbd(
-                "name = \"gateway\"\nuid = 1000\nrole = \"gateway\"",
-                "name = \"gateway\"\nuid = 1000\nrole = \"worker\"",
+                "name = \"gateway\"\nuid = 1003\nrole = \"gateway\"",
+                "name = \"gateway\"\nuid = 1003\nrole = \"worker\"",
             ),
             "route `chat`: no qbd client has role `gateway`",
         ),

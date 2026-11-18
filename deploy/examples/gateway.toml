@@ -2,7 +2,7 @@
 # Format: docs/config.md#gateway-config. deploy/examples/qbd.toml is the matching qbd config: the
 # gateway's client by uid with role "gateway", that role's ladder, and the logins and vendors below.
 
-socket = "/run/user/1000/qb-gateway/gateway.sock"
+socket = "/run/user/1003/qb-gateway/gateway.sock"
 qbd_socket = "/run/qb/qb.sock"
 max_turns = 4
 max_attempts = 4

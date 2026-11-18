@@ -145,5 +145,5 @@ uid = 1002
 
 [[clients]]
 name = "gateway"
-uid = 1000
+uid = 1003
 role = "gateway"

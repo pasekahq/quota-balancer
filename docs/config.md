@@ -428,7 +428,7 @@ together are one working installation. Every route of that gateway runs on the `
 # qbd.toml
 [[clients]]
 name = "gateway"
-uid = 1000
+uid = 1003
 role = "gateway"
 ```
 
