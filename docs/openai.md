@@ -35,7 +35,7 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | Usage | OpenAI reports no cache writes: `cache_write` reads as 0 upstream, and fronts fold it into `prompt_tokens`/`input_tokens`. The canonical usage has no reasoning count, so fronts write `reasoning_tokens: 0`. |
 | `reasoning.summary`, `include`, `store` of a Responses client | Ignored: the upstream adapter asks for summaries and encrypted reasoning of every model that reasons, and never stores. |
 | `n` > 1, logprobs, audio, structured output (`response_format`, `text.format`), non-function tools of the Chat front, image URLs, files | Refused with a clear `400`. |
-| Non-function tools of a Responses client (`custom`, `tool_search`, `web_search`, …) | Sent as declared to a Responses upstream; elsewhere a `custom` tool is a function of one string argument `input` with its grammar in the description, tools the vendor runs itself or that only extend the toolset (`web_search*`, `file_search`, `code_interpreter`, `image_generation`, `mcp`, `tool_search`) are left out, and any other type fails the attempt with `bad_request` naming the tool. |
+| Non-function tools of a Responses client (`custom`, `tool_search`, `web_search`, …) | Sent as declared to a Responses upstream; elsewhere a `custom` tool is a function of one string argument `input` with its grammar in the description, tools the vendor runs itself or that only extend the toolset (`web_search*`, `file_search`, `code_interpreter`, `image_generation`, `mcp`, `tool_search`, `namespace`) are left out, and any other type fails the attempt with `bad_request` naming the tool. |
 | Mid-conversation `system`/`developer` messages | Kept in place: a `developer` item on the Responses upstream, a mid-conversation system message on the Messages upstream where the vendor accepts one; elsewhere joined into the system prompt. |
 | `tool_choice` other than `auto` (`none` with tools, `required`, a named tool) | Refused with a clear `400`: the canonical turn always leaves the choice to the model, so honouring it is impossible and ignoring it would run tools the client forbade. `none` without tools is accepted. |
 | `reasoning_effort` / `reasoning.effort` `none` | Read as `low`: the canonical effort has no "off", so the model still reasons a little. |
@@ -428,11 +428,13 @@ tool call with its `index` from 0, its id, name and whole arguments, a last chun
   its declaration in `native` (`api: openai_responses`) with the rule `elsewhere`: `function` for
   functions and `custom` (offered as a function of one string `input`, the `format` grammar
   appended to the description), `omit` for `web_search*`, `file_search`, `code_interpreter`,
-  `image_generation`, `mcp` and `tool_search` (named `tool_search`), `refuse` for any other type
-  (`local_shell`, `shell`, `computer_use_preview`, `namespace`, …). A tool without a name takes
-  its `server_label` or type, with `_2`, `_3`, … when taken; a second `tool_search` tool is
-  refused. On another vendor a client `tool_search` is left out, so tools the client keeps for
-  its search (Codex's deferred MCP tools) are not reachable there;
+  `image_generation`, `mcp`, `tool_search` (named `tool_search`) and `namespace` (a group of
+  functions, such as the sub-agent tools Codex declares for a model it has no metadata for),
+  `refuse` for any other type (`local_shell`, `shell`, `computer_use_preview`, …). A tool
+  without a name takes its `server_label` or type, with `_2`, `_3`, … when taken; a second
+  `tool_search` tool is refused. On another vendor a client `tool_search` and a `namespace` are
+  left out, so tools the client keeps for its search (Codex's deferred MCP tools) and the
+  functions of a namespace are not reachable there;
 - a `reasoning` item becomes canonical `thinking`: of `native_vendor` with the item's reduced form
   as `opaque`, or, when its `encrypted_content` starts with `qb-thinking:`, the vendor and payload
   that prefix wraps; a reasoning item without encrypted content cannot be passed on and is
