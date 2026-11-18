@@ -49,11 +49,11 @@ leaves `messages` and its text joins the system prompt as further text blocks, a
 client's `system`, which is what a client that knows no mid-conversation messages does with it.
 
 With thinking on, the vendor refuses (400 `invalid_request_error`) a request whose last assistant
-message calls a tool without its thinking block; earlier assistant messages may lack thinking.
-Clients that strip thinking from their history send exactly that in every tool loop, so when the
-last assistant message of the built request holds a `tool_use` but no `thinking` or
-`redacted_thinking` block (none of the picked vendor survived the table above), the request goes
-without `thinking`. The model then answers that turn without thinking.
+message calls a tool and does not start with a thinking block; earlier assistant messages may lack
+thinking. Clients that strip thinking from their history send exactly that in every tool loop, so
+when the last assistant message of the built request holds a `tool_use` and its first block is not
+`thinking` or `redacted_thinking` (none of the picked vendor survived the table above, or the
+history put text before it), the request goes without `thinking`. The model then answers that turn without thinking.
 
 ### Prompt cache (`cache: auto`)
 

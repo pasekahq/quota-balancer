@@ -415,6 +415,14 @@ fn thinking_is_requested_unless_the_last_assistant_tool_call_lost_its_thinking()
             false,
         ),
         (
+            "last assistant with thinking after its text",
+            history(vec![(
+                vec![says("Let me look."), signed_thinking(VENDOR), call("c1")],
+                result("c1"),
+            )]),
+            false,
+        ),
+        (
             "stripped earlier assistant only",
             history(vec![
                 (vec![call("c1")], result("c1")),

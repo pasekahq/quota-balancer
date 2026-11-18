@@ -131,8 +131,8 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 ///
 /// Empty text blocks, thinking blocks of another vendor and own blocks whose payload is not an
 /// Anthropic thinking block are dropped, and so is a message left without blocks. With `cache: auto`, breakpoints follow [`place_cache_breakpoints`].
-/// The `thinking` config is left out when the last assistant message calls a tool without a
-/// thinking block, a history the vendor refuses while thinking is on. System messages stay in
+/// The `thinking` config is left out when the last assistant message calls a tool and does not
+/// start with a thinking block, a history the vendor refuses while thinking is on. System messages stay in
 /// place where the vendor and the model take them and join the system prompt otherwise; tools
 /// of another API follow their `elsewhere`.
 ///
@@ -281,7 +281,8 @@ fn lift_misplaced_system(messages: &mut Vec<MessageParam>, in_place: bool) -> Ve
     lifted
 }
 
-/// The last assistant message of `messages` calls a tool and carries no thinking block.
+/// The last assistant message of `messages` calls a tool and does not start with a thinking
+/// block, which the vendor requires of it while thinking is on.
 fn tool_call_lacks_thinking(messages: &[MessageParam]) -> bool {
     let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") else {
         return false;
@@ -292,13 +293,11 @@ fn tool_call_lacks_thinking(messages: &[MessageParam]) -> bool {
     let calls = blocks
         .iter()
         .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-    let thinks = blocks.iter().any(|b| {
-        matches!(
-            b,
-            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
-        )
-    });
-    calls && !thinks
+    let starts_thinking = matches!(
+        blocks.first(),
+        Some(ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. })
+    );
+    calls && !starts_thinking
 }
 
 fn text_block(text: &str) -> TextBlock {
