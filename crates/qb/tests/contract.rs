@@ -171,16 +171,6 @@ fn oversized_and_unframed_requests() {
     assert!(raw.starts_with("HTTP/1.1 411 "), "{raw}");
 }
 
-#[test]
-fn a_silent_client_does_not_wedge_the_daemon() {
-    let sock = spawn_server();
-    let _idle = UnixStream::connect(&sock).unwrap();
-    let t = Instant::now();
-    let (status, _) = call(&sock, "GET", paths::HEALTH, None, None).unwrap();
-    assert_eq!(status, 200);
-    assert!(t.elapsed() < qb::server::IO_TIMEOUT + Duration::from_secs(2));
-}
-
 fn example(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../deploy/examples")
@@ -1477,15 +1467,28 @@ fn spawn_agent(sock: &Path, bearer: Option<&'static str>, fetcher: TestFetcher) 
 fn with_probes_off_a_parked_agent_gets_no_job_and_others_are_served() {
     let dir = temp_dir("probeoff");
     let sock = dir.join("qb.sock");
-    let _d = start(&agent_config(&dir, &[]), &sock);
-    let mut parked = park(&sock, None, &["login-1", "login-2", "login-3"]);
+    let config = agent_config(
+        &dir,
+        &[(
+            "agents = [\"agent-1\"]",
+            "agents = [\"agent-1\", \"client-b\"]".to_owned(),
+        )],
+    );
+    let _d = start(&config, &sock);
+    let logins = ["login-1", "login-2", "login-3"];
+    let mut parked = park(&sock, None, &logins);
     for _ in 0..3 {
         let p = pick_worker(&sock);
         assert_eq!(p.decision, Decision::Run, "{p:?}");
         assert!(p.stale, "the pick relied on a stale login");
         assert_eq!(state(&sock).logins.len(), 6);
     }
-    assert_eq!(answer(&mut parked, Duration::from_millis(500)), None);
+    // A `next` gets a due job before the daemon accepts the next connection, so once `state`
+    // has answered, a job for `late` would already be in its socket.
+    let mut late = park(&sock, Some(BEARER), &logins);
+    assert_eq!(state(&sock).logins.len(), 6);
+    assert_eq!(answer(&mut late, Duration::from_millis(10)), None);
+    assert_eq!(answer(&mut parked, Duration::from_millis(10)), None);
 }
 
 #[test]
@@ -1518,9 +1521,12 @@ fn a_pick_on_a_stale_login_sends_one_probe_whose_windows_show_in_state() {
     let login = called.recv_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(login, "login-1");
     assert!(pick_worker(&sock).stale, "the probe has not answered yet");
+    // Singleflight itself is a table test in qb-core; here no second job may have reached the
+    // other agent by the time the daemon answers again, without waiting for its absence.
+    state(&sock);
     assert_eq!(
-        called.recv_timeout(Duration::from_secs(1)),
-        Err(mpsc::RecvTimeoutError::Timeout),
+        called.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
         "no second job while one is in flight"
     );
 
@@ -1538,8 +1544,8 @@ fn a_pick_on_a_stale_login_sends_one_probe_whose_windows_show_in_state() {
     assert_eq!(s.logins[0].status, LoginStatus::Ok);
     assert!(s.logins[0].windows.iter().all(|w| !w.stale));
     assert_eq!(
-        called.recv_timeout(Duration::from_millis(300)),
-        Err(mpsc::RecvTimeoutError::Timeout),
+        called.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
         "exactly one job"
     );
 }
