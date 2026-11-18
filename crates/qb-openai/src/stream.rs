@@ -8,7 +8,7 @@ use qb_proto::{Object, StopReason, StreamEvent, Thinking, ToolCall, Usage, Windo
 use serde_json::Value;
 
 use crate::limits::{Failure, FailureKind, RateLimits, classify_stream_error};
-use crate::request::reasoning_to_opaque;
+use crate::request::{CUSTOM_INPUT, TOOL_SEARCH, join_namespace, reasoning_to_opaque};
 use crate::sse::{self, Frame};
 use crate::wire::{Content, Item, ResponseEvent, ResponseObject, ResponsesUsage, event};
 
@@ -258,7 +258,7 @@ impl Translator {
         let open = match item.kind.as_deref() {
             Some("message") => Open::Message { streamed: false },
             Some("function_call") => {
-                let args = item.arguments.unwrap_or_default();
+                let args = item.arguments_text();
                 if self.held + args.len() > MAX_BLOCK_BYTES {
                     return Err(malformed("open items exceed the size bound"));
                 }
@@ -301,17 +301,65 @@ impl Translator {
                     None => Default::default(),
                     Some(_) => return Err(malformed("item changed its type")),
                 };
+                let done_args = item.arguments_text();
                 let id = item.call_id.filter(|s| !s.is_empty()).unwrap_or(call_id);
                 let name = item.name.filter(|s| !s.is_empty()).unwrap_or(name);
-                let args = item.arguments.filter(|s| !s.is_empty()).unwrap_or(args);
+                let args = if done_args.is_empty() {
+                    args
+                } else {
+                    done_args
+                };
                 if id.is_empty() || name.is_empty() {
                     return Err(malformed("function call without call_id or name"));
                 }
                 let input = call_input(&args)
                     .ok_or_else(|| malformed("function arguments are not a JSON object"))?;
+                let name = join_namespace(item.namespace, name);
                 self.tool_calls = true;
                 out.push(StreamEvent::ToolCall {
                     tool_call: ToolCall { id, name, input },
+                });
+            }
+            Some("custom_tool_call") => {
+                let (Some(id), Some(name)) = (
+                    item.call_id.filter(|s| !s.is_empty()),
+                    item.name.filter(|s| !s.is_empty()),
+                ) else {
+                    return Err(malformed("custom tool call without call_id or name"));
+                };
+                let mut input = Object::new();
+                input.insert(
+                    CUSTOM_INPUT.into(),
+                    Value::String(item.input.unwrap_or_default()),
+                );
+                let name = join_namespace(item.namespace, name);
+                self.tool_calls = true;
+                out.push(StreamEvent::ToolCall {
+                    tool_call: ToolCall { id, name, input },
+                });
+            }
+            // A search the client runs; the vendor runs a `server` one itself.
+            Some("tool_search_call") if item.execution.as_deref() == Some("client") => {
+                let Some(id) = item.call_id.clone().filter(|s| !s.is_empty()) else {
+                    return Err(malformed("tool search call without call_id"));
+                };
+                let input = match item.arguments {
+                    Some(Value::Object(m)) => m,
+                    None | Some(Value::Null) => Object::new(),
+                    Some(other) => call_input(
+                        &other
+                            .as_str()
+                            .map_or_else(|| other.to_string(), str::to_owned),
+                    )
+                    .ok_or_else(|| malformed("tool search arguments are not a JSON object"))?,
+                };
+                self.tool_calls = true;
+                out.push(StreamEvent::ToolCall {
+                    tool_call: ToolCall {
+                        id,
+                        name: TOOL_SEARCH.into(),
+                        input,
+                    },
                 });
             }
             Some("reasoning") => {

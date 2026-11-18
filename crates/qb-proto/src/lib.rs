@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 pub mod gateway;
 
 pub use gateway::{
-    Attempt, Block, CacheMode, CancelAnswer, CancelRequest, Effort, ErrorClass, GatewayError,
-    LoginSpend, MediaType, Message, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus,
-    RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool, ToolCall,
-    TurnRequest, TurnRequestError, Usage,
+    Attempt, Block, CacheMode, CancelAnswer, CancelRequest, Effort, Elsewhere, ErrorClass,
+    GatewayError, LoginSpend, MediaType, Message, NativeApi, NativeTool, Object, ReloadAnswer,
+    Role, RouteInfo, RouteState, RouteStatus, RoutesAnswer, SpendAnswer, SpendReset, StopReason,
+    StreamEvent, Thinking, Tool, ToolCall, TurnRequest, TurnRequestError, Usage,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.

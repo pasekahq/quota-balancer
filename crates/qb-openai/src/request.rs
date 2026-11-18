@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use qb_proto::{Block, Effort, MediaType, Role, TurnRequest};
+use qb_proto::{Block, Effort, MediaType, NativeApi, Role, Tool, TurnRequest};
 use serde_json::Value;
 
 use crate::wire::{
@@ -141,17 +141,60 @@ pub struct Target<'a> {
 pub enum BuildError {
     /// An image given by `path`: the gateway reads no file a client names.
     ImagePath(String),
+    /// A tool of another vendor API that this vendor cannot offer and the client cannot do
+    /// without.
+    Tool(String),
 }
 
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ImagePath(path) => write!(f, "image `{path}` is a path; send it as base64"),
+            Self::Tool(name) => write!(
+                f,
+                "tool `{name}` is a tool of another vendor API that this vendor cannot run"
+            ),
         }
     }
 }
 
 impl std::error::Error for BuildError {}
+
+/// The one argument a canonical call of a `custom` tool carries: the tool's free-text input.
+pub const CUSTOM_INPUT: &str = "input";
+
+/// Separator of a call's namespace and name in a canonical tool name, `namespace/name`: a tool
+/// that a client-run tool search loaded inside a namespace is called by both, and `/` occurs
+/// in neither.
+pub const NAMESPACE_SEP: char = '/';
+
+/// The canonical name of a call of `name` in `namespace`.
+pub fn join_namespace(namespace: Option<String>, name: String) -> String {
+    match namespace.filter(|n| !n.is_empty()) {
+        Some(ns) => format!("{ns}{NAMESPACE_SEP}{name}"),
+        None => name,
+    }
+}
+
+/// The namespace and name of a canonical tool name; see [`join_namespace`].
+pub fn split_namespace(name: &str) -> (Option<String>, String) {
+    match name.split_once(NAMESPACE_SEP) {
+        Some((ns, n)) if !ns.is_empty() && !n.is_empty() => (Some(ns.to_owned()), n.to_owned()),
+        _ => (None, name.to_owned()),
+    }
+}
+
+/// The canonical name of a `tool_search` tool, which has no name of its own.
+pub const TOOL_SEARCH: &str = "tool_search";
+
+/// The Responses `type` of a tool the client declared in this API's own form; `None` for
+/// plain function tools.
+pub fn native_kind(t: &Tool) -> Option<&str> {
+    let n = t.native.as_ref()?;
+    match n.api {
+        NativeApi::OpenaiResponses => n.spec.get("type").and_then(Value::as_str),
+    }
+}
 
 /// Smallest `max_output_tokens` the vendor accepts.
 pub const MIN_OUTPUT_TOKENS: u32 = 16;
@@ -200,15 +243,19 @@ pub fn build(req: &TurnRequest, at: &Target<'_>) -> Result<CreateResponse, Build
         .map(effort_name)
         .or_else(|| at.effort.map(|e| if e == "max" { "xhigh" } else { e }))
         .filter(|e| EFFORTS.contains(e));
-    let tools: Vec<ResponseTool> = req
+    let tools: Vec<Value> = req
         .tools
         .iter()
-        .map(|t| ResponseTool {
-            kind: "function".into(),
-            name: Some(t.name.clone()),
-            description: Some(t.description.clone()),
-            parameters: Some(t.input_schema.clone()),
-            strict: Some(false),
+        .map(|t| match &t.native {
+            Some(n) if n.api == NativeApi::OpenaiResponses => Value::Object(n.spec.clone()),
+            _ => serde_json::to_value(ResponseTool {
+                kind: "function".into(),
+                name: Some(t.name.clone()),
+                description: Some(t.description.clone()),
+                parameters: Some(t.input_schema.clone()),
+                strict: Some(false),
+            })
+            .unwrap_or_default(),
         })
         .collect();
     let has_tools = !tools.is_empty();
@@ -240,20 +287,30 @@ pub fn build(req: &TurnRequest, at: &Target<'_>) -> Result<CreateResponse, Build
     })
 }
 
-/// The input items of the conversation, in order.
+/// The input items of the conversation, in order. Calls of a declared `custom` or
+/// `tool_search` tool and their results take that tool's item types.
 fn input_items(req: &TurnRequest, vendor: &str) -> Result<Vec<Item>, BuildError> {
+    let kind_of = |name: &str| {
+        req.tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(native_kind)
+            .map(str::to_owned)
+    };
+    let mut call_kinds: Vec<(String, String)> = Vec::new();
     let mut input: Vec<Item> = Vec::with_capacity(req.messages.len());
     for m in &req.messages {
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::System => "developer",
         };
         let mut parts: Vec<Part> = Vec::new();
         for b in &m.content {
             match b {
                 Block::Text { text } if text.is_empty() => {}
                 Block::Text { text } => parts.push(match m.role {
-                    Role::User => text_part("input_text", text),
+                    Role::User | Role::System => text_part("input_text", text),
                     Role::Assistant => output_text(text),
                 }),
                 Block::Image {
@@ -275,22 +332,19 @@ fn input_items(req: &TurnRequest, vendor: &str) -> Result<Vec<Item>, BuildError>
                     input: args,
                 } => {
                     flush(&mut input, role, &mut parts);
-                    input.push(Item {
-                        kind: Some("function_call".into()),
-                        call_id: Some(id.clone()),
-                        name: Some(name.clone()),
-                        arguments: Some(Value::Object(args.clone()).to_string()),
-                        ..Item::default()
-                    });
+                    let kind = kind_of(name);
+                    input.push(call_item(kind.as_deref(), id, name, args));
+                    if let Some(k) = kind {
+                        call_kinds.push((id.clone(), k));
+                    }
                 }
                 Block::ToolResult { id, content, .. } => {
                     flush(&mut input, role, &mut parts);
-                    input.push(Item {
-                        kind: Some("function_call_output".into()),
-                        call_id: Some(id.clone()),
-                        output: Some(Content::Text(content.clone())),
-                        ..Item::default()
-                    });
+                    let kind = call_kinds
+                        .iter()
+                        .find(|(c, _)| c == id)
+                        .map(|(_, k)| k.as_str());
+                    input.push(result_item(kind, id, content));
                 }
                 Block::Thinking {
                     vendor: from,
@@ -310,6 +364,73 @@ fn input_items(req: &TurnRequest, vendor: &str) -> Result<Vec<Item>, BuildError>
     }
 
     Ok(input)
+}
+
+/// The input item of a tool call, by the Responses type `kind` of the tool it calls.
+fn call_item(kind: Option<&str>, id: &str, name: &str, args: &qb_proto::Object) -> Item {
+    let (namespace, name) = split_namespace(name);
+    match kind {
+        Some("custom") => Item {
+            kind: Some("custom_tool_call".into()),
+            call_id: Some(id.into()),
+            name: Some(name),
+            namespace,
+            input: Some(custom_input(args)),
+            ..Item::default()
+        },
+        Some("tool_search") => Item {
+            kind: Some("tool_search_call".into()),
+            status: Some("completed".into()),
+            call_id: Some(id.into()),
+            execution: Some("client".into()),
+            arguments: Some(Value::Object(args.clone())),
+            ..Item::default()
+        },
+        _ => Item {
+            kind: Some("function_call".into()),
+            call_id: Some(id.into()),
+            name: Some(name),
+            namespace,
+            arguments: Some(Value::String(Value::Object(args.clone()).to_string())),
+            ..Item::default()
+        },
+    }
+}
+
+/// The input item of a tool result, by the Responses type `kind` of the tool whose call it
+/// answers; a `tool_search` result is the loaded tools as a JSON array.
+fn result_item(kind: Option<&str>, id: &str, content: &str) -> Item {
+    match kind {
+        Some("custom") => Item {
+            kind: Some("custom_tool_call_output".into()),
+            call_id: Some(id.into()),
+            output: Some(Content::Text(content.into())),
+            ..Item::default()
+        },
+        Some("tool_search") => Item {
+            kind: Some("tool_search_output".into()),
+            status: Some("completed".into()),
+            call_id: Some(id.into()),
+            execution: Some("client".into()),
+            tools: Some(serde_json::from_str(content).unwrap_or_default()),
+            ..Item::default()
+        },
+        _ => Item {
+            kind: Some("function_call_output".into()),
+            call_id: Some(id.into()),
+            output: Some(Content::Text(content.into())),
+            ..Item::default()
+        },
+    }
+}
+
+/// The free-text input of a canonical `custom` tool call: its [`CUSTOM_INPUT`] string, else
+/// all arguments as JSON.
+pub fn custom_input(args: &qb_proto::Object) -> String {
+    match args.get(CUSTOM_INPUT) {
+        Some(Value::String(s)) if args.len() == 1 => s.clone(),
+        _ => Value::Object(args.clone()).to_string(),
+    }
 }
 
 fn text_part(kind: &str, text: &str) -> Part {

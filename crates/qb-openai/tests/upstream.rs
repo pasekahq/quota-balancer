@@ -10,8 +10,8 @@ use qb_openai::limits::{
 use qb_openai::request::{AuthMode, BuildError, Target, build, identity};
 use qb_openai::stream::{Progress, Reader, event_bound};
 use qb_proto::{
-    Block, Effort, ErrorClass, MediaType, Message, Outcome, Role, StopReason, StreamEvent,
-    Thinking, Tool, ToolCall, TurnRequest, Usage, WindowReport,
+    Block, Effort, Elsewhere, ErrorClass, MediaType, Message, NativeApi, NativeTool, Outcome, Role,
+    StopReason, StreamEvent, Thinking, Tool, ToolCall, TurnRequest, Usage, WindowReport,
 };
 use serde_json::{Value, json};
 
@@ -193,6 +193,7 @@ fn turn() -> TurnRequest {
             name: "read_file".into(),
             description: "Read a file.".into(),
             input_schema: object(json!({"type": "object"})),
+            native: None,
         }],
         max_tokens: 4096,
         effort: Some(Effort::Max),
@@ -663,4 +664,145 @@ fn a_stream_rate_limit_on_an_exhausted_window_is_a_usage_limit() {
             retry_after: Some(2)
         }
     );
+}
+
+#[test]
+fn native_tool_calls_become_tool_calls_and_hosted_ones_are_skipped() {
+    let got = run(&fixture("upstream_native_tool_calls.sse"));
+    assert_eq!(
+        got.events,
+        vec![
+            call(
+                "call_p1",
+                "apply_patch",
+                json!({"input": "*** Begin Patch\n*** End Patch\n"})
+            ),
+            call("call_s1", "tool_search", json!({"query": "calendar"})),
+            usage(500, 60, 0),
+        ]
+    );
+    assert_eq!(got.end, Ok(StopReason::ToolUse));
+}
+
+fn native(name: &str, spec: Value, elsewhere: Elsewhere) -> Tool {
+    Tool {
+        name: name.into(),
+        description: format!("{name} tool"),
+        input_schema: object(json!({"type": "object"})),
+        native: Some(NativeTool {
+            api: NativeApi::OpenaiResponses,
+            spec: object(spec),
+            elsewhere,
+        }),
+    }
+}
+
+fn says(role: Role, text: &str) -> Message {
+    Message {
+        role,
+        content: vec![Block::Text { text: text.into() }],
+    }
+}
+
+#[test]
+fn native_tools_go_out_as_declared_with_their_own_call_items() {
+    let patch = json!({"type": "custom", "name": "apply_patch", "description": "Patch.",
+                       "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}});
+    let search = json!({"type": "tool_search", "execution": "client", "description": "Find tools.",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}});
+    let web = json!({"type": "web_search", "external_web_access": false});
+    let mut req = turn();
+    req.tools
+        .push(native("apply_patch", patch.clone(), Elsewhere::Function));
+    req.tools
+        .push(native("tool_search", search.clone(), Elsewhere::Omit));
+    req.tools
+        .push(native("web_search", web.clone(), Elsewhere::Omit));
+    req.messages = vec![
+        says(Role::User, "Fix it"),
+        says(Role::System, "Sandbox: workspace-write."),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                Block::ToolUse {
+                    id: "call_s".into(),
+                    name: "tool_search".into(),
+                    input: object(json!({"query": "calendar"})),
+                },
+                Block::ToolUse {
+                    id: "call_p".into(),
+                    name: "apply_patch".into(),
+                    input: object(json!({"input": "*** Begin Patch\n*** End Patch\n"})),
+                },
+            ],
+        },
+        Message {
+            role: Role::User,
+            content: vec![
+                Block::ToolResult {
+                    id: "call_s".into(),
+                    content: r#"[{"type":"function","name":"cal_list"}]"#.into(),
+                    is_error: None,
+                },
+                Block::ToolResult {
+                    id: "call_p".into(),
+                    content: "Done!".into(),
+                    is_error: None,
+                },
+            ],
+        },
+    ];
+    let got = serde_json::to_value(build(&req, &target(AuthMode::ApiKey)).expect("builds"))
+        .expect("json");
+    assert_eq!(got["tools"][1], patch);
+    assert_eq!(got["tools"][2], search);
+    assert_eq!(got["tools"][3], web);
+    assert_eq!(
+        got["input"],
+        json!([
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Fix it"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Sandbox: workspace-write."}]},
+            {"type": "tool_search_call", "status": "completed", "call_id": "call_s", "execution": "client",
+             "arguments": {"query": "calendar"}},
+            {"type": "custom_tool_call", "call_id": "call_p", "name": "apply_patch",
+             "input": "*** Begin Patch\n*** End Patch\n"},
+            {"type": "tool_search_output", "status": "completed", "call_id": "call_s", "execution": "client",
+             "tools": [{"type": "function", "name": "cal_list"}]},
+            {"type": "custom_tool_call_output", "call_id": "call_p", "output": "Done!"}
+        ])
+    );
+}
+
+#[test]
+fn namespaced_calls_round_trip_through_the_upstream() {
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_m\",\"namespace\":\"mcp__apps__gmail\",\"name\":\"send\",\"arguments\":\"{}\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n",
+    );
+    let got = run(sse.as_bytes());
+    assert_eq!(
+        got.events,
+        vec![call("call_m", "mcp__apps__gmail/send", json!({}))]
+    );
+
+    let mut req = turn();
+    req.messages = vec![
+        says(Role::User, "mail"),
+        Message {
+            role: Role::Assistant,
+            content: vec![Block::ToolUse {
+                id: "call_m".into(),
+                name: "mcp__apps__gmail/send".into(),
+                input: object(json!({})),
+            }],
+        },
+    ];
+    let body = serde_json::to_value(build(&req, &target(AuthMode::ApiKey)).expect("builds"))
+        .expect("json");
+    assert_eq!(body["input"][1]["namespace"], "mcp__apps__gmail");
+    assert_eq!(body["input"][1]["name"], "send");
 }

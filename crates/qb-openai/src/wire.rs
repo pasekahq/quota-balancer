@@ -397,9 +397,10 @@ pub struct CreateResponse {
     /// A string or items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Input>,
-    /// Tools the model may call.
+    /// Tools the model may call, each a [`ResponseTool`] when its `type` is `function`; other
+    /// types keep their own shape, which an upstream of the same API receives as is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ResponseTool>>,
+    pub tools: Option<Vec<Value>>,
     /// `auto`, `none`, `required` or a named function.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
@@ -487,10 +488,25 @@ pub struct Item {
     /// Function name of a `function_call`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Arguments of a `function_call`, as a JSON string.
+    /// Arguments of a `function_call` as a JSON string, or of a `tool_search_call` as an
+    /// object; see [`Item::arguments_text`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<String>,
-    /// Output of a `function_call_output`: a string or parts.
+    pub arguments: Option<Value>,
+    /// Namespace of a `function_call` or `custom_tool_call` of a tool a `tool_search_output`
+    /// loaded inside a namespace; see [`crate::request::NAMESPACE_SEP`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Free-text input of a `custom_tool_call`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// Who runs a `tool_search_call` and answers it with a `tool_search_output`: `client` or
+    /// `server`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
+    /// Tools a `tool_search_output` loads, in the request's tool shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Value>>,
+    /// Output of a `function_call_output` or `custom_tool_call_output`: a string or parts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Content>,
     /// Summary parts of a `reasoning` item.
@@ -499,6 +515,17 @@ pub struct Item {
     /// Vendor-encrypted reasoning of a `reasoning` item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_content: Option<String>,
+}
+
+impl Item {
+    /// The arguments as text: a JSON string's value, an object as JSON, empty when absent.
+    pub fn arguments_text(&self) -> String {
+        match &self.arguments {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(v) => v.to_string(),
+        }
+    }
 }
 
 /// Message content or tool output: a string or parts.

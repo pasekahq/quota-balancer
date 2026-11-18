@@ -74,6 +74,10 @@ pub enum Role {
     User,
     /// The model.
     Assistant,
+    /// An instruction of the client from this point of the conversation on, text blocks only
+    /// (Anthropic's mid-conversation system message, OpenAI's `developer` message). An upstream
+    /// that cannot place it there adds its text to the system prompt.
+    System,
 }
 
 /// One conversation message.
@@ -261,6 +265,43 @@ pub struct Tool {
     pub description: String,
     /// JSON Schema of the arguments.
     pub input_schema: Object,
+    /// The tool as the client declared it in a vendor API, when it is not a plain function
+    /// tool there; an upstream of that API sends the declaration as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeTool>,
+}
+
+/// A tool declaration in a vendor API's own form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTool {
+    /// The API of the declaration.
+    pub api: NativeApi,
+    /// The declaration as the client sent it.
+    pub spec: Object,
+    /// What an upstream of another API does with the tool.
+    pub elsewhere: Elsewhere,
+}
+
+/// A vendor API whose tool declarations a [`NativeTool`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeApi {
+    /// The OpenAI Responses API.
+    OpenaiResponses,
+}
+
+/// What an upstream of another API does with a [`NativeTool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Elsewhere {
+    /// Offer it as a function tool of `name`, `description` and `input_schema`.
+    Function,
+    /// Leave it out: the vendor runs the tool itself or it only extends the toolset, so the
+    /// model works without it.
+    Omit,
+    /// Fail the attempt with `bad_request`: the client expects calls only that API makes.
+    Refuse,
 }
 
 /// Why a [`TurnRequest`] is malformed beyond what JSON decoding catches.
@@ -308,9 +349,18 @@ impl TurnRequest {
         if self.messages.is_empty() {
             return fail("`messages` is empty".into());
         }
+        if self.messages.iter().all(|m| m.role == Role::System) {
+            return fail("`messages` has no user or assistant message".into());
+        }
         for (i, m) in self.messages.iter().enumerate() {
             if m.content.is_empty() {
                 return fail(format!("`messages[{i}].content` is empty"));
+            }
+            if m.role == Role::System && m.content.iter().any(|b| !matches!(b, Block::Text { .. }))
+            {
+                return fail(format!(
+                    "`messages[{i}]` is a system message with a non-text block"
+                ));
             }
             for (j, b) in m.content.iter().enumerate() {
                 let at = format!("messages[{i}].content[{j}]");

@@ -10,8 +10,8 @@ use qb_openai::limits::{FailureKind, classify_chat_response};
 use qb_openai::request::BuildError;
 use qb_openai::stream::Progress;
 use qb_proto::{
-    Block, Effort, MediaType, Message, Role, StopReason, StreamEvent, Tool, ToolCall, TurnRequest,
-    Usage,
+    Block, Effort, Elsewhere, MediaType, Message, NativeApi, NativeTool, Role, StopReason,
+    StreamEvent, Tool, ToolCall, TurnRequest, Usage,
 };
 use serde_json::{Value, json};
 
@@ -111,6 +111,7 @@ fn turn() -> TurnRequest {
             name: "read_file".into(),
             description: "Read a file.".into(),
             input_schema: object(json!({"type": "object"})),
+            native: None,
         }],
         max_tokens: 4096,
         effort: Some(Effort::Max),
@@ -597,4 +598,59 @@ fn a_failure_message_is_shortened_and_never_quotes_a_header_value() {
     let f = classify_chat_response(400, &[], long.as_bytes(), NOW);
     assert!(f.message.chars().count() < 340, "{}", f.message);
     assert!(!f.message.chars().any(char::is_control));
+}
+
+fn native(name: &str, kind: &str, elsewhere: Elsewhere) -> Tool {
+    Tool {
+        name: name.into(),
+        description: format!("{name} tool"),
+        input_schema: object(json!({"type": "object"})),
+        native: Some(NativeTool {
+            api: NativeApi::OpenaiResponses,
+            spec: object(json!({"type": kind})),
+            elsewhere,
+        }),
+    }
+}
+
+#[test]
+fn system_messages_join_the_system_prompt_and_native_tools_follow_their_rule() {
+    let mut req = turn();
+    req.messages.insert(
+        1,
+        Message {
+            role: Role::System,
+            content: vec![Block::Text {
+                text: "Mid-conversation.".into(),
+            }],
+        },
+    );
+    req.tools
+        .push(native("apply_patch", "custom", Elsewhere::Function));
+    req.tools
+        .push(native("web_search", "web_search", Elsewhere::Omit));
+    let got = serde_json::to_value(build(&req, "model-c").expect("builds")).expect("json");
+    let messages = got["messages"].as_array().expect("messages");
+    assert_eq!(messages[0]["role"], "system");
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .is_some_and(|s| s.ends_with("\n\nMid-conversation."))
+    );
+    assert_eq!(messages.iter().filter(|m| m["role"] == "system").count(), 1);
+    let names: Vec<&str> = got["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(names.last(), Some(&"apply_patch"));
+    assert!(!names.contains(&"web_search"));
+
+    req.tools
+        .push(native("local_shell", "local_shell", Elsewhere::Refuse));
+    assert_eq!(
+        build(&req, "model-c").expect_err("refused"),
+        BuildError::Tool("local_shell".into())
+    );
 }

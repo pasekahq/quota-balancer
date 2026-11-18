@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use qb_proto::{Block, Role, StopReason, StreamEvent, ToolCall, TurnRequest, Usage};
+use qb_proto::{Block, Elsewhere, Role, StopReason, StreamEvent, ToolCall, TurnRequest, Usage};
 use serde_json::Value;
 
 use crate::limits::{Failure, FailureKind, classify_chat_stream_error};
@@ -72,10 +72,10 @@ pub fn headers(
 /// [`BuildError::ImagePath`] for an image given by path.
 pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> {
     let mut messages = Vec::with_capacity(req.messages.len() + 1);
-    if let Some(system) = req.system.as_deref().filter(|s| !s.is_empty()) {
-        messages.push(message("system", Some(ChatContent::Text(system.into()))));
+    if let Some(system) = system_prompt(req) {
+        messages.push(message("system", Some(ChatContent::Text(system))));
     }
-    for m in &req.messages {
+    for m in req.messages.iter().filter(|m| m.role != Role::System) {
         let mut parts: Vec<ChatPart> = Vec::new();
         let mut calls: Vec<ChatToolCall> = Vec::new();
         let mut results: Vec<ChatMessage> = Vec::new();
@@ -124,6 +124,7 @@ pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> 
                     messages.push(message("user", Some(ChatContent::Parts(parts))));
                 }
             }
+            Role::System => {}
             Role::Assistant => {
                 let text: String = parts.into_iter().filter_map(|p| p.text).collect();
                 if !text.is_empty() || !calls.is_empty() {
@@ -139,19 +140,7 @@ pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> 
             }
         }
     }
-    let tools: Vec<ChatTool> = req
-        .tools
-        .iter()
-        .map(|t| ChatTool {
-            kind: "function".into(),
-            function: Some(FunctionDef {
-                name: t.name.clone(),
-                description: Some(t.description.clone()),
-                parameters: Some(t.input_schema.clone()),
-                strict: None,
-            }),
-        })
-        .collect();
+    let tools = chat_tools(req)?;
     let has_tools = !tools.is_empty();
     Ok(ChatRequest {
         model: model.into(),
@@ -165,6 +154,50 @@ pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> 
         }),
         ..ChatRequest::default()
     })
+}
+
+/// The system prompt and the text of every system message, joined by a blank line: compatible
+/// vendors differ on system messages after the first one. `None` when empty.
+fn system_prompt(req: &TurnRequest) -> Option<String> {
+    let parts: Vec<&str> = req
+        .system
+        .as_deref()
+        .into_iter()
+        .chain(
+            req.messages
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .flat_map(|m| &m.content)
+                .filter_map(|b| match b {
+                    Block::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }),
+        )
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The function tools of `req`; a tool of another API follows its `elsewhere`.
+fn chat_tools(req: &TurnRequest) -> Result<Vec<ChatTool>, BuildError> {
+    let mut tools = Vec::with_capacity(req.tools.len());
+    for t in &req.tools {
+        match t.native.as_ref().map(|n| n.elsewhere) {
+            None | Some(Elsewhere::Function) => {}
+            Some(Elsewhere::Omit) => continue,
+            Some(Elsewhere::Refuse) => return Err(BuildError::Tool(t.name.clone())),
+        }
+        tools.push(ChatTool {
+            kind: "function".into(),
+            function: Some(FunctionDef {
+                name: t.name.clone(),
+                description: Some(t.description.clone()),
+                parameters: Some(t.input_schema.clone()),
+                strict: None,
+            }),
+        });
+    }
+    Ok(tools)
 }
 
 fn message(role: &str, content: Option<ChatContent>) -> ChatMessage {

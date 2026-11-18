@@ -1,0 +1,29 @@
+{
+  "route": "codex",
+  "system": "You are a coding agent.",
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Fix the build."}]},
+    {"role": "system", "content": [{"type": "text", "text": "Sandbox: workspace-write."}]}
+  ],
+  "tools": [
+    {
+      "name": "apply_patch",
+      "description": "Edit files with a patch.",
+      "input_schema": {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]},
+      "native": {
+        "api": "openai_responses",
+        "spec": {"type": "custom", "name": "apply_patch", "description": "Edit files with a patch.",
+                 "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}},
+        "elsewhere": "function"
+      }
+    },
+    {
+      "name": "web_search",
+      "description": "",
+      "input_schema": {"type": "object", "properties": {}},
+      "native": {"api": "openai_responses", "spec": {"type": "web_search"}, "elsewhere": "omit"}
+    }
+  ],
+  "max_tokens": 4096,
+  "request_id": "turn-0002"
+}

@@ -1,0 +1,126 @@
+{
+  "model": "gpt-5.5",
+  "instructions": "You are a coding agent running in a terminal.",
+  "input": [
+    {
+      "type": "message",
+      "id": "msg_1",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<permissions instructions>\nSandbox: read-only.\n</permissions instructions>"
+        },
+        {
+          "type": "input_text",
+          "text": "<skills_instructions>\nNo skills.\n</skills_instructions>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_2",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<environment_context>\n  <cwd>/work/project-1</cwd>\n</environment_context>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_3",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "say ok"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "exec_command",
+      "description": "Runs a command in a PTY.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "custom",
+      "name": "apply_patch",
+      "description": "Edit files with a patch. This is a FREEFORM tool.",
+      "format": {
+        "type": "grammar",
+        "syntax": "lark",
+        "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\nhunk: /(.|\\n)+/\n%import common.LF\n"
+      }
+    },
+    {
+      "type": "tool_search",
+      "execution": "client",
+      "description": "Searches deferred tools.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of tools to return. Defaults to 8."
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query for deferred tools."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "web_search",
+      "external_web_access": false,
+      "search_content_types": [
+        "text",
+        "image"
+      ]
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "medium"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000002",
+  "text": {
+    "verbosity": "low"
+  },
+  "client_metadata": {
+    "root_turn_id": "synthetic",
+    "x-codex-installation-id": "synthetic",
+    "x-codex-turn-metadata": "synthetic",
+    "session_id": "synthetic",
+    "thread_id": "synthetic",
+    "x-codex-window-id": "synthetic",
+    "turn_id": "synthetic"
+  }
+}

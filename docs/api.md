@@ -255,11 +255,23 @@ serves only the HTTP fronts, to requests with the local client token
 Required: `route` (an alias of the gateway config, `^[a-z][a-z0-9_-]{0,63}$`), `messages` (at
 least one, each with at least one block), `max_tokens` (≥ 1) and `request_id`
 (`^[A-Za-z0-9_-]{1,64}$`, unique among running turns). Optional: `system`, `tools`
-(`{name, description, input_schema}`, names unique), `effort` (`low|medium|high|max`),
-`session_key` (1 to 128 bytes), `cache` (`auto`).
+(`{name, description, input_schema}`, names unique, and optional `native`, below), `effort`
+(`low|medium|high|max`), `session_key` (1 to 128 bytes), `cache` (`auto`).
 
-A message has `role` (`user|assistant`) and `content`, a list of blocks, each one flat object
-with `type`:
+A message has `role` (`user|assistant|system`) and `content`, a list of blocks, each one flat
+object with `type`. At least one message is `user` or `assistant`. A `system` message holds
+`text` blocks only: an instruction from that point
+of the conversation on (Anthropic's mid-conversation system message, OpenAI's `developer`
+message). An upstream keeps it in place where its vendor accepts one there and otherwise adds
+its text to the system prompt ([anthropic.md](anthropic.md), [openai.md](openai.md)).
+
+A tool's `native` is `{api, spec, elsewhere}`: the declaration `spec` as a client sent it in the
+vendor API `api` (`openai_responses`) when it is not a plain function tool there. An upstream of
+that API sends `spec` as is; another follows `elsewhere`: `function` offers the tool as a function
+of `name`, `description` and `input_schema`, `omit` leaves it out, `refuse` fails the attempt with
+`bad_request`.
+
+Block types:
 
 | `type` | Fields |
 |---|---|

@@ -60,13 +60,16 @@ fn bad(message: impl Into<String>) -> GatewayError {
 ///
 /// `route_of` maps the client's `model` to a route alias. Thinking blocks become canonical
 /// thinking of `native_vendor`, except redacted blocks this front wrapped for another vendor.
+/// Mid-conversation `system` messages stay in place as canonical system messages; tool changes
+/// by reference in them are dropped and `tool_reference` blocks become text, since every tool
+/// goes upstream loaded.
 /// `cache` is `auto` when the request sets `cache_control` on a block, a tool or the request. Sampling parameters,
 /// `tool_choice`, `stop_sequences` and thinking budgets are ignored.
 ///
 /// # Errors
 /// A `bad_request` error for a body that is not a Messages request, an unknown model, a block
-/// the canonical form cannot carry (documents, URL images, images in tool results), or a turn
-/// that fails [`TurnRequest::validate`].
+/// the canonical form cannot carry (documents, URL images, images in tool results, inline tool
+/// definitions, turn-scoped system messages), or a turn that fails [`TurnRequest::validate`].
 pub fn decode_request(
     body: &[u8],
     request_id: &str,
@@ -98,32 +101,7 @@ pub fn decode_request(
     }
     .filter(|s| !s.is_empty());
 
-    let mut messages = Vec::with_capacity(req.messages.len());
-    for (i, m) in req.messages.into_iter().enumerate() {
-        let role = match m.role.as_str() {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            other => {
-                return Err(bad(format!(
-                    "`messages[{i}].role` `{other}` is not supported"
-                )));
-            }
-        };
-        let blocks = match m.content {
-            Content::Text(text) => vec![Block::Text { text }],
-            Content::Blocks(blocks) => blocks
-                .into_iter()
-                .enumerate()
-                .map(|(j, b)| {
-                    canonical_block(b, native_vendor, &format!("messages[{i}].content[{j}]"))
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        messages.push(Message {
-            role,
-            content: blocks,
-        });
-    }
+    let messages = canonical_messages(req.messages, native_vendor)?;
 
     let effort = req
         .output_config
@@ -150,6 +128,7 @@ pub fn decode_request(
                 name: t.name,
                 description: t.description.unwrap_or_default(),
                 input_schema: t.input_schema,
+                native: None,
             })
             .collect(),
         max_tokens: req.max_tokens,
@@ -168,6 +147,68 @@ pub fn decode_request(
         stream: req.stream.unwrap_or(false),
         model: req.model,
     })
+}
+
+/// The canonical messages of a request's `messages`: `user`, `assistant` and text-only `system`
+/// messages; a system message without content, which only sets `output_config` for later
+/// turns, is dropped, since the request's own `output_config` is the one that counts.
+fn canonical_messages(
+    input: Vec<crate::wire::MessageParam>,
+    native_vendor: &str,
+) -> Result<Vec<Message>, GatewayError> {
+    let mut messages = Vec::with_capacity(input.len());
+    for (i, m) in input.into_iter().enumerate() {
+        let role = match m.role.as_str() {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "system" => Role::System,
+            other => {
+                return Err(bad(format!(
+                    "`messages[{i}].role` `{other}` is not supported"
+                )));
+            }
+        };
+        if let Some(c) = m.clear_at.as_deref().filter(|c| *c != "never") {
+            return Err(bad(format!(
+                "`messages[{i}].clear_at` `{c}` is not supported by this gateway"
+            )));
+        }
+        let mut blocks: Vec<Block> = Vec::new();
+        match m.content {
+            Content::Text(text) => blocks.push(Block::Text { text }),
+            Content::Blocks(input) => {
+                for (j, b) in input.into_iter().enumerate() {
+                    let at = format!("messages[{i}].content[{j}]");
+                    match (role, b) {
+                        (Role::System, b @ ContentBlock::Text { .. }) => {
+                            blocks.push(canonical_block(b, native_vendor, &at)?);
+                        }
+                        // Every tool goes upstream loaded, so a change that only names a
+                        // declared tool changes nothing.
+                        (Role::System, ContentBlock::ToolAddition { tool })
+                            if tool.get("type").and_then(Value::as_str)
+                                == Some("tool_reference") => {}
+                        (Role::System, _) => {
+                            return Err(bad(format!(
+                                "`{at}`: a system message may hold text blocks and tool \
+                                 changes by reference only here"
+                            )));
+                        }
+                        (_, b) => blocks.push(canonical_block(b, native_vendor, &at)?),
+                    }
+                }
+            }
+        }
+        if role == Role::System && blocks.is_empty() {
+            continue;
+        }
+        messages.push(Message {
+            role,
+            content: blocks,
+        });
+    }
+
+    Ok(messages)
 }
 
 /// Whether the request sets `cache_control` where the vendor reads it: at the top level, on a
@@ -261,6 +302,9 @@ fn canonical_block(b: ContentBlock, native_vendor: &str, at: &str) -> Result<Blo
                     for b in blocks {
                         match b {
                             ContentBlock::Text { text, .. } => texts.push(text),
+                            ContentBlock::ToolReference { tool_name, name } => {
+                                texts.push(loaded(tool_name.or(name).as_deref()));
+                            }
                             _ => {
                                 return Err(bad(format!(
                                     "`{at}.content` may hold text blocks only"
@@ -287,8 +331,22 @@ fn canonical_block(b: ContentBlock, native_vendor: &str, at: &str) -> Result<Blo
                 opaque: crate::request::thinking_to_opaque(&b),
             }
         }
+        ContentBlock::ToolReference { tool_name, name } => Block::Text {
+            text: loaded(tool_name.or(name).as_deref()),
+        },
+        ContentBlock::ToolAddition { .. } => {
+            return Err(bad(format!(
+                "`{at}` is a tool change outside a system message"
+            )));
+        }
         ContentBlock::Other => return Err(bad(format!("`{at}` has an unsupported block type"))),
     })
+}
+
+/// The text a `tool_reference` becomes: every tool goes upstream loaded, so a tool search's
+/// result only tells the model the tool is there.
+fn loaded(name: Option<&str>) -> String {
+    format!("Tool `{}` is loaded.", name.unwrap_or_default())
 }
 
 /// The Anthropic block a canonical thinking event is shown as: the vendor's own block when it

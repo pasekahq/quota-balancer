@@ -101,10 +101,14 @@ pub struct Metadata {
 /// One conversation message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageParam {
-    /// `user` or `assistant`.
+    /// `user`, `assistant` or `system` (a mid-conversation system message).
     pub role: String,
     /// A string or blocks.
     pub content: Content,
+    /// When a system message stops rendering (`never`, `next_user_message`); read by the front
+    /// only, to refuse what it cannot carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_at: Option<String>,
 }
 
 /// Message content: a string or blocks.
@@ -174,6 +178,23 @@ pub enum ContentBlock {
     RedactedThinking {
         /// Opaque payload.
         data: String,
+    },
+    /// A reference to a tool of the request's `tools`: a custom tool search's result in a
+    /// `tool_result` (`tool_name`), or the `tool` of a `tool_addition`/`tool_removal` (`name`).
+    ToolReference {
+        /// Tool name in a tool search result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        /// Tool name in a tool change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// A mid-conversation system message's tool change: `tool_addition` or `tool_removal` of
+    /// `tool`, a `tool_reference` or an inline `tool_definition`.
+    #[serde(alias = "tool_removal")]
+    ToolAddition {
+        /// The tool.
+        tool: Value,
     },
     /// Any block type this crate does not translate.
     #[serde(other)]

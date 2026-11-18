@@ -57,6 +57,7 @@ fn turn(effort: Effort) -> TurnRequest {
             name: "read".into(),
             description: "Read a file.".into(),
             input_schema: object(json!({"type": "object"})),
+            native: None,
         }],
         max_tokens: 1024,
         effort: Some(effort),

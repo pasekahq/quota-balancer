@@ -7,8 +7,9 @@ use common::{Answer, NOW, VENDOR, fixture, run};
 use qb_anthropic::limits::{FailureKind, classify_response, rate_limits};
 use qb_anthropic::request::{AuthMode, BuildError, Target, build, identity};
 use qb_proto::{
-    Block, CacheMode, Effort, ErrorClass, Message, Object, Outcome, Role, StopReason, StreamEvent,
-    Thinking, Tool, ToolCall, TurnRequest, Usage, WindowReport,
+    Block, CacheMode, Effort, Elsewhere, ErrorClass, Message, NativeApi, NativeTool, Object,
+    Outcome, Role, StopReason, StreamEvent, Thinking, Tool, ToolCall, TurnRequest, Usage,
+    WindowReport,
 };
 use serde_json::{Value, json};
 
@@ -195,6 +196,7 @@ fn turn() -> TurnRequest {
             name: "read".into(),
             description: "Read a text file.".into(),
             input_schema: obj(json!({"type": "object"})),
+            native: None,
         }],
         max_tokens: 4096,
         effort: Some(Effort::Medium),
@@ -628,4 +630,198 @@ fn a_usage_limit_reports_the_rejected_window_as_full() {
         ]
     );
     assert!(f.windows.iter().all(|w| w.resets_at > Some(NOW)));
+}
+
+fn msg(role: Role, text: &str) -> Message {
+    Message {
+        role,
+        content: vec![Block::Text { text: text.into() }],
+    }
+}
+
+/// A target on `model`.
+fn on(model: &'static str) -> Target<'static> {
+    Target {
+        model,
+        ..target(AuthMode::ApiKey)
+    }
+}
+
+/// A model that takes mid-conversation system messages.
+const SYSTEM_MODEL: &str = "claude-opus-5-5";
+
+fn roles_and_system(req: &TurnRequest) -> (Vec<String>, Vec<String>) {
+    roles_and_system_on(req, SYSTEM_MODEL)
+}
+
+fn roles_and_system_on(req: &TurnRequest, model: &'static str) -> (Vec<String>, Vec<String>) {
+    let body =
+        serde_json::to_value(build(req, &on(model), &mut load).expect("builds")).expect("json");
+    let roles = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| m["role"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    let system = body["system"]
+        .as_array()
+        .map(|b| {
+            b.iter()
+                .map(|x| x["text"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    (roles, system)
+}
+
+#[test]
+fn a_system_message_after_a_user_turn_stays_in_place() {
+    let mut req = turn();
+    req.cache = None;
+    req.messages = vec![
+        msg(Role::User, "Hi"),
+        msg(Role::System, "Be brief."),
+        msg(Role::System, "Use metric units."),
+    ];
+    let (roles, system) = roles_and_system(&req);
+    assert_eq!(roles, ["user", "system", "system"]);
+    assert_eq!(system, ["You are a helpful assistant."]);
+    let body = serde_json::to_value(build(&req, &on(SYSTEM_MODEL), &mut load).expect("builds"))
+        .expect("json");
+    assert_eq!(
+        body["messages"][1],
+        json!({"role": "system", "content": [{"type": "text", "text": "Be brief."}]})
+    );
+
+    req.messages.push(msg(Role::Assistant, "Done."));
+    req.messages.push(msg(Role::User, "Again"));
+    let (roles, _) = roles_and_system(&req);
+    assert_eq!(roles, ["user", "system", "system", "assistant", "user"]);
+}
+
+#[test]
+fn a_misplaced_system_message_joins_the_system_prompt() {
+    let mut req = turn();
+    req.cache = None;
+    req.messages = vec![
+        msg(Role::System, "First of all."),
+        msg(Role::User, "Hi"),
+        msg(Role::Assistant, "Hello."),
+        msg(Role::System, "After the model."),
+        msg(Role::User, "Bye"),
+    ];
+    let (roles, system) = roles_and_system(&req);
+    assert_eq!(roles, ["user", "assistant", "user"]);
+    assert_eq!(
+        system,
+        [
+            "You are a helpful assistant.",
+            "First of all.",
+            "After the model."
+        ]
+    );
+
+    // After a user turn but followed by another user turn: also lifted.
+    req.messages = vec![
+        msg(Role::User, "Hi"),
+        msg(Role::System, "Between users."),
+        msg(Role::User, "Again"),
+    ];
+    let (roles, system) = roles_and_system(&req);
+    assert_eq!(roles, ["user", "user"]);
+    assert_eq!(system, ["You are a helpful assistant.", "Between users."]);
+}
+
+#[test]
+fn a_cached_turn_marks_the_trailing_system_message() {
+    let mut req = turn();
+    req.messages = vec![msg(Role::User, "Hi"), msg(Role::System, "Context.")];
+    let body = serde_json::to_value(build(&req, &on(SYSTEM_MODEL), &mut load).expect("builds"))
+        .expect("json");
+    assert_eq!(body["messages"][1]["role"], "system");
+    assert_eq!(
+        body["messages"][1]["content"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+}
+
+fn native(name: &str, spec: Value, elsewhere: Elsewhere) -> Tool {
+    Tool {
+        name: name.into(),
+        description: format!("{name} tool"),
+        input_schema: obj(json!({"type": "object", "properties": {"input": {"type": "string"}}})),
+        native: Some(NativeTool {
+            api: NativeApi::OpenaiResponses,
+            spec: obj(spec),
+            elsewhere,
+        }),
+    }
+}
+
+#[test]
+fn native_tools_of_another_api_become_functions_are_left_out_or_refused() {
+    let mut req = turn();
+    req.tools.push(native(
+        "apply_patch",
+        json!({"type": "custom", "name": "apply_patch"}),
+        Elsewhere::Function,
+    ));
+    req.tools.push(native(
+        "web_search",
+        json!({"type": "web_search"}),
+        Elsewhere::Omit,
+    ));
+    let body =
+        serde_json::to_value(build(&req, &target(AuthMode::ApiKey), &mut load).expect("builds"))
+            .expect("json");
+    let names: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(names, ["read", "apply_patch"]);
+    assert_eq!(body["tools"][1]["description"], "apply_patch tool");
+    assert!(body["tools"][1].get("type").is_none());
+
+    req.tools.push(native(
+        "local_shell",
+        json!({"type": "local_shell"}),
+        Elsewhere::Refuse,
+    ));
+    let e = build(&req, &target(AuthMode::ApiKey), &mut load).expect_err("refused");
+    assert_eq!(e, BuildError::Tool("local_shell".into()));
+    assert!(e.to_string().contains("local_shell"));
+}
+
+#[test]
+fn models_without_mid_conversation_system_messages_get_them_in_the_system_prompt() {
+    let mut req = turn();
+    req.cache = None;
+    req.messages = vec![msg(Role::User, "Hi"), msg(Role::System, "Be brief.")];
+    for model in [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+    ] {
+        assert_eq!(
+            roles_and_system_on(&req, model).0,
+            ["user", "system"],
+            "{model}"
+        );
+    }
+    for model in ["claude-sonnet-5", "claude-sonnet-4-5-20250929", "model-a"] {
+        let (roles, system) = roles_and_system_on(&req, model);
+        assert_eq!(roles, ["user"], "{model}");
+        assert_eq!(
+            system,
+            ["You are a helpful assistant.", "Be brief."],
+            "{model}"
+        );
+    }
 }

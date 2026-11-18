@@ -34,7 +34,9 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | `tool_result.is_error` to an OpenAI upstream | Dropped: `function_call_output` and the Chat Completions `tool` message have no error flag. |
 | Usage | OpenAI reports no cache writes: `cache_write` reads as 0 upstream, and fronts fold it into `prompt_tokens`/`input_tokens`. The canonical usage has no reasoning count, so fronts write `reasoning_tokens: 0`. |
 | `reasoning.summary`, `include`, `store` of a Responses client | Ignored: the upstream adapter asks for summaries and encrypted reasoning of every model that reasons, and never stores. |
-| `n` > 1, logprobs, audio, structured output (`response_format`, `text.format`), non-function tools, image URLs, files | Refused with a clear `400`. |
+| `n` > 1, logprobs, audio, structured output (`response_format`, `text.format`), non-function tools of the Chat front, image URLs, files | Refused with a clear `400`. |
+| Non-function tools of a Responses client (`custom`, `tool_search`, `web_search`, …) | Sent as declared to a Responses upstream; elsewhere a `custom` tool is a function of one string argument `input` with its grammar in the description, tools the vendor runs itself or that only extend the toolset (`web_search*`, `file_search`, `code_interpreter`, `image_generation`, `mcp`, `tool_search`) are left out, and any other type fails the attempt with `bad_request` naming the tool. |
+| Mid-conversation `system`/`developer` messages | Kept in place: a `developer` item on the Responses upstream, a mid-conversation system message on the Messages upstream where the vendor accepts one; elsewhere joined into the system prompt. |
 | `tool_choice` other than `auto` (`none` with tools, `required`, a named tool) | Refused with a clear `400`: the canonical turn always leaves the choice to the model, so honouring it is impossible and ignoring it would run tools the client forbade. `none` without tools is accepted. |
 | `reasoning_effort` / `reasoning.effort` `none` | Read as `low`: the canonical effort has no "off", so the model still reasons a little. |
 | `parallel_tool_calls`, sampling parameters, `stop` | Ignored, as on the Messages front. |
@@ -49,14 +51,17 @@ Messages client on a ChatGPT login. What does not survive a crossing:
 | Canonical | Responses |
 |---|---|
 | `system` | `instructions` (always present on a subscription login, which requires it) |
+| a `system` message | a `developer` `message` item of `input_text` parts, in place |
 | `user` text and images | one `message` item of `input_text` and `input_image` (a base64 `data:` URL, detail `auto`) parts |
 | `assistant` text | one assistant `message` item of `output_text` parts |
 | `tool_use{id,name,input}` | `function_call{call_id: id, name, arguments: input as JSON}` |
-| `tool_result{id,content}` | `function_call_output{call_id: id, output: content}` |
+| `tool_use` of a declared `custom` tool | `custom_tool_call{call_id, name, input}`, `input` the call's string `input` argument |
+| `tool_use` of the declared `tool_search` tool | `tool_search_call{call_id, execution: client, status: completed, arguments: input}` |
+| `tool_result{id,content}` | `function_call_output{call_id: id, output: content}`, or `custom_tool_call_output` / `tool_search_output{tools: content parsed as a JSON array}` when it answers such a call |
 | `thinking` of the picked vendor whose `opaque` is a reasoning item | that `reasoning` item (`summary`, `encrypted_content`) |
 | `thinking` of another vendor, or another `opaque`; empty text | dropped |
 | `image` with `path` | `BuildError`: the gateway reads no file a client names |
-| `tools[]` | `tools[]{type: function, name, description, parameters, strict: false}`, `tool_choice: auto`, `parallel_tool_calls: true` |
+| `tools[]` | `tools[]{type: function, name, description, parameters, strict: false}`, or a tool's `native.spec` as is when its `native.api` is `openai_responses`; `tool_choice: auto`, `parallel_tool_calls: true` |
 | `max_tokens` | `max_output_tokens`, at least 16, the vendor's minimum (API key only; the subscription endpoint refuses it) |
 | `effort`, else the ladder candidate's effort | `reasoning.effort`: `low`, `medium`, `high`; `max` is `xhigh`; a candidate effort other than `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` is dropped |
 | `session_key` | `prompt_cache_key`, and the subscription mode's `session_id` header when it is visible ASCII |
@@ -94,6 +99,8 @@ Events are decoded by their `type`; unknown types (such as `codex.rate_limits`,
 | `response.output_text.delta`, `response.refusal.delta` | `text_delta` per non-empty delta; a refusal makes the stop `refusal` |
 | `response.function_call_arguments.delta` / `.done` | accumulated per item |
 | `response.output_item.done` of a `function_call` | one `tool_call{id: call_id, name, input}`; the done item's arguments win over the accumulated ones; empty arguments are `{}` |
+| `response.output_item.done` of a `custom_tool_call` | one `tool_call{id: call_id, name, input: {input: <its input>}}` |
+| `response.output_item.done` of a `tool_search_call` with `execution: client` | one `tool_call{id: call_id, name: tool_search, input: arguments}`; a `server` one, and the calls of tools the vendor runs itself (`web_search_call`, …), are skipped |
 | `response.output_item.done` of a `reasoning` item with `encrypted_content` | one `thinking{vendor, opaque}`, `opaque` = `{"type":"reasoning","summary":[…],"encrypted_content":…}` (no id, no status) |
 | `response.output_item.done` of a `message` that streamed no deltas | its text as `text_delta` |
 | `response.completed` | `usage`, then `Progress::Finished(tool_use)` when the answer has tool calls, `refusal` after a refusal, else `end` |
@@ -163,12 +170,12 @@ is the path below the vendor's base URL.
 
 | Canonical | Chat Completions |
 |---|---|
-| `system` | the first message, `{role: system, content}`; absent when empty |
+| `system` and every `system` message | the first message, `{role: system, content}`, joined by a blank line (compatible vendors differ on later system messages); absent when empty |
 | `user` message | one `tool` message per `tool_result{id,content}` (`tool_call_id: id`, `content`), then one `user` message of `text` and `image_url` parts (a base64 `data:` URL) |
 | `assistant` message | one `assistant` message: its text joined as `content` (`null` without text), `tool_calls[]{id, type: function, function{name, arguments: input as JSON}}` with the canonical id unchanged |
 | `thinking` of any vendor; empty text; images of an assistant message | dropped |
 | `image` with `path` | `BuildError` |
-| `tools[]` | `tools[]{type: function, function{name, description, parameters}}`, `tool_choice: auto` |
+| `tools[]` | `tools[]{type: function, function{name, description, parameters}}`, `tool_choice: auto`; a tool with `native` follows its `elsewhere` as on the Messages upstream (`omit` left out, `refuse` a `BuildError`) |
 | `max_tokens` | `max_tokens` |
 | (always) | `stream: true`, `stream_options.include_usage: true` |
 
@@ -400,13 +407,32 @@ tool call with its `index` from 0, its id, name and whole arguments, a last chun
 
 `responses::decode_request(body, request_id, native_vendor, route_of, default_max_tokens)`:
 
-- `model` as on the Chat front; `instructions` and `system`/`developer` messages join into
-  `system`;
+- `model` as on the Chat front; `instructions` and the `system`/`developer` messages before the
+  first other item join into `system`; a later one becomes a canonical `system` message in
+  place (Codex sends one when the sandbox or approval mode changes mid-session);
 - `input` as a string (one user message) or items: messages (with or without `type`) with
   `input_text`, `input_image` (base64 `data:` URL), `output_text` and `refusal` parts;
   `function_call` (arguments parsed as a JSON object) joins the assistant message before it,
   `function_call_output` (string or text parts) the user message after, and must answer an
-  earlier `function_call`;
+  earlier `function_call`; `custom_tool_call` is a `tool_use` with `input: {input: <text>}` and
+  `custom_tool_call_output` its result; a client `tool_search_call` is a `tool_use` of
+  `tool_search` with its arguments and `tool_search_output` its result, the loaded tools as a
+  JSON array; a `server` tool search and the calls of tools the vendor runs itself
+  (`web_search_call`, `file_search_call`, `code_interpreter_call`, `image_generation_call`,
+  `mcp_call`, `mcp_list_tools`) are dropped, since their results are already in the answer; a
+  call's `namespace` (a tool a client tool search loaded inside a namespace) joins its name as
+  `namespace/name` in the canonical form (`/` occurs in no tool name), and the Responses
+  upstream and this front's encoder split it again;
+- `tools`: a plain function tool becomes a canonical tool; every other tool, and a function
+  with fields beyond `name`, `description`, `parameters` and `strict` (`defer_loading`), keeps
+  its declaration in `native` (`api: openai_responses`) with the rule `elsewhere`: `function` for
+  functions and `custom` (offered as a function of one string `input`, the `format` grammar
+  appended to the description), `omit` for `web_search*`, `file_search`, `code_interpreter`,
+  `image_generation`, `mcp` and `tool_search` (named `tool_search`), `refuse` for any other type
+  (`local_shell`, `shell`, `computer_use_preview`, `namespace`, …). A tool without a name takes
+  its `server_label` or type, with `_2`, `_3`, … when taken; a second `tool_search` tool is
+  refused. On another vendor a client `tool_search` is left out, so tools the client keeps for
+  its search (Codex's deferred MCP tools) are not reachable there;
 - a `reasoning` item becomes canonical `thinking`: of `native_vendor` with the item's reduced form
   as `opaque`, or, when its `encrypted_content` starts with `qb-thinking:`, the vendor and payload
   that prefix wraps; a reasoning item without encrypted content cannot be passed on and is
@@ -419,8 +445,8 @@ tool call with its `index` from 0, its id, name and whole arguments, a last chun
 
 Refused with `bad_request`: `previous_response_id` and `conversation` (the gateway is stateless:
 the message says to send the whole conversation in `input`), `item_reference` items,
-`background: true`, a `text.format` other than text, tools that are not functions, item types
-other than the above, `input_image` by `file_id`, file parts, a damaged `qb-thinking:` payload,
+`background: true`, a `text.format` other than text, a tool without a type or a function
+without a name, item types other than the above, `input_image` by `file_id`, file parts, a damaged `qb-thinking:` payload,
 and a turn that fails `TurnRequest::validate`.
 
 `responses::SseEncoder` writes named events with `sequence_number` from 0:
@@ -435,7 +461,11 @@ and a turn that fails `TurnRequest::validate`.
    `reasoning_summary_part.done`), `output_item.done` with `encrypted_content`;
 4. per tool call, a `function_call` item `fc_<id>_<n>` with `call_id` = the canonical id:
    `output_item.added`, `function_call_arguments.delta` with the whole arguments,
-   `function_call_arguments.done`, `output_item.done`;
+   `function_call_arguments.done`, `output_item.done`; a call of a tool the request declared as
+   `custom` is instead a `custom_tool_call` item `ctc_<id>_<n>` (its `input` the call's string
+   `input` argument) and one of its `tool_search` tool a `tool_search_call` item `tsc_<id>_<n>`
+   (`execution: client`, `arguments` the call's input), each `output_item.added` then
+   `output_item.done` (`SseEncoder::tools`, `Assembler::tools`);
 5. `response.completed` with every item and the usage, or `response.incomplete` with
    `incomplete_details.reason` `max_output_tokens` (`max_tokens`) or `content_filter`
    (`refusal`).

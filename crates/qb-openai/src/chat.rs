@@ -168,6 +168,7 @@ fn tools(input: Vec<ChatTool>) -> Result<Vec<Tool>, GatewayError> {
             name: f.name,
             description: f.description.unwrap_or_default(),
             input_schema: f.parameters.unwrap_or_else(empty_schema),
+            native: None,
         });
     }
     Ok(tools)

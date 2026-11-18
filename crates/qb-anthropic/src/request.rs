@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use qb_proto::{Block, CacheMode, Effort, MediaType, Role, TurnRequest};
+use qb_proto::{Block, CacheMode, Effort, Elsewhere, MediaType, Role, TurnRequest};
 use serde_json::Value;
 
 use crate::wire::{
@@ -104,12 +104,19 @@ pub struct Target<'a> {
 pub enum BuildError {
     /// An image `path` the caller's loader could not turn into base64.
     Image(String),
+    /// A tool of another vendor API that this vendor cannot offer and the client cannot do
+    /// without.
+    Tool(String),
 }
 
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Image(path) => write!(f, "image `{path}` cannot be read"),
+            Self::Tool(name) => write!(
+                f,
+                "tool `{name}` is a tool of another vendor API that this vendor cannot run"
+            ),
         }
     }
 }
@@ -125,10 +132,13 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Empty text blocks, thinking blocks of another vendor and own blocks whose payload is not an
 /// Anthropic thinking block are dropped, and so is a message left without blocks. With `cache: auto`, breakpoints follow [`place_cache_breakpoints`].
 /// The `thinking` config is left out when the last assistant message calls a tool without a
-/// thinking block, a history the vendor refuses while thinking is on.
+/// thinking block, a history the vendor refuses while thinking is on. System messages stay in
+/// place where the vendor and the model take them and join the system prompt otherwise; tools
+/// of another API follow their `elsewhere`.
 ///
 /// # Errors
-/// [`BuildError::Image`] when `load` fails.
+/// [`BuildError::Image`] when `load` fails, [`BuildError::Tool`] for a tool whose `elsewhere`
+/// is `refuse`.
 pub fn build(
     req: &TurnRequest,
     at: &Target<'_>,
@@ -148,12 +158,15 @@ pub fn build(
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::System => "system",
         };
         messages.push(MessageParam {
             role: role.into(),
             content: Content::Blocks(blocks),
+            clear_at: None,
         });
     }
+    let lifted = lift_misplaced_system(&mut messages, takes_system_messages(at.model));
 
     let mut system = Vec::new();
     if at.auth == AuthMode::Oauth {
@@ -161,6 +174,22 @@ pub fn build(
     }
     if let Some(s) = req.system.as_deref().filter(|s| !s.is_empty()) {
         system.push(text_block(s));
+    }
+    system.extend(lifted.iter().map(|s| text_block(s)));
+
+    let mut tools = Vec::with_capacity(req.tools.len());
+    for t in &req.tools {
+        match t.native.as_ref().map(|n| n.elsewhere) {
+            None | Some(Elsewhere::Function) => {}
+            Some(Elsewhere::Omit) => continue,
+            Some(Elsewhere::Refuse) => return Err(BuildError::Tool(t.name.clone())),
+        }
+        tools.push(ToolParam {
+            name: t.name.clone(),
+            description: Some(t.description.clone()),
+            input_schema: t.input_schema.clone(),
+            cache_control: None,
+        });
     }
 
     let effort = req
@@ -175,16 +204,7 @@ pub fn build(
         max_tokens: req.max_tokens,
         system: (!system.is_empty()).then_some(System::Blocks(system)),
         messages,
-        tools: req
-            .tools
-            .iter()
-            .map(|t| ToolParam {
-                name: t.name.clone(),
-                description: Some(t.description.clone()),
-                input_schema: t.input_schema.clone(),
-                cache_control: None,
-            })
-            .collect(),
+        tools,
         stream: Some(true),
         thinking: thinking.then(|| ThinkingConfig {
             kind: "adaptive".into(),
@@ -200,6 +220,65 @@ pub fn build(
         place_cache_breakpoints(&mut body);
     }
     Ok(body)
+}
+
+/// Model id prefixes of the models that take mid-conversation system messages, from the vendor's
+/// list; `claude-sonnet-5` itself does not, nor do older models. Any other model gets every
+/// system message in the system prompt.
+const SYSTEM_MESSAGE_MODELS: &[&str] = &[
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+];
+
+/// Whether `model` takes mid-conversation system messages.
+pub fn takes_system_messages(model: &str) -> bool {
+    SYSTEM_MESSAGE_MODELS.iter().any(|p| model.starts_with(p))
+}
+
+/// Keeps each run of system messages where the vendor accepts one (when `in_place`), right after
+/// a `user` message and followed by an `assistant` message or the end, and takes every other run
+/// out, returning its text, in order, for the system prompt.
+fn lift_misplaced_system(messages: &mut Vec<MessageParam>, in_place: bool) -> Vec<String> {
+    let mut lifted = Vec::new();
+    let mut out: Vec<MessageParam> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    let all = std::mem::take(messages);
+    while i < all.len() {
+        if all[i].role != "system" {
+            out.push(all[i].clone());
+            i += 1;
+            continue;
+        }
+        let end = all[i..]
+            .iter()
+            .position(|m| m.role != "system")
+            .map_or(all.len(), |p| i + p);
+        let after_user = out.last().is_some_and(|m| m.role == "user");
+        let before_assistant = all.get(end).is_none_or(|m| m.role == "assistant");
+        if in_place && after_user && before_assistant {
+            out.extend_from_slice(&all[i..end]);
+        } else {
+            for m in &all[i..end] {
+                if let Content::Blocks(blocks) = &m.content {
+                    let text: Vec<&str> = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    lifted.push(text.join("\n\n"));
+                }
+            }
+        }
+        i = end;
+    }
+    *messages = out;
+    lifted
 }
 
 /// The last assistant message of `messages` calls a tool and carries no thinking block.

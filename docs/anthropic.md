@@ -23,7 +23,7 @@ value.
 | Canonical | Messages |
 |---|---|
 | `system` | a text block in `system` (absent when empty) |
-| `messages[].role` | `user`, `assistant` |
+| `messages[].role` | `user`, `assistant`, `system` (below) |
 | `text` | `text`; an empty text block is dropped |
 | `image` (`base64`) | `image` with a `base64` source |
 | `image` (`path`) | the same, with the bytes from the caller's loader; a load failure is a `BuildError` |
@@ -31,12 +31,22 @@ value.
 | `tool_result{id,content,is_error}` | `tool_result{tool_use_id,content,is_error}` |
 | `thinking{vendor,opaque}` of the picked vendor | the block whose JSON `opaque` holds (`thinking` with `signature`, or `redacted_thinking`) |
 | `thinking` of another vendor, or an `opaque` that is not such a block | dropped |
-| `tools[]` | `tools[]{name,description,input_schema}` |
+| `tools[]` | `tools[]{name,description,input_schema}`; a tool with `native` follows its `elsewhere`: `function` goes out like any tool, `omit` is left out, `refuse` is a `BuildError` |
 | `max_tokens` | `max_tokens` |
 | `effort`, else the ladder candidate's effort | `output_config.effort`; a value other than `low`, `medium`, `high`, `xhigh`, `max` is dropped |
 | — | `stream: true`; `thinking: {type: adaptive}` unless the target turns it off or the history lost its thinking (below) |
 
 A message left without blocks is dropped. The model id comes from `qbd`'s pick.
+
+A canonical `system` message is the vendor's mid-conversation system message
+(`{role: system, content: [text blocks]}`, stable in the Messages API, no beta header). The vendor
+accepts a run of them only right after a `user` message and followed by an `assistant` message
+or the end of `messages`, and only on the models it lists (ids starting with `claude-fable-5`,
+`claude-mythos-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5-5`, `claude-haiku-5-5`;
+not `claude-sonnet-5` or older models). Such a run stays in place, so the cached prefix before
+it holds. On any other model every run, and on a listed model any other run (first in the conversation, after an assistant message, before another user message)
+leaves `messages` and its text joins the system prompt as further text blocks, after the
+client's `system`, which is what a client that knows no mid-conversation messages does with it.
 
 With thinking on, the vendor refuses (400 `invalid_request_error`) a request whose last assistant
 message calls a tool without its thinking block; earlier assistant messages may lack thinking.
@@ -248,8 +258,20 @@ A client closing its connection cancels the turn and shuts the upstream connecti
   inside a tool schema or tool input is data and does not count;
 - sampling parameters, `tool_choice`, `stop_sequences` and thinking budgets are ignored; unknown
   fields are ignored;
-- documents, URL or file images, images inside tool results, roles other than `user` and
-  `assistant`, and a turn that fails `TurnRequest::validate` are `bad_request`.
+- a `system` message (Claude Code sends the turn's environment and reminders as one after the
+  last user message) becomes a canonical `system` message in place; one without content, which
+  only sets `output_config` for the turns after it, is dropped, since the request's own
+  `output_config` is what the turn uses; a per-message `output_config` is ignored;
+- every tool goes upstream loaded (`defer_loading` is not sent), so what a client's tool search
+  says about loading needs no upstream support: a `tool_reference` block (in a `tool_result` or
+  on its own) becomes the text ``Tool `<name>` is loaded.``, and a `tool_addition` or
+  `tool_removal` of a system message that names a tool by `tool_reference` is dropped (a system
+  message left without blocks with it);
+- documents, URL or file images, images inside tool results, roles other than `user`,
+  `assistant` and `system`, a system message with another block than text and tool changes by
+  reference (an inline `tool_definition` needs a beta the upstream does not send), a system
+  message with `clear_at` other than `never` (turn-scoped messages need a beta too), and a turn
+  that fails `TurnRequest::validate` are `bad_request`.
 
 `front::SseEncoder` writes canonical events as Messages SSE: `message_start` (deferred to the
 first event after `route`, so it carries the input usage), one `content_block_*` group per text

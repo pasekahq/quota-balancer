@@ -99,8 +99,15 @@ fn rejected_requests_are_bad_requests() {
         json!({"type": "url", "url": "https://example.invalid/a.png"});
     cases.push(("url image", v));
     let mut v = base.clone();
-    v["messages"][0]["role"] = json!("system");
-    cases.push(("system role", v));
+    v["messages"][0]["role"] = json!("developer");
+    cases.push(("developer role", v));
+    let mut v = base.clone();
+    v["messages"][1]["role"] = json!("system");
+    cases.push(("system message with an image", v));
+    let mut v = base.clone();
+    v["messages"][1] = json!({"role": "system", "clear_at": "next_user_message",
+                              "content": [{"type": "text", "text": "Until the next user turn."}]});
+    cases.push(("turn-scoped system message", v));
     let mut v = base.clone();
     v["messages"] = json!([]);
     cases.push(("no messages", v));
@@ -482,4 +489,121 @@ fn foreign_thinking_can_be_dropped_on_the_front() {
         matches!(&content[0], ContentBlock::RedactedThinking { data } if data.starts_with(FOREIGN_THINKING)),
         "kept by default"
     );
+}
+
+/// A request as Claude Code 2.1.327 sends it (recorded, texts and ids replaced): messages
+/// `[user, system]`, the system message with its own `output_config` and a breakpoint.
+#[test]
+fn claude_code_request_keeps_its_system_message_in_place() {
+    let got = decode_request(
+        &fixture("claude_code_cli_request.json"),
+        "msg-1",
+        VENDOR,
+        &route_of,
+    )
+    .expect("a Claude Code request decodes");
+    assert!(got.stream);
+    let t = got.turn;
+    assert_eq!(
+        t.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
+        [Role::User, Role::System]
+    );
+    assert_eq!(
+        t.messages[1].content,
+        vec![Block::Text {
+            text:
+                "# Environment\n - Primary working directory: /work/project-1\n - Platform: linux"
+                    .into()
+        }]
+    );
+    assert_eq!(t.effort, Some(Effort::Medium));
+    assert_eq!(t.cache, Some(CacheMode::Auto));
+    assert_eq!(
+        t.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        ["Bash", "Read", "DeferredToolPlaceholder"]
+    );
+    assert!(
+        t.system
+            .as_deref()
+            .is_some_and(|s| s.starts_with("x-anthropic-billing-header"))
+    );
+}
+
+#[test]
+fn a_system_message_that_only_sets_effort_is_dropped() {
+    let body = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "system", "content": [], "output_config": {"effort": "low"}},
+            {"role": "system", "content": "Be brief.", "clear_at": "never"}
+        ]
+    });
+    let got = decode_request(body.to_string().as_bytes(), "m", VENDOR, &route_of).expect("ok");
+    assert_eq!(
+        got.turn.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
+        [Role::User, Role::System]
+    );
+}
+
+/// Claude Code's own tool search answers with `tool_reference` blocks and may name loaded or
+/// unloaded tools in a system message; every tool goes upstream loaded, so both reduce to text
+/// or nothing.
+#[test]
+fn tool_references_and_tool_changes_by_reference_need_no_upstream_support() {
+    let body = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "Find the cron tool"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "ToolSearch", "input": {"query": "cron"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "tool_reference", "tool_name": "CronList"}
+                ]}
+            ]},
+            {"role": "system", "content": [
+                {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "CronList"}},
+                {"type": "tool_removal", "tool": {"type": "tool_reference", "name": "Old"}},
+                {"type": "text", "text": "CronList is available."}
+            ]}
+        ]
+    });
+    let got = decode_request(body.to_string().as_bytes(), "m", VENDOR, &route_of).expect("ok");
+    let m = &got.turn.messages;
+    assert_eq!(
+        m[2].content,
+        vec![Block::ToolResult {
+            id: "toolu_1".into(),
+            content: "Tool `CronList` is loaded.".into(),
+            is_error: None
+        }]
+    );
+    assert_eq!(m[3].role, Role::System);
+    assert_eq!(
+        m[3].content,
+        vec![Block::Text {
+            text: "CronList is available.".into()
+        }]
+    );
+
+    // A system message of tool changes only is left out.
+    let mut only = body.clone();
+    only["messages"][3]["content"] = json!([
+        {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "CronList"}}
+    ]);
+    let got = decode_request(only.to_string().as_bytes(), "m", VENDOR, &route_of).expect("ok");
+    assert_eq!(got.turn.messages.len(), 3);
+
+    // An inline definition needs a beta the upstream does not send.
+    let mut inline = body;
+    inline["messages"][3]["content"] = json!([
+        {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {"name": "x"}}}
+    ]);
+    let e = decode_request(inline.to_string().as_bytes(), "m", VENDOR, &route_of)
+        .expect_err("inline definition");
+    assert_eq!(e.class, ErrorClass::BadRequest);
 }
