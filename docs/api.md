@@ -375,6 +375,11 @@ Across vendors, on a chain step or a re-pick with `avoid_vendor`, a turn keeps t
 time), `tried` (the attempts of the turn in order, each with `vendor`, `model`, `login_label`
 and `class`) and `message` (never a credential).
 
+A login's 429 with a `retry-after` before the first event moves the turn to the next login, and
+qbd hears only the outcome. When the turn then ends with a retryable error that has no
+`retry_after` of its own, it carries the soonest such wait as `retry_after` (seconds left, at
+least 1), and its `resets_at`, if any, is no earlier than the end of that wait.
+
 | `class` | When | `retryable` |
 |---|---|---|
 | `quota_exhausted` | `qbd` answered `wait`: every candidate waits for a reset or back-off; `resets_at` is the `wait`'s `retry_after`, the nearest time one becomes usable. On a chain route: every step was spent or waiting, `resets_at` the nearest of them | true |

@@ -5718,6 +5718,14 @@ fn a_429_with_retry_after_on_a_chat_completions_login_is_rate_limited() {
     let events = events(&answer);
     let error = last_error(&events);
     assert!(error.retryable, "{error:?}");
+    // qbd's own 60 s back-off is the later reset; the vendor's 12 s still reaches the client.
+    let now = unix_now();
+    assert_eq!(error.class, ErrorClass::QuotaExhausted, "{error:?}");
+    assert!(matches!(error.retry_after, Some(11..=12)), "{error:?}");
+    assert!(
+        error.resets_at.is_some_and(|at| at >= now + 50),
+        "{error:?}"
+    );
     let tried: Vec<(Option<&str>, ErrorClass)> = error
         .tried
         .iter()
@@ -5743,6 +5751,39 @@ fn a_429_with_retry_after_on_a_chat_completions_login_is_rate_limited() {
         assert!(!logged.contains(key), "{key}: {logged}");
         assert!(!answer.contains(key), "{key}: {answer}");
     }
+}
+
+/// `answer` with its `retry-after` header set to `seconds`.
+fn retry_after(answer: Answer, seconds: &str) -> Answer {
+    let Answer::Full(status, mut headers, body) = answer else {
+        panic!("a full answer");
+    };
+    for (name, value) in &mut headers {
+        if name.eq_ignore_ascii_case("retry-after") {
+            seconds.clone_into(value);
+        }
+    }
+    Answer::Full(status, headers, body)
+}
+
+#[test]
+fn a_vendor_wait_longer_than_qbd_s_back_off_moves_the_messages_retry_after() {
+    let (r, vendor) = chat_rig(&key_files());
+    vendor.answer(retry_after(chat_recorded("429_retry"), "200"));
+    vendor.answer(retry_after(chat_recorded("429_retry"), "250"));
+    let asked = unix_now();
+    let (status, head, body) = sdk_call(&r.gw, &sdk_body("model-2025-01-01", false), None);
+    assert_eq!(status, 429, "{}", String::from_utf8_lossy(&body));
+    let (wait, should_retry) = retry_headers(&head);
+    assert!(
+        wait.is_some_and(|s| (195..=200).contains(&s)),
+        "the soonest vendor wait, not qbd's 60 s: {head}"
+    );
+    assert_eq!(should_retry, None, "{head}");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::RateLimited);
+    assert_eq!(status_of(&s, "login-2"), LoginStatus::RateLimited);
+    assert!(unix_now() - asked < 5);
 }
 
 #[test]
