@@ -243,6 +243,13 @@ is read. The socket file is
 serves only the HTTP fronts, to requests with the local client token
 ([openai.md](openai.md#serving-the-fronts)).
 
+**Connections.** The gateway serves at most `max_turns` + 2 connections at once; one more gets
+429 `overloaded` with `retry_after: 1` before its request is read. A loopback peer counts against
+that cap only once its head showed the client token (429 in its front's format when the cap is
+full then); before that it holds one of 4 slots of its own, also answered 429 when full, and must
+send its head within 2 s or is dropped without an answer. Peers without the token never hold the
+slots of the unix socket's clients.
+
 ### `POST /v1/model/turn`
 
 ```json
