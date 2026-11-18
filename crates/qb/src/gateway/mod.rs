@@ -14,6 +14,7 @@
 //! - [`chat_upstream`]: the adapter of the `chat_completions` API family;
 //! - [`oauth`]: the token refresher of `oauth_anthropic` and `chatgpt_oauth` logins;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
+//! - [`spend`]: the monthly spend count of capped logins;
 //! - [`front`]: the listeners and the C4 front;
 //! - [`answer`]: how the HTTP fronts answer a turn, SSE or one body;
 //! - [`messages`]: the Messages front;
@@ -30,5 +31,6 @@ pub mod messages;
 pub mod oauth;
 pub mod openai;
 pub mod openai_upstream;
+pub mod spend;
 pub mod upstream;
 pub mod vendor;

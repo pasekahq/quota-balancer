@@ -10,15 +10,16 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_proto::{
-    Attempt, Block, Decision, ErrorClass, GatewayError, LoginStatus, Outcome, PickRequest,
-    PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState, RouteStatus, RoutesAnswer,
-    StreamEvent, TurnRequest, WindowReport, paths,
+    Attempt, Block, Decision, ErrorClass, GatewayError, LoginSpend, LoginStatus, Outcome,
+    PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState, RouteStatus,
+    RoutesAnswer, SpendAnswer, StreamEvent, TurnRequest, Usage, WindowReport, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::creds::{CredentialStore, Refresher};
+use super::spend::{self, Ledger};
 use super::upstream::{CancelToken, Failure, FailureKind, Finished, Flow, Picked, Upstream};
 use crate::config::Error;
 use crate::sandbox::file_dir;
@@ -116,6 +117,8 @@ pub struct Gateway {
     upstreams: Upstreams,
     qbd_bearer: Option<Zeroizing<String>>,
     running: Arc<Running>,
+    /// The counts of the startup `spend_file`; every snapshot with a `spend_cap` has that file.
+    spend: Option<Mutex<Ledger>>,
 }
 
 fn bad_request(message: impl Into<String>) -> GatewayError {
@@ -175,6 +178,8 @@ fn cancelled() -> GatewayError {
 struct Relay<'e> {
     route: Option<StreamEvent>,
     emitted: bool,
+    /// The last `usage` of the attempt, whether or not it reached the client.
+    usage: Option<Usage>,
     /// The client is gone: nothing more reaches it.
     gone: bool,
     emit: &'e mut dyn FnMut(StreamEvent) -> Flow,
@@ -193,6 +198,9 @@ impl Relay<'_> {
     }
 
     fn pass(&mut self, mut event: StreamEvent, vendor: &str, cancel: &CancelToken) -> Flow {
+        if let StreamEvent::Usage { usage } = &event {
+            self.usage = Some(*usage);
+        }
         if cancel.is_cancelled() {
             return Flow::Stop;
         }
@@ -264,19 +272,33 @@ struct StateLogin {
     vendor: String,
     status: LoginStatus,
     dead_until: Option<u64>,
+    windows: Vec<StateWindow>,
+}
+
+#[derive(Deserialize)]
+struct StateWindow {
+    used: f64,
+    resets_at: Option<u64>,
 }
 
 impl Gateway {
     /// A gateway for `config` with vendor adapters `upstreams`, OAuth refreshes through
     /// `refresher` and `qbd_bearer` for qbd, if qbd knows the gateway by token.
+    ///
+    /// # Errors
+    /// The config's `spend_file` exists but cannot be read as one.
     pub fn new(
         config: GatewayConfig,
         upstreams: Upstreams,
         refresher: Box<dyn Refresher>,
         qbd_bearer: Option<Zeroizing<String>>,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let spend = match &config.spend_file {
+            Some(f) => Some(Mutex::new(Ledger::open(f, unix_now())?)),
+            None => None,
+        };
         let startup = Arc::new(sorted(config));
-        Self {
+        Ok(Self {
             config: Mutex::new(Arc::clone(&startup)),
             startup,
             reloading: Mutex::new(()),
@@ -288,7 +310,8 @@ impl Gateway {
                 admitted: AtomicU64::new(0),
                 ended: Condvar::new(),
             }),
-        }
+            spend,
+        })
     }
 
     /// The current config snapshot.
@@ -319,7 +342,14 @@ impl Gateway {
             routes: config.routes.len(),
             logins: config.logins.len(),
         };
-        *lock(&self.config) = Arc::new(config);
+        let config = Arc::new(config);
+        let old = std::mem::replace(&mut *lock(&self.config), Arc::clone(&config));
+        for login in &config.logins {
+            let before = old.login(&login.name).and_then(|l| l.spend_cap);
+            if login.spend_cap != before {
+                self.publish_spend(&login.name, login.spend_cap);
+            }
+        }
         log::info(&format!(
             "gateway: reloaded {}: {} routes, {} logins",
             self.startup.file.display(),
@@ -560,6 +590,20 @@ impl Gateway {
             Ok(r) => r,
             Err(next) => return next,
         };
+        if let Some(window) = self.over_cap(entry, now) {
+            // `error`, not `usage_limit`: qbd's exhaustion mark would outlast a reset or a raised
+            // cap, while the full spend window keeps qbd off the login until either.
+            self.report(&lease, Outcome::Error, vec![window]);
+            log::warn(&format!(
+                "gateway: turn {} on {login}: the login reached its spend cap",
+                turn.request_id
+            ));
+            let mut attempt = attempt;
+            attempt.class = ErrorClass::QuotaExhausted;
+            progress.tried.push(attempt);
+            progress.failed.push(login);
+            return Next::Retry;
+        }
         let mut refreshed = false;
         loop {
             let loaded = self.store.load(entry, now, refreshed);
@@ -600,6 +644,7 @@ impl Gateway {
                     },
                 }),
                 emitted: false,
+                usage: None,
                 gone: false,
                 emit: &mut *emit,
             };
@@ -641,12 +686,18 @@ impl Gateway {
         &self,
         turn: &Admitted,
         lease: &str,
-        result: Result<Finished, Failure>,
+        mut result: Result<Finished, Failure>,
         mut relay: Relay<'_>,
         mut attempt: Attempt,
         progress: &mut Progress,
     ) -> Next {
         let login = attempt.login_label.clone().unwrap_or_default();
+        let (cost, windows) = match &mut result {
+            Ok(done) => (done.cost, &mut done.windows),
+            Err(f) => (f.cost, &mut f.windows),
+        };
+        let usage = relay.usage.as_ref();
+        windows.extend(self.count(&turn.config, &login, &attempt.model, cost, usage));
         let failure = match result {
             Ok(done) => {
                 self.report(lease, Outcome::Ok, done.windows);
@@ -717,6 +768,126 @@ impl Gateway {
         error.tried = std::mem::take(&mut progress.tried);
         relay.send(StreamEvent::Error { error });
         Next::Done(class.as_str().to_owned())
+    }
+
+    /// The spend window of `entry` when it has a `spend_cap` and spent it by `now`.
+    fn over_cap(&self, entry: &GatewayLogin, now: u64) -> Option<WindowReport> {
+        let cap = entry.spend_cap?;
+        let window = lock(self.ledger()).window(&entry.name, cap, now);
+        (window.utilization >= 1.0).then_some(window)
+    }
+
+    /// The ledger; only called for a login with a `spend_cap`, which needs the startup file.
+    fn ledger(&self) -> &Mutex<Ledger> {
+        self.spend
+            .as_ref()
+            .expect("a config with a spend_cap has the startup spend_file")
+    }
+
+    /// Adds an attempt's cost on `login` of `config` to its count when the login has a cap: the
+    /// vendor's `cost`, else `usage` at the price of `model`. The login's spend window after it.
+    fn count(
+        &self,
+        config: &GatewayConfig,
+        login: &str,
+        model: &str,
+        cost: Option<f64>,
+        usage: Option<&Usage>,
+    ) -> Option<WindowReport> {
+        let cap = config.login(login)?.spend_cap?;
+        let mut ledger = lock(self.ledger());
+        let usd = match (cost, config.price(model)) {
+            (Some(usd), _) => usd,
+            (None, Some(price)) => usage.map_or(0.0, |u| spend::priced(u, price)),
+            (None, None) => {
+                if ledger.first_unpriced(model) {
+                    log::warn(&format!(
+                        "gateway: model `{model}` has no price and its vendor reports no cost; \
+                         turns on capped logins count nothing for it"
+                    ));
+                }
+                0.0
+            }
+        };
+        let now = unix_now();
+        if usd.is_finite() && usd > 0.0 {
+            if let Err(e) = ledger.add(login, usd, now) {
+                log::error(&format!("gateway: spend of {login}: {e}"));
+            }
+        }
+        Some(ledger.window(login, cap, now))
+    }
+
+    /// Reports the spend window of `login` under `cap` to qbd, or an empty one without a cap.
+    fn publish_spend(&self, login: &str, cap: Option<f64>) {
+        let now = unix_now();
+        let window = match cap {
+            Some(cap) => lock(self.ledger()).window(login, cap, now),
+            None => WindowReport {
+                name: spend::WINDOW.to_owned(),
+                utilization: 0.0,
+                resets_at: None,
+                length_s: None,
+            },
+        };
+        // `error` marks nothing; `ok` would also clear an auth mark of the login.
+        self.send_report(&ReportRequest {
+            lease_id: None,
+            login: Some(login.to_owned()),
+            outcome: Outcome::Error,
+            model: None,
+            windows: vec![window],
+            release: false,
+        });
+    }
+
+    /// The month's spend of each login of the current config with a `spend_cap`.
+    pub fn spend(&self) -> SpendAnswer {
+        let config = self.config();
+        let now = unix_now();
+        let logins = config
+            .logins
+            .iter()
+            .filter_map(|l| {
+                let cap = l.spend_cap?;
+                let mut ledger = lock(self.ledger());
+                Some(LoginSpend {
+                    login: l.name.clone(),
+                    spent_usd: ledger.spent(&l.name, now),
+                    cap_usd: cap,
+                    period_end: ledger.period_end(now),
+                })
+            })
+            .collect();
+        SpendAnswer { logins }
+    }
+
+    /// Sets the count of `login` to zero and tells qbd, so the login runs again.
+    ///
+    /// # Errors
+    /// `bad_request` when the current config gives `login` no `spend_cap`, `unavailable` when
+    /// the spend file cannot be written; the count is zero in memory either way.
+    pub fn reset_spend(&self, login: &str) -> Result<LoginSpend, GatewayError> {
+        let config = self.config();
+        let Some(cap) = config.login(login).and_then(|l| l.spend_cap) else {
+            return Err(bad_request(format!("login `{login}` has no spend_cap")));
+        };
+        let now = unix_now();
+        let written = lock(self.ledger()).reset(login, now);
+        self.publish_spend(login, Some(cap));
+        if let Err(e) = written {
+            log::error(&format!("gateway: spend reset of {login}: {e}"));
+            let message = format!("the count of `{login}` is zero but not saved");
+            return Err(GatewayError::new(ErrorClass::Unavailable, true, message));
+        }
+        log::info(&format!("gateway: spend of {login} reset"));
+        let period_end = lock(self.ledger()).period_end(now);
+        Ok(LoginSpend {
+            login: login.to_owned(),
+            spent_usd: 0.0,
+            cap_usd: cap,
+            period_end,
+        })
     }
 
     /// Each route alias, sorted, with the state of the logins it can run on in qbd's
@@ -892,7 +1063,8 @@ impl Gateway {
 }
 
 /// The state of the logins of `config` of `vendor`, or of all of them, in `state`: `ready` when
-/// one is usable, else `exhausted` with the nearest reset when one waits, else `unavailable`.
+/// one is usable, else `exhausted` with the nearest reset when one waits, else `unavailable`. A
+/// login with a full window waits for its reset, as qbd does not pick it before.
 fn standing(
     config: &GatewayConfig,
     state: &State,
@@ -904,7 +1076,16 @@ fn standing(
         if !ours {
             continue;
         }
+        let full = l
+            .windows
+            .iter()
+            .filter(|w| w.used >= 1.0)
+            .filter_map(|w| w.resets_at)
+            .max();
         match l.status {
+            LoginStatus::Ok | LoginStatus::Unknown | LoginStatus::AuthStale if full.is_some() => {
+                standing = (RouteState::Exhausted, nearest(standing.1, full));
+            }
             LoginStatus::Ok | LoginStatus::Unknown | LoginStatus::AuthStale => {
                 return (RouteState::Ready, None);
             }
@@ -932,8 +1113,8 @@ fn sorted(mut config: GatewayConfig) -> GatewayConfig {
 }
 
 /// The first restart-only change of `new` against the startup config `old`, naming its file
-/// and field: the listeners, the qbd connection, and a credential file outside the directories
-/// the sandbox opened at startup.
+/// and field: the listeners, the qbd connection, the spend file, and a credential file outside
+/// the directories the sandbox opened at startup.
 fn restart_only(old: &GatewayConfig, new: &GatewayConfig) -> Option<String> {
     let fail = |field: String, reason: &str| {
         let e = Error {
@@ -952,6 +1133,7 @@ fn restart_only(old: &GatewayConfig, new: &GatewayConfig) -> Option<String> {
             "qbd_bearer_file",
             old.qbd_bearer_file != new.qbd_bearer_file,
         ),
+        ("spend_file", old.spend_file != new.spend_file),
         ("fronts.listen", listen(old) != listen(new)),
     ];
     if let Some((field, _)) = changed.into_iter().find(|(_, c)| *c) {

@@ -170,6 +170,8 @@ pub struct Finished {
     pub stop: StopReason,
     /// Quota windows the vendor reported (for example in response headers), for qbd's `report`.
     pub windows: Vec<WindowReport>,
+    /// USD the vendor reported the call cost; `None` when it reports none.
+    pub cost: Option<f64>,
 }
 
 /// How a call failed, vendor-neutral. The core maps it to a qbd outcome and decides whether to
@@ -217,6 +219,8 @@ pub struct Failure {
     /// Detail for the log and the client's `error.message`; never a credential or a header
     /// value. The core still replaces the attempt's credential by `[redacted]` if it appears.
     pub message: String,
+    /// USD the vendor reported the call cost before it failed; `None` when it reports none.
+    pub cost: Option<f64>,
 }
 
 impl FailureKind {
@@ -237,12 +241,13 @@ impl FailureKind {
 }
 
 impl Failure {
-    /// A failure of `kind` without windows.
+    /// A failure of `kind` without windows or cost.
     pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             windows: Vec::new(),
             message: message.into(),
+            cost: None,
         }
     }
 }

@@ -30,12 +30,15 @@ fn kernel_abi() -> Option<ABI> {
 }
 
 #[test]
-fn gateway_may_rewrite_credentials_read_its_config_and_reach_qbd_only() {
+fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_qbd_only() {
     let dir = Path::new("/tmp").join(format!("qb-gw-sandbox-{}", std::process::id()));
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
     let credential = creds.join("login-1.json");
     std::fs::write(&credential, r#"{"type":"api_key","key":"test-token-1"}"#).unwrap();
+    let state = dir.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let spend_file = state.join("spend.json");
     let outside = dir.join("outside.txt");
     std::fs::write(&outside, "outside").unwrap();
     let qbd = dir.join("qb.sock");
@@ -48,13 +51,14 @@ fn gateway_may_rewrite_credentials_read_its_config_and_reach_qbd_only() {
     std::fs::create_dir_all(&etc).unwrap();
     let file = etc.join("gateway.toml");
     let text = format!(
-        "socket = \"{}\"\nqbd_socket = \"{}\"\n\
+        "socket = \"{}\"\nqbd_socket = \"{}\"\nspend_file = \"{}\"\n\
              [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\napi = \"anthropic\"\ncredentials = \"{}\"\n\
              [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n\
              [fronts]\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\n\
              [fronts.messages]\nvendor = \"vendor-a\"\n",
         dir.join("gw.sock").display(),
         qbd.display(),
+        spend_file.display(),
         credential.display(),
         "0".repeat(64)
     );
@@ -65,6 +69,7 @@ fn gateway_may_rewrite_credentials_read_its_config_and_reach_qbd_only() {
         assert!(abi >= Some(ABI::V4), "landlock ABI {abi:?} < V4");
     }
     let (written, unreadable) = (credential.clone(), outside.clone());
+    let counted = spend_file.clone();
     let (hardened, edit) = std::sync::mpsc::channel();
     let (edited, reload) = std::sync::mpsc::channel();
     let reread = file.clone();
@@ -79,6 +84,9 @@ fn gateway_may_rewrite_credentials_read_its_config_and_reach_qbd_only() {
         );
         assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
         qb::gateway::creds::write_atomic(&written, br#"{"type":"api_key","key":"k2"}"#).unwrap();
+        let now = qb::server::unix_now();
+        let mut ledger = qb::gateway::spend::Ledger::open(&counted, now).unwrap();
+        ledger.add("login-1", 1.5, now).unwrap();
         assert!(UnixStream::connect(&qbd).is_ok(), "qbd stays reachable");
         let (accepted, _) = tcp.accept().unwrap();
         assert_eq!(
@@ -122,5 +130,6 @@ fn gateway_may_rewrite_credentials_read_its_config_and_reach_qbd_only() {
         std::fs::read_to_string(&credential).unwrap(),
         r#"{"type":"api_key","key":"k2"}"#
     );
+    assert!(spend_file.exists(), "written in the sandbox");
     let _ = std::fs::remove_dir_all(&dir);
 }

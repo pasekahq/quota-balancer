@@ -23,7 +23,7 @@ use qb::{
     stream,
 };
 use qb_core::Core;
-use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, paths};
+use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, SpendReset, paths};
 use qb_vendors::claude::Event;
 
 const HELP: &str = "\
@@ -45,6 +45,9 @@ COMMANDS:
                                         and reporting via qbd; SIGHUP reloads its config
     reload                              POST /v1/model/reload: the gateway on --socket reads
                                         its config again; exit 1 with the reason if it refuses
+    spend                               GET /v1/model/spend: the month's spend, cap and period
+                                        end of each capped login of the gateway on --socket
+    spend reset <LOGIN>                 POST /v1/model/spend/reset: set LOGIN's count to zero
     health                              GET /v1/health
     state                               GET /v1/state
     why <LEASE>                         GET /v1/why/<LEASE>: why a live lease was granted
@@ -92,6 +95,8 @@ enum Call {
     Health,
     State,
     Reload,
+    Spend,
+    SpendReset(String),
     Why(String),
     Pick(PickRequest),
     Report(ReportRequest),
@@ -147,6 +152,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
     let mut bearer_file = None;
     let mut config = None;
     let mut operand: Option<OsString> = None;
+    let mut spend_args: Vec<OsString> = Vec::new();
     let (mut at, mut sim_pick) = (None, None);
     let mut from_stream = None;
     let mut name: Option<String> = if as_qbd {
@@ -191,6 +197,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             Value(v) if matches!(sub, Some("why" | "simulate")) && operand.is_none() => {
                 operand = Some(v);
             }
+            Value(v) if sub == Some("spend") && spend_args.len() < 2 => spend_args.push(v),
             Long("config") if matches!(sub, Some("daemon" | "simulate" | "agent" | "gateway")) => {
                 config = Some(PathBuf::from(p.value()?));
             }
@@ -245,6 +252,11 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
         Some("health") => Cmd::Call(Call::Health),
         Some("state") => Cmd::Call(Call::State),
         Some("reload") => Cmd::Call(Call::Reload),
+        Some("spend") => match spend_args.as_slice() {
+            [] => Cmd::Call(Call::Spend),
+            [verb, login] if verb == "reset" => Cmd::Call(Call::SpendReset(string(login.clone())?)),
+            _ => return Err("expected `spend` or `spend reset <LOGIN>`".into()),
+        },
         Some("version") => Cmd::Version,
         Some("why") => {
             let lease = operand.ok_or("a lease id is required")?;
@@ -337,6 +349,11 @@ fn run(args: Args) -> Result<ExitCode, String> {
                 Call::Health => send("GET", paths::HEALTH, None),
                 Call::State => send("GET", paths::STATE, None),
                 Call::Reload => send("POST", paths::MODEL_RELOAD, Some(b"")),
+                Call::Spend => send("GET", paths::MODEL_SPEND, None),
+                Call::SpendReset(login) => {
+                    let body = encode(&SpendReset { login })?;
+                    send("POST", paths::MODEL_SPEND_RESET, Some(&body))
+                }
                 Call::Why(lease) => send("GET", &format!("{}{lease}", paths::WHY), None),
                 Call::Pick(req) => send("POST", paths::PICK, Some(&encode(&req)?)),
                 Call::Report(req) => send("POST", paths::REPORT, Some(&encode(&req)?)),
@@ -479,7 +496,7 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
         (Api::ChatCompletions, Box::new(ChatCompletions::new())),
     ];
     let refresher = Box::new(OauthRefresher::new());
-    let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer);
+    let gateway = Gateway::new(config, upstreams, refresher, qbd_bearer)?;
     let Err(e) = front::serve(
         &listener,
         loopback.as_ref(),

@@ -530,6 +530,10 @@ fn error_answers_classify_by_status() {
                 retry_after: Some(12),
             },
         ),
+        (
+            "answer_429_insufficient_quota.json",
+            FailureKind::UsageLimit { resets_at: None },
+        ),
         ("answer_404_model.json", FailureKind::ModelUnavailable),
         ("chat_answer_400_model.json", FailureKind::ModelUnavailable),
         ("chat_answer_400_context.json", FailureKind::ContextTooLong),
@@ -562,6 +566,18 @@ fn error_answers_classify_by_status() {
         classify_chat_response(429, &[], b"", NOW).kind,
         FailureKind::RateLimited { retry_after: None }
     );
+    for error in [
+        json!({"code": "insufficient_quota", "message": "credit spent"}),
+        json!({"type": "insufficient_quota", "message": "credit spent"}),
+    ] {
+        let body = json!({ "error": error }).to_string();
+        let retry = [("retry-after", "30")];
+        assert_eq!(
+            classify_chat_response(429, &retry, body.as_bytes(), NOW).kind,
+            FailureKind::UsageLimit { resets_at: None },
+            "{error}"
+        );
+    }
     assert_eq!(
         classify_chat_response(413, &[], b"<html>context length</html>", NOW).kind,
         FailureKind::BadRequest,

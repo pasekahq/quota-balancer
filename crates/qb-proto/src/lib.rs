@@ -18,9 +18,9 @@ pub mod gateway;
 
 pub use gateway::{
     Attempt, Block, CacheMode, CancelAnswer, CancelRequest, Effort, ErrorClass, GatewayError,
-    MediaType, Message, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus,
-    RoutesAnswer, StopReason, StreamEvent, Thinking, Tool, ToolCall, TurnRequest, TurnRequestError,
-    Usage,
+    LoginSpend, MediaType, Message, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus,
+    RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool, ToolCall,
+    TurnRequest, TurnRequestError, Usage,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.
@@ -50,6 +50,10 @@ pub mod paths {
     pub const MODEL_CANCEL: &str = "/v1/model/cancel";
     /// Gateway, `POST`: read the gateway's config file again; only the gateway's own uid.
     pub const MODEL_RELOAD: &str = "/v1/model/reload";
+    /// Gateway, `GET`: the month's spend of each capped login; only the gateway's own uid.
+    pub const MODEL_SPEND: &str = "/v1/model/spend";
+    /// Gateway, `POST`: set a login's spend count to zero; only the gateway's own uid.
+    pub const MODEL_SPEND_RESET: &str = "/v1/model/spend/reset";
     /// Gateway, `POST`: an Anthropic Messages request, answered in the Messages format.
     pub const MESSAGES: &str = "/v1/messages";
     /// Gateway, `POST`: an OpenAI Chat Completions request, answered in that format.

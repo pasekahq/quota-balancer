@@ -627,6 +627,34 @@ pub struct ReloadAnswer {
     pub logins: usize,
 }
 
+/// The spend of one login with a `spend_cap` in the current UTC calendar month.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoginSpend {
+    /// Login name.
+    pub login: String,
+    /// USD counted this month.
+    pub spent_usd: f64,
+    /// The login's `spend_cap` in USD; at or above it the login is not called.
+    pub cap_usd: f64,
+    /// Unix time the month ends and the count starts again from zero.
+    pub period_end: u64,
+}
+
+/// `GET /v1/model/spend` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpendAnswer {
+    /// Every login of the config with a `spend_cap`, in config order.
+    pub logins: Vec<LoginSpend>,
+}
+
+/// `POST /v1/model/spend/reset` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpendReset {
+    /// The login whose count goes back to zero.
+    pub login: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

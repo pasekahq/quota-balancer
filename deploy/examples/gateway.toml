@@ -6,6 +6,8 @@ socket = "/run/user/1000/qb-gateway/gateway.sock"
 qbd_socket = "/run/qb/qb.sock"
 max_turns = 4
 max_attempts = 4
+# Counts the monthly spend of the logins with a spend_cap; only the gateway writes it.
+spend_file = "/var/lib/qb-gateway/spend.json"
 
 [[logins]]
 name = "login-1"
@@ -31,10 +33,14 @@ name = "login-3"
 kind = "chatgpt_oauth"
 credentials = "/var/lib/qb-gateway/credentials/login-3.json"
 
+# At most 50 USD per UTC calendar month; at the cap the login is not called until the next
+# month, a raised cap or `qb spend reset key-2`. The key's own qbd vendor ("vendor-c", with no
+# uncapped login) declares the window { name = "spend", length_s = 2678400, t_burn_s = 0 }.
 [[logins]]
 name = "key-2"
 kind = "api_key"
 api = "openai"
+spend_cap = 50.0
 credentials = "/var/lib/qb-gateway/credentials/key-2.json"
 
 # An OpenAI-compatible vendor's API key over Chat Completions; referer and title are
@@ -46,6 +52,7 @@ api = "chat_completions"
 base_url = "https://openrouter.ai/api/v1"
 referer = "https://app.example.com"
 title = "example-app"
+spend_cap = 20.0
 credentials = "/var/lib/qb-gateway/credentials/key-3.json"
 
 # A chain of pins tried in order: the subscription logins of vendor-a, then the OpenAI API key
@@ -79,6 +86,14 @@ model = "model-small"
 # carry no reasoning, effort or include, on every route and login that runs it.
 [openai_models."model-plain"]
 reasoning = false
+
+# USD per million tokens, for turns of capped logins whose vendor reports no cost (key-2 here;
+# key-3's vendor reports each turn's cost, which wins over a price).
+[prices."model-large"]
+input = 2.0
+output = 8.0
+cache_read = 0.5
+cache_write = 0.0
 
 # The HTTP fronts for SDK clients: the model names clients send mapped to route aliases (a model
 # equal to an alias needs no entry), the same on every front.
