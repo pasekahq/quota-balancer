@@ -145,23 +145,29 @@ impl SignIn {
                 Some(_) => format!("the token endpoint refused the code: {}", e.message),
                 None => format!("the token exchange failed: {}", e.message),
             })?;
-        let access_token = answered("access_token", Some(&tokens.access_token))?;
-        let refresh_token = answered("refresh_token", tokens.refresh_token.as_ref())?;
+        let file = self.login.credentials.as_path();
+        let visible =
+            |field: &str, value: &str| creds::visible(file, field, value).map_err(|e| e.message);
+        visible("access_token", &tokens.access_token)?;
+        let refresh_token = tokens
+            .refresh_token
+            .as_ref()
+            .ok_or("the token answer has no `refresh_token`")?;
+        visible("refresh_token", refresh_token)?;
         let account_id = if self.login.kind == CredentialKind::ChatgptOauth {
             let id = tokens
                 .id_token
                 .as_deref()
                 .and_then(|t| claimed_account(t))
                 .ok_or("the token answer has no `id_token` with a `chatgpt_account_id` claim")?;
-            answered("chatgpt_account_id", Some(&id))?;
+            visible("chatgpt_account_id", &id)?;
             Some(id)
         } else {
             None
         };
-        let file = self.login.credentials.as_path();
         let body = Written {
             kind: self.login.kind.into(),
-            access_token: Some(access_token),
+            access_token: Some(&tokens.access_token),
             refresh_token: Some(refresh_token),
             account_id: account_id.as_deref().map(String::as_str),
             expires_at: Some(tokens.expires_at),
@@ -228,17 +234,6 @@ impl SignIn {
             return Err("the pasted code is not a non-empty visible ASCII string".into());
         }
         Ok(code)
-    }
-}
-
-/// `value` of the token answer's `field`, when it is a non-empty run of visible ASCII.
-fn answered<'a>(field: &str, value: Option<&'a Zeroizing<String>>) -> Result<&'a str, String> {
-    match value {
-        None => Err(format!("the token answer has no `{field}`")),
-        Some(v) if v.is_empty() || !v.bytes().all(|b| b.is_ascii_graphic()) => Err(format!(
-            "the token answer's `{field}` is not a non-empty visible ASCII string"
-        )),
-        Some(v) => Ok(v.as_str()),
     }
 }
 

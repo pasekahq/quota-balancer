@@ -5,12 +5,12 @@
 
 mod common;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{Value, json};
 
+use common::credentials::{jwt, written};
 use common::temp_dir;
 
 /// Part of every synthetic secret; it must appear in no output.
@@ -91,38 +91,6 @@ difficulty = 1
         assert!(!text.contains(MARK), "a value leaked: {text}");
         (out.status.code().unwrap(), text)
     }
-
-    /// The written credential file of `login`, after checking it is 0600.
-    fn written(&self, login: &str) -> Value {
-        let f = self.target(login);
-        let mode = std::fs::metadata(&f).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap()
-    }
-}
-
-fn b64url(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
-        for i in 0..=chunk.len() {
-            out.push(char::from(DIGITS[(n >> (18 - 6 * i)) as usize & 63]));
-        }
-    }
-    out
-}
-
-/// An unsigned JWT with `claims`; the marker sits in its signature.
-fn jwt(claims: &Value) -> String {
-    format!(
-        "{}.{}.sig-{MARK}",
-        b64url(br#"{"alg":"none"}"#),
-        b64url(claims.to_string().as_bytes())
-    )
 }
 
 fn account_claims(account: &str) -> Value {
@@ -157,7 +125,7 @@ fn hermes_pool() -> String {
             "openai-codex": [
                 {
                     "id": "c0dex1", "label": "codex", "auth_type": "oauth",
-                    "access_token": jwt(&account_claims(&format!("acct-{MARK}"))),
+                    "access_token": jwt(&account_claims(&format!("acct-{MARK}")), MARK),
                     "refresh_token": format!("rt-{MARK}"),
                     "expires_at": "2027-01-15T09:00:00.123456+01:00",
                     "extra_field": format!("x-{MARK}")
@@ -186,7 +154,7 @@ fn a_hermes_anthropic_oauth_entry_becomes_an_oauth_anthropic_file_with_a_warning
     );
     assert_eq!(code, 0, "{out}");
     assert_eq!(
-        s.written("login-oauth"),
+        written(&s.target("login-oauth")),
         json!({
             "type": "oauth_anthropic",
             "access_token": format!("sk-ant-oat-{MARK}"),
@@ -212,7 +180,7 @@ fn a_hermes_codex_entry_takes_its_account_from_the_token_claims_and_its_iso_expi
         &["--from", "hermes", "--provider", "openai-codex"],
     );
     assert_eq!(code, 0, "{out}");
-    let written = s.written("login-chatgpt");
+    let written = written(&s.target("login-chatgpt"));
     assert_eq!(written["type"], "chatgpt_oauth");
     assert_eq!(written["account_id"], format!("acct-{MARK}"));
     assert_eq!(written["refresh_token"], format!("rt-{MARK}"));
@@ -238,7 +206,7 @@ fn a_hermes_api_key_entry_becomes_an_api_key_file_without_a_warning() {
     );
     assert_eq!(code, 0, "{out}");
     assert_eq!(
-        s.written("login-key"),
+        written(&s.target("login-key")),
         json!({"type": "api_key", "key": format!("sk-ant-api-{MARK}")})
     );
     assert!(!out.contains("refresh token"), "{out}");
@@ -261,7 +229,7 @@ fn claude_code_credentials_become_an_oauth_anthropic_file() {
     let (code, out) = s.import("login-oauth", &src, &["--from", "claude-code"]);
     assert_eq!(code, 0, "{out}");
     assert_eq!(
-        s.written("login-oauth"),
+        written(&s.target("login-oauth")),
         json!({
             "type": "oauth_anthropic",
             "access_token": format!("at-{MARK}"),
@@ -276,7 +244,10 @@ fn claude_code_credentials_become_an_oauth_anthropic_file() {
 fn codex_tokens_take_the_account_id_or_else_the_id_token_claim() {
     for (account_id, id_token) in [
         (Some(format!("acct-{MARK}")), None),
-        (None, Some(jwt(&account_claims(&format!("acct-{MARK}"))))),
+        (
+            None,
+            Some(jwt(&account_claims(&format!("acct-{MARK}")), MARK)),
+        ),
     ] {
         let s = Setup::new();
         let src = s.source(
@@ -296,7 +267,7 @@ fn codex_tokens_take_the_account_id_or_else_the_id_token_claim() {
         let (code, out) = s.import("login-chatgpt", &src, &["--from", "codex"]);
         assert_eq!(code, 0, "{out}");
         assert_eq!(
-            s.written("login-chatgpt"),
+            written(&s.target("login-chatgpt")),
             json!({
                 "type": "chatgpt_oauth",
                 "access_token": format!("at-{MARK}"),
@@ -320,7 +291,7 @@ fn an_env_variable_becomes_an_api_key_file() {
     let (code, out) = s.import("login-key", &src, &["--from", "env", "--var", "VENDOR_KEY"]);
     assert_eq!(code, 0, "{out}");
     assert_eq!(
-        s.written("login-key"),
+        written(&s.target("login-key")),
         json!({"type": "api_key", "key": format!("sk-{MARK}")})
     );
     assert!(!out.contains("refresh token"), "{out}");
@@ -339,7 +310,7 @@ fn an_existing_file_is_replaced_only_with_force() {
     assert_eq!(std::fs::read_to_string(s.target("login-key")).unwrap(), old);
     let (code, out) = s.import("login-key", &src, &[&args[..], &["--force"]].concat());
     assert_eq!(code, 0, "{out}");
-    assert_eq!(s.written("login-key")["key"], format!("sk-{MARK}"));
+    assert_eq!(written(&s.target("login-key"))["key"], format!("sk-{MARK}"));
 }
 
 /// One refused import: the login, the source, the arguments, the exit code and a part of the
@@ -458,7 +429,7 @@ fn malformed_claude_code_and_codex_sources_are_refused_by_field() {
                     "codex.json",
                     &json!({"tokens": {
                         "access_token": format!("at-{MARK}"),
-                        "id_token": jwt(&json!({"sub": MARK})),
+                        "id_token": jwt(&json!({"sub": MARK}), MARK),
                     }})
                     .to_string(),
                 ),

@@ -7,7 +7,6 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -18,6 +17,7 @@ use qb::gateway::signin::SignIn;
 use qb::gateway::upstream::Credential;
 use serde_json::{Value, json};
 
+use common::credentials::{jwt, written};
 use common::temp_dir;
 use common::vendor::{Answer, Vendor};
 
@@ -129,14 +129,6 @@ difficulty = 1
         (signin, url)
     }
 
-    /// The written credential file of `login`, after checking it is 0600.
-    fn written(&self, login: &str) -> Value {
-        let f = self.target(login);
-        let mode = std::fs::metadata(&f).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap()
-    }
-
     fn assert_nothing_written(&self) {
         let left: Vec<_> = std::fs::read_dir(self.dir.join("creds")).unwrap().collect();
         assert!(left.is_empty(), "a refused sign-in wrote {left:?}");
@@ -190,30 +182,6 @@ fn s256(verifier: &str) -> String {
         .output()
         .unwrap();
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
-
-fn b64url(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
-        for i in 0..=chunk.len() {
-            out.push(char::from(DIGITS[(n >> (18 - 6 * i)) as usize & 63]));
-        }
-    }
-    out
-}
-
-/// An unsigned JWT with `claims`; the marker sits in its signature.
-fn jwt(claims: &Value) -> String {
-    format!(
-        "{}.{}.sig-{MARK}",
-        b64url(br#"{"alg":"none"}"#),
-        b64url(claims.to_string().as_bytes())
-    )
 }
 
 fn json_answer(status: u16, body: &Value) -> Answer {
@@ -394,7 +362,7 @@ fn an_anthropic_code_is_exchanged_as_json_with_the_verifier_and_written_with_its
             s.target("login-oauth").display()
         )
     );
-    let written = s.written("login-oauth");
+    let written = written(&s.target("login-oauth"));
     assert_eq!(written["type"], "oauth_anthropic");
     assert_eq!(written["access_token"], format!("sk-ant-oat-{MARK}"));
     assert_eq!(written["refresh_token"], format!("sk-ant-ort-{MARK}"));
@@ -427,11 +395,14 @@ fn an_anthropic_code_is_exchanged_as_json_with_the_verifier_and_written_with_its
 fn a_chatgpt_redirect_is_exchanged_as_a_form_and_takes_the_account_from_the_id_token() {
     let tokens = Vendor::start();
     let s = Setup::new(Some(&format!("{}/oauth/token", tokens.base_url)));
-    let id_token = jwt(&json!({
-        "exp": 1_900_000_100_u64, "email": MARK,
-        "https://api.openai.com/auth": {"chatgpt_account_id": format!("acct-{MARK}")}
-    }));
-    let access = jwt(&json!({"exp": 1_900_000_200_u64}));
+    let id_token = jwt(
+        &json!({
+            "exp": 1_900_000_100_u64, "email": MARK,
+            "https://api.openai.com/auth": {"chatgpt_account_id": format!("acct-{MARK}")}
+        }),
+        MARK,
+    );
+    let access = jwt(&json!({"exp": 1_900_000_200_u64}), MARK);
     tokens.answer(json_answer(
         200,
         &json!({
@@ -453,7 +424,7 @@ fn a_chatgpt_redirect_is_exchanged_as_a_form_and_takes_the_account_from_the_id_t
         )
     );
     assert_eq!(
-        s.written("login-chatgpt"),
+        written(&s.target("login-chatgpt")),
         json!({
             "type": "chatgpt_oauth", "access_token": access, "refresh_token": format!("rt-{MARK}"),
             "account_id": format!("acct-{MARK}"), "expires_at": 1_900_000_100_u64,
@@ -570,7 +541,7 @@ fn refused_and_failed_exchanges_write_nothing_and_name_no_value() {
                 200,
                 &json!({
                     "access_token": format!("at-{MARK}"), "refresh_token": format!("rt-{MARK}"),
-                    "expires_in": 3600, "id_token": jwt(&json!({"email": MARK})),
+                    "expires_in": 3600, "id_token": jwt(&json!({"email": MARK}), MARK),
                 }),
             )),
             |state| chatgpt_redirect(&format!("code-{MARK}"), state),
@@ -621,7 +592,10 @@ fn a_paste_with_another_state_or_without_a_code_is_refused_before_any_request() 
 fn the_gateway_serves_the_credential_a_sign_in_wrote() {
     let tokens = Vendor::start();
     let s = Setup::new(Some(&format!("{}/token", tokens.base_url)));
-    let id_token = jwt(&json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-1"}}));
+    let id_token = jwt(
+        &json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-1"}}),
+        MARK,
+    );
     tokens.answer(json_answer(
         200,
         &json!({"access_token": "at-1", "refresh_token": "rt-1", "id_token": id_token, "expires_in": 3600}),

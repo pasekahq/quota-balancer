@@ -253,8 +253,10 @@ and `qbd` ladder, invisible to clients. The rules for users are in the README's
 ## Consequences
 
 - `qb` carries model traffic when the gateway runs, and the gateway holds, reads and refreshes
-  tokens. README, `docs/design.md` and AGENTS.md rules 3 and 6 name it as the second component
-  allowed outbound connections and credential access, and the only one that writes credentials.
+  tokens. README, `docs/design.md` and AGENTS.md rules 3 and 6 name it among the components
+  allowed outbound connections and credential access, and as the only long-running one that
+  writes credentials; the operator commands `qb login import` and `qb login` each write one
+  login's credential file.
 - `qbd`'s guarantees hold unchanged; a deployment without the gateway is what it was.
 - A compromised gateway has its owner's credentials and outbound port 443; landlock bounds files
   and ports, not destinations.
