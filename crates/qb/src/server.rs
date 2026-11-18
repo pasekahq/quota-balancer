@@ -470,6 +470,10 @@ mod tests {
             "the back-off ends before the probe timeout would have"
         );
         let logins = ["login-1".to_owned()];
-        assert_eq!(core.probe_next("agent-2", &logins, NOW), None, "backing off");
+        assert_eq!(
+            core.probe_next("agent-2", &logins, NOW),
+            None,
+            "backing off"
+        );
     }
 }

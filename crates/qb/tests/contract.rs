@@ -1598,6 +1598,31 @@ fn stale_and_foreign_probe_results_change_nothing() {
     assert_eq!(status, 404, "an answered probe is gone");
 }
 
+#[test]
+fn a_failed_probe_result_is_logged_with_its_login_and_outcome() {
+    let dir = temp_dir("probelog");
+    let sock = dir.join("qb.sock");
+    let mut d = start_with(&agent_config(&dir, &[probe_on()]), &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    pick_worker(&sock);
+    let (status, resp) = next_now(&sock, None, &["login-1"]);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    let job: AgentJob = serde_json::from_slice(&resp).unwrap();
+    let body = format!(
+        r#"{{"probe_id":"{}","outcome":"http_429","retry_after_s":120}}"#,
+        job.probe_id
+    );
+    let (status, resp) = result(&sock, None, &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&resp));
+    let line = line_with(&lines, "probe of login-1 by ", Duration::from_secs(10));
+    let line = line.expect("a warning about the failed probe");
+    assert!(line.starts_with("<4>"), "{line}");
+    assert!(
+        line.ends_with("failed: http_429, retry after 120 s"),
+        "{line}"
+    );
+}
+
 fn status_of(sock: &Path, login: &str) -> LoginStatus {
     state(sock)
         .logins
