@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used)]
 
 use qb_proto::{
-    Block, CancelAnswer, CancelRequest, ErrorClass, GatewayError, Message, ReloadAnswer, Role,
-    RouteState, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest,
+    Block, CancelAnswer, CancelRequest, Elsewhere, ErrorClass, GatewayError, Message, ReloadAnswer,
+    Role, RouteState, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -59,6 +59,17 @@ fn turn_requests() {
     let min: TurnRequest = roundtrip("gateway_turn_request_minimal.json");
     assert_eq!(min.validate(), Ok(()));
     assert_eq!(min.route, "compact");
+    let native: TurnRequest = roundtrip("gateway_turn_request_native.json");
+    assert_eq!(native.validate(), Ok(()));
+    assert_eq!(native.messages[1].role, Role::System);
+    assert_eq!(
+        native
+            .tools
+            .iter()
+            .map(|t| t.native.as_ref().map(|n| n.elsewhere))
+            .collect::<Vec<_>>(),
+        [Some(Elsewhere::Function), Some(Elsewhere::Omit)]
+    );
 }
 
 #[test]
@@ -237,4 +248,25 @@ fn openapi_enums_match_the_types() {
     assert_eq!(schema("StopReason"), names(&stops));
     let states = [R::Ready, R::Degraded, R::Exhausted, R::Unavailable];
     assert_eq!(schema("RouteState"), names(&states));
+    assert_eq!(
+        schema("Role"),
+        names(&[Role::User, Role::Assistant, Role::System])
+    );
+    let tool: Value = doc["components"]["schemas"]["NativeTool"]["properties"].clone();
+    let listed = |field: &str| -> Vec<String> {
+        tool[field]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        listed("elsewhere"),
+        names(&[Elsewhere::Function, Elsewhere::Omit, Elsewhere::Refuse])
+    );
+    assert_eq!(
+        listed("api"),
+        names(&[qb_proto::NativeApi::OpenaiResponses])
+    );
 }

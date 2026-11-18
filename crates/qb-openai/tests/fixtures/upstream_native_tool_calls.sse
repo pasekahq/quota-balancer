@@ -1,0 +1,36 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_7","object":"response","created_at":1800000000,"status":"in_progress","model":"model-o","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"ws_test_1","type":"web_search_call","status":"in_progress"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"id":"ws_test_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"lark grammar"}}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":3,"output_index":1,"item":{"id":"ctc_test_1","type":"custom_tool_call","status":"in_progress","call_id":"call_p1","name":"apply_patch","input":""}}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":4,"output_index":1,"item_id":"ctc_test_1","delta":"*** Begin Patch\n"}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":5,"output_index":1,"item_id":"ctc_test_1","delta":"*** End Patch\n"}
+
+event: response.custom_tool_call_input.done
+data: {"type":"response.custom_tool_call_input.done","sequence_number":6,"output_index":1,"item_id":"ctc_test_1","input":"*** Begin Patch\n*** End Patch\n"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":7,"output_index":1,"item":{"id":"ctc_test_1","type":"custom_tool_call","status":"completed","call_id":"call_p1","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":8,"output_index":2,"item":{"id":"tsc_test_1","type":"tool_search_call","status":"in_progress","execution":"client","call_id":"call_s1","arguments":{}}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":9,"output_index":2,"item":{"id":"tsc_test_1","type":"tool_search_call","status":"completed","execution":"client","call_id":"call_s1","arguments":{"query":"calendar"}}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":10,"output_index":3,"item":{"id":"tsc_test_2","type":"tool_search_call","status":"completed","execution":"server","call_id":null,"arguments":{"paths":["crm"]}}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":11,"response":{"id":"resp_test_7","object":"response","created_at":1800000000,"status":"completed","model":"model-o","output":[],"usage":{"input_tokens":500,"input_tokens_details":{"cached_tokens":0},"output_tokens":60,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":560}}}
+

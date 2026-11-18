@@ -309,10 +309,11 @@
       },
       "Role": {
         "type": "string",
-        "description": "Author of a message; tool results travel in `user` messages.",
+        "description": "Author of a message; tool results travel in `user` messages. A `system` message holds text blocks only: an instruction from that point of the conversation on, which an upstream that cannot place it there adds to the system prompt.",
         "enum": [
           "user",
-          "assistant"
+          "assistant",
+          "system"
         ]
       },
       "Message": {
@@ -538,12 +539,46 @@
           "input_schema": {
             "type": "object",
             "description": "JSON Schema of the tool arguments."
+          },
+          "native": {
+            "$ref": "#/components/schemas/NativeTool"
           }
         },
         "required": [
           "name",
           "description",
           "input_schema"
+        ],
+        "additionalProperties": false
+      },
+      "NativeTool": {
+        "type": "object",
+        "description": "The tool as the client declared it in a vendor API, when it is not a plain function tool there. An upstream of that API sends `spec` as is; another follows `elsewhere`.",
+        "properties": {
+          "api": {
+            "type": "string",
+            "enum": [
+              "openai_responses"
+            ]
+          },
+          "spec": {
+            "type": "object",
+            "description": "The declaration as the client sent it."
+          },
+          "elsewhere": {
+            "type": "string",
+            "description": "`function`: offer it as a function tool of name, description and input_schema; `omit`: leave it out; `refuse`: fail the attempt with bad_request.",
+            "enum": [
+              "function",
+              "omit",
+              "refuse"
+            ]
+          }
+        },
+        "required": [
+          "api",
+          "spec",
+          "elsewhere"
         ],
         "additionalProperties": false
       },

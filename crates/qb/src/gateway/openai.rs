@@ -148,9 +148,11 @@ pub(super) fn responses_turn(
     drop(body);
     let vendor = &front.vendor;
     let answer = if req.stream {
-        Answer::Stream(responses::SseEncoder::new(&id, &req.model, now, vendor))
+        Answer::Stream(
+            responses::SseEncoder::new(&id, &req.model, now, vendor).tools(&req.turn.tools),
+        )
     } else {
-        Answer::Body(responses::Assembler::new(&id, &req.model, now, vendor))
+        Answer::Body(responses::Assembler::new(&id, &req.model, now, vendor).tools(&req.turn.tools))
     };
     answer::serve(
         stream,

@@ -57,6 +57,7 @@ fn turn() -> TurnRequest {
             name: "read".into(),
             description: "Read a file.".into(),
             input_schema: Object::new(),
+            native: None,
         }],
         max_tokens: 1024,
         effort: Some(Effort::Max),

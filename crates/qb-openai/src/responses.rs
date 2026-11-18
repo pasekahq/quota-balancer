@@ -6,8 +6,8 @@
 //! refused, and reasoning travels in the client's history as `encrypted_content`.
 
 use qb_proto::{
-    Block, CacheMode, ErrorClass, GatewayError, Message, Role, StopReason, StreamEvent, Thinking,
-    Tool, TurnRequest, Usage,
+    Block, CacheMode, Elsewhere, ErrorClass, GatewayError, Message, NativeApi, NativeTool, Object,
+    Role, StopReason, StreamEvent, Thinking, Tool, TurnRequest, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +17,10 @@ use crate::front::{
     FOREIGN_THINKING, ForeignThinking, FrontRequest, bad, check_tool_choice, effort, error_kind,
     image, join_system, push_message, responses_usage, session_key,
 };
-use crate::request::{output_text, reasoning_from_opaque, reasoning_to_opaque};
+use crate::request::{
+    CUSTOM_INPUT, TOOL_SEARCH, custom_input, native_kind, output_text, reasoning_from_opaque,
+    reasoning_to_opaque,
+};
 use crate::sse;
 use crate::wire::{
     Content, CreateResponse, IncompleteDetails, Input, Item, Part, ResponseError, ResponseEvent,
@@ -122,7 +125,15 @@ fn conversation(
                     .content
                     .ok_or_else(|| bad(format!("`{at}.content` is missing")))?;
                 match role {
-                    "system" | "developer" => system.push(text_of(content, &at)?),
+                    "system" | "developer" if messages.is_empty() => {
+                        system.push(text_of(content, &at)?);
+                    }
+                    "system" | "developer" => {
+                        let text = text_of(content, &at)?;
+                        if !text.is_empty() {
+                            push_message(&mut messages, Role::System, vec![Block::Text { text }]);
+                        }
+                    }
                     "user" => {
                         let blocks = user_blocks(content, &at)?;
                         push_message(&mut messages, Role::User, blocks);
@@ -140,30 +151,34 @@ fn conversation(
                     other => return Err(bad(format!("`{at}.role` `{other}` is not supported"))),
                 }
             }
-            "function_call" => {
-                let (Some(id), Some(name)) = (item.call_id, item.name) else {
-                    return Err(bad(format!("`{at}` needs call_id and name")));
-                };
-                let input = arguments(item.arguments.as_deref().unwrap_or_default(), &at)?;
-                calls.push(id.clone());
-                push_message(
-                    &mut messages,
-                    Role::Assistant,
-                    vec![Block::ToolUse { id, name, input }],
-                );
+            // A search the vendor ran itself leaves nothing for the client to answer.
+            "tool_search_call" | "tool_search_output"
+                if item.execution.as_deref() == Some("server") => {}
+            // Calls of tools the vendor runs itself: their results are already in the answer
+            // that follows, and the vendor needs no record of them.
+            kind if HOSTED_CALLS.contains(&kind) => {}
+            kind @ ("function_call" | "custom_tool_call" | "tool_search_call") => {
+                let kind = kind.to_owned();
+                let block = call_of(&kind, item, &at)?;
+                if let Block::ToolUse { id, .. } = &block {
+                    calls.push(id.clone());
+                }
+                push_message(&mut messages, Role::Assistant, vec![block]);
             }
-            "function_call_output" => {
+            "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
                 let id = item
                     .call_id
+                    .clone()
                     .ok_or_else(|| bad(format!("`{at}.call_id` is missing")))?;
                 if !calls.contains(&id) {
                     return Err(bad(format!(
-                        "`{at}` answers call `{id}`, which no earlier function_call made"
+                        "`{at}` answers call `{id}`, which no earlier call item made"
                     )));
                 }
-                let content = match item.output {
-                    None => String::new(),
-                    Some(c) => text_of(c, &at)?,
+                let content = match (item.output, item.tools) {
+                    (_, Some(tools)) => Value::Array(tools).to_string(),
+                    (None, None) => String::new(),
+                    (Some(c), None) => text_of(c, &at)?,
                 };
                 push_message(
                     &mut messages,
@@ -192,19 +207,172 @@ fn conversation(
     Ok((system, messages))
 }
 
-fn tools(input: Vec<ResponseTool>) -> Result<Vec<Tool>, GatewayError> {
-    let mut tools = Vec::with_capacity(input.len());
-    for (i, t) in input.into_iter().enumerate() {
-        let (true, Some(name)) = (t.kind == "function", t.name) else {
-            return Err(bad(format!("`tools[{i}]` is not a function tool")));
+/// The `tool_use` of a call item: a `function_call` with its arguments, a `custom_tool_call`
+/// with `{input: <text>}`, a client `tool_search_call` of [`TOOL_SEARCH`] with its arguments.
+fn call_of(kind: &str, item: Item, at: &str) -> Result<Block, GatewayError> {
+    let id = item
+        .call_id
+        .clone()
+        .ok_or_else(|| bad(format!("`{at}.call_id` is missing")))?;
+    let name = match kind {
+        "tool_search_call" => TOOL_SEARCH.to_owned(),
+        _ => item
+            .name
+            .clone()
+            .ok_or_else(|| bad(format!("`{at}` needs call_id and name")))?,
+    };
+    let input = match (kind, item.arguments) {
+        ("custom_tool_call", _) => {
+            let mut input = Object::new();
+            input.insert(
+                CUSTOM_INPUT.into(),
+                Value::String(item.input.unwrap_or_default()),
+            );
+            input
+        }
+        ("tool_search_call", None | Some(Value::Null)) => Object::new(),
+        (_, Some(Value::Object(m))) => m,
+        (_, Some(Value::String(s))) => arguments(&s, at)?,
+        (_, None) => arguments("", at)?,
+        (_, Some(_)) => return Err(bad(format!("`{at}.arguments` is not an object"))),
+    };
+    Ok(Block::ToolUse { id, name, input })
+}
+
+/// Output item types of tools the vendor runs itself, dropped from a client's history.
+const HOSTED_CALLS: &[&str] = &[
+    "web_search_call",
+    "file_search_call",
+    "code_interpreter_call",
+    "image_generation_call",
+    "mcp_call",
+    "mcp_list_tools",
+];
+
+/// Tool types the vendor runs itself, or that only extend the toolset; another vendor leaves
+/// them out.
+const OMIT_ELSEWHERE: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "web_search_2025_08_26",
+    "web_search_preview_2025_03_11",
+    "file_search",
+    "code_interpreter",
+    "image_generation",
+    "mcp",
+    "tool_search",
+];
+
+/// Fields of a function tool that the canonical tool carries; a function tool with any other
+/// field (`defer_loading`, …) keeps its declaration for a Responses upstream.
+const FUNCTION_FIELDS: &[&str] = &["type", "name", "description", "parameters", "strict"];
+
+/// The canonical tools of a request. Function tools become plain tools. Every other type keeps
+/// its declaration for a Responses upstream; elsewhere a `custom` tool becomes a function of
+/// one string argument `input`, the types in [`OMIT_ELSEWHERE`] are left out, and the rest fail
+/// the attempt.
+fn tools(input: Vec<Value>) -> Result<Vec<Tool>, GatewayError> {
+    let mut tools: Vec<Tool> = Vec::with_capacity(input.len());
+    for (i, raw) in input.into_iter().enumerate() {
+        let Value::Object(spec) = raw else {
+            return Err(bad(format!("`tools[{i}]` is not an object")));
         };
-        tools.push(Tool {
-            name,
-            description: t.description.unwrap_or_default(),
-            input_schema: t.parameters.unwrap_or_else(empty_schema),
-        });
+        let kind = spec
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let text = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_owned);
+        let native = |spec: Object, elsewhere| {
+            Some(NativeTool {
+                api: NativeApi::OpenaiResponses,
+                spec,
+                elsewhere,
+            })
+        };
+        let tool = match kind.as_str() {
+            "function" => {
+                let t: ResponseTool = serde_json::from_value(Value::Object(spec.clone()))
+                    .map_err(|e| bad(format!("`tools[{i}]` is not a function tool: {e}")))?;
+                let Some(name) = t.name else {
+                    return Err(bad(format!("`tools[{i}]` needs a name")));
+                };
+                let plain = spec.keys().all(|k| FUNCTION_FIELDS.contains(&k.as_str()));
+                Tool {
+                    name,
+                    description: t.description.unwrap_or_default(),
+                    input_schema: t.parameters.unwrap_or_else(empty_schema),
+                    native: if plain {
+                        None
+                    } else {
+                        native(spec, Elsewhere::Function)
+                    },
+                }
+            }
+            "custom" => {
+                let Some(name) = text("name") else {
+                    return Err(bad(format!("`tools[{i}]` needs a name")));
+                };
+                let mut description = text("description").unwrap_or_default();
+                if let Some(format) = spec.get("format").filter(|f| !f.is_null()) {
+                    description.push_str("\n\nThe `");
+                    description.push_str(CUSTOM_INPUT);
+                    description.push_str("` argument is free text in this format: ");
+                    description.push_str(&format.to_string());
+                }
+                Tool {
+                    name,
+                    description,
+                    input_schema: custom_schema(),
+                    native: native(spec, Elsewhere::Function),
+                }
+            }
+            "" => return Err(bad(format!("`tools[{i}]` has no type"))),
+            other => {
+                let elsewhere = if OMIT_ELSEWHERE.contains(&other) {
+                    Elsewhere::Omit
+                } else {
+                    Elsewhere::Refuse
+                };
+                let base = if other == "tool_search" {
+                    TOOL_SEARCH.to_owned()
+                } else {
+                    text("name")
+                        .or_else(|| text("server_label"))
+                        .unwrap_or_else(|| other.to_owned())
+                };
+                let mut name = base.clone();
+                let mut n = 2;
+                while tools.iter().any(|t| t.name == name) {
+                    name = format!("{base}_{n}");
+                    n += 1;
+                }
+                Tool {
+                    name,
+                    description: text("description").unwrap_or_default(),
+                    input_schema: match spec.get("parameters") {
+                        Some(Value::Object(p)) => p.clone(),
+                        _ => empty_schema(),
+                    },
+                    native: native(spec, elsewhere),
+                }
+            }
+        };
+        tools.push(tool);
     }
     Ok(tools)
+}
+
+/// The arguments of a `custom` tool offered as a function: one free-text string.
+fn custom_schema() -> Object {
+    let mut schema = Object::new();
+    schema.insert("type".into(), "object".into());
+    schema.insert(
+        "properties".into(),
+        serde_json::json!({ CUSTOM_INPUT: {"type": "string"} }),
+    );
+    schema.insert("required".into(), serde_json::json!([CUSTOM_INPUT]));
+    schema
 }
 
 fn reject_unsupported(req: &CreateResponse) -> Result<(), GatewayError> {
@@ -357,6 +525,8 @@ pub struct SseEncoder {
     text: Option<OpenText>,
     usage: Usage,
     done: bool,
+    /// Names of the request's `custom` and `tool_search` tools, with that type.
+    native: Vec<(String, String)>,
 }
 
 impl SseEncoder {
@@ -376,7 +546,22 @@ impl SseEncoder {
             text: None,
             usage: Usage::default(),
             done: false,
+            native: Vec::new(),
         }
+    }
+
+    /// The encoder for a request of `tools`: calls of a `custom` or `tool_search` tool go out
+    /// as that tool's item type, not as `function_call`.
+    #[must_use]
+    pub fn tools(mut self, tools: &[Tool]) -> Self {
+        self.native = tools
+            .iter()
+            .filter_map(|t| {
+                let kind = native_kind(t).filter(|k| matches!(*k, "custom" | "tool_search"))?;
+                Some((t.name.clone(), kind.to_owned()))
+            })
+            .collect();
+        self
     }
 
     /// The encoder with `policy` for thinking of other vendors.
@@ -660,6 +845,48 @@ impl SseEncoder {
     fn tool_call(&mut self, call: &qb_proto::ToolCall, out: &mut Vec<u8>) {
         self.start(out);
         self.close_text(out);
+        let kind = self
+            .native
+            .iter()
+            .find(|(n, _)| *n == call.name)
+            .map(|(_, k)| k.clone());
+        match kind.as_deref() {
+            Some("custom") => {
+                let id = self.item_id("ctc");
+                let item = |status: &str, input: &str| Item {
+                    kind: Some("custom_tool_call".into()),
+                    id: Some(id.clone()),
+                    status: Some(status.into()),
+                    call_id: Some(call.id.clone()),
+                    name: Some(call.name.clone()),
+                    input: Some(input.into()),
+                    ..Item::default()
+                };
+                let (added, done) = (
+                    item("in_progress", ""),
+                    item("completed", &custom_input(&call.input)),
+                );
+                return self.whole_item(added, done, out);
+            }
+            Some("tool_search") => {
+                let id = self.item_id("tsc");
+                let item = |status: &str, arguments: Object| Item {
+                    kind: Some("tool_search_call".into()),
+                    id: Some(id.clone()),
+                    status: Some(status.into()),
+                    call_id: Some(call.id.clone()),
+                    execution: Some("client".into()),
+                    arguments: Some(Value::Object(arguments)),
+                    ..Item::default()
+                };
+                let (added, done) = (
+                    item("in_progress", Object::new()),
+                    item("completed", call.input.clone()),
+                );
+                return self.whole_item(added, done, out);
+            }
+            _ => {}
+        }
         let index = self.next_index();
         let id = self.item_id("fc");
         let args = Value::Object(call.input.clone()).to_string();
@@ -669,7 +896,7 @@ impl SseEncoder {
             status: Some(status.into()),
             call_id: Some(call.id.clone()),
             name: Some(call.name.clone()),
-            arguments: Some(arguments.into()),
+            arguments: Some(Value::String(arguments.into())),
             ..Item::default()
         };
         self.emit(
@@ -696,6 +923,19 @@ impl SseEncoder {
             out,
         );
         let done = item("completed", &args);
+        self.emit(
+            item_event(event::OUTPUT_ITEM_DONE, index, done.clone()),
+            out,
+        );
+        self.items.push(done);
+    }
+}
+
+impl SseEncoder {
+    /// One output item without deltas: `output_item.added`, then `output_item.done`.
+    fn whole_item(&mut self, added: Item, done: Item, out: &mut Vec<u8>) {
+        let index = self.next_index();
+        self.emit(item_event(event::OUTPUT_ITEM_ADDED, index, added), out);
         self.emit(
             item_event(event::OUTPUT_ITEM_DONE, index, done.clone()),
             out,
@@ -748,6 +988,13 @@ impl Assembler {
     #[must_use]
     pub fn foreign_thinking(mut self, policy: ForeignThinking) -> Self {
         self.encoder.foreign = policy;
+        self
+    }
+
+    /// The assembler for a request of `tools`; see [`SseEncoder::tools`].
+    #[must_use]
+    pub fn tools(mut self, tools: &[Tool]) -> Self {
+        self.encoder = self.encoder.tools(tools);
         self
     }
 

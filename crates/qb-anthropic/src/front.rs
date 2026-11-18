@@ -98,32 +98,7 @@ pub fn decode_request(
     }
     .filter(|s| !s.is_empty());
 
-    let mut messages = Vec::with_capacity(req.messages.len());
-    for (i, m) in req.messages.into_iter().enumerate() {
-        let role = match m.role.as_str() {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            other => {
-                return Err(bad(format!(
-                    "`messages[{i}].role` `{other}` is not supported"
-                )));
-            }
-        };
-        let blocks = match m.content {
-            Content::Text(text) => vec![Block::Text { text }],
-            Content::Blocks(blocks) => blocks
-                .into_iter()
-                .enumerate()
-                .map(|(j, b)| {
-                    canonical_block(b, native_vendor, &format!("messages[{i}].content[{j}]"))
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        messages.push(Message {
-            role,
-            content: blocks,
-        });
-    }
+    let messages = canonical_messages(req.messages, native_vendor)?;
 
     let effort = req
         .output_config
@@ -150,6 +125,7 @@ pub fn decode_request(
                 name: t.name,
                 description: t.description.unwrap_or_default(),
                 input_schema: t.input_schema,
+                native: None,
             })
             .collect(),
         max_tokens: req.max_tokens,
@@ -168,6 +144,58 @@ pub fn decode_request(
         stream: req.stream.unwrap_or(false),
         model: req.model,
     })
+}
+
+/// The canonical messages of a request's `messages`: `user`, `assistant` and text-only `system`
+/// messages; a system message without content, which only sets `output_config` for later
+/// turns, is dropped, since the request's own `output_config` is the one that counts.
+fn canonical_messages(
+    input: Vec<crate::wire::MessageParam>,
+    native_vendor: &str,
+) -> Result<Vec<Message>, GatewayError> {
+    let mut messages = Vec::with_capacity(input.len());
+    for (i, m) in input.into_iter().enumerate() {
+        let role = match m.role.as_str() {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "system" => Role::System,
+            other => {
+                return Err(bad(format!(
+                    "`messages[{i}].role` `{other}` is not supported"
+                )));
+            }
+        };
+        if let Some(c) = m.clear_at.as_deref().filter(|c| *c != "never") {
+            return Err(bad(format!(
+                "`messages[{i}].clear_at` `{c}` is not supported by this gateway"
+            )));
+        }
+        let blocks: Vec<Block> = match m.content {
+            Content::Text(text) => vec![Block::Text { text }],
+            Content::Blocks(blocks) => blocks
+                .into_iter()
+                .enumerate()
+                .map(|(j, b)| {
+                    let at = format!("messages[{i}].content[{j}]");
+                    if role == Role::System && !matches!(b, ContentBlock::Text { .. }) {
+                        return Err(bad(format!(
+                            "`{at}`: a system message may hold text blocks only here"
+                        )));
+                    }
+                    canonical_block(b, native_vendor, &at)
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        if role == Role::System && blocks.is_empty() {
+            continue;
+        }
+        messages.push(Message {
+            role,
+            content: blocks,
+        });
+    }
+
+    Ok(messages)
 }
 
 /// Whether the request sets `cache_control` where the vendor reads it: at the top level, on a

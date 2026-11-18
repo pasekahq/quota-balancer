@@ -30,6 +30,7 @@ fn tool(name: &str, description: &str, arg: &str) -> Tool {
             "required": [arg],
             "additionalProperties": false
         })),
+        native: None,
     }
 }
 

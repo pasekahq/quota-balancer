@@ -101,10 +101,14 @@ pub struct Metadata {
 /// One conversation message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageParam {
-    /// `user` or `assistant`.
+    /// `user`, `assistant` or `system` (a mid-conversation system message).
     pub role: String,
     /// A string or blocks.
     pub content: Content,
+    /// When a system message stops rendering (`never`, `next_user_message`); read by the front
+    /// only, to refuse what it cannot carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_at: Option<String>,
 }
 
 /// Message content: a string or blocks.
