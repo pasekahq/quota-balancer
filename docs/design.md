@@ -54,7 +54,8 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   outbound connection even if compromised. Alerts go out through a configured hook, not from
   the daemon.
 - **`qb agent`** touches credentials only to probe: it reads the vendor CLI's own credential
-  file right before one GET, keeps the token for at most a second, then zeroizes it. It never
+  file right before one GET, keeps the token for at most a second, then zeroizes it (the
+  copies the HTTP client makes are listed in `SECURITY.md`). It never
   writes or refreshes credentials. Before its first connection to `qbd` it makes itself
   non-dumpable and restricts itself with landlock to reading the credential directories,
   `/etc/resolv.conf` and `/etc/hosts`, and to TCP connections to port 443; a kernel that cannot

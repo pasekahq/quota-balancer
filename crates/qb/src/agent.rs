@@ -2,15 +2,15 @@
 //! fetches the login's usage endpoint through a [`Fetcher`] and answers with window numbers only.
 //! The protocol is `POST /v1/agent/next` and `POST /v1/agent/result` in `docs/api.md`.
 
-use std::borrow::Cow;
 use std::path::Path;
 use std::time::Duration;
 
 use qb_proto::{AgentJob, AgentNextRequest, AgentResultRequest, ProbeOutcome, paths};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::config::{AgentConfig, Kind};
 use crate::{client, log, server};
@@ -55,17 +55,32 @@ pub struct UsageRequest {
     pub headers: Vec<(&'static str, Zeroizing<String>)>,
 }
 
-/// A credential string, borrowed from the file's bytes unless it had JSON escapes; an owned copy
-/// is zeroized on drop.
-#[derive(Deserialize)]
-#[serde(transparent)]
-struct Secret<'a>(#[serde(borrow)] Cow<'a, str>);
+/// A credential string, always borrowed from the file's zeroizing buffer. It is read as raw JSON
+/// because `serde_json` unescapes a string into a scratch buffer it frees without zeroizing; a
+/// string with escapes is refused, which no vendor CLI writes into a token.
+struct Secret<'a>(&'a str);
 
-impl Drop for Secret<'_> {
-    fn drop(&mut self) {
-        if let Cow::Owned(s) = &mut self.0 {
-            s.zeroize();
+/// The start of the error for a credential that is not a JSON string without escapes.
+const NOT_PLAIN: &str = "not a JSON string without escapes";
+
+impl<'de: 'a, 'a> Deserialize<'de> for Secret<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, Unexpected};
+        let raw = <&RawValue>::deserialize(d)?;
+        let Some(s) = raw
+            .get()
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+        else {
+            return Err(D::Error::invalid_type(
+                Unexpected::Other("not a string"),
+                &"a string",
+            ));
+        };
+        if s.contains('\\') {
+            return Err(D::Error::custom(NOT_PLAIN));
         }
+        Ok(Secret(s))
     }
 }
 
@@ -143,7 +158,9 @@ fn credential_json<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, String>
     };
     let mut de = serde_json::Deserializer::from_slice(bytes);
     let value = serde_path_to_error::deserialize(&mut de).map_err(|e| {
-        if e.inner().is_data() {
+        if e.inner().is_data() && e.inner().to_string().starts_with(NOT_PLAIN) {
+            format!("`{}` is {NOT_PLAIN}", e.path())
+        } else if e.inner().is_data() {
             format!("`{}` has the wrong type", e.path())
         } else {
             syntax(e.inner())
@@ -155,7 +172,7 @@ fn credential_json<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, String>
 
 /// `secret` copied into a zeroizing header value, if it is a non-empty run of visible ASCII.
 fn header_value(field: &str, secret: Option<&Secret>) -> Result<Zeroizing<String>, String> {
-    let value = secret.map_or("", |s| &s.0);
+    let value = secret.map_or("", |s| s.0);
     if value.is_empty() {
         return Err(format!("no `{field}`"));
     }
@@ -502,12 +519,6 @@ mod tests {
                 "{account}"
             );
         }
-        let escaped = r#"{"claudeAiOauth":{"accessToken":"token"}}"#;
-        assert_eq!(
-            built(Kind::Claude, escaped).1[0].1,
-            "Bearer token",
-            "an escaped token is decoded"
-        );
     }
 
     fn temp_file(name: &str, contents: Option<&str>) -> std::path::PathBuf {
@@ -559,6 +570,20 @@ mod tests {
                 "no `tokens.access_token`",
             ),
             (
+                Kind::Claude,
+                "escaped-token.json",
+                Some(format!(
+                    r#"{{"claudeAiOauth":{{"accessToken":"{MARK}\/x"}}}}"#
+                )),
+                "`claudeAiOauth.accessToken` is not a JSON string without escapes",
+            ),
+            (
+                Kind::Codex,
+                "escaped-account.json",
+                Some(r#"{"tokens":{"access_token":"a","account_id":"\u0061"}}"#.to_owned()),
+                "`tokens.account_id` is not a JSON string without escapes",
+            ),
+            (
                 Kind::Codex,
                 "number-token.json",
                 Some(r#"{"tokens":{"access_token":73519}}"#.to_owned()),
@@ -578,6 +603,12 @@ mod tests {
                 Some(format!(
                     r#"{{"tokens":{{"access_token":"{MARK}\r\nX-Injected: 1"}}}}"#
                 )),
+                "`tokens.access_token` is not a JSON string without escapes",
+            ),
+            (
+                Kind::Codex,
+                "space-token.json",
+                Some(format!(r#"{{"tokens":{{"access_token":"{MARK} X"}}}}"#)),
                 "`tokens.access_token` is not a visible ASCII string",
             ),
         ];

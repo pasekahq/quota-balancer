@@ -72,7 +72,7 @@ Secrets:
 - A credential file is read into a zeroizing buffer right before each upstream attempt. The
   header value is built at its final size in a zeroizing string, as `qb agent` builds its
   bearer, and dropped once the request is sent. Copies inside the HTTP client's buffers are
-  out of reach; the agent accepts the same limit.
+  out of reach; the agent accepts the same limit. `SECURITY.md` lists them.
 - An OAuth refresh writes the new token set to a temporary file created 0600 in the same
   directory, syncs it, renames it over the credential file and syncs the directory. One
   refresh per credential file runs at a time; a turn waiting on it re-reads the file afterwards. Before
