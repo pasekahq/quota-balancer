@@ -72,7 +72,7 @@ Secrets:
 - A credential file is read into a zeroizing buffer right before each upstream attempt. The
   header value is built at its final size in a zeroizing string, as `qb agent` builds its
   bearer, and dropped once the request is sent. Copies inside the HTTP client's buffers are
-  out of reach; the agent accepts the same limit.
+  out of reach; the agent accepts the same limit. `SECURITY.md` lists them.
 - An OAuth refresh writes the new token set to a temporary file created 0600 in the same
   directory, syncs it, renames it over the credential file and syncs the directory. One
   refresh per credential file runs at a time; a turn waiting on it re-reads the file afterwards. Before
@@ -155,7 +155,9 @@ There is no async runtime: the gateway uses std threads and blocking I/O.
 - Each attempt is bounded by a 10 s connect timeout and a 10 min attempt timeout through ureq's
   timeouts. Host names resolve on the turn's own thread, bounded by the system resolver's
   timeouts: ureq's default resolver would start a thread per connect, and a thread that cannot
-  start aborts the process.
+  start aborts the process. A lookup that gets no answer holds the turn and its slot until the
+  resolver gives up: with musl, `timeout` × `attempts` of `/etc/resolv.conf` (5 s × 2 by
+  default), before the connect timeout starts.
 - Cancel: turns in flight are registered by `request_id` with a cancel flag. Each attempt runs on
   its own ureq agent, and the flag's hook shuts that agent down (`Agent::shutdown`), which shuts
   its upstream TCP stream down. `POST /v1/model/cancel` sets the flag; the turn's blocked read
@@ -231,7 +233,7 @@ A G2 vendor type crate needs its own reason and measured cost under AGENTS.md ru
 
 | Resource | Target |
 |---|---|
-| binary | the same static binary within the existing ≤ 4 MiB (2.5 MiB until 2026-11-17); the gateway links no TLS or HTTP crate the agent does not already link |
+| binary | the same static binary within the existing ≤ 4 MiB; the gateway links no TLS or HTTP crate the agent does not already link |
 | gateway RSS | idle ≤ 4 MiB; per turn in flight ≲ 1 MiB plus twice its request body |
 | unit memory | `MemoryMax` ≥ `max_turns` × (2 × `max_request_bytes` + 1 MiB) + 4 MiB; the formula gives 72 MiB for the defaults and the unit sets 96 MiB, a third as headroom |
 | unit tasks | `TasksMax` ≥ 1 + `max_turns` + 2: the main thread and the connection threads, 8 for the defaults with one for a thread still exiting; upstream connects start no thread |

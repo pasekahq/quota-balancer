@@ -382,6 +382,12 @@ fn agent_result(
     let before = core.probe_login(id).and_then(|l| core.marks(l));
     match core.probe_result(id, &caller.client, &outcome, now) {
         Ok((login, status)) => {
+            if let Some(failure) = probe_failure(req.outcome, req.retry_after_s) {
+                log::warn(&format!(
+                    "probe of {login} by {} failed: {failure}",
+                    caller.client
+                ));
+            }
             record_marks(journal, hooks, core, login, before.as_ref(), now);
             json(
                 200,
@@ -399,6 +405,17 @@ fn agent_result(
             ErrorCode::BadRequest,
             "window utilization must be within 0.0..=1.0",
         ),
+    }
+}
+
+/// How a failed probe's outcome reads in the log; `None` for `ok`.
+fn probe_failure(outcome: ProbeOutcome, retry_after_s: Option<u64>) -> Option<String> {
+    match (outcome, retry_after_s) {
+        (ProbeOutcome::Ok, _) => None,
+        (ProbeOutcome::Http401, _) => Some("http_401".to_owned()),
+        (ProbeOutcome::Http429, Some(s)) => Some(format!("http_429, retry after {s} s")),
+        (ProbeOutcome::Http429, None) => Some("http_429".to_owned()),
+        (ProbeOutcome::Error, _) => Some("error".to_owned()),
     }
 }
 

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -269,6 +270,19 @@ fn woken(before: &BTreeMap<PathBuf, u64>, after: &BTreeMap<PathBuf, u64>) -> u64
     let threads = |s: &BTreeMap<PathBuf, u64>| s.keys().cloned().collect::<Vec<_>>();
     assert_eq!(threads(before), threads(after), "threads started or ended");
     after.iter().map(|(t, n)| n - before[t]).sum()
+}
+
+#[test]
+#[ignore = "acceptance lane, run by the budgets CI job"]
+fn a_silent_client_does_not_wedge_the_daemon() {
+    let dir = temp_dir("acc-silent");
+    let sock = dir.join("qb.sock");
+    let _d = start(&config(&dir, false, &A_AND_B, ""), &sock);
+    let _idle = UnixStream::connect(&sock).unwrap();
+    let t = Instant::now();
+    let (status, _) = call(&sock, "GET", paths::HEALTH, None, None).unwrap();
+    assert_eq!(status, 200);
+    assert!(t.elapsed() < qb::server::IO_TIMEOUT + Duration::from_secs(2));
 }
 
 #[test]

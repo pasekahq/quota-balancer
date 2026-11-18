@@ -13,8 +13,7 @@ set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/qb}"
 max_bytes="${QB_MAX_BINARY_BYTES:-4194304}"
-# 4 MiB since 2026-11-17 (owner decision): room to wire the qb-anthropic and qb-openai
-# gateway fronts; it was 2.5 MiB (2621440) before.
+# 4 MiB (owner decision): room for TLS, the gateway and its qb-anthropic and qb-openai fronts.
 fail=0
 
 size=$(stat -c %s "$bin")
