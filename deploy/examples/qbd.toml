@@ -1,4 +1,5 @@
-# Example qbd config: two vendors, three logins, two roles, three clients, one of them an agent.
+# Example qbd config: five vendors, six logins, three roles, four clients, one of them an agent
+# and one the gateway of deploy/examples/gateway.toml.
 # Format: docs/config.md. Install as /etc/qb/qbd.toml.
 
 [journal]
@@ -45,6 +46,20 @@ windows = [
   { name = "five_hour", length_s = 18000, t_burn_s = 1800 },
 ]
 
+# The gateway's API keys: an uncapped key on a vendor without quota windows, and each capped key
+# on a vendor of its own that declares the gateway's monthly `spend` window.
+[[vendors]]
+name = "vendor-c"
+windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
+
+[[vendors]]
+name = "vendor-d"
+windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
+
+[[vendors]]
+name = "vendor-e"
+windows = []
+
 [[logins]]
 name = "login-1"
 vendor = "vendor-a"
@@ -56,6 +71,18 @@ vendor = "vendor-a"
 [[logins]]
 name = "login-3"
 vendor = "vendor-b"
+
+[[logins]]
+name = "key-1"
+vendor = "vendor-e"
+
+[[logins]]
+name = "key-2"
+vendor = "vendor-c"
+
+[[logins]]
+name = "key-3"
+vendor = "vendor-d"
 
 [[roles]]
 name = "worker"
@@ -89,6 +116,19 @@ candidates = [
   { vendor = "vendor-a", model = "model-large", effort = "high", tier = 1 },
 ]
 
+# The gateway's role: subscription logins first, the uncapped key as the last tier. Its chain
+# steps pin vendor-c and vendor-d, which no ladder reaches.
+[[roles]]
+name = "gateway"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [
+  { vendor = "vendor-a", model = "model-large", tier = 1 },
+  { vendor = "vendor-b", model = "model-large", tier = 1 },
+  { vendor = "vendor-e", model = "model-large", tier = 2 },
+]
+
 [[clients]]
 name = "client-a"
 uid = 1001
@@ -102,3 +142,8 @@ role = "reviewer"
 [[clients]]
 name = "agent-1"
 uid = 1002
+
+[[clients]]
+name = "gateway"
+uid = 1000
+role = "gateway"

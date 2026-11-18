@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use qb::config::{self, Journal, Kind};
+use qb::gateway::config::{Api, GatewayConfig};
 use qb_core::ProbeSpec;
 
 const BASE: &str = r#"
@@ -477,6 +478,222 @@ fn shipped_examples_validate() {
         }
     }
     assert!(seen > 1, "no examples in {}", dir.display());
+}
+
+fn served_by<'a>(qbd: &'a config::Config, vendor: &str) -> Vec<&'a str> {
+    qbd.logins
+        .iter()
+        .filter(|l| l.vendor == vendor)
+        .map(|l| l.name.as_str())
+        .collect()
+}
+
+/// Breaks of the rule that each front's vendor serves gateway logins of the front's API family.
+fn front_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> {
+    let mut faults = Vec::new();
+    let fronts = gw.fronts.as_ref();
+    for (front, vendor, api) in [
+        (
+            "messages",
+            fronts.and_then(|f| f.messages.as_ref()).map(|m| &m.vendor),
+            Api::Anthropic,
+        ),
+        (
+            "openai",
+            fronts.and_then(|f| f.openai.as_ref()).map(|o| &o.vendor),
+            Api::Openai,
+        ),
+    ] {
+        let Some(vendor) = vendor else { continue };
+        let logins = served_by(qbd, vendor);
+        if logins.is_empty() {
+            faults.push(format!(
+                "front {front}: vendor `{vendor}` serves no qbd login"
+            ));
+        }
+        for login in logins {
+            if gw.login(login).is_none_or(|l| l.api != api) {
+                faults.push(format!(
+                    "front {front}: `{login}` does not speak {}",
+                    api.as_str()
+                ));
+            }
+        }
+    }
+    faults
+}
+
+/// Every break of the rules that make `gw` and `qbd` one installation (docs/config.md, Gateway
+/// config and Spend caps), one line each.
+fn installation_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> {
+    let mut faults = Vec::new();
+    let has_spend = |vendor: &str| {
+        qbd.vendors
+            .iter()
+            .any(|v| v.name == vendor && v.windows.iter().any(|w| w.name == "spend"))
+    };
+    let mut pickable: Vec<&str> = Vec::new();
+    for route in &gw.routes {
+        let alias = &route.alias;
+        let Some(role) = qbd.roles.iter().find(|r| r.name == route.role) else {
+            faults.push(format!("route `{alias}`: role `{}` not in qbd", route.role));
+            continue;
+        };
+        if !qbd
+            .clients
+            .iter()
+            .any(|c| c.role.as_deref() == Some(role.name.as_str()))
+        {
+            faults.push(format!(
+                "route `{alias}`: no qbd client has role `{}`",
+                role.name
+            ));
+        }
+        let mut vendors: Vec<&str> = route.chain.iter().map(|s| s.vendor.as_str()).collect();
+        vendors.extend(route.vendor.as_deref());
+        if let Some(difficulty) = route.difficulty {
+            if !role.ladder.iter().any(|s| s.difficulty == difficulty) {
+                faults.push(format!(
+                    "route `{alias}`: no step {difficulty} in `{}`",
+                    role.name
+                ));
+            }
+            vendors.extend(
+                role.ladder
+                    .iter()
+                    .flat_map(|s| &s.candidates)
+                    .map(|c| c.vendor.as_str()),
+            );
+        }
+        for vendor in vendors {
+            let logins = served_by(qbd, vendor);
+            if logins.is_empty() {
+                faults.push(format!(
+                    "route `{alias}`: vendor `{vendor}` serves no qbd login"
+                ));
+            }
+            for login in logins {
+                if gw.login(login).is_none() {
+                    faults.push(format!("route `{alias}`: `{login}` is no gateway login"));
+                }
+            }
+            pickable.push(vendor);
+        }
+    }
+    for login in &gw.logins {
+        let name = &login.name;
+        let Some(declared) = qbd.logins.iter().find(|l| &l.name == name) else {
+            faults.push(format!("gateway login `{name}` not in qbd"));
+            continue;
+        };
+        let vendor = declared.vendor.as_str();
+        if !pickable.contains(&vendor) {
+            faults.push(format!("`{name}`: no route picks vendor `{vendor}`"));
+        }
+        if login.spend_cap.is_some() && !has_spend(vendor) {
+            faults.push(format!(
+                "capped `{name}`: vendor `{vendor}` has no spend window"
+            ));
+        }
+    }
+    for vendor in qbd.vendors.iter().filter(|v| has_spend(&v.name)) {
+        for login in served_by(qbd, &vendor.name) {
+            if gw.login(login).is_none_or(|l| l.spend_cap.is_none()) {
+                faults.push(format!(
+                    "spend vendor `{}`: `{login}` is uncapped",
+                    vendor.name
+                ));
+            }
+        }
+    }
+    faults.extend(front_faults(qbd, gw));
+    faults
+}
+
+fn example_faults(qbd_edit: (&str, &str), gw_edit: (&str, &str)) -> Vec<String> {
+    let edited = |name: &str, (from, to): (&str, &str)| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/examples")
+            .join(name);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{name} has no {from:?}");
+        (path, text.replace(from, to))
+    };
+    let (qbd_path, qbd_text) = edited("qbd.toml", qbd_edit);
+    let (gw_path, gw_text) = edited("gateway.toml", gw_edit);
+    let qbd = config::parse(&qbd_path, &qbd_text).unwrap();
+    let gw = qb::gateway::config::parse(&gw_path, &gw_text).unwrap();
+    installation_faults(&qbd, &gw)
+}
+
+#[test]
+fn shipped_gateway_and_qbd_examples_are_one_installation() {
+    assert_eq!(example_faults(("", ""), ("", "")), Vec::<String>::new());
+}
+
+#[test]
+fn a_broken_installation_rule_is_found_in_either_example() {
+    let qbd = |from, to| ((from, to), ("", ""));
+    let gw = |from, to| (("", ""), (from, to));
+    let cases = [
+        (
+            qbd(
+                "name = \"login-2\"\nvendor = \"vendor-a\"",
+                "name = \"login-9\"\nvendor = \"vendor-a\"",
+            ),
+            "route `chat`: `login-9` is no gateway login",
+        ),
+        (
+            qbd(
+                "name = \"key-1\"\nvendor = \"vendor-e\"",
+                "name = \"key-9\"\nvendor = \"vendor-e\"",
+            ),
+            "gateway login `key-1` not in qbd",
+        ),
+        (
+            qbd(
+                "name = \"key-3\"\nvendor = \"vendor-d\"",
+                "name = \"key-3\"\nvendor = \"vendor-a\"",
+            ),
+            "capped `key-3`: vendor `vendor-a` has no spend window",
+        ),
+        (
+            qbd(
+                "name = \"key-1\"\nvendor = \"vendor-e\"",
+                "name = \"key-1\"\nvendor = \"vendor-c\"",
+            ),
+            "spend vendor `vendor-c`: `key-1` is uncapped",
+        ),
+        (
+            qbd(
+                "name = \"gateway\"\nuid = 1000\nrole = \"gateway\"",
+                "name = \"gateway\"\nuid = 1000\nrole = \"worker\"",
+            ),
+            "route `chat`: no qbd client has role `gateway`",
+        ),
+        (
+            gw(
+                "{ vendor = \"vendor-d\", model",
+                "{ vendor = \"vendor-f\", model",
+            ),
+            "route `chat`: vendor `vendor-f` serves no qbd login",
+        ),
+        (
+            gw(
+                "[fronts.openai]\nvendor = \"vendor-b\"",
+                "[fronts.openai]\nvendor = \"vendor-a\"",
+            ),
+            "front openai: `login-1` does not speak openai",
+        ),
+        (
+            gw("difficulty = 1", "difficulty = 2"),
+            "route `work`: no step 2 in `gateway`",
+        ),
+    ];
+    for ((qbd_edit, gw_edit), fault) in cases {
+        let faults = example_faults(qbd_edit, gw_edit);
+        assert!(faults.iter().any(|f| f == fault), "{fault}: {faults:?}");
+    }
 }
 
 const AGENT: &str = r#"

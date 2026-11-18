@@ -46,7 +46,7 @@ Order matters; each item lands as its own PR with tests.
 Also in S1: `clients/python/qb_client.py` — a single-file stdlib client (~60 lines) for
 Python orchestrators, with a fallback to local logic when the daemon is unreachable.
 
-## G1: model gateway, contract and Anthropic
+## G1: model gateway, contract and Anthropic (done)
 
 The optional `qb gateway` role as decided in [ADR 0001](adr/0001-model-gateway.md).
 
@@ -67,7 +67,9 @@ The optional `qb gateway` role as decided in [ADR 0001](adr/0001-model-gateway.m
 7. Operation: gateway budgets in `ci/budgets.sh` and the acceptance lane, a hardened systemd
    user unit with its exposure threshold in CI, a manual smoke test on one OAuth login.
 
-## G2: model gateway, OpenAI and Codex, keys, OpenRouter, chains
+## G2: model gateway, OpenAI and Codex, keys, OpenRouter, chains (done)
+
+The live check of the subscription logins runs per [runbooks/openai-live-smoke.md](runbooks/openai-live-smoke.md).
 
 1. OpenAI Responses upstream: ChatGPT subscription logins (`chatgpt_oauth`, access token and
    account id) and OpenAI API keys, rotated like Anthropic logins.
