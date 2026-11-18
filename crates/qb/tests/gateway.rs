@@ -3698,6 +3698,45 @@ fn a_silent_stream_gets_pings_after_message_start_only() {
     assert_eq!(leases, 0, "the lease is released");
 }
 
+#[test]
+fn messages_sends_message_start_with_the_input_usage_before_the_vendor_s_content() {
+    let (r, vendor) = vendor_rig(&key_files(), two_keys);
+    let start = through_first(&vendor_fixture("upstream_text.sse"), "event: message_start");
+    vendor.answer(Answer::Hold(start));
+    let body = sdk_body("model-2025-01-01", true);
+    let mut client = sdk_send(&r.gw, &body, None);
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let event = loop {
+        let text = String::from_utf8_lossy(&seen).into_owned();
+        if let Some(at) = text.find("event: message_start") {
+            if let Some(end) = text[at..].find("\n\n") {
+                break text[at..at + end].to_owned();
+            }
+        }
+        let n = client
+            .read(&mut chunk)
+            .expect("message_start arrives while the vendor still holds its content");
+        assert!(n > 0, "stream ended early");
+        seen.extend_from_slice(&chunk[..n]);
+    };
+    let text = String::from_utf8_lossy(&seen);
+    assert!(!text.contains("content_block"), "{text}");
+    let data = event.split_once("data: ").unwrap().1;
+    let start: Value = serde_json::from_str(data.lines().next().unwrap()).unwrap();
+    let usage = &start["message"]["usage"];
+    assert_eq!(usage["input_tokens"], 25, "{start}");
+    assert_eq!(
+        usage["output_tokens"], 1,
+        "the vendor's start, not a final count: {start}"
+    );
+    drop(client);
+    vendor.closed.recv_timeout(Duration::from_secs(1)).unwrap();
+}
+
 /// The headers the official OpenAI Python SDK sends besides `Host` and `Content-Length`, with a
 /// synthetic key the unix socket ignores.
 const OPENAI_SDK_HEADERS: &str = "Accept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\n\

@@ -274,7 +274,8 @@ A client closing its connection cancels the turn and shuts the upstream connecti
   that fails `TurnRequest::validate` are `bad_request`.
 
 `front::SseEncoder` writes canonical events as Messages SSE: `message_start` (deferred to the
-first event after `route`, so it carries the input usage), one `content_block_*` group per text
+first event after `route`, so it carries the input usage; on an Anthropic login that event is
+the vendor's own `message_start`, relayed as it arrives, before any content), one `content_block_*` group per text
 run, thinking block and tool call with indices from 0, then `message_delta` with the stop reason
 and cumulative usage, and `message_stop`. A tool call is one `input_json_delta` with the whole
 input. `route` writes nothing; an `error` writes an `error` event and ends the stream.
