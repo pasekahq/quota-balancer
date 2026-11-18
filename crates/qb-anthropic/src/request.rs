@@ -132,10 +132,13 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Empty text blocks, thinking blocks of another vendor and own blocks whose payload is not an
 /// Anthropic thinking block are dropped, and so is a message left without blocks. With `cache: auto`, breakpoints follow [`place_cache_breakpoints`].
 /// The `thinking` config is left out when the last assistant message calls a tool without a
-/// thinking block, a history the vendor refuses while thinking is on.
+/// thinking block, a history the vendor refuses while thinking is on. System messages stay in
+/// place where the vendor and the model take them and join the system prompt otherwise; tools
+/// of another API follow their `elsewhere`.
 ///
 /// # Errors
-/// [`BuildError::Image`] when `load` fails.
+/// [`BuildError::Image`] when `load` fails, [`BuildError::Tool`] for a tool whose `elsewhere`
+/// is `refuse`.
 pub fn build(
     req: &TurnRequest,
     at: &Target<'_>,
@@ -163,7 +166,7 @@ pub fn build(
             clear_at: None,
         });
     }
-    let lifted = lift_misplaced_system(&mut messages);
+    let lifted = lift_misplaced_system(&mut messages, takes_system_messages(at.model));
 
     let mut system = Vec::new();
     if at.auth == AuthMode::Oauth {
@@ -219,10 +222,27 @@ pub fn build(
     Ok(body)
 }
 
-/// Keeps each run of system messages where the vendor accepts one, right after a `user`
-/// message and followed by an `assistant` message or the end, and takes every other run out,
-/// returning its text, in order, for the system prompt.
-fn lift_misplaced_system(messages: &mut Vec<MessageParam>) -> Vec<String> {
+/// Model id prefixes of the models that take mid-conversation system messages, from the vendor's
+/// list; `claude-sonnet-5` itself does not, nor do older models. Any other model gets every
+/// system message in the system prompt.
+const SYSTEM_MESSAGE_MODELS: &[&str] = &[
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+];
+
+/// Whether `model` takes mid-conversation system messages.
+pub fn takes_system_messages(model: &str) -> bool {
+    SYSTEM_MESSAGE_MODELS.iter().any(|p| model.starts_with(p))
+}
+
+/// Keeps each run of system messages where the vendor accepts one (when `in_place`), right after
+/// a `user` message and followed by an `assistant` message or the end, and takes every other run
+/// out, returning its text, in order, for the system prompt.
+fn lift_misplaced_system(messages: &mut Vec<MessageParam>, in_place: bool) -> Vec<String> {
     let mut lifted = Vec::new();
     let mut out: Vec<MessageParam> = Vec::with_capacity(messages.len());
     let mut i = 0;
@@ -239,7 +259,7 @@ fn lift_misplaced_system(messages: &mut Vec<MessageParam>) -> Vec<String> {
             .map_or(all.len(), |p| i + p);
         let after_user = out.last().is_some_and(|m| m.role == "user");
         let before_assistant = all.get(end).is_none_or(|m| m.role == "assistant");
-        if after_user && before_assistant {
+        if in_place && after_user && before_assistant {
             out.extend_from_slice(&all[i..end]);
         } else {
             for m in &all[i..end] {

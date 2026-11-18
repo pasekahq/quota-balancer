@@ -8,7 +8,7 @@ use qb_proto::{Object, StopReason, StreamEvent, Thinking, ToolCall, Usage, Windo
 use serde_json::Value;
 
 use crate::limits::{Failure, FailureKind, RateLimits, classify_stream_error};
-use crate::request::{CUSTOM_INPUT, TOOL_SEARCH, reasoning_to_opaque};
+use crate::request::{CUSTOM_INPUT, TOOL_SEARCH, join_namespace, reasoning_to_opaque};
 use crate::sse::{self, Frame};
 use crate::wire::{Content, Item, ResponseEvent, ResponseObject, ResponsesUsage, event};
 
@@ -314,6 +314,7 @@ impl Translator {
                 }
                 let input = call_input(&args)
                     .ok_or_else(|| malformed("function arguments are not a JSON object"))?;
+                let name = join_namespace(item.namespace, name);
                 self.tool_calls = true;
                 out.push(StreamEvent::ToolCall {
                     tool_call: ToolCall { id, name, input },
@@ -331,6 +332,7 @@ impl Translator {
                     CUSTOM_INPUT.into(),
                     Value::String(item.input.unwrap_or_default()),
                 );
+                let name = join_namespace(item.namespace, name);
                 self.tool_calls = true;
                 out.push(StreamEvent::ToolCall {
                     tool_call: ToolCall { id, name, input },

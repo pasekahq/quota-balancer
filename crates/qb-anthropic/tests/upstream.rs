@@ -639,10 +639,24 @@ fn msg(role: Role, text: &str) -> Message {
     }
 }
 
+/// A target on `model`.
+fn on(model: &'static str) -> Target<'static> {
+    Target {
+        model,
+        ..target(AuthMode::ApiKey)
+    }
+}
+
+/// A model that takes mid-conversation system messages.
+const SYSTEM_MODEL: &str = "claude-opus-5-5";
+
 fn roles_and_system(req: &TurnRequest) -> (Vec<String>, Vec<String>) {
+    roles_and_system_on(req, SYSTEM_MODEL)
+}
+
+fn roles_and_system_on(req: &TurnRequest, model: &'static str) -> (Vec<String>, Vec<String>) {
     let body =
-        serde_json::to_value(build(req, &target(AuthMode::ApiKey), &mut load).expect("builds"))
-            .expect("json");
+        serde_json::to_value(build(req, &on(model), &mut load).expect("builds")).expect("json");
     let roles = body["messages"]
         .as_array()
         .expect("messages")
@@ -672,9 +686,8 @@ fn a_system_message_after_a_user_turn_stays_in_place() {
     let (roles, system) = roles_and_system(&req);
     assert_eq!(roles, ["user", "system", "system"]);
     assert_eq!(system, ["You are a helpful assistant."]);
-    let body =
-        serde_json::to_value(build(&req, &target(AuthMode::ApiKey), &mut load).expect("builds"))
-            .expect("json");
+    let body = serde_json::to_value(build(&req, &on(SYSTEM_MODEL), &mut load).expect("builds"))
+        .expect("json");
     assert_eq!(
         body["messages"][1],
         json!({"role": "system", "content": [{"type": "text", "text": "Be brief."}]})
@@ -723,9 +736,8 @@ fn a_misplaced_system_message_joins_the_system_prompt() {
 fn a_cached_turn_marks_the_trailing_system_message() {
     let mut req = turn();
     req.messages = vec![msg(Role::User, "Hi"), msg(Role::System, "Context.")];
-    let body =
-        serde_json::to_value(build(&req, &target(AuthMode::ApiKey), &mut load).expect("builds"))
-            .expect("json");
+    let body = serde_json::to_value(build(&req, &on(SYSTEM_MODEL), &mut load).expect("builds"))
+        .expect("json");
     assert_eq!(body["messages"][1]["role"], "system");
     assert_eq!(
         body["messages"][1]["content"][0]["cache_control"],
@@ -784,4 +796,32 @@ fn native_tools_of_another_api_become_functions_are_left_out_or_refused() {
     let e = build(&req, &target(AuthMode::ApiKey), &mut load).expect_err("refused");
     assert_eq!(e, BuildError::Tool("local_shell".into()));
     assert!(e.to_string().contains("local_shell"));
+}
+
+#[test]
+fn models_without_mid_conversation_system_messages_get_them_in_the_system_prompt() {
+    let mut req = turn();
+    req.cache = None;
+    req.messages = vec![msg(Role::User, "Hi"), msg(Role::System, "Be brief.")];
+    for model in [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+    ] {
+        assert_eq!(
+            roles_and_system_on(&req, model).0,
+            ["user", "system"],
+            "{model}"
+        );
+    }
+    for model in ["claude-sonnet-5", "claude-sonnet-4-5-20250929", "model-a"] {
+        let (roles, system) = roles_and_system_on(&req, model);
+        assert_eq!(roles, ["user"], "{model}");
+        assert_eq!(
+            system,
+            ["You are a helpful assistant.", "Be brief."],
+            "{model}"
+        );
+    }
 }

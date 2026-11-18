@@ -772,3 +772,37 @@ fn native_tools_go_out_as_declared_with_their_own_call_items() {
         ])
     );
 }
+
+#[test]
+fn namespaced_calls_round_trip_through_the_upstream() {
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_m\",\"namespace\":\"mcp__apps__gmail\",\"name\":\"send\",\"arguments\":\"{}\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n",
+    );
+    let got = run(sse.as_bytes());
+    assert_eq!(
+        got.events,
+        vec![call("call_m", "mcp__apps__gmail/send", json!({}))]
+    );
+
+    let mut req = turn();
+    req.messages = vec![
+        says(Role::User, "mail"),
+        Message {
+            role: Role::Assistant,
+            content: vec![Block::ToolUse {
+                id: "call_m".into(),
+                name: "mcp__apps__gmail/send".into(),
+                input: object(json!({})),
+            }],
+        },
+    ];
+    let body = serde_json::to_value(build(&req, &target(AuthMode::ApiKey)).expect("builds"))
+        .expect("json");
+    assert_eq!(body["input"][1]["namespace"], "mcp__apps__gmail");
+    assert_eq!(body["input"][1]["name"], "send");
+}

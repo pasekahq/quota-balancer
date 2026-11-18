@@ -349,6 +349,9 @@ impl TurnRequest {
         if self.messages.is_empty() {
             return fail("`messages` is empty".into());
         }
+        if self.messages.iter().all(|m| m.role == Role::System) {
+            return fail("`messages` has no user or assistant message".into());
+        }
         for (i, m) in self.messages.iter().enumerate() {
             if m.content.is_empty() {
                 return fail(format!("`messages[{i}].content` is empty"));

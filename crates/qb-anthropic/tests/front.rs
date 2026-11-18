@@ -546,3 +546,64 @@ fn a_system_message_that_only_sets_effort_is_dropped() {
         [Role::User, Role::System]
     );
 }
+
+/// Claude Code's own tool search answers with `tool_reference` blocks and may name loaded or
+/// unloaded tools in a system message; every tool goes upstream loaded, so both reduce to text
+/// or nothing.
+#[test]
+fn tool_references_and_tool_changes_by_reference_need_no_upstream_support() {
+    let body = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "Find the cron tool"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "ToolSearch", "input": {"query": "cron"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "tool_reference", "tool_name": "CronList"}
+                ]}
+            ]},
+            {"role": "system", "content": [
+                {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "CronList"}},
+                {"type": "tool_removal", "tool": {"type": "tool_reference", "name": "Old"}},
+                {"type": "text", "text": "CronList is available."}
+            ]}
+        ]
+    });
+    let got = decode_request(body.to_string().as_bytes(), "m", VENDOR, &route_of).expect("ok");
+    let m = &got.turn.messages;
+    assert_eq!(
+        m[2].content,
+        vec![Block::ToolResult {
+            id: "toolu_1".into(),
+            content: "Tool `CronList` is loaded.".into(),
+            is_error: None
+        }]
+    );
+    assert_eq!(m[3].role, Role::System);
+    assert_eq!(
+        m[3].content,
+        vec![Block::Text {
+            text: "CronList is available.".into()
+        }]
+    );
+
+    // A system message of tool changes only is left out.
+    let mut only = body.clone();
+    only["messages"][3]["content"] = json!([
+        {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "CronList"}}
+    ]);
+    let got = decode_request(only.to_string().as_bytes(), "m", VENDOR, &route_of).expect("ok");
+    assert_eq!(got.turn.messages.len(), 3);
+
+    // An inline definition needs a beta the upstream does not send.
+    let mut inline = body;
+    inline["messages"][3]["content"] = json!([
+        {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {"name": "x"}}}
+    ]);
+    let e = decode_request(inline.to_string().as_bytes(), "m", VENDOR, &route_of)
+        .expect_err("inline definition");
+    assert_eq!(e.class, ErrorClass::BadRequest);
+}

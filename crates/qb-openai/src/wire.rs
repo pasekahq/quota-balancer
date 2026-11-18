@@ -492,6 +492,10 @@ pub struct Item {
     /// object; see [`Item::arguments_text`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Value>,
+    /// Namespace of a `function_call` or `custom_tool_call` of a tool a `tool_search_output`
+    /// loaded inside a namespace; see [`crate::request::NAMESPACE_SEP`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Free-text input of a `custom_tool_call`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,

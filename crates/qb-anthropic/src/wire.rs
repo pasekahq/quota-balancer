@@ -179,6 +179,23 @@ pub enum ContentBlock {
         /// Opaque payload.
         data: String,
     },
+    /// A reference to a tool of the request's `tools`: a custom tool search's result in a
+    /// `tool_result` (`tool_name`), or the `tool` of a `tool_addition`/`tool_removal` (`name`).
+    ToolReference {
+        /// Tool name in a tool search result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        /// Tool name in a tool change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// A mid-conversation system message's tool change: `tool_addition` or `tool_removal` of
+    /// `tool`, a `tool_reference` or an inline `tool_definition`.
+    #[serde(alias = "tool_removal")]
+    ToolAddition {
+        /// The tool.
+        tool: Value,
+    },
     /// Any block type this crate does not translate.
     #[serde(other)]
     Other,

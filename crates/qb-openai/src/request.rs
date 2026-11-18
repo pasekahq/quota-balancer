@@ -163,6 +163,27 @@ impl std::error::Error for BuildError {}
 /// The one argument a canonical call of a `custom` tool carries: the tool's free-text input.
 pub const CUSTOM_INPUT: &str = "input";
 
+/// Separator of a call's namespace and name in a canonical tool name, `namespace/name`: a tool
+/// that a client-run tool search loaded inside a namespace is called by both, and `/` occurs
+/// in neither.
+pub const NAMESPACE_SEP: char = '/';
+
+/// The canonical name of a call of `name` in `namespace`.
+pub fn join_namespace(namespace: Option<String>, name: String) -> String {
+    match namespace.filter(|n| !n.is_empty()) {
+        Some(ns) => format!("{ns}{NAMESPACE_SEP}{name}"),
+        None => name,
+    }
+}
+
+/// The namespace and name of a canonical tool name; see [`join_namespace`].
+pub fn split_namespace(name: &str) -> (Option<String>, String) {
+    match name.split_once(NAMESPACE_SEP) {
+        Some((ns, n)) if !ns.is_empty() && !n.is_empty() => (Some(ns.to_owned()), n.to_owned()),
+        _ => (None, name.to_owned()),
+    }
+}
+
 /// The canonical name of a `tool_search` tool, which has no name of its own.
 pub const TOOL_SEARCH: &str = "tool_search";
 
@@ -347,11 +368,13 @@ fn input_items(req: &TurnRequest, vendor: &str) -> Result<Vec<Item>, BuildError>
 
 /// The input item of a tool call, by the Responses type `kind` of the tool it calls.
 fn call_item(kind: Option<&str>, id: &str, name: &str, args: &qb_proto::Object) -> Item {
+    let (namespace, name) = split_namespace(name);
     match kind {
         Some("custom") => Item {
             kind: Some("custom_tool_call".into()),
             call_id: Some(id.into()),
-            name: Some(name.into()),
+            name: Some(name),
+            namespace,
             input: Some(custom_input(args)),
             ..Item::default()
         },
@@ -366,7 +389,8 @@ fn call_item(kind: Option<&str>, id: &str, name: &str, args: &qb_proto::Object) 
         _ => Item {
             kind: Some("function_call".into()),
             call_id: Some(id.into()),
-            name: Some(name.into()),
+            name: Some(name),
+            namespace,
             arguments: Some(Value::String(Value::Object(args.clone()).to_string())),
             ..Item::default()
         },

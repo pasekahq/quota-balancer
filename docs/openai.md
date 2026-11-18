@@ -419,7 +419,10 @@ tool call with its `index` from 0, its id, name and whole arguments, a last chun
   `tool_search` with its arguments and `tool_search_output` its result, the loaded tools as a
   JSON array; a `server` tool search and the calls of tools the vendor runs itself
   (`web_search_call`, `file_search_call`, `code_interpreter_call`, `image_generation_call`,
-  `mcp_call`, `mcp_list_tools`) are dropped, since their results are already in the answer;
+  `mcp_call`, `mcp_list_tools`) are dropped, since their results are already in the answer; a
+  call's `namespace` (a tool a client tool search loaded inside a namespace) joins its name as
+  `namespace/name` in the canonical form (`/` occurs in no tool name), and the Responses
+  upstream and this front's encoder split it again;
 - `tools`: a plain function tool becomes a canonical tool; every other tool, and a function
   with fields beyond `name`, `description`, `parameters` and `strict` (`defer_loading`), keeps
   its declaration in `native` (`api: openai_responses`) with the rule `elsewhere`: `function` for
@@ -427,7 +430,9 @@ tool call with its `index` from 0, its id, name and whole arguments, a last chun
   appended to the description), `omit` for `web_search*`, `file_search`, `code_interpreter`,
   `image_generation`, `mcp` and `tool_search` (named `tool_search`), `refuse` for any other type
   (`local_shell`, `shell`, `computer_use_preview`, `namespace`, …). A tool without a name takes
-  its `server_label` or type, with `_2`, `_3`, … when taken;
+  its `server_label` or type, with `_2`, `_3`, … when taken; a second `tool_search` tool is
+  refused. On another vendor a client `tool_search` is left out, so tools the client keeps for
+  its search (Codex's deferred MCP tools) are not reachable there;
 - a `reasoning` item becomes canonical `thinking`: of `native_vendor` with the item's reduced form
   as `opaque`, or, when its `encrypted_content` starts with `qb-thinking:`, the vendor and payload
   that prefix wraps; a reasoning item without encrypted content cannot be passed on and is

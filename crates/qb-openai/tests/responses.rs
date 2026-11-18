@@ -531,3 +531,40 @@ fn calls_of_custom_and_tool_search_tools_stream_as_their_own_items() {
     let obj = serde_json::to_value(asm.finish().expect("object")).expect("json");
     assert_eq!(&obj["output"], &last["output"]);
 }
+
+/// A tool a client-run tool search loaded inside a namespace is called by namespace and name;
+/// the canonical name is `namespace/name` and the item gets both back.
+#[test]
+fn namespaced_calls_keep_their_namespace() {
+    let body = json!({"model": "gpt-chat", "input": [
+        {"role": "user", "content": "mail"},
+        {"type": "function_call", "call_id": "call_m", "namespace": "mcp__apps__gmail", "name": "send", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_m", "output": "sent"}
+    ]});
+    let req = decode(&body).expect("decodes");
+    let Block::ToolUse { name, .. } = &req.turn.messages[1].content[0] else {
+        panic!("tool use")
+    };
+    assert_eq!(name, "mcp__apps__gmail/send");
+
+    let mut enc = SseEncoder::new("test1", "gpt-chat", NOW, VENDOR);
+    let mut bytes = enc.push(&StreamEvent::ToolCall {
+        tool_call: ToolCall {
+            id: "call_n".into(),
+            name: "mcp__apps__gmail/send".into(),
+            input: common::object(json!({"to": "a"})),
+        },
+    });
+    bytes.extend(enc.push(&StreamEvent::Stop {
+        reason: StopReason::ToolUse,
+    }));
+    let (_, last) = check_responses(&bytes);
+    assert_eq!(last["output"][0]["namespace"], "mcp__apps__gmail");
+    assert_eq!(last["output"][0]["name"], "send");
+
+    let e = decode(&json!({"model": "gpt-chat", "input": "Hi", "tools": [
+        {"type": "tool_search", "execution": "client"}, {"type": "tool_search", "execution": "client"}
+    ]}))
+    .expect_err("two tool searches");
+    assert!(e.message.unwrap_or_default().contains("second tool_search"));
+}

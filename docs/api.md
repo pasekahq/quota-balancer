@@ -259,7 +259,8 @@ least one, each with at least one block), `max_tokens` (≥ 1) and `request_id`
 (`low|medium|high|max`), `session_key` (1 to 128 bytes), `cache` (`auto`).
 
 A message has `role` (`user|assistant|system`) and `content`, a list of blocks, each one flat
-object with `type`. A `system` message holds `text` blocks only: an instruction from that point
+object with `type`. At least one message is `user` or `assistant`. A `system` message holds
+`text` blocks only: an instruction from that point
 of the conversation on (Anthropic's mid-conversation system message, OpenAI's `developer`
 message). An upstream keeps it in place where its vendor accepts one there and otherwise adds
 its text to the system prompt ([anthropic.md](anthropic.md), [openai.md](openai.md)).

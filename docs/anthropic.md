@@ -41,8 +41,10 @@ A message left without blocks is dropped. The model id comes from `qbd`'s pick.
 A canonical `system` message is the vendor's mid-conversation system message
 (`{role: system, content: [text blocks]}`, stable in the Messages API, no beta header). The vendor
 accepts a run of them only right after a `user` message and followed by an `assistant` message
-or the end of `messages`; such a run stays in place, so the cached prefix before it holds. Any
-other run (first in the conversation, after an assistant message, before another user message)
+or the end of `messages`, and only on the models it lists (ids starting with `claude-fable-5`,
+`claude-mythos-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5-5`, `claude-haiku-5-5`;
+not `claude-sonnet-5` or older models). Such a run stays in place, so the cached prefix before
+it holds. On any other model every run, and on a listed model any other run (first in the conversation, after an assistant message, before another user message)
 leaves `messages` and its text joins the system prompt as further text blocks, after the
 client's `system`, which is what a client that knows no mid-conversation messages does with it.
 
@@ -260,10 +262,16 @@ A client closing its connection cancels the turn and shuts the upstream connecti
   last user message) becomes a canonical `system` message in place; one without content, which
   only sets `output_config` for the turns after it, is dropped, since the request's own
   `output_config` is what the turn uses; a per-message `output_config` is ignored;
+- every tool goes upstream loaded (`defer_loading` is not sent), so what a client's tool search
+  says about loading needs no upstream support: a `tool_reference` block (in a `tool_result` or
+  on its own) becomes the text ``Tool `<name>` is loaded.``, and a `tool_addition` or
+  `tool_removal` of a system message that names a tool by `tool_reference` is dropped (a system
+  message left without blocks with it);
 - documents, URL or file images, images inside tool results, roles other than `user`,
-  `assistant` and `system`, a system message with a block other than text (`tool_addition`,
-  `tool_removal`) or with `clear_at` other than `never` (turn-scoped messages need a beta the
-  upstream does not send), and a turn that fails `TurnRequest::validate` are `bad_request`.
+  `assistant` and `system`, a system message with another block than text and tool changes by
+  reference (an inline `tool_definition` needs a beta the upstream does not send), a system
+  message with `clear_at` other than `never` (turn-scoped messages need a beta too), and a turn
+  that fails `TurnRequest::validate` are `bad_request`.
 
 `front::SseEncoder` writes canonical events as Messages SSE: `message_start` (deferred to the
 first event after `route`, so it carries the input usage), one `content_block_*` group per text

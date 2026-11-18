@@ -18,8 +18,8 @@ use crate::front::{
     image, join_system, push_message, responses_usage, session_key,
 };
 use crate::request::{
-    CUSTOM_INPUT, TOOL_SEARCH, custom_input, native_kind, output_text, reasoning_from_opaque,
-    reasoning_to_opaque,
+    CUSTOM_INPUT, TOOL_SEARCH, custom_input, join_namespace, native_kind, output_text,
+    reasoning_from_opaque, reasoning_to_opaque, split_namespace,
 };
 use crate::sse;
 use crate::wire::{
@@ -36,9 +36,12 @@ struct Foreign {
 /// Decodes a Responses request body into a canonical turn with `request_id`.
 ///
 /// `route_of` maps the client's `model` to a route alias; `default_max_tokens` bounds the output
-/// when the request names no bound. `instructions` and `system`/`developer` messages join into
-/// the system prompt; `function_call` items join the assistant message before them and
-/// `function_call_output` items the user message after. A reasoning item with encrypted content
+/// when the request names no bound. `instructions` and the `system`/`developer` messages before
+/// any other item join into the system prompt, later ones become canonical system messages in
+/// place; call items (`function_call`, `custom_tool_call`, a client `tool_search_call`) join the
+/// assistant message before them and their outputs the user message after; calls of tools the
+/// vendor runs itself are dropped. Tools other than plain functions keep their declaration as
+/// [`qb_proto::NativeTool`] (see `docs/openai.md`). A reasoning item with encrypted content
 /// becomes canonical thinking of `native_vendor`, except one this front wrapped for another
 /// vendor; one without is dropped. `cache` is always `auto`. `store`, `include`,
 /// `reasoning.summary`, sampling parameters and `parallel_tool_calls` are ignored; a `tool_choice`
@@ -47,8 +50,8 @@ struct Foreign {
 /// # Errors
 /// A `bad_request` error for a body that is not a Responses request, an unknown model, state the
 /// gateway does not keep (`previous_response_id`, `conversation`, `item_reference`,
-/// `background`), structured output, a `tool_choice` other than `auto`, non-function tools,
-/// items or parts the canonical form cannot carry, a tool output that answers no earlier call,
+/// `background`), structured output, a `tool_choice` other than `auto`, a tool without a type or
+/// name, a second `tool_search` tool, items or parts the canonical form cannot carry, a tool output that answers no earlier call,
 /// or a turn that fails [`TurnRequest::validate`].
 pub fn decode_request(
     body: &[u8],
@@ -216,10 +219,12 @@ fn call_of(kind: &str, item: Item, at: &str) -> Result<Block, GatewayError> {
         .ok_or_else(|| bad(format!("`{at}.call_id` is missing")))?;
     let name = match kind {
         "tool_search_call" => TOOL_SEARCH.to_owned(),
-        _ => item
-            .name
-            .clone()
-            .ok_or_else(|| bad(format!("`{at}` needs call_id and name")))?,
+        _ => join_namespace(
+            item.namespace.clone(),
+            item.name
+                .clone()
+                .ok_or_else(|| bad(format!("`{at}` needs call_id and name")))?,
+        ),
     };
     let input = match (kind, item.arguments) {
         ("custom_tool_call", _) => {
@@ -334,6 +339,9 @@ fn tools(input: Vec<Value>) -> Result<Vec<Tool>, GatewayError> {
                 } else {
                     Elsewhere::Refuse
                 };
+                if other == "tool_search" && tools.iter().any(|t| t.name == TOOL_SEARCH) {
+                    return Err(bad(format!("`tools[{i}]` is a second tool_search tool")));
+                }
                 let base = if other == "tool_search" {
                     TOOL_SEARCH.to_owned()
                 } else {
@@ -853,12 +861,14 @@ impl SseEncoder {
         match kind.as_deref() {
             Some("custom") => {
                 let id = self.item_id("ctc");
+                let (namespace, name) = split_namespace(&call.name);
                 let item = |status: &str, input: &str| Item {
                     kind: Some("custom_tool_call".into()),
                     id: Some(id.clone()),
                     status: Some(status.into()),
                     call_id: Some(call.id.clone()),
-                    name: Some(call.name.clone()),
+                    name: Some(name.clone()),
+                    namespace: namespace.clone(),
                     input: Some(input.into()),
                     ..Item::default()
                 };
@@ -889,13 +899,15 @@ impl SseEncoder {
         }
         let index = self.next_index();
         let id = self.item_id("fc");
+        let (namespace, name) = split_namespace(&call.name);
         let args = Value::Object(call.input.clone()).to_string();
         let item = |status: &str, arguments: &str| Item {
             kind: Some("function_call".into()),
             id: Some(id.clone()),
             status: Some(status.into()),
             call_id: Some(call.id.clone()),
-            name: Some(call.name.clone()),
+            name: Some(name.clone()),
+            namespace: namespace.clone(),
             arguments: Some(Value::String(arguments.into())),
             ..Item::default()
         };
