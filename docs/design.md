@@ -162,7 +162,9 @@ A hook is exec'd without a shell, with stdin and stdout on `/dev/null` and stder
 its output lands in `qbd`'s log. The loop never waits for it: finished hooks are reaped on the
 next loop pass, and a non-zero exit or a failed spawn is logged and changes nothing else. At
 most 2 run at once (`TasksMax=4` counts the daemon); an event beyond that is dropped with a
-warning naming the event and login.
+warning naming the event and login. A hook still running 60 s after its spawn gets `SIGKILL`
+on the next loop pass, or when the next event needs its slot, and the kill is logged; no timer
+wakes an idle loop for it, and processes the hook started itself are not tracked.
 
 Hooks run inside `qbd`'s sandbox: its `DynamicUser`, no network, a read-only system. An alert
 has to leave through something the sandbox allows, such as the journal via `logger` or a line
