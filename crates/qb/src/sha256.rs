@@ -1,4 +1,6 @@
-//! SHA-256 (FIPS 180-4) and a constant-time digest comparison, for bearer tokens.
+//! SHA-256 (FIPS 180-4), its hex form and a constant-time digest comparison.
+
+use std::fmt::Write as _;
 
 const K: [u32; 64] = [
     0x428a_2f98,
@@ -148,18 +150,17 @@ pub(crate) fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
+/// `digest` as 64 lowercase hex characters.
+pub(crate) fn hex(digest: [u8; 32]) -> String {
+    digest.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
     use super::*;
-
-    fn hex(d: [u8; 32]) -> String {
-        d.iter().fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
-    }
 
     #[test]
     fn fips_180_4_vectors() {

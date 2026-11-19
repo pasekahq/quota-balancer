@@ -11,13 +11,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_proto::{
-    Attempt, Block, Decision, ErrorClass, GatewayError, LoginSpend, LoginStatus, Outcome,
-    PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState, RouteStatus,
-    RoutesAnswer, SpendAnswer, StreamEvent, TurnRequest, Usage, WindowReport, paths,
+    Attempt, AuditAction, AuditEntry, Block, Decision, ErrorClass, GatewayError, LoginSpend,
+    LoginStatus, Outcome, PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo,
+    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StreamEvent, TurnRequest, Usage,
+    WindowReport, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use super::audit;
 use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::creds::{CredentialStore, Refresher};
 use super::spend::{self, Ledger};
@@ -27,7 +29,7 @@ use super::upstream::{
 use crate::config::Error;
 use crate::sandbox::file_dir;
 use crate::server::unix_now;
-use crate::{client, log};
+use crate::{client, log, sha256};
 
 /// How long `cancel` waits for the cancelled turn to end.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
@@ -341,15 +343,41 @@ impl Gateway {
         Arc::clone(&lock(&self.config))
     }
 
-    /// Reads the config file again. A config that parses and validates as at startup and keeps
-    /// every restart-only field becomes the snapshot of later admissions; admitted turns keep
-    /// theirs. Logs one line either way.
+    /// Appends `entry` to the `audit_file`; without one it is dropped. Every admin action
+    /// records through here.
+    pub(crate) fn record(&self, entry: &AuditEntry) {
+        if let Some(file) = &self.startup.audit_file {
+            audit::append(file, entry);
+        }
+    }
+
+    /// The audit entry of a reload by `actor` that turned the config of SHA-256 `before` into
+    /// that of `after`.
+    fn reload_entry(&self, actor: &str, before: [u8; 32], after: [u8; 32]) -> AuditEntry {
+        let object = Some(self.startup.file.display().to_string());
+        let mut entry = audit::entry(actor, AuditAction::Reload, object);
+        entry.config_sha256_before = Some(sha256::hex(before));
+        entry.config_sha256_after = Some(sha256::hex(after));
+        entry
+    }
+
+    /// Records a reload by `actor` refused for `reason` before the file was read.
+    pub(crate) fn refuse_reload(&self, actor: &str, reason: &str) {
+        let sha256 = self.config().sha256;
+        let entry = self.reload_entry(actor, sha256, sha256);
+        self.record(&audit::refused(entry, reason));
+    }
+
+    /// Reads the config file again for `actor`. A config that parses and validates as at
+    /// startup and keeps every restart-only field becomes the snapshot of later admissions;
+    /// admitted turns keep theirs. Logs one line and records one audit entry either way.
     ///
     /// # Errors
     /// The file is unreadable or invalid, or changes a restart-only field; the running config
     /// stays.
-    pub fn reload(&self) -> Result<ReloadAnswer, String> {
+    pub fn reload(&self, actor: &str) -> Result<ReloadAnswer, String> {
         let _one = lock(&self.reloading);
+        let before = self.config().sha256;
         let loaded = super::config::load(&self.startup.file)
             .map_err(|e| e.to_string())
             .and_then(|c| restart_only(&self.startup, &c, &self.opened).map_or(Ok(c), Err));
@@ -357,6 +385,8 @@ impl Gateway {
             Ok(c) => sorted(c),
             Err(e) => {
                 log::warn(&format!("gateway: reload refused: {e}"));
+                let entry = self.reload_entry(actor, before, before);
+                self.record(&audit::refused(entry, e.as_str()));
                 return Err(e);
             }
         };
@@ -378,6 +408,7 @@ impl Gateway {
             answer.routes,
             answer.logins
         ));
+        self.record(&self.reload_entry(actor, before, config.sha256));
         Ok(answer)
     }
 
@@ -899,12 +930,30 @@ impl Gateway {
         SpendAnswer { logins }
     }
 
-    /// Sets the count of `login` to zero and tells qbd, so the login runs again.
+    /// Sets the count of `login` to zero for `actor` and tells qbd, so the login runs again;
+    /// records one audit entry either way.
     ///
     /// # Errors
     /// `bad_request` when the current config gives `login` no `spend_cap`, `unavailable` when
     /// the spend file cannot be written; the count is zero in memory either way.
-    pub fn reset_spend(&self, login: &str) -> Result<LoginSpend, GatewayError> {
+    pub fn reset_spend(&self, actor: &str, login: &str) -> Result<LoginSpend, GatewayError> {
+        let reset = self.reset_count(login);
+        let entry = audit::entry(actor, AuditAction::SpendReset, Some(login.to_owned()));
+        match &reset {
+            Ok(_) => self.record(&entry),
+            Err(e) => {
+                let reason = e
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| e.class.as_str().to_owned());
+                self.record(&audit::refused(entry, reason));
+            }
+        }
+        reset
+    }
+
+    /// [`Self::reset_spend`] without the audit entry.
+    fn reset_count(&self, login: &str) -> Result<LoginSpend, GatewayError> {
         let config = self.config();
         let Some(cap) = config.login(login).and_then(|l| l.spend_cap) else {
             return Err(bad_request(format!("login `{login}` has no spend_cap")));
@@ -1153,8 +1202,8 @@ fn sorted(mut config: GatewayConfig) -> GatewayConfig {
 }
 
 /// The first restart-only change of `new` against the startup config `old`, naming its file
-/// and field: the listeners, the qbd connection, the spend file, and a credential file outside
-/// the directories `opened` the sandbox opened at startup.
+/// and field: the listeners, the qbd connection, the spend and audit files, and a credential
+/// file outside the directories `opened` the sandbox opened at startup.
 fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) -> Option<String> {
     let fail = |field: String, reason: &str| {
         let e = Error {
@@ -1174,6 +1223,7 @@ fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) ->
             old.qbd_bearer_file != new.qbd_bearer_file,
         ),
         ("spend_file", old.spend_file != new.spend_file),
+        ("audit_file", old.audit_file != new.audit_file),
         ("fronts.listen", listen(old) != listen(new)),
     ];
     if let Some((field, _)) = changed.into_iter().find(|(_, c)| *c) {

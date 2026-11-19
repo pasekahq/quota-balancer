@@ -43,6 +43,8 @@ pub const TOKEN_CALLER: &str = "client-token";
 pub struct GatewayConfig {
     /// The file the config was read from; a reload reads it again.
     pub file: PathBuf,
+    /// SHA-256 of the text the config was parsed from.
+    pub sha256: [u8; 32],
     /// Absolute path of the gateway's unix socket.
     pub socket: PathBuf,
     /// Mode of the socket file: 0o600 (the gateway's own user only) or 0o660 (its group too).
@@ -68,6 +70,8 @@ pub struct GatewayConfig {
     /// Absolute path of the file that counts the spend of the logins with a `spend_cap`; set
     /// when any login has one.
     pub spend_file: Option<PathBuf>,
+    /// Absolute path of the file the admin actions are appended to, one JSON line each.
+    pub audit_file: Option<PathBuf>,
     /// Token prices by model id, at most [`MAX_MODELS`].
     pub prices: Vec<Price>,
     /// The HTTP fronts; without it their endpoints answer 404.
@@ -319,6 +323,7 @@ pub fn parse(file: &Path, text: &str) -> Result<GatewayConfig, Error> {
         at_line((field, reason, at))
     })?;
     file.clone_into(&mut config.file);
+    config.sha256 = crate::sha256::digest(text.as_bytes());
     Ok(config)
 }
 
@@ -446,6 +451,7 @@ fn tables<'v, 'i>(at: &str, v: &'v Value<'i>) -> Result<Vec<(String, &'v DeTable
 fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
     let mut c = GatewayConfig {
         file: PathBuf::new(),
+        sha256: [0; 32],
         socket: PathBuf::new(),
         socket_mode: 0o600,
         qbd_socket: PathBuf::from(crate::DEFAULT_SOCKET),
@@ -458,6 +464,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         routes: Vec::new(),
         openai_models: Vec::new(),
         spend_file: None,
+        audit_file: None,
         prices: Vec::new(),
         fronts: None,
     };
@@ -474,6 +481,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         "routes",
         "openai_models",
         "spend_file",
+        "audit_file",
         "prices",
         "fronts",
     ];
@@ -504,6 +512,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
             }
             "openai_models" => c.openai_models = walk_openai_models(at, table(at, v)?)?,
             "spend_file" => c.spend_file = Some(string(at, v)?.into()),
+            "audit_file" => c.audit_file = Some(string(at, v)?.into()),
             "prices" => c.prices = walk_prices(at, table(at, v)?)?,
             _ => c.fronts = Some(walk_fronts(at, table(at, v)?)?),
         }
@@ -1066,6 +1075,9 @@ impl GatewayConfig {
         }
         if let Some(f) = &self.spend_file {
             absolute("spend_file", f)?;
+        }
+        if let Some(f) = &self.audit_file {
+            absolute("audit_file", f)?;
         }
         self.validate_routes()?;
         if self.openai_models.len() > MAX_MODELS {
@@ -2059,6 +2071,21 @@ difficulty = 1
             let err = check(top, &extra).unwrap_err();
             assert!(err.contains(want), "{top}{extra}: {err}");
         }
+    }
+
+    #[test]
+    fn the_audit_file_is_an_optional_absolute_path() {
+        let c = check("audit_file = \"/var/lib/qb-gateway/audit.jsonl\"", "").unwrap();
+        assert_eq!(
+            c.audit_file.as_deref(),
+            Some(Path::new("/var/lib/qb-gateway/audit.jsonl"))
+        );
+        assert_eq!(check("", "").unwrap().audit_file, None);
+        let err = check("audit_file = \"audit.jsonl\"", "").unwrap_err();
+        assert!(
+            err.contains("audit_file: must be an absolute path (line 1)"),
+            "{err}"
+        );
     }
 
     #[test]

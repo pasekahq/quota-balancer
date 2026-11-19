@@ -1,8 +1,9 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
-//! `/v1/model/spend/reset` and `/v1/health`, and the HTTP fronts: `/v1/messages`
-//! ([`super::messages`]), `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the
-//! optional loopback TCP listener serves only the HTTP fronts, to clients with a client token.
+//! `/v1/model/spend/reset`, `/v1/model/audit` and `/v1/health`, and the HTTP fronts:
+//! `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
+//! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
+//! clients with a client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
 //! peer takes one of these slots only once its head showed a client token, and before that one
 //! of [`LOOPBACK_UNCHECKED`] slots of its own, for at most [`LOOPBACK_HEAD_DEADLINE`]. On the C4
@@ -22,14 +23,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_proto::{
-    API_VERSION, CancelAnswer, CancelRequest, ErrorClass, GatewayError, HealthResponse,
-    HealthStatus, SpendReset, StreamEvent, TurnRequest, paths,
+    API_VERSION, AuditAction, CancelAnswer, CancelRequest, ErrorClass, GatewayError,
+    HealthResponse, HealthStatus, SpendReset, StreamEvent, TurnRequest, paths,
 };
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use serde::Serialize;
 
 use super::answer::Keepalive;
+use super::audit;
 use super::config::{Fronts, TOKEN_CALLER};
 use super::core::{Cancel, Gateway};
 use super::upstream::{CancelToken, Flow};
@@ -327,7 +329,7 @@ pub fn serve(
         let ready = watch.wait(listener, loopback, hangup);
         if ready.reload {
             // The outcome is logged; nobody waits for an answer.
-            let _ = gateway.reload();
+            let _ = gateway.reload(audit::SIGNAL);
         }
         let mut accepted = Vec::with_capacity(2);
         if ready.unix {
@@ -431,10 +433,9 @@ fn reject(stream: &mut Conn, status: u16, class: ErrorClass, message: &str) {
 }
 
 /// The caller of a unix socket peer: the gateway's own uid, or a configured client's.
-fn caller(gateway: &Gateway, uid: Option<u32>, own_uid: u32) -> Option<Caller> {
-    let uid = uid?;
+fn caller(gateway: &Gateway, uid: u32, own_uid: u32) -> Option<Caller> {
     let name = if uid == own_uid {
-        format!("uid:{uid}")
+        audit::uid_actor(uid)
     } else {
         let config = gateway.config();
         config.clients.iter().find(|c| c.uid == uid)?.name.clone()
@@ -491,7 +492,8 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         Conn::Tcp(_) => return,
     };
     // Checked before reading, so a foreign peer cannot make the gateway buffer a body.
-    let Some(caller) = caller(gateway, uid, own_uid) else {
+    let Some((uid, caller)) = uid.and_then(|uid| Some((uid, caller(gateway, uid, own_uid)?)))
+    else {
         return reject(
             &mut stream,
             401,
@@ -525,33 +527,18 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             Dialect::of(path).reject(&mut stream, 405, &e);
         }
         (Method::Get, paths::MODEL_ROUTES) => reply(&mut stream, 200, &gateway.routes()),
-        (Method::Post, paths::MODEL_RELOAD) => reload(&mut stream, gateway, uid == Some(own_uid)),
-        (Method::Get, paths::MODEL_SPEND) | (Method::Post, paths::MODEL_SPEND_RESET) => {
-            spend(&mut stream, gateway, &req, uid == Some(own_uid));
+        (Method::Post, paths::MODEL_RELOAD) => {
+            reload(&mut stream, gateway, &audit::uid_actor(uid), uid == own_uid);
         }
-        (Method::Post, paths::MODEL_CANCEL) => {
-            let c = match serde_json::from_slice::<CancelRequest>(&req.body) {
-                Ok(c) => c,
-                Err(e) => return reject(&mut stream, 400, ErrorClass::BadRequest, &e.to_string()),
-            };
-            match gateway.cancel(&caller.name, &c.request_id) {
-                Cancel::Cancelled => reply(&mut stream, 200, &CancelAnswer { cancelled: true }),
-                Cancel::Unknown => {
-                    reject(
-                        &mut stream,
-                        404,
-                        ErrorClass::BadRequest,
-                        "no such running turn",
-                    );
-                }
-                Cancel::Forbidden => reject(
-                    &mut stream,
-                    403,
-                    ErrorClass::BadRequest,
-                    "the turn belongs to another caller",
-                ),
-            }
+        (Method::Get, paths::MODEL_SPEND) => spend(&mut stream, gateway, uid == own_uid),
+        (Method::Post, paths::MODEL_SPEND_RESET) => {
+            let actor = audit::uid_actor(uid);
+            spend_reset(&mut stream, gateway, &req.body, &actor, uid == own_uid);
         }
+        (Method::Get, paths::MODEL_AUDIT) => {
+            read_audit(&mut stream, gateway, req.query.as_deref(), uid == own_uid);
+        }
+        (Method::Post, paths::MODEL_CANCEL) => cancel(&mut stream, gateway, &caller, &req.body),
         (Method::Get, paths::HEALTH) => {
             let health = HealthResponse {
                 status: HealthStatus::Ok,
@@ -569,6 +556,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             | paths::MODEL_RELOAD
             | paths::MODEL_SPEND
             | paths::MODEL_SPEND_RESET
+            | paths::MODEL_AUDIT
             | paths::HEALTH,
         ) => {
             reject(
@@ -582,13 +570,32 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
     }
 }
 
-/// Answers `POST /v1/model/reload`, which only the gateway's `own` uid may send.
-fn reload(stream: &mut Conn, gateway: &Gateway, own: bool) {
+/// Answers `POST /v1/model/cancel` of `caller` with `body`.
+fn cancel(stream: &mut Conn, gateway: &Gateway, caller: &Caller, body: &[u8]) {
+    let c = match serde_json::from_slice::<CancelRequest>(body) {
+        Ok(c) => c,
+        Err(e) => return reject(stream, 400, ErrorClass::BadRequest, &e.to_string()),
+    };
+    match gateway.cancel(&caller.name, &c.request_id) {
+        Cancel::Cancelled => reply(stream, 200, &CancelAnswer { cancelled: true }),
+        Cancel::Unknown => reject(stream, 404, ErrorClass::BadRequest, "no such running turn"),
+        Cancel::Forbidden => reject(
+            stream,
+            403,
+            ErrorClass::BadRequest,
+            "the turn belongs to another caller",
+        ),
+    }
+}
+
+/// Answers `POST /v1/model/reload` of `actor`, which only the gateway's `own` uid may send.
+fn reload(stream: &mut Conn, gateway: &Gateway, actor: &str, own: bool) {
     if !own {
         let message = "only the gateway's own uid may reload it";
+        gateway.refuse_reload(actor, message);
         return reject(stream, 403, ErrorClass::Auth, message);
     }
-    match gateway.reload() {
+    match gateway.reload(actor) {
         Ok(answer) => reply(stream, 200, &answer),
         Err(e) => {
             let message = format!("reload refused: {e}");
@@ -597,24 +604,62 @@ fn reload(stream: &mut Conn, gateway: &Gateway, own: bool) {
     }
 }
 
-/// Answers `GET /v1/model/spend` and `POST /v1/model/spend/reset`, which only the gateway's
-/// `own` uid may send.
-fn spend(stream: &mut Conn, gateway: &Gateway, req: &http::Request, own: bool) {
+/// Who may read or reset the spend.
+const SPEND_OWNER: &str = "only the gateway's own uid may read or reset the spend";
+
+/// Answers `GET /v1/model/spend`, which only the gateway's `own` uid may send.
+fn spend(stream: &mut Conn, gateway: &Gateway, own: bool) {
     if !own {
-        let message = "only the gateway's own uid may read or reset the spend";
-        return reject(stream, 403, ErrorClass::Auth, message);
+        return reject(stream, 403, ErrorClass::Auth, SPEND_OWNER);
     }
-    if req.method == Method::Get {
-        return reply(stream, 200, &gateway.spend());
-    }
-    let r = match serde_json::from_slice::<SpendReset>(&req.body) {
-        Ok(r) => r,
-        Err(e) => return reject(stream, 400, ErrorClass::BadRequest, &e.to_string()),
+    reply(stream, 200, &gateway.spend());
+}
+
+/// Answers `POST /v1/model/spend/reset` of `actor` with `body`, which only the gateway's `own`
+/// uid may send.
+fn spend_reset(stream: &mut Conn, gateway: &Gateway, body: &[u8], actor: &str, own: bool) {
+    let refuse = |stream: &mut Conn, status: u16, class: ErrorClass, message: &str| {
+        let entry = audit::entry(actor, AuditAction::SpendReset, None);
+        gateway.record(&audit::refused(entry, message));
+        reject(stream, status, class, message);
     };
-    match gateway.reset_spend(&r.login) {
+    if !own {
+        return refuse(stream, 403, ErrorClass::Auth, SPEND_OWNER);
+    }
+    let r = match serde_json::from_slice::<SpendReset>(body) {
+        Ok(r) => r,
+        Err(e) => return refuse(stream, 400, ErrorClass::BadRequest, &e.to_string()),
+    };
+    match gateway.reset_spend(actor, &r.login) {
         Ok(answer) => reply(stream, 200, &answer),
         Err(e) if e.class == ErrorClass::BadRequest => reply(stream, 400, &e),
         Err(e) => reply(stream, 500, &e),
+    }
+}
+
+/// Answers `GET /v1/model/audit` with the query string `query`, which only the gateway's `own`
+/// uid may send.
+fn read_audit(stream: &mut Conn, gateway: &Gateway, query: Option<&str>, own: bool) {
+    if !own {
+        let message = "only the gateway's own uid may read the audit";
+        return reject(stream, 403, ErrorClass::Auth, message);
+    }
+    let config = gateway.config();
+    let Some(file) = &config.audit_file else {
+        let message = "this gateway keeps no audit: its config sets no `audit_file`";
+        return reject(stream, 404, ErrorClass::BadRequest, message);
+    };
+    let query = match audit::Query::parse(query) {
+        Ok(q) => q,
+        Err(message) => return reject(stream, 400, ErrorClass::BadRequest, &message),
+    };
+    match audit::read(file, &query) {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(e) => {
+            let message = format!("cannot read the audit file {}: {e}", file.display());
+            log::error(&format!("gateway: {message}"));
+            reject(stream, 500, ErrorClass::Unavailable, &message);
+        }
     }
 }
 

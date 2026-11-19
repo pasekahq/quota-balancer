@@ -59,8 +59,8 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
 /// truncate files, create regular files and remove files, so a refreshed token can be written
 /// back by a rename inside the directory; no `REFER`, so nothing moves across directories. The
-/// same beneath the directory of `spend_file`. Read files beneath the directory of
-/// `config.file`, so a reload sees the file an editor replaced.
+/// same beneath the directories of `spend_file` and `audit_file`. Read files beneath the
+/// directory of `config.file`, so a reload sees the file an editor replaced.
 /// TCP bind only on the port of `fronts.listen`, whose listener must exist before. Call it
 /// before starting any thread.
 ///
@@ -72,6 +72,7 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Confined, String> {
         .iter()
         .map(|l| l.credentials.as_path())
         .chain(config.spend_file.as_deref())
+        .chain(config.audit_file.as_deref())
         .collect();
     let bind = config
         .fronts

@@ -36,9 +36,10 @@ use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
-    Block, CancelAnswer, ErrorClass, GatewayError, LoginSpend, LoginStatus, ReloadAnswer,
-    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent,
-    Thinking, ToolCall, TurnRequest, Usage, WindowReport, paths,
+    AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ErrorClass,
+    GatewayError, LoginSpend, LoginStatus, ReloadAnswer, RouteState, RouteStatus, RoutesAnswer,
+    SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
+    WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -284,8 +285,7 @@ struct Rig {
     refreshes: Arc<AtomicUsize>,
 }
 
-/// A qbd of config `text` on a fresh socket in `dir`.
-/// A qbd on `dir/qb.sock` that journals to [`qbd_journal`] of `dir`.
+/// A qbd of config `text` on `dir/qb.sock` that journals to [`qbd_journal`] of `dir`.
 fn start_qbd(dir: &Path, text: &str) -> PathBuf {
     let sock = dir.join("qb.sock");
     let listener = UnixListener::bind(&sock).unwrap();
@@ -392,8 +392,8 @@ fn own_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// A rig whose gateway runs as `gateway_uid`, with `extra` in its config: appended when it is
-/// a table, else put first as top-level keys.
+/// A rig whose gateway runs as `gateway_uid`, with `extra` in its config: its top-level keys
+/// first, its tables appended.
 fn rig_as(max_turns: u32, files: &[(&str, String, u32)], extra: &str, gateway_uid: u32) -> Rig {
     rig_on(max_turns, files, extra, gateway_uid, None)
 }
@@ -410,11 +410,12 @@ fn rig_on(
     credentials(&dir, files);
     let qbd = start_qbd(&dir, QBD);
     let keys = |i: usize| files.get(i).map_or(ANTHROPIC_KEY, |f| keys_of(&f.1));
-    let text = if extra.trim_start().starts_with('[') {
-        gateway_toml(&dir, &qbd, max_turns, [keys(0), keys(1)], extra)
+    let (top, tables) = split_top(extra);
+    let toml = gateway_toml(&dir, &qbd, max_turns, [keys(0), keys(1)], tables);
+    let text = if top.is_empty() && !tables.is_empty() {
+        toml
     } else {
-        let toml = gateway_toml(&dir, &qbd, max_turns, [keys(0), keys(1)], "");
-        format!("{extra}\n{toml}")
+        format!("{top}\n{toml}")
     };
     let fake = Arc::new(Fake::default());
     let refreshes = Arc::new(AtomicUsize::new(0));
@@ -435,6 +436,16 @@ fn rig_on(
         fake,
         refreshes,
     }
+}
+
+/// `extra` cut before its first table header: its top-level keys and its tables.
+fn split_top(extra: &str) -> (&str, &str) {
+    if extra.trim_start().starts_with('[') {
+        return ("", extra);
+    }
+    extra
+        .find("\n[")
+        .map_or((extra, ""), |i| extra.split_at(i + 1))
 }
 
 /// Serves a gateway of config `text`, written to `gateway.toml` beside its socket, with
@@ -1557,7 +1568,8 @@ fn chain_rig() -> Rig {
 }
 
 /// [`chain_rig`] with qbd's config `qbd_text`, the logins' `spend_cap` amounts in USD when
-/// given, the spend file `state/spend.json` with them, and `extra` after the routes.
+/// given, the spend file `state/spend.json` with them, and `extra`: its top-level keys first,
+/// its tables after the routes.
 fn chain_rig_with(qbd_text: &str, caps: Option<[f64; 3]>, extra: &str) -> Rig {
     let dir = temp_dir("chain");
     let logins = ["login-1", "login-2", "login-3"];
@@ -1567,8 +1579,9 @@ fn chain_rig_with(qbd_text: &str, caps: Option<[f64; 3]>, extra: &str) -> Rig {
         .collect();
     credentials(&dir, &files);
     let qbd = start_qbd(&dir, qbd_text);
+    let (top, tables) = split_top(extra);
     let mut text = format!(
-        "socket = \"{dir}/gw.sock\"\nqbd_socket = \"{qbd}\"\n",
+        "socket = \"{dir}/gw.sock\"\nqbd_socket = \"{qbd}\"\n{top}",
         dir = dir.display(),
         qbd = qbd.display()
     );
@@ -1596,7 +1609,7 @@ chain = [
 ]
 "#,
     );
-    text.push_str(extra);
+    text.push_str(tables);
     let fake = Arc::new(Fake::default());
     let refreshes = Arc::new(AtomicUsize::new(0));
     let gw = serve_gateway(
@@ -2278,6 +2291,269 @@ fn only_the_gateway_s_own_uid_may_read_or_reset_the_spend() {
         let (status, e) = rejection(&r.gw, method, path, body);
         assert_eq!((status, e.class), (403, ErrorClass::Auth), "{path}: {e:?}");
     }
+}
+
+/// A fresh `audit.jsonl` path in a directory of its own, not created yet.
+fn audit_path() -> PathBuf {
+    temp_dir("audit").join("audit.jsonl")
+}
+
+/// The `audit_file` line of `file`.
+fn audit_key(file: &Path) -> String {
+    format!("audit_file = \"{}\"\n", file.display())
+}
+
+/// `GET /v1/model/audit` with `query` on `gw`: the status and the answer body.
+fn audit_of(gw: &Path, query: &str) -> (u16, Vec<u8>) {
+    call(gw, "GET", &format!("{}{query}", paths::MODEL_AUDIT), "")
+}
+
+fn audit_answer(gw: &Path, query: &str) -> AuditAnswer {
+    let (status, body) = audit_of(gw, query);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// Actor, action, object, result and reason of an audit entry.
+type AuditRow<'a> = (
+    &'a str,
+    AuditAction,
+    Option<&'a str>,
+    AuditResult,
+    Option<&'a str>,
+);
+
+/// The [`AuditRow`] of each entry.
+fn audit_rows(entries: &[AuditEntry]) -> Vec<AuditRow<'_>> {
+    entries
+        .iter()
+        .map(|e| {
+            let (object, reason) = (e.object.as_deref(), e.reason.as_deref());
+            (e.actor.as_str(), e.action, object, e.result, reason)
+        })
+        .collect()
+}
+
+fn mode_of(file: &Path) -> u32 {
+    std::fs::metadata(file).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn reloads_and_spend_resets_leave_audit_lines_that_read_back_oldest_first() {
+    let audit = audit_path();
+    let started = unix_now();
+    let r = chain_rig_with(
+        &qbd_with_spend(),
+        Some([1.0, 100.0, 100.0]),
+        &format!("{}{PRICES}", audit_key(&audit)),
+    );
+    let (status, body) = reload_with(&r.gw, |t| t.replace("spend_cap = 1.0", "spend_cap = 5.0"));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let file = config_file(&r.gw);
+    let served = std::fs::read_to_string(&file).unwrap();
+    let (status, _) = reload_with(&r.gw, |t| format!("{t}[[routes]\n"));
+    assert_eq!(status, 400);
+    std::fs::write(&file, served).unwrap();
+    for (body, want) in [
+        (r#"{"login":"login-1"}"#, 200),
+        (r#"{"name":"login-1"}"#, 400),
+        (r#"{"login":"login-9"}"#, 400),
+    ] {
+        let (status, answer) = call(&r.gw, "POST", paths::MODEL_SPEND_RESET, body);
+        assert_eq!(status, want, "{body}: {}", String::from_utf8_lossy(&answer));
+    }
+
+    let answer = audit_answer(&r.gw, "");
+    let actor = format!("uid:{}", own_uid());
+    let config = file.display().to_string();
+    let mut rows = audit_rows(&answer.entries);
+    let broken = rows[1].4.take().unwrap();
+    let unclosed = format!("{config}: unclosed array table");
+    assert!(broken.starts_with(&unclosed), "{broken}");
+    let bad_body = rows[3].4.take().unwrap();
+    assert!(bad_body.contains("unknown field `name`"), "{bad_body}");
+    let (reload, reset) = (AuditAction::Reload, AuditAction::SpendReset);
+    let (ok, refused) = (AuditResult::Ok, AuditResult::Refused);
+    let (actor, config) = (actor.as_str(), Some(config.as_str()));
+    let no_cap = Some("login `login-9` has no spend_cap");
+    assert_eq!(
+        rows,
+        [
+            (actor, reload, config, ok, None),
+            (actor, reload, config, refused, None),
+            (actor, reset, Some("login-1"), ok, None),
+            (actor, reset, None, refused, None),
+            (actor, reset, Some("login-9"), refused, no_cap),
+        ]
+    );
+    assert_eq!(answer.skipped, 0);
+    let hashes: Vec<_> = answer
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e.config_sha256_before.as_deref(),
+                e.config_sha256_after.as_deref(),
+            )
+        })
+        .collect();
+    let (Some(first), Some(edited)) = hashes[0] else {
+        panic!("a reload names both hashes: {hashes:?}");
+    };
+    assert_ne!(first, edited, "the reload took the edited file");
+    assert_eq!(first.len(), 64);
+    assert!(first.bytes().all(|b| b.is_ascii_hexdigit()), "{first}");
+    assert_eq!(
+        hashes[1..],
+        [
+            (Some(edited), Some(edited)),
+            (None, None),
+            (None, None),
+            (None, None)
+        ],
+        "a refused reload keeps the served file"
+    );
+    let now = unix_now();
+    assert!(
+        answer
+            .entries
+            .iter()
+            .all(|e| (started..=now).contains(&e.at))
+    );
+    assert!(answer.entries.iter().all(|e| e.backup.is_none()));
+    assert_eq!(mode_of(&audit), 0o600);
+
+    let first_two = audit_answer(&r.gw, "?limit=2");
+    assert_eq!(first_two.entries, answer.entries[..2]);
+    let later = audit_answer(&r.gw, &format!("?since={}&limit=1000", now + 1));
+    assert_eq!(later.entries, Vec::new());
+    for query in ["?limit=0", "?limit=1001", "?since=soon", "?until=1"] {
+        let (status, body) = audit_of(&r.gw, query);
+        assert_eq!(status, 400, "{query}: {}", String::from_utf8_lossy(&body));
+    }
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_AUDIT, "");
+    assert_eq!(status, 405);
+}
+
+#[test]
+fn another_uid_is_refused_the_admin_endpoints_and_its_refusals_are_recorded() {
+    let audit = audit_path();
+    let files = [("login-1", api_key("test-token-1"), 0o600)];
+    let extra = format!(
+        "{}[[clients]]\nname = \"client-a\"\nuid = {}\n",
+        audit_key(&audit),
+        own_uid()
+    );
+    let r = rig_as(4, &files, &extra, own_uid() + 1);
+    for (method, path, body) in [
+        ("POST", paths::MODEL_RELOAD, ""),
+        ("POST", paths::MODEL_SPEND_RESET, r#"{"login":"login-1"}"#),
+        ("GET", paths::MODEL_AUDIT, ""),
+    ] {
+        let (status, e) = rejection(&r.gw, method, path, body);
+        assert_eq!((status, e.class), (403, ErrorClass::Auth), "{path}: {e:?}");
+    }
+    let entries: Vec<AuditEntry> = std::fs::read_to_string(&audit)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let actor = format!("uid:{}", own_uid());
+    let config = config_file(&r.gw).display().to_string();
+    assert_eq!(
+        audit_rows(&entries),
+        [
+            (
+                actor.as_str(),
+                AuditAction::Reload,
+                Some(config.as_str()),
+                AuditResult::Refused,
+                Some("only the gateway's own uid may reload it"),
+            ),
+            (
+                actor.as_str(),
+                AuditAction::SpendReset,
+                None,
+                AuditResult::Refused,
+                Some("only the gateway's own uid may read or reset the spend"),
+            ),
+        ]
+    );
+    assert_eq!(
+        entries[0].config_sha256_before, entries[0].config_sha256_after,
+        "nothing was reloaded"
+    );
+    assert_eq!(mode_of(&audit), 0o600);
+}
+
+#[test]
+fn the_loopback_listener_does_not_serve_the_audit_to_a_client_token() {
+    let (listener, addr, front) = loopback_front("");
+    let extra = format!("{}{front}", audit_key(&audit_path()));
+    let r = rig_on(4, &key_files(), &extra, own_uid(), Some(listener));
+    assert_eq!(audit_answer(&r.gw, "").entries, Vec::new());
+    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+    let (status, _, body) = finish(
+        tcp_send(addr, "GET", paths::MODEL_AUDIT, &auth, ""),
+        Vec::new(),
+    );
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert!(!String::from_utf8_lossy(&body).contains("entries"));
+}
+
+#[test]
+fn a_line_that_does_not_parse_is_skipped_and_counted() {
+    let audit = audit_path();
+    let r = rig_as(4, &key_files(), &audit_key(&audit), own_uid());
+    let empty = audit_answer(&r.gw, "");
+    assert_eq!((empty.entries, empty.skipped), (Vec::new(), 0));
+    let kept = r#"{"at":1800000000,"actor":"uid:1000","action":"spend_reset","object":"login-1","result":"ok"}"#;
+    let later = kept.replace("1800000000", "1800000060");
+    let lines = [
+        kept,
+        "{\"at\":1800000030,\"actor\":\"uid:1000\"",
+        r#"{"at":1800000040,"actor":"uid:1000","action":"rename","result":"ok"}"#,
+        "not json",
+        &later,
+    ];
+    std::fs::write(&audit, format!("{}\n", lines.join("\n"))).unwrap();
+    let answer = audit_answer(&r.gw, "");
+    let at: Vec<u64> = answer.entries.iter().map(|e| e.at).collect();
+    assert_eq!(
+        (at, answer.skipped),
+        (vec![1_800_000_000, 1_800_000_060], 3)
+    );
+    let since = audit_answer(&r.gw, "?since=1800000001");
+    assert_eq!(since.entries.len(), 1);
+    assert_eq!(since.skipped, 3);
+
+    let plain = rig();
+    let (status, e) = rejection(&plain.gw, "GET", paths::MODEL_AUDIT, "");
+    assert_eq!((status, e.class), (404, ErrorClass::BadRequest), "{e:?}");
+    assert_eq!(
+        e.message.as_deref(),
+        Some("this gateway keeps no audit: its config sets no `audit_file`")
+    );
+}
+
+#[test]
+fn a_failed_audit_append_is_logged_and_leaves_the_answer_alone() {
+    let audit = temp_dir("audit").join("missing").join("audit.jsonl");
+    let r = rig_as(4, &key_files(), &audit_key(&audit), own_uid());
+    let mut answer = (0, Vec::new());
+    let needle = format!("gateway: audit line not appended to {}: ", audit.display());
+    let logged = stderr_until(&needle, || {
+        answer = reload_with(&r.gw, |t| {
+            t.replace("alias = \"spare\"", "alias = \"added\"")
+        });
+    });
+    assert_eq!(answer.0, 200, "{}", String::from_utf8_lossy(&answer.1));
+    let line = logged.lines().find(|l| l.contains(&needle)).unwrap();
+    assert!(
+        line.starts_with("error: ") || line.starts_with("<3>"),
+        "{logged}"
+    );
+    assert_eq!(aliases(&r.gw), ["added", "chat"]);
 }
 
 #[test]

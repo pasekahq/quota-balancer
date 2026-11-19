@@ -705,6 +705,66 @@ pub struct SpendReset {
     pub login: String,
 }
 
+/// An admin action of the gateway, as its audit line names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditAction {
+    /// `POST /v1/model/reload` or a SIGHUP: the config file read again.
+    Reload,
+    /// `POST /v1/model/spend/reset`: a login's spend count set to zero.
+    SpendReset,
+}
+
+/// Whether an admin action went through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditResult {
+    /// It answered 200.
+    Ok,
+    /// It was refused or failed; `reason` says why.
+    Refused,
+}
+
+/// One line of the gateway's `audit_file`: an admin action and its result. No field holds a
+/// token, key or credential content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEntry {
+    /// Unix time of the action.
+    pub at: u64,
+    /// `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload.
+    pub actor: String,
+    /// What was done.
+    pub action: AuditAction,
+    /// The login of a spend reset, the config file of a reload; absent when a refused request
+    /// named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    /// Whether it went through.
+    pub result: AuditResult,
+    /// Why it was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// A reload: hex SHA-256 of the config file serving before the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sha256_before: Option<String>,
+    /// A reload: hex SHA-256 of the config file serving after it; the same as before when it
+    /// was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sha256_after: Option<String>,
+    /// Path of the copy an action kept of what it replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
+}
+
+/// `GET /v1/model/audit` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditAnswer {
+    /// The first `limit` entries at or after `since`, oldest first.
+    pub entries: Vec<AuditEntry>,
+    /// Lines of the file that do not parse as an entry; they are left out.
+    pub skipped: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
