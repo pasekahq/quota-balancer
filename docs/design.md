@@ -71,7 +71,8 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   when one fails, and reports the outcome and the windows it saw. It refreshes OAuth tokens on
   demand and replaces the credential file atomically (0600, rename in the same directory).
   It rotates the token of a named loopback client with a `token_file` the same way, and replaces
-  the `[[routes]]` of its config file atomically with a 0600 backup, on its own uid's request.
+  the `[[routes]]` and the logins' `spend_cap`s of its config file atomically with a 0600 backup,
+  on its own uid's request.
   Before serving it makes itself non-dumpable and restricts itself with landlock to its config's
   and credential directories and the directories of its spend, audit, usage, client token and
   grace files (read-write), the resolver files, TCP connections to port 443 and a

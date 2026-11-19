@@ -174,6 +174,18 @@ fn login_scoped(kind: FailureKind) -> bool {
     )
 }
 
+/// The audit action of a config edit of body `put`: `config_spend_caps` when it carries only
+/// `spend_caps`, `config_routes` otherwise, an undecodable body included.
+pub(crate) fn edit_action(put: Option<&ConfigRoutesPut>) -> AuditAction {
+    match put {
+        Some(ConfigRoutesPut {
+            routes: None,
+            spend_caps: Some(_),
+        }) => AuditAction::ConfigSpendCaps,
+        _ => AuditAction::ConfigRoutes,
+    }
+}
+
 /// `req` without `thinking` blocks of another vendor than `vendor`; borrowed when it has none.
 fn own_thinking<'a>(req: &'a TurnRequest, vendor: &str) -> Cow<'a, TurnRequest> {
     let foreign = |b: &Block| matches!(b, Block::Thinking { vendor: v, .. } if v != vendor);
@@ -477,8 +489,8 @@ impl Gateway {
         answer
     }
 
-    /// The `[[routes]]` of the config file as it is on disk, which a reload has not necessarily
-    /// taken, and the file's hash.
+    /// The `[[routes]]` and the `api_key` logins' `spend_cap`s of the config file as it is on
+    /// disk, which a reload has not necessarily taken, and the file's hash.
     ///
     /// # Errors
     /// The file cannot be read or does not validate.
@@ -487,32 +499,37 @@ impl Gateway {
         Ok(ConfigRoutes {
             sha256: sha256::hex(config.sha256),
             routes: config_edit::routes_of(&config.routes),
+            spend_caps: config_edit::spend_caps_of(&config.logins),
         })
     }
 
-    /// Replaces the `[[routes]]` items of the config file with those of the
-    /// [`qb_proto::ConfigRoutesPut`] `body` for `actor`, when `if_match` is the file's hash, and
-    /// reloads it. The candidate file must pass a reload's checks; the old file is kept as a
+    /// Edits the config file as the [`qb_proto::ConfigRoutesPut`] `body` for `actor` asks, when
+    /// `if_match` is the file's hash, and reloads it: its `[[routes]]` replaced, `spend_cap`s set
+    /// or removed. The candidate file must pass a reload's checks; the old file is kept as a
     /// 0600 backup, the new one written atomically. Serialised with reloads and rotations; logs
-    /// one line and records one audit entry either way.
+    /// one line and records one audit entry either way, `config_spend_caps` for a body of
+    /// `spend_caps` only and `config_routes` otherwise.
     ///
     /// # Errors
     /// 428 without `if_match`, 412 when it is not the file's hash, 400 for a body or candidate
-    /// that does not validate, 500 when a file cannot be read or written; the file, its backups
-    /// and the running config stay as they were.
-    pub fn put_routes(
+    /// that does not validate, 500 when a file cannot be read or written. The file, its backups
+    /// and the running config stay as they were, except that a failed write which replaced the
+    /// file keeps the backup.
+    pub fn put_config(
         &self,
         actor: &str,
         if_match: Option<&str>,
         body: &[u8],
     ) -> Result<ConfigRoutesWritten, Refusal> {
         let _one = lock(&self.reloading);
+        let put = serde_json::from_slice::<ConfigRoutesPut>(body).map_err(|e| e.to_string());
+        let action = edit_action(put.as_ref().ok());
         let object = Some(self.startup.file.display().to_string());
-        let mut entry = audit::entry(actor, AuditAction::ConfigRoutes, object);
-        match self.write_routes(if_match, body, &mut entry) {
+        let mut entry = audit::entry(actor, action, object);
+        match self.write_config(if_match, put, &mut entry) {
             Ok(written) => {
                 log::info(&format!(
-                    "gateway: routes of {} replaced, the old file kept as {}",
+                    "gateway: {} edited, the old file kept as {}",
                     self.startup.file.display(),
                     written.backup
                 ));
@@ -521,7 +538,7 @@ impl Gateway {
             }
             Err(refusal) => {
                 log::warn(&format!(
-                    "gateway: routes edit refused: {}",
+                    "gateway: config edit refused: {}",
                     refusal.message
                 ));
                 self.record(&audit::refused(entry, refusal.message.as_str()));
@@ -530,12 +547,12 @@ impl Gateway {
         }
     }
 
-    /// The steps of [`Self::put_routes`] under `reloading`, filling the hashes and backup of
-    /// `entry`.
-    fn write_routes(
+    /// The steps of [`Self::put_config`] under `reloading` for the decoded body `put`, filling
+    /// the hashes and backup of `entry`.
+    fn write_config(
         &self,
         if_match: Option<&str>,
-        body: &[u8],
+        put: Result<ConfigRoutesPut, String>,
         entry: &mut AuditEntry,
     ) -> Result<ConfigRoutesWritten, Refusal> {
         let file = &self.startup.file;
@@ -554,20 +571,54 @@ impl Gateway {
             let message = format!("`If-Match` is not the config file's sha256 {before}");
             return Err(Refusal::new(412, ErrorClass::BadRequest, message));
         }
-        let put: ConfigRoutesPut =
-            serde_json::from_slice(body).map_err(|e| invalid(e.to_string()))?;
-        let items = config_edit::render(&put.routes);
-        let refused = |e: String| invalid(format!("routes refused: {e}"));
-        let candidate =
-            config_edit::splice(file, &text, &items).map_err(|e| refused(e.to_string()))?;
+        let put = put.map_err(invalid)?;
+        let what = match (&put.routes, &put.spend_caps) {
+            (None, None) => return Err(invalid("give `routes`, `spend_caps` or both".into())),
+            (Some(_), _) => "routes",
+            (None, Some(_)) => "spend_caps",
+        };
+        let refused = |e: String| invalid(format!("{what} refused: {e}"));
+        let mut candidate = text.clone();
+        if let Some(routes) = &put.routes {
+            let items = config_edit::render(routes);
+            candidate = config_edit::splice(file, &candidate, &items)
+                .map_err(|e| refused(e.to_string()))?;
+        }
+        if let Some(caps) = &put.spend_caps {
+            candidate = config_edit::set_spend_caps(file, &candidate, caps)
+                .map_err(|e| refused(e.to_string()))?;
+        }
         let (config, current) = self
             .admissible(super::config::parse(file, &candidate))
             .map_err(refused)?;
         let backup = config_edit::backup(file, text.as_bytes(), unix_now())
             .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
-        if let Err(e) = write_atomic(file, candidate.as_bytes()) {
-            let _ = std::fs::remove_file(&backup);
-            return Err(failed(format!("cannot write {}: {e}", file.display())));
+        let replaced = config_edit::replace(
+            file,
+            text.as_bytes(),
+            candidate.as_bytes(),
+            &backup,
+            write_atomic,
+        );
+        if let Err(u) = replaced {
+            if !u.replaced {
+                return Err(failed(format!(
+                    "cannot write {}: {}",
+                    file.display(),
+                    u.error
+                )));
+            }
+            if let Ok(now) = std::fs::read(file) {
+                entry.config_sha256_after = Some(sha256::hex(sha256::digest(&now)));
+            }
+            let file = file.display();
+            let backup = backup.display().to_string();
+            let message = format!(
+                "{file} was replaced but not installed: {}; the old file is kept as {backup}",
+                u.error
+            );
+            entry.backup = Some(backup);
+            return Err(failed(message));
         }
         let after = sha256::hex(config.sha256);
         self.install(config, current);

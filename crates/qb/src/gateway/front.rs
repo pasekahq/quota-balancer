@@ -35,7 +35,7 @@ use serde::Serialize;
 use super::answer::Keepalive;
 use super::audit;
 use super::config::{Fronts, TOKEN_CALLER};
-use super::core::{Cancel, Gateway};
+use super::core::{Cancel, Gateway, edit_action};
 use super::tokens::ClientTokens;
 use super::upstream::{CancelToken, Flow};
 use super::usage::{self, AggregateError};
@@ -676,11 +676,12 @@ fn put_config_routes(
 ) {
     if !own {
         let object = Some(gateway.config().file.display().to_string());
-        let entry = audit::entry(actor, AuditAction::ConfigRoutes, object);
+        let put = serde_json::from_slice(&req.body).ok();
+        let entry = audit::entry(actor, edit_action(put.as_ref()), object);
         gateway.record(&audit::refused(entry, CONFIG_OWNER));
         return reject(stream, 403, ErrorClass::Auth, CONFIG_OWNER);
     }
-    match gateway.put_routes(actor, req.if_match.as_deref(), &req.body) {
+    match gateway.put_config(actor, req.if_match.as_deref(), &req.body) {
         Ok(answer) => reply(stream, 200, &answer),
         Err(r) => reject(stream, r.status, r.class, &r.message),
     }

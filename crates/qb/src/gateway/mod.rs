@@ -6,7 +6,8 @@
 //! what happened. qbd itself stays without secrets and network.
 //!
 //! - [`config`]: the gateway's TOML config;
-//! - [`config_edit`]: the `[[routes]]` of the config file rendered and spliced for an edit;
+//! - [`config_edit`]: the `[[routes]]` of the config file rendered and spliced and the logins'
+//!   `spend_cap`s set for an edit;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
 //! - [`import`]: `qb login import`, a credential of another client copied into a login's file;
 //! - [`signin`]: `qb login`, an OAuth login signed in from scratch with PKCE;

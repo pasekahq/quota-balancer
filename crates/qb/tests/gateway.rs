@@ -8015,7 +8015,8 @@ fn put_routes(gw: &Path, if_match: Option<&str>, body: &str) -> (u16, Vec<u8>) {
 /// The body of a `PUT` of `routes`.
 fn routes_body(routes: &[ConfigRoute]) -> String {
     serde_json::to_string(&ConfigRoutesPut {
-        routes: routes.to_vec(),
+        routes: Some(routes.to_vec()),
+        spend_caps: None,
     })
     .unwrap()
 }
@@ -8335,4 +8336,269 @@ fn only_the_gateway_s_own_uid_reads_or_replaces_the_routes_and_only_on_the_unix_
         );
     }
     assert_eq!(aliases(&r.gw), ["chat", "spare"]);
+}
+
+/// The body of a `PUT` of `spend_caps` only.
+fn caps_body(caps: &[(&str, Option<f64>)]) -> String {
+    serde_json::to_string(&ConfigRoutesPut {
+        routes: None,
+        spend_caps: Some(caps.iter().map(|(l, c)| ((*l).to_owned(), *c)).collect()),
+    })
+    .unwrap()
+}
+
+/// `(login, cap_usd)` of each login in the spend view of `gw`.
+fn caps_in_spend(gw: &Path) -> Vec<(String, f64)> {
+    let answer = spend_of(gw);
+    answer
+        .logins
+        .into_iter()
+        .map(|l| (l.login, l.cap_usd))
+        .collect()
+}
+
+/// The `[[logins]]` table of `login` as [`chain_rig_with`] writes it, `cap` its `spend_cap`
+/// line.
+fn chain_login(r: &Rig, login: &str, cap: &str) -> String {
+    format!(
+        "[[logins]]\nname = \"{login}\"\n{ANTHROPIC_KEY}\n{cap}credentials = \"{}/creds/{login}.json\"\n",
+        r.dir.display()
+    )
+}
+
+#[test]
+fn spend_caps_are_set_changed_and_removed_in_place_and_the_spend_view_follows() {
+    let audit = audit_path();
+    let extra = format!("{}{PRICES}", audit_key(&audit));
+    let r = chain_rig_with(&qbd_with_spend(), Some([1.0, 100.0, 100.0]), &extra);
+    let file = config_file(&r.gw);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let (got, etag) = config_routes(&r.gw);
+    let caps = |c: [Option<f64>; 3]| {
+        let names = ["login-1", "login-2", "login-3"].map(str::to_owned);
+        names
+            .into_iter()
+            .zip(c)
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(got.spend_caps, caps([Some(1.0), Some(100.0), Some(100.0)]));
+
+    let body = caps_body(&[("login-1", Some(2.5)), ("login-2", None)]);
+    let (status, answer) = put_routes(&r.gw, Some(&etag), &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let written: ConfigRoutesWritten = serde_json::from_slice(&answer).unwrap();
+    let after = std::fs::read_to_string(&file).unwrap();
+    let want = before
+        .replace(
+            &chain_login(&r, "login-1", "spend_cap = 1.0\n"),
+            &chain_login(&r, "login-1", "spend_cap = 2.5\n"),
+        )
+        .replace(
+            &chain_login(&r, "login-2", "spend_cap = 100.0\n"),
+            &chain_login(&r, "login-2", ""),
+        );
+    assert_eq!(after, want);
+    assert_eq!(written.sha256, sha256_hex(&after));
+    assert_eq!(
+        caps_in_spend(&r.gw),
+        [("login-1".into(), 2.5), ("login-3".into(), 100.0)]
+    );
+    let (got, etag) = config_routes(&r.gw);
+    assert_eq!(got.spend_caps, caps([Some(2.5), None, Some(100.0)]));
+
+    let (status, answer) = put_routes(&r.gw, Some(&etag), &caps_body(&[("login-2", Some(0.1))]));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let added = std::fs::read_to_string(&file).unwrap();
+    let with_cap = format!("{}spend_cap = 0.1\n", chain_login(&r, "login-2", ""));
+    assert_eq!(
+        added,
+        after.replace(&chain_login(&r, "login-2", ""), &with_cap)
+    );
+    assert_eq!(
+        caps_in_spend(&r.gw),
+        [
+            ("login-1".into(), 2.5),
+            ("login-2".into(), 0.1),
+            ("login-3".into(), 100.0)
+        ]
+    );
+    let (got, _) = config_routes(&r.gw);
+    assert_eq!(got.spend_caps, caps([Some(2.5), Some(0.1), Some(100.0)]));
+
+    let entries = audit_answer(&r.gw, "").entries;
+    let rows: Vec<_> = entries
+        .iter()
+        .map(|e| (e.action, e.result, e.backup.is_some()))
+        .collect();
+    let edited = (AuditAction::ConfigSpendCaps, AuditResult::Ok, true);
+    assert_eq!(rows, [edited; 2]);
+    assert_eq!(backups(&r.gw).len(), 2);
+    assert_eq!(std::fs::read_to_string(&backups(&r.gw)[0]).unwrap(), before);
+}
+
+#[test]
+fn a_put_of_routes_and_caps_is_one_edit_audited_as_config_routes() {
+    let audit = audit_path();
+    let extra = format!("{}{PRICES}", audit_key(&audit));
+    let r = chain_rig_with(&qbd_with_spend(), Some([1.0, 100.0, 100.0]), &extra);
+    let (_, etag) = config_routes(&r.gw);
+    let body = json!({
+        "routes": [ladder_route("chat"), ladder_route("added")],
+        "spend_caps": {"login-3": 50, "login-1": null},
+    })
+    .to_string();
+    let (status, answer) = put_routes(&r.gw, Some(&etag), &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let written: ConfigRoutesWritten = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(aliases(&r.gw), ["added", "chat"]);
+    assert_eq!(
+        caps_in_spend(&r.gw),
+        [("login-2".into(), 100.0), ("login-3".into(), 50.0)]
+    );
+    let text = std::fs::read_to_string(config_file(&r.gw)).unwrap();
+    assert!(
+        text.contains(&chain_login(&r, "login-3", "spend_cap = 50.0\n")),
+        "{text}"
+    );
+    assert_eq!(backups(&r.gw), [PathBuf::from(&written.backup)]);
+    let entries = audit_answer(&r.gw, "").entries;
+    let rows: Vec<_> = entries
+        .iter()
+        .map(|e| (e.action, e.result, e.backup.clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        [(
+            AuditAction::ConfigRoutes,
+            AuditResult::Ok,
+            Some(written.backup)
+        )]
+    );
+}
+
+#[test]
+fn caps_of_unknown_or_other_kind_logins_or_without_a_spend_file_are_refused_by_name() {
+    let audit = audit_path();
+    let files = [
+        ("login-1", api_key("test-token-1"), 0o600),
+        ("login-2", chatgpt("access-0", "account-0"), 0o600),
+    ];
+    let r = rig_as(4, &files, &audit_key(&audit), own_uid());
+    let file = config_file(&r.gw);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let (got, etag) = config_routes(&r.gw);
+    assert_eq!(
+        got.spend_caps.into_iter().collect::<Vec<_>>(),
+        [("login-1".to_owned(), None)]
+    );
+
+    let cases = [
+        (caps_body(&[("login-9", Some(1.0))]), "no login `login-9`"),
+        (
+            caps_body(&[("login-2", Some(1.0))]),
+            "login `login-2` is not an `api_key` login",
+        ),
+        (
+            caps_body(&[("login-1", Some(5.0))]),
+            "logins[0].spend_cap: needs a top-level `spend_file` to count in",
+        ),
+        ("{}".to_owned(), "give `routes`, `spend_caps` or both"),
+        (
+            r#"{"spend_caps": {"login-1": "5"}}"#.to_owned(),
+            "invalid type: string \"5\"",
+        ),
+    ];
+    for (body, says) in &cases {
+        let (status, e) = put_error(&r.gw, Some(&etag), body);
+        let message = e.message.unwrap();
+        assert_eq!(
+            (status, e.class),
+            (400, ErrorClass::BadRequest),
+            "{message}"
+        );
+        assert!(message.contains(says), "{body}: {message}");
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    assert_eq!(backups(&r.gw), Vec::<PathBuf>::new());
+    let actions: Vec<_> = audit_answer(&r.gw, "")
+        .entries
+        .iter()
+        .map(|e| (e.action, e.result))
+        .collect();
+    let caps = (AuditAction::ConfigSpendCaps, AuditResult::Refused);
+    let routes = (AuditAction::ConfigRoutes, AuditResult::Refused);
+    assert_eq!(actions, [caps, caps, caps, routes, routes]);
+}
+
+#[test]
+fn a_routes_item_split_by_an_unrelated_table_is_refused_and_nothing_changes() {
+    let r = rig();
+    let file = config_file(&r.gw);
+    let split = "[[routes]]\nalias = \"split\"\nrole = \"gateway\"\n\
+                 [openai_models.\"model-z\"]\nreasoning = false\n\
+                 [[routes.chain]]\nvendor = \"vendor-a\"\nmodel = \"model-a\"\n";
+    let text = format!("{}{split}", std::fs::read_to_string(&file).unwrap());
+    std::fs::write(&file, &text).unwrap();
+    let (got, etag) = config_routes(&r.gw);
+    assert_eq!(got.routes.last().unwrap().alias, "split");
+    let (status, e) = put_error(&r.gw, Some(&etag), &routes_body(&[ladder_route("chat")]));
+    let message = e.message.unwrap();
+    assert_eq!(status, 400, "{message}");
+    assert!(
+        message.contains("routes: a table outside `routes` lies between a `[[routes]]` item"),
+        "{message}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    assert_eq!(backups(&r.gw), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn a_write_that_replaced_the_file_and_then_failed_keeps_the_backup_and_installs_nothing() {
+    let audit = audit_path();
+    let r = rig_as(4, &key_files(), &audit_key(&audit), own_uid());
+    let file = config_file(&r.gw);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let (_, etag) = config_routes(&r.gw);
+    let dir = file.parent().unwrap();
+    // Without read permission the rename into the directory works, its sync after it does not.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::read_dir(dir).is_ok() {
+        // Running as root: directory modes do not bind, nothing to check.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let (status, e) = put_error(&r.gw, Some(&etag), &routes_body(&[ladder_route("other")]));
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!((status, e.class), (500, ErrorClass::Unavailable), "{e:?}");
+    let message = e.message.unwrap();
+    let replaced = format!("{} was replaced but not installed: ", file.display());
+    assert!(message.starts_with(&replaced), "{message}");
+    let kept = backups(&r.gw);
+    assert_eq!(kept.len(), 1);
+    assert!(
+        message.ends_with(&format!("the old file is kept as {}", kept[0].display())),
+        "{message}"
+    );
+    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), before);
+    let (on_disk, _) = config_routes(&r.gw);
+    assert_eq!(on_disk.routes, [ladder_route("other")]);
+    assert_eq!(
+        aliases(&r.gw),
+        ["chat", "spare"],
+        "the running config stays"
+    );
+    let last = audit_answer(&r.gw, "").entries.pop().unwrap();
+    assert_eq!(
+        (last.action, last.result, last.backup),
+        (
+            AuditAction::ConfigRoutes,
+            AuditResult::Refused,
+            Some(kept[0].display().to_string())
+        )
+    );
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        (last.config_sha256_before, last.config_sha256_after),
+        (Some(sha256_hex(&before)), Some(sha256_hex(&after)))
+    );
 }

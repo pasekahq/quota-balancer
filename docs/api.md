@@ -490,12 +490,12 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 |---|---|
 | `at` | Unix time of the action |
 | `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
-| `action` | `reload`, `spend_reset`, `client_rotate` or `config_routes` |
-| `object` | the config file of a reload or a routes edit, the login of a spend reset, the client of a rotation; absent when a refused request named none |
+| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse) or `config_spend_caps` (one with `spend_caps` only) |
+| `object` | the config file of a reload or a config edit, the login of a spend reset, the client of a rotation; absent when a refused request named none |
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
-| `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a routes edit's of the file on disk before and after it; equal when it was refused |
-| `backup` | a routes edit that went through: path of the copy of the file it replaced |
+| `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a config edit's of the file on disk before and after it; equal when it was refused, unless the edit replaced the file but could not install it |
+| `backup` | a config edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced |
 | `token_sha256_prefix` | a rotation that went through: the first 12 hex characters of the new token's SHA-256 |
 
 Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/spend/reset`,
@@ -541,13 +541,15 @@ written is 500 `unavailable`: the token file and the accepted tokens stay as the
 
 ### `GET` and `PUT /v1/model/config/routes`
 
-The `[[routes]]` items of the gateway's config file ([config.md](config.md#gateway-config)), read
-and replaced as JSON. Only the gateway's own uid may call them: any other caller gets 403 `auth`;
-the loopback listener answers 404. Both read the file as it is on disk, which may differ from the
-running config until a reload.
+The `[[routes]]` items and the `api_key` logins' `spend_cap`s of the gateway's config file
+([config.md](config.md#gateway-config)), read and edited as JSON. Only the gateway's own uid may
+call them: any other caller gets 403 `auth`; the loopback listener answers 404. Both read the
+file as it is on disk, which may differ from the running config until a reload.
 
-`GET` answers the file's hex SHA-256 and its items in file order, each key as the file has it
-and a chain as an array of steps; the same hash goes out as the strong `ETag: "<sha256>"`:
+`GET` answers the file's hex SHA-256, its items in file order, each key as the file has it and a
+chain as an array of steps, and `spend_caps`: every `api_key` login by name with its `spend_cap`
+in USD, `null` for one without; logins of other kinds are not listed. The same hash goes out as
+the strong `ETag: "<sha256>"`:
 
 ```json
 {"sha256": "a1b2…",
@@ -555,37 +557,64 @@ and a chain as an array of steps; the same hash goes out as the strong `ETag: "<
             {"alias": "pinned", "role": "gateway", "vendor": "vendor-b", "model": "model-b"},
             {"alias": "chain", "role": "gateway",
              "chain": [{"vendor": "vendor-a", "model": "model-a"},
-                       {"vendor": "vendor-c", "model": "model-c", "effort": "low"}]}]}
+                       {"vendor": "vendor-c", "model": "model-c", "effort": "low"}]}],
+ "spend_caps": {"key-1": 25.0, "key-2": null}}
 ```
 
 A file that cannot be read or does not validate is 500 `unavailable`.
 
-`PUT` takes `{"routes": [...]}` with items of the same shape, unknown fields refused, and
-`If-Match` with the hash `GET` answered, quoted as in the `ETag` or bare. The gateway holds its
-reload lock for the whole request, so reloads and client token rotations wait, and reads the file
-again: no `If-Match` is 428 `bad_request`, one that is not the file's current hash 412
-`bad_request`, so an edit by hand since the `GET` is detected. It renders the items as
+`PUT` takes `routes`, `spend_caps` or both, unknown fields refused, a body with neither 400
+`bad_request`, and `If-Match` with the hash `GET` answered, quoted as in the `ETag` or bare:
+
+```json
+{"routes": [{"alias": "chat", "role": "gateway", "difficulty": 1}],
+ "spend_caps": {"key-1": 40.5, "key-2": null}}
+```
+
+The gateway holds its reload lock for the whole request, so reloads and client token rotations
+wait, and reads the file again: no `If-Match` is 428 `bad_request`, one that is not the file's
+current hash 412 `bad_request`, so an edit by hand since the `GET` is detected.
+
+`routes`, items of the `GET` shape, replace the file's items: the gateway renders them as
 `[[routes]]` tables, TOML basic strings escaped, puts them where the first old item starts and
 removes the other old items. An item spans from its `[[routes]]` header to the end of the line of
 its last value, its `[[routes.chain]]` tables included: every byte outside the old items stays,
 comments and other tables included, and comments inside them go. A file whose `routes` are an
-inline array cannot be edited. The candidate file must pass what a reload checks
-([config.md](config.md#reload)); otherwise the answer is 400 `bad_request` with the message
-`routes refused: <file>: <field>: <reason>`, the line being the candidate's, for example
-``routes[1].alias: duplicate `chat` ``. Integers of the body are not range-checked before that, so
-the parser names a `difficulty` out of range. On success the old file is copied to
-`<config>.bak-<unix s>`, `-<n>` appended when a backup of that second exists, with mode 0600; the
-candidate is written atomically with mode 0600 (temporary file in the same directory, fsync,
-rename, fsync of the directory) and becomes the running config as a reload makes it, logging
-`gateway: reloaded <file>: …`. The answer is
+inline array, or with a table outside `routes` between an item and its `[[routes.chain]]`, cannot
+be edited this way: 400 `bad_request`, nothing written.
+
+`spend_caps` maps login names to a USD amount or `null`; logins not named keep theirs. An amount
+replaces the value of the login's `spend_cap` in place, or adds the line `spend_cap = <amount>`
+after the line of the login's last value; `null` removes the `spend_cap` line, its comment
+included. Amounts are written as TOML floats that parse back to the same number. A login the
+file does not have as a `[[logins]]` table, or whose `kind` is not `api_key`, is 400
+`bad_request` naming it. Every other byte stays.
+
+With both, the routes are replaced first and the caps set in the result; the request is one
+edit. The candidate file must pass what a reload checks ([config.md](config.md#reload)), so a cap
+without a top-level `spend_file` or of 0 is refused; otherwise the answer is 400 `bad_request`
+with the message `routes refused: <file>: <field>: <reason>` (`spend_caps refused: …` for a body
+of `spend_caps` only), the line being the candidate's, for example
+``routes[1].alias: duplicate `chat` `` or ``logins[0].spend_cap: needs a top-level `spend_file`
+to count in``. Integers of the body are not range-checked before that, so the parser names a
+`difficulty` out of range. On success the old file is copied to `<config>.bak-<unix s>`, `-<n>`
+appended when a backup of that second exists, with mode 0600; the candidate is written
+atomically with mode 0600 (temporary file in the same directory, fsync, rename, fsync of the
+directory) and becomes the running config as a reload makes it, logging
+`gateway: reloaded <file>: …`, so `GET /v1/model/spend` and `qbd`'s `spend` windows follow the
+new caps at once. The answer is
 
 ```json
 {"sha256": "5f0e…", "backup": "/etc/qb/gateway.toml.bak-1800000360"}
 ```
 
 with the hash of the file now on disk. A file that cannot be read or written is 500
-`unavailable`. On every refusal the file, its backups and the running config stay as they were.
-The gateway never removes a backup.
+`unavailable`. On every refusal the file, its backups and the running config stay as they were,
+with one exception: a write that fails after the rename replaced the file is 500 `unavailable`
+with the message `<file> was replaced but not installed: <error>; the old file is kept as
+<backup>`. The running config stays, the file on disk is the candidate and the backup is kept,
+so a reload installs the candidate and the backup restores the old file. The gateway removes the
+new backup only when a failed write left the file unchanged, and no other backup.
 
 ### Usage ledger
 

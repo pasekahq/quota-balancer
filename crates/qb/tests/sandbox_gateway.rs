@@ -191,9 +191,13 @@ fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
         let current = gateway.config_routes().unwrap();
         let mut routes = current.routes;
         routes[0].expected_minutes = Some(3);
-        let body = serde_json::to_vec(&ConfigRoutesPut { routes }).unwrap();
+        let body = serde_json::to_vec(&ConfigRoutesPut {
+            routes: Some(routes),
+            spend_caps: None,
+        })
+        .unwrap();
         let edit = gateway
-            .put_routes("uid:1", Some(&current.sha256), &body)
+            .put_config("uid:1", Some(&current.sha256), &body)
             .unwrap();
         assert_eq!(gateway.config().routes[0].expected_minutes, Some(3));
         let answer = gateway.rotate_client("uid:1", "client-f").unwrap();

@@ -4,6 +4,8 @@
 //! Variants are internally tagged by `type`, so a block or an event is one flat JSON object:
 //! `{"type": "text", "text": "..."}`, `{"type": "stop", "reason": "end"}`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -758,21 +760,31 @@ pub struct ConfigRoute {
     pub expected_minutes: Option<i64>,
 }
 
-/// `GET /v1/model/config/routes` response: the `[[routes]]` items of the config file on disk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `GET /v1/model/config/routes` response: the `[[routes]]` items and the `api_key` logins'
+/// `spend_cap`s of the config file on disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigRoutes {
     /// Hex SHA-256 of the config file; also the answer's `ETag`.
     pub sha256: String,
     /// The items in file order.
     pub routes: Vec<ConfigRoute>,
+    /// USD `spend_cap` of each `api_key` login by name; `None` for one without a cap.
+    #[serde(default)]
+    pub spend_caps: BTreeMap<String, Option<f64>>,
 }
 
-/// `PUT /v1/model/config/routes` request: the items that replace the file's `[[routes]]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `PUT /v1/model/config/routes` request: the items that replace the file's `[[routes]]`, the
+/// `spend_cap`s to set or remove, or both; the gateway refuses a body with neither.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigRoutesPut {
-    /// The new items in file order.
-    pub routes: Vec<ConfigRoute>,
+    /// The new items in file order; `None` keeps the file's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<ConfigRoute>>,
+    /// USD `spend_cap` of `api_key` logins by name, `None` to remove it; logins not named keep
+    /// theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_caps: Option<BTreeMap<String, Option<f64>>>,
 }
 
 /// `PUT /v1/model/config/routes` response.
@@ -795,8 +807,12 @@ pub enum AuditAction {
     /// `POST /v1/model/clients/{name}/rotate`: a fresh token written to a named loopback
     /// client's `token_file`.
     ClientRotate,
-    /// `PUT /v1/model/config/routes`: the config file's `[[routes]]` replaced and reloaded.
+    /// `PUT /v1/model/config/routes` with `routes`: the config file's `[[routes]]` replaced,
+    /// with any `spend_caps` set, and reloaded.
     ConfigRoutes,
+    /// `PUT /v1/model/config/routes` with `spend_caps` only: logins' `spend_cap`s set or removed
+    /// in the config file and reloaded.
+    ConfigSpendCaps,
 }
 
 /// Whether an admin action went through.
@@ -819,7 +835,7 @@ pub struct AuditEntry {
     pub actor: String,
     /// What was done.
     pub action: AuditAction,
-    /// The login of a spend reset, the config file of a reload or a routes edit, the client of a
+    /// The login of a spend reset, the config file of a reload or a config edit, the client of a
     /// rotation; absent when a refused request named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
@@ -828,11 +844,11 @@ pub struct AuditEntry {
     /// Why it was refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// A reload or a routes edit: hex SHA-256 of the config file before the action.
+    /// A reload or a config edit: hex SHA-256 of the config file before the action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_before: Option<String>,
-    /// A reload or a routes edit: hex SHA-256 of the config file after it; the same as before
-    /// when it was refused.
+    /// A reload or a config edit: hex SHA-256 of the config file after it; the same as before
+    /// when it was refused, unless a refused edit had replaced the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_after: Option<String>,
     /// Path of the copy an action kept of what it replaced.
