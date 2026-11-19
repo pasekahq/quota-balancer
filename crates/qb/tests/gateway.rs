@@ -7650,13 +7650,18 @@ fn rotating_keys(token_file: &Path, grace_file: &Path, grace_s: u32) -> String {
     )
 }
 
-/// A [`Rotating`] gateway whose token file holds `contents`.
-fn rotating_rig(grace_s: u32, contents: &str) -> Rotating {
-    let tokens = temp_dir("tokens");
-    let token_file = tokens.join("client-f.token");
+/// `client-f`'s 0600 token file holding `contents` and a grace file path, each in a directory of
+/// its own.
+fn token_files(contents: &str) -> (PathBuf, PathBuf) {
+    let token_file = temp_dir("tokens").join("client-f.token");
     std::fs::write(&token_file, contents).unwrap();
     std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let grace_file = temp_dir("grace").join("grace.json");
+    (token_file, temp_dir("grace").join("grace.json"))
+}
+
+/// A [`Rotating`] gateway whose token file holds `contents`.
+fn rotating_rig(grace_s: u32, contents: &str) -> Rotating {
+    let (token_file, grace_file) = token_files(contents);
     let (audit, ledger) = (audit_path(), temp_dir("ledger").join("usage.jsonl"));
     let (listener, addr, front) = loopback_front(&rotating_keys(&token_file, &grace_file, grace_s));
     let extra = format!(
@@ -9082,6 +9087,17 @@ fn old_credential(kind: &str) -> String {
 }
 
 fn sign_rig(kind: &'static str, expiry: u64, extra: &str, gateway_uid: u32) -> SignRig {
+    sign_rig_on(kind, expiry, extra, gateway_uid, None)
+}
+
+/// [`sign_rig`] with the HTTP fronts also on `loopback`.
+fn sign_rig_on(
+    kind: &'static str,
+    expiry: u64,
+    extra: &str,
+    gateway_uid: u32,
+    loopback: Option<TcpListener>,
+) -> SignRig {
     let tokens = Vendor::start();
     let dir = temp_dir("gw");
     let (audit, ledger) = (audit_path(), temp_dir("ledger").join("usage.jsonl"));
@@ -9116,7 +9132,7 @@ fn sign_rig(kind: &'static str, expiry: u64, extra: &str, gateway_uid: u32) -> S
         ],
         Box::new(Counting(Arc::clone(&refreshes))),
         gateway_uid,
-        None,
+        loopback,
         |g| g.sign_in_expiry(expiry),
     );
     let file = dir.join("creds/login-1.json");
@@ -9237,15 +9253,16 @@ impl SignRig {
             .collect()
     }
 
-    /// Asserts that none of `answers`, `logged`, the audit file and the ledger holds a marked
-    /// value or one of `hidden`.
+    /// Asserts that none of `answers`, `logged`, the audit file and the ledger files holds a
+    /// marked value or one of `hidden`.
     fn assert_hidden(&self, answers: &[(u16, Vec<u8>)], logged: &str, hidden: &[&str]) {
         let read = |f: &Path| std::fs::read_to_string(f).unwrap_or_default();
-        let mut texts = vec![
-            ("stderr", logged.to_owned()),
-            ("audit", read(&self.audit)),
-            ("ledger", read(&self.ledger)),
-        ];
+        let mut texts = vec![("stderr", logged.to_owned()), ("audit", read(&self.audit))];
+        texts.extend(
+            ledger_files(&self.ledger)
+                .iter()
+                .map(|f| ("ledger", read(f))),
+        );
         texts.extend(
             answers
                 .iter()
@@ -9790,4 +9807,142 @@ fn a_bad_sign_in_request_is_refused_and_audited_without_echoing_the_body() {
             ),
         ],
     );
+}
+
+/// The answers of every admin read on `gw`: routes, config routes, spend, audit, health, and the
+/// usage since `from` by each grouping.
+fn admin_reads(gw: &Path, from: u64) -> Vec<(u16, Vec<u8>)> {
+    let mut answers: Vec<_> = [
+        paths::MODEL_ROUTES,
+        paths::MODEL_CONFIG_ROUTES,
+        paths::MODEL_SPEND,
+        paths::MODEL_AUDIT,
+        paths::HEALTH,
+    ]
+    .into_iter()
+    .map(|path| call(gw, "GET", path, ""))
+    .collect();
+    for group_by in ["client", "login", "model", "route", "tool"] {
+        answers.push(usage_of(gw, &format!("?from={from}&group_by={group_by}")));
+    }
+    answers
+}
+
+/// The access token, refresh token and account id of the old `chatgpt_oauth` credential of
+/// [`sign_rig`] and of its [`SignRig::grant`], the two access tokens first.
+fn oauth_values() -> Vec<String> {
+    [
+        "access-old",
+        "access-new",
+        "refresh-old",
+        "refresh-new",
+        "acct-old",
+        "acct-new",
+    ]
+    .map(|v| format!("{v}-{SIGN_MARK}"))
+    .to_vec()
+}
+
+#[test]
+fn no_secret_the_gateway_handles_reaches_its_log_ledger_audit_or_any_answer() {
+    let (token_file, grace_file) = token_files(FILE_TOKEN);
+    let (listener, addr, front) = loopback_front(&rotating_keys(&token_file, &grace_file, 3600));
+    let s = sign_rig_on("chatgpt_oauth", 600, &front, own_uid(), Some(listener));
+    let old_key = common::credentials::written(&s.r.dir.join("creds/login-2.json"))["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let code = format!("code-{SIGN_MARK}");
+    let messages = sdk_body("model-2025-01-01", false);
+    let front_turn = |token: &str| loopback_post(addr, paths::MESSAGES, token, &messages);
+    let unix_turn = |id: &str| {
+        call(
+            &s.r.gw,
+            "POST",
+            paths::MODEL_TURN,
+            &turn_body(id).to_string(),
+        )
+    };
+    let now = unix_now();
+    let mut answers = Vec::new();
+    let mut start = (0, Vec::new());
+    let mut rotated_token = String::new();
+    let logged = stderr_until("on login-1: usage_limit", || {
+        answers.push(unix_turn("turn-1"));
+        answers.extend([CLIENT_TOKEN, FILE_TOKEN, CLIENT_A.0].map(front_turn));
+        answers.push(rotate(&s.r.gw, "client-f"));
+        rotated_token = std::fs::read_to_string(&token_file).unwrap();
+        answers.extend([rotated_token.as_str(), FILE_TOKEN].map(front_turn));
+        answers.push(put_key(
+            &s.r.gw,
+            "login-2",
+            &json!({"key": NEW_KEY}).to_string(),
+        ));
+        start = s.post("login-1", "start", "");
+        let started: LoginOauthStarted = serde_json::from_slice(&start.1).unwrap();
+        s.grant();
+        answers.push(s.code(&s.paste(&code, &param(&started.url, "state"))));
+        s.r.fake.script("login-1", usage_limit(now + 3600));
+        answers.push(unix_turn("turn-2"));
+        answers.push(front_turn(&rotated_token));
+        answers.extend(admin_reads(&s.r.gw, now - 60));
+    });
+    for (status, body) in answers.iter().chain([&start]) {
+        assert_eq!(*status, 200, "{}", String::from_utf8_lossy(body));
+    }
+    for done in [
+        "rotated the token of client `client-f`",
+        "replaced the key of login `login-2`",
+        "signed in login `login-1`",
+    ] {
+        assert!(logged.contains(done), "{logged}");
+    }
+
+    let calls = s.r.fake.calls();
+    let sent: Vec<(&str, &str)> = calls
+        .iter()
+        .map(|(l, k, _)| (l.as_str(), k.as_str()))
+        .collect();
+    let oauth = oauth_values();
+    assert_eq!(sent[0], ("login-1", oauth[0].as_str()));
+    assert_eq!(
+        sent[sent.len() - 3..],
+        [
+            ("login-1", oauth[1].as_str()),
+            ("login-2", NEW_KEY),
+            ("login-2", NEW_KEY)
+        ],
+        "the attempts after the replacements send the new credentials"
+    );
+    let ledger = usage_lines(&s.ledger);
+    let clients: Vec<&str> = ledger.iter().map(|l| l.client.as_str()).collect();
+    for client in ["client-f", "client-a"] {
+        assert!(clients.contains(&client), "{clients:?}");
+    }
+
+    let started: LoginOauthStarted = serde_json::from_slice(&start.1).unwrap();
+    let verifier = s.exchanged(&started);
+    let state = param(&started.url, "state");
+    let challenge = param(&started.url, "code_challenge");
+    let in_url = [state.as_str(), challenge.as_str()];
+    let mut secrets = vec![
+        CLIENT_TOKEN.to_owned(),
+        CLIENT_A.0.to_owned(),
+        FILE_TOKEN.to_owned(),
+        rotated_token,
+        old_key,
+        NEW_KEY.to_owned(),
+        code,
+        verifier,
+    ];
+    secrets.extend(oauth);
+    for secret in &secrets {
+        assert!(!started.url.contains(secret.as_str()), "{}", started.url);
+    }
+    // The authorize URL is the one place the state and the challenge may appear.
+    let start_text = String::from_utf8(start.1).unwrap();
+    assert!(start_text.contains(&started.url), "{start_text}");
+    answers.push((200, start_text.replace(&started.url, "").into_bytes()));
+    let hidden: Vec<&str> = secrets.iter().map(String::as_str).chain(in_url).collect();
+    s.assert_hidden(&answers, &logged, &hidden);
 }

@@ -291,8 +291,9 @@ vendor rejects makes the login unusable: the attempt is reported to `qbd` as `ht
 turn moves to the next login. A field of another type (`key` in an OAuth file, `account_id` in
 an `oauth_anthropic` or `api_key` file, an OAuth field in an `api_key` file) or any other field
 is refused, and the error names the field, never a value. The gateway may create, write and
-remove files in its config file's directory, the credential files' directories and the
-directories of `spend_file`, `audit_file` and `usage.file`, and nowhere else.
+remove files in its config file's directory, the credential files' directories, the
+directories of `spend_file`, `audit_file` and `usage.file`, the directories of the named
+clients' `token_file`s and the directory of `fronts.grace_file`, and nowhere else.
 
 `[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to a `qbd` pick target: a
 ladder step, a pin, or a chain of pins.
@@ -312,9 +313,11 @@ A chain across vendors: [Examples](#a-route-chaining-subscription-key-and-openro
 `GET` and `PUT /v1/model/config/routes` read and replace these items as JSON
 ([api.md](api.md#get-and-put-v1modelconfigroutes)). A `PUT` rewrites only the `[[routes]]` items,
 from each header to the line of its last value: the rest of the file stays byte for byte, and
-comments inside the items are lost. It keeps the old file as `<config>.bak-<unix s>`. `routes`
-given as an inline array, or an item whose `[[routes.chain]]` follows another table, cannot be
-edited this way.
+comments inside the items are lost. It keeps the old file as `<config>.bak-<unix s>`, mode
+0600, and writes the new one by a rename in the config file's directory, mode 0600: a config
+path that is a symlink becomes a regular 0600 file, and the symlink's target keeps the old
+bytes. `routes` given as an inline array, or an item whose `[[routes.chain]]` follows another
+table, cannot be edited this way.
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
@@ -480,7 +483,7 @@ The previous token stays accepted for `rotate_grace_s`; its hash and the end of 
 `grace_file` first, so a reload or a restart within the grace still accepts it. Each client has one previous token: a second
 rotation replaces it. Entries whose grace is over are ignored and dropped at the next write.
 Neither the answer, the audit, the log nor the usage ledger holds a token; they show the first
-12 hex characters of the new token's SHA-256. The gateway never rewrites the config file.
+12 hex characters of the new token's SHA-256. A rotation leaves the config file as it is.
 
 ```toml
 [fronts]

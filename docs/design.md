@@ -203,7 +203,7 @@ refreshes the login for later picks.
 | binary | static musl, ≤ 4 MiB with TLS, the gateway and both of its fronts (owner decision) |
 | dependencies | ≤ 12 direct, ≲ 50 total |
 | CPU | 0 wake-ups/s idle (daemon, agent and gateway); pick ≤ 50 µs server-side, p99 ≤ 1 ms over UDS from connect to response; gateway p99 ≤ 5 ms from a request to its upstream request |
-| disk | ≤ ~150 B per pick, or 0 with `journal = off`; the gateway writes only refreshed credential files |
+| disk | ≤ ~150 B per pick, or 0 with `journal = off`; the gateway writes credential files on a refresh, a key replacement and a sign-in with 0600 backups of the replaced ones, `spend_file`, `audit_file`, the usage ledger, named clients' token files, `grace_file`, and its config file with 0600 backups on a routes `PUT` |
 | network | 0 idle; agent ≤ 1 small HTTPS GET per login per TTL, only on demand; gateway one HTTPS request per attempt, one per token refresh and one per sign-in code its own uid sends |
 
 CI enforces the binary budget, the daemon's RSS, latency, wake-up and `journal = off` budgets and
