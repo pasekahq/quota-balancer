@@ -547,7 +547,8 @@ impl Gateway {
     /// Edits the config file as the [`qb_proto::ConfigRoutesPut`] `body` for `actor` asks, when
     /// `if_match` is the file's hash, and reloads it: its `[[routes]]` replaced, `spend_cap`s set
     /// or removed. The candidate file must pass a reload's checks; the old file is kept as a
-    /// 0600 backup, the new one written atomically. Serialised with reloads and rotations; logs
+    /// 0600 backup, the new one written atomically. A candidate equal to the file is neither
+    /// written nor reloaded and has no backup. Serialised with reloads and rotations; logs
     /// one line and records one audit entry either way, `config_spend_caps` for a body of
     /// `spend_caps` only and `config_routes` otherwise.
     ///
@@ -569,11 +570,13 @@ impl Gateway {
         let mut entry = audit::entry(actor, action, object);
         match self.write_config(if_match, put, &mut entry) {
             Ok(written) => {
-                log::info(&format!(
-                    "gateway: {} edited, the old file kept as {}",
-                    self.startup.file.display(),
-                    written.backup
-                ));
+                let file = self.startup.file.display();
+                log::info(&match &written.backup {
+                    Some(backup) => {
+                        format!("gateway: {file} edited, the old file kept as {backup}")
+                    }
+                    None => format!("gateway: {file} left as it was: the edit changes no byte"),
+                });
                 self.record(&entry);
                 Ok(written)
             }
@@ -632,6 +635,12 @@ impl Gateway {
         let (config, current) = self
             .admissible(super::config::parse(file, &candidate))
             .map_err(refused)?;
+        if candidate == text {
+            return Ok(ConfigRoutesWritten {
+                sha256: before,
+                backup: None,
+            });
+        }
         let backup = config_edit::backup(file, text.as_bytes(), unix_now())
             .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
         let replaced = config_edit::replace(
@@ -668,7 +677,7 @@ impl Gateway {
         entry.backup = Some(backup.clone());
         Ok(ConfigRoutesWritten {
             sha256: after,
-            backup,
+            backup: Some(backup),
         })
     }
 
@@ -1751,9 +1760,6 @@ impl Gateway {
     }
 }
 
-/// The state of the logins of `config` of `vendor`, or of all of them, in `state`: `ready` when
-/// one is usable, else `exhausted` with the nearest reset when one waits, else `unavailable`. A
-/// login with a full window waits for its reset, as qbd does not pick it before.
 /// Replaces the credential file `file` with `bytes`, its old content, when there was a file,
 /// kept as a 0600 backup: the backup's path. A failure that replaced the file sets the backup of
 /// `entry`.
@@ -1804,6 +1810,9 @@ fn replace_credential(
     Ok(backup)
 }
 
+/// The state of the logins of `config` of `vendor`, or of all of them, in `state`: `ready` when
+/// one is usable, else `exhausted` with the nearest reset when one waits, else `unavailable`. A
+/// login with a full window waits for its reset, as qbd does not pick it before.
 fn standing(
     config: &GatewayConfig,
     state: &State,

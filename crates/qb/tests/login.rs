@@ -194,7 +194,9 @@ fn each_run_prints_a_fresh_s256_authorize_url_and_refuses_a_state_it_did_not_sen
             });
             assert_eq!(code, 1, "{out}");
             assert!(
-                out.contains("the pasted state is not the one this sign-in sent"),
+                out.contains(
+                    "the pasted state is not the one this sign-in sent; run `qb login` again\n"
+                ),
                 "{out}"
             );
             let url = url.unwrap();
@@ -515,7 +517,7 @@ fn a_paste_with_another_state_or_without_a_code_is_refused_before_any_request() 
             "login-oauth",
             None,
             |state| format!("code-{MARK}#{state}-{MARK}"),
-            "the pasted state is not the one this sign-in sent",
+            "the pasted state is not the one this sign-in sent; run `qb login` again",
         ),
         (
             "login-oauth",
@@ -539,7 +541,7 @@ fn a_paste_with_another_state_or_without_a_code_is_refused_before_any_request() 
             "login-chatgpt",
             None,
             |_| chatgpt_redirect(&format!("code-{MARK}"), &format!("s-{MARK}")),
-            "the pasted state is not the one this sign-in sent",
+            "the pasted state is not the one this sign-in sent; run `qb login` again",
         ),
     ];
     refused(cases);

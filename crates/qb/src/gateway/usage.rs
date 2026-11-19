@@ -17,7 +17,7 @@ use super::audit::{json_line, write_line};
 use super::config::UsageLedger;
 use super::spend;
 use crate::journal::open_append;
-use crate::{jsonl, log};
+use crate::{http, jsonl, log};
 
 /// The ledger files of one gateway; appends and rotations take turns.
 #[derive(Debug)]
@@ -143,50 +143,19 @@ fn free_stamp(file: &Path, now: u64) -> io::Result<PathBuf> {
 /// # Errors
 /// A message naming the parameter that is unknown, given twice, missing or invalid.
 pub(crate) fn parse_query(query: Option<&str>) -> Result<UsageQuery, String> {
-    let (mut from, mut to, mut group_by, mut bucket) = (None, None, None, None);
-    for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match key {
-            "from" => set(&mut from, key, number(key, value)?)?,
-            "to" => set(&mut to, key, number(key, value)?)?,
-            "group_by" => {
-                let named = named(key, value, UsageGroupBy::ALL, UsageGroupBy::as_str)?;
-                set(&mut group_by, key, named)?;
-            }
-            "bucket" => {
-                let named = named(key, value, UsageBucket::ALL, UsageBucket::as_str)?;
-                set(&mut bucket, key, named)?;
-            }
-            _ => {
-                return Err(format!(
-                    "unknown parameter `{key}`: the query takes `from`, `to`, `group_by` and \
-                     `bucket`"
-                ));
-            }
-        }
-    }
-    let from = from.ok_or("`from` is required")?;
+    let [from, to, group_by, bucket] =
+        http::query_params(query, ["from", "to", "group_by", "bucket"])?;
+    let from = http::whole_number("from", from.ok_or("`from` is required")?)?;
     Ok(UsageQuery {
         from,
-        to,
-        group_by,
-        bucket,
+        to: to.map(|v| http::whole_number("to", v)).transpose()?,
+        group_by: group_by
+            .map(|v| named("group_by", v, UsageGroupBy::ALL, UsageGroupBy::as_str))
+            .transpose()?,
+        bucket: bucket
+            .map(|v| named("bucket", v, UsageBucket::ALL, UsageBucket::as_str))
+            .transpose()?,
     })
-}
-
-/// Stores `value` of parameter `key` in `slot`.
-fn set<T>(slot: &mut Option<T>, key: &str, value: T) -> Result<(), String> {
-    match slot.replace(value) {
-        Some(_) => Err(format!("`{key}` is given twice")),
-        None => Ok(()),
-    }
-}
-
-/// `value` of parameter `key` as Unix seconds.
-fn number(key: &str, value: &str) -> Result<u64, String> {
-    value
-        .parse()
-        .map_err(|_| format!("`{key}` must be a whole number"))
 }
 
 /// The one of `all` whose `name` is `value` of parameter `key`.
