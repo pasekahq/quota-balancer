@@ -11,13 +11,15 @@ pub const MAX_HEAD: usize = 8 * 1024;
 pub const MAX_BODY: usize = 64 * 1024;
 const MAX_HEADERS: usize = 32;
 
-/// Request method. Only `GET` and `POST` are routed.
+/// Request method. Only `GET`, `POST` and `PUT` are routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     /// `GET`
     Get,
     /// `POST`
     Post,
+    /// `PUT`
+    Put,
     /// Anything else.
     Other,
 }
@@ -33,6 +35,8 @@ pub struct Request {
     pub query: Option<String>,
     /// Bearer token from `Authorization`, if any.
     pub bearer: Option<String>,
+    /// Value of `If-Match`, if any.
+    pub if_match: Option<String>,
     /// Body (`Content-Length` bytes).
     pub body: Vec<u8>,
 }
@@ -53,7 +57,7 @@ pub enum ReadError {
         /// Declared body bytes not read yet.
         unread: usize,
     },
-    /// `POST` without `Content-Length`.
+    /// `POST` or `PUT` without `Content-Length`.
     LengthRequired,
     /// The head was refused by the caller's check; the body is not read.
     Refused {
@@ -110,6 +114,7 @@ pub fn read_request_limited<R: Read>(
                 let method = match req.method {
                     Some("GET") => Method::Get,
                     Some("POST") => Method::Post,
+                    Some("PUT") => Method::Put,
                     _ => Method::Other,
                 };
                 let raw_path = req.path.unwrap_or("/");
@@ -120,6 +125,7 @@ pub fn read_request_limited<R: Read>(
                 let mut content_length = None;
                 let mut bearer = None;
                 let mut api_key = None;
+                let mut if_match = None;
                 for h in req.headers.iter() {
                     if h.name.eq_ignore_ascii_case("content-length") {
                         let v = std::str::from_utf8(h.value).map_err(|_| ReadError::Malformed)?;
@@ -138,9 +144,12 @@ pub fn read_request_limited<R: Read>(
                     } else if h.name.eq_ignore_ascii_case("x-api-key") {
                         let v = std::str::from_utf8(h.value).map_err(|_| ReadError::Malformed)?;
                         api_key = Some(v.trim());
+                    } else if h.name.eq_ignore_ascii_case("if-match") {
+                        let v = std::str::from_utf8(h.value).map_err(|_| ReadError::Malformed)?;
+                        if_match = Some(v.trim());
                     }
                 }
-                if method == Method::Post && content_length.is_none() {
+                if matches!(method, Method::Post | Method::Put) && content_length.is_none() {
                     return Err(ReadError::LengthRequired);
                 }
                 let want = content_length.unwrap_or(0);
@@ -172,6 +181,7 @@ pub fn read_request_limited<R: Read>(
                     path: path.to_owned(),
                     query: query.map(str::to_owned),
                     bearer: bearer.map(str::to_owned),
+                    if_match: if_match.map(str::to_owned),
                     body,
                 });
             }
@@ -205,7 +215,9 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         411 => "Length Required",
+        412 => "Precondition Failed",
         413 => "Content Too Large",
+        428 => "Precondition Required",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",

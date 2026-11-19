@@ -11,9 +11,9 @@ use qb_proto::{ClientRotateAnswer, ErrorClass};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::base64url;
 use super::config::{ClientToken, FrontClient, Fronts, GatewayConfig};
 use super::creds::write_atomic;
+use super::{Refusal, base64url};
 use crate::auth::token_matches;
 use crate::config::{BearerHash, Error};
 use crate::{log, sha256};
@@ -41,27 +41,6 @@ struct Previous {
 pub struct ClientTokens {
     current: Vec<(String, BearerHash)>,
     previous: Vec<Previous>,
-}
-
-/// Why a rotation was refused: the answer's status and class, and a message without the token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refusal {
-    /// HTTP status of the answer.
-    pub status: u16,
-    /// Class of the answer's error.
-    pub class: ErrorClass,
-    /// What went wrong.
-    pub message: String,
-}
-
-impl Refusal {
-    fn new(status: u16, class: ErrorClass, message: String) -> Self {
-        Self {
-            status,
-            class,
-            message,
-        }
-    }
 }
 
 /// The grace file: the previous hash of each rotated client and its end of grace.

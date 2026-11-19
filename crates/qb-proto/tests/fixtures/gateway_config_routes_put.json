@@ -1,0 +1,17 @@
+{
+  "routes": [
+    {
+      "alias": "chat",
+      "role": "gateway",
+      "chain": [
+        { "vendor": "vendor-c", "model": "model-c" },
+        { "vendor": "vendor-a", "model": "model-a", "effort": "low" }
+      ]
+    },
+    {
+      "alias": "added",
+      "role": "gateway",
+      "difficulty": 2
+    }
+  ]
+}

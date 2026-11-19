@@ -373,6 +373,89 @@
         }
       }
     },
+    "/v1/model/config/routes": {
+      "get": {
+        "operationId": "configRoutes",
+        "summary": "The `[[routes]]` items of the gateway's config file as it is on disk, in file order, which a reload has not necessarily taken, and the file's hex SHA-256, also sent as the strong `ETag` `\"<sha256>\"`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 500 `unavailable` when the file cannot be read or does not validate.",
+        "responses": {
+          "200": {
+            "description": "The file's routes and hash.",
+            "headers": {
+              "ETag": {
+                "description": "The file's hex SHA-256 in double quotes.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigRoutes"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "configRoutesPut",
+        "summary": "Replace the `[[routes]]` items of the config file and reload it. The new items are rendered as `[[routes]]` tables at the place of the first old item, the other old items are removed, and every byte outside the old items stays; comments inside them go. The candidate file is validated as a reload validates the file. On success the old file is copied to `<config>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, the candidate is written atomically with mode 0600 and serves every later turn. Serialised with reloads and client token rotations. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 428 `bad_request` without `If-Match`, 412 `bad_request` when it is not the file's current hash, 400 `bad_request` for a body or candidate that does not validate (`routes refused: <file>: <field>: <reason>`, the line being the candidate's), 500 `unavailable` when a file cannot be read or written; on every refusal the file, its backups and the running config stay as they were.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "description": "The config file's hex SHA-256 as `GET` answered it, with or without the double quotes of its `ETag`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigRoutesPut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The file holds the new routes and the gateway serves them.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigRoutesWritten"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -1310,11 +1393,12 @@
       },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced by `PUT /v1/model/config/routes` and reloaded.",
         "enum": [
           "reload",
           "spend_reset",
-          "client_rotate"
+          "client_rotate",
+          "config_routes"
         ]
       },
       "AuditResult": {
@@ -1344,7 +1428,7 @@
           },
           "object": {
             "type": "string",
-            "description": "The config file of a reload, the login of a spend reset, the client of a rotation; absent when a refused request named none."
+            "description": "The config file of a reload or a routes edit, the login of a spend reset, the client of a rotation; absent when a refused request named none."
           },
           "result": {
             "$ref": "#/components/schemas/AuditResult"
@@ -1356,16 +1440,16 @@
           "config_sha256_before": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$",
-            "description": "A reload: hex SHA-256 of the config file serving before the action."
+            "description": "A reload or a routes edit: hex SHA-256 of the config file before the action."
           },
           "config_sha256_after": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$",
-            "description": "A reload: hex SHA-256 of the config file serving after it; the same as before when it was refused."
+            "description": "A reload or a routes edit: hex SHA-256 of the config file after it; the same as before when it was refused."
           },
           "backup": {
             "type": "string",
-            "description": "Path of the copy an action kept of what it replaced; no current action sets it."
+            "description": "A routes edit that went through: path of the copy of the file it replaced."
           },
           "token_sha256_prefix": {
             "type": "string",
@@ -1577,6 +1661,135 @@
           "api_version",
           "version",
           "uptime_s"
+        ]
+      },
+      "ConfigStep": {
+        "type": "object",
+        "description": "One step of a chain route.",
+        "additionalProperties": false,
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Pinned vendor."
+          },
+          "model": {
+            "type": "string",
+            "description": "Pinned model."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort."
+          }
+        },
+        "required": [
+          "vendor",
+          "model"
+        ]
+      },
+      "ConfigRoute": {
+        "type": "object",
+        "description": "One `[[routes]]` item of the gateway config file, key for key (`config.md`). Integers take any 64-bit value: the config parser judges every value of a `PUT`.",
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string",
+            "description": "Alias clients name in `route`."
+          },
+          "role": {
+            "type": "string",
+            "description": "qbd role of the pick."
+          },
+          "difficulty": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ladder step of the role."
+          },
+          "vendor": {
+            "type": "string",
+            "description": "Pinned vendor."
+          },
+          "model": {
+            "type": "string",
+            "description": "Pinned model."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort of the pin."
+          },
+          "chain": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigStep"
+            },
+            "description": "Pins a turn tries in order."
+          },
+          "expected_minutes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Expected minutes of a turn."
+          }
+        },
+        "required": [
+          "alias",
+          "role"
+        ]
+      },
+      "ConfigRoutes": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/config/routes`.",
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex SHA-256 of the config file."
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigRoute"
+            },
+            "description": "The items in file order."
+          }
+        },
+        "required": [
+          "sha256",
+          "routes"
+        ]
+      },
+      "ConfigRoutesPut": {
+        "type": "object",
+        "description": "Request of `PUT /v1/model/config/routes`.",
+        "additionalProperties": false,
+        "properties": {
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigRoute"
+            },
+            "description": "The items that replace the file's `[[routes]]`, in file order."
+          }
+        },
+        "required": [
+          "routes"
+        ]
+      },
+      "ConfigRoutesWritten": {
+        "type": "object",
+        "description": "Answer of `PUT /v1/model/config/routes`.",
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex SHA-256 of the config file written and now serving."
+          },
+          "backup": {
+            "type": "string",
+            "description": "Path of the copy of the file it replaced."
+          }
+        },
+        "required": [
+          "sha256",
+          "backup"
         ]
       }
     }

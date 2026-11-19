@@ -12,24 +12,25 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_proto::{
-    Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, Decision, ErrorClass,
-    GatewayError, LoginSpend, LoginStatus, Outcome, PickRequest, PickResponse, ReloadAnswer,
-    ReportRequest, RouteInfo, RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StopReason,
-    StreamEvent, TurnRequest, Usage, UsageLine, WindowReport, gateway::MAX_NAME,
-    gateway::MAX_USAGE_TOOLS, paths,
+    Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut,
+    ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LoginSpend, LoginStatus, Outcome,
+    PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState, RouteStatus,
+    RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest, Usage, UsageLine,
+    WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use super::Refusal;
 use super::config::{Api, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route};
-use super::creds::{CredentialStore, Refresher};
+use super::creds::{CredentialStore, Refresher, write_atomic};
 use super::spend::{self, Ledger};
-use super::tokens::{self, ClientTokens, Refusal};
+use super::tokens::{self, ClientTokens};
 use super::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Upstream,
 };
-use super::{audit, usage};
-use crate::config::Error;
+use super::{audit, config_edit, usage};
+use crate::config::{BearerHash, Error};
 use crate::sandbox::{file_dir, gateway_files};
 use crate::server::unix_now;
 use crate::{client, log, sha256};
@@ -39,6 +40,9 @@ pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
 /// Vendor adapters by the API family they serve.
 pub type Upstreams = Vec<(Api, Box<dyn Upstream>)>;
+
+/// A config a reload may take and the hashes of its client token files.
+type Admissible = (GatewayConfig, Vec<(String, BearerHash)>);
 
 /// What `cancel` found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,12 +425,8 @@ impl Gateway {
     pub fn reload(&self, actor: &str) -> Result<ReloadAnswer, String> {
         let _one = lock(&self.reloading);
         let before = self.config().sha256;
-        let loaded = super::config::load(&self.startup.file)
-            .map_err(|e| e.to_string())
-            .and_then(|c| restart_only(&self.startup, &c, &self.opened).map_or(Ok(c), Err))
-            .and_then(|c| tokens::read(&c).map(|t| (c, t)).map_err(|e| e.to_string()));
-        let (config, current) = match loaded {
-            Ok((c, current)) => (sorted(c), current),
+        let (config, current) = match self.admissible(super::config::load(&self.startup.file)) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 log::warn(&format!("gateway: reload refused: {e}"));
                 let entry = self.reload_entry(actor, before, before);
@@ -434,11 +434,29 @@ impl Gateway {
                 return Err(e);
             }
         };
+        let after = config.sha256;
+        let answer = self.install(config, current);
+        self.record(&self.reload_entry(actor, before, after));
+        Ok(answer)
+    }
+
+    /// The config `loaded` and its client token hashes when a reload may take it: it parsed and
+    /// validated, keeps every restart-only field, and its token files read.
+    fn admissible(&self, loaded: Result<GatewayConfig, Error>) -> Result<Admissible, String> {
+        loaded
+            .map_err(|e| e.to_string())
+            .and_then(|c| restart_only(&self.startup, &c, &self.opened).map_or(Ok(c), Err))
+            .and_then(|c| tokens::read(&c).map(|t| (c, t)).map_err(|e| e.to_string()))
+    }
+
+    /// Makes the [`Self::admissible`] `config` with the token hashes `current` the snapshot of
+    /// later admissions and logs it. Call it under `reloading`.
+    fn install(&self, config: GatewayConfig, current: Vec<(String, BearerHash)>) -> ReloadAnswer {
+        let config = Arc::new(sorted(config));
         let answer = ReloadAnswer {
             routes: config.routes.len(),
             logins: config.logins.len(),
         };
-        let config = Arc::new(config);
         // The hashes go first: a connection that takes the old config meanwhile finds no hash
         // of a client the new one adds.
         let tokens = self.client_tokens().with_current(current);
@@ -456,8 +474,110 @@ impl Gateway {
             answer.routes,
             answer.logins
         ));
-        self.record(&self.reload_entry(actor, before, config.sha256));
-        Ok(answer)
+        answer
+    }
+
+    /// The `[[routes]]` of the config file as it is on disk, which a reload has not necessarily
+    /// taken, and the file's hash.
+    ///
+    /// # Errors
+    /// The file cannot be read or does not validate.
+    pub fn config_routes(&self) -> Result<ConfigRoutes, Error> {
+        let config = super::config::load(&self.startup.file)?;
+        Ok(ConfigRoutes {
+            sha256: sha256::hex(config.sha256),
+            routes: config_edit::routes_of(&config.routes),
+        })
+    }
+
+    /// Replaces the `[[routes]]` items of the config file with those of the
+    /// [`qb_proto::ConfigRoutesPut`] `body` for `actor`, when `if_match` is the file's hash, and
+    /// reloads it. The candidate file must pass a reload's checks; the old file is kept as a
+    /// 0600 backup, the new one written atomically. Serialised with reloads and rotations; logs
+    /// one line and records one audit entry either way.
+    ///
+    /// # Errors
+    /// 428 without `if_match`, 412 when it is not the file's hash, 400 for a body or candidate
+    /// that does not validate, 500 when a file cannot be read or written; the file, its backups
+    /// and the running config stay as they were.
+    pub fn put_routes(
+        &self,
+        actor: &str,
+        if_match: Option<&str>,
+        body: &[u8],
+    ) -> Result<ConfigRoutesWritten, Refusal> {
+        let _one = lock(&self.reloading);
+        let object = Some(self.startup.file.display().to_string());
+        let mut entry = audit::entry(actor, AuditAction::ConfigRoutes, object);
+        match self.write_routes(if_match, body, &mut entry) {
+            Ok(written) => {
+                log::info(&format!(
+                    "gateway: routes of {} replaced, the old file kept as {}",
+                    self.startup.file.display(),
+                    written.backup
+                ));
+                self.record(&entry);
+                Ok(written)
+            }
+            Err(refusal) => {
+                log::warn(&format!(
+                    "gateway: routes edit refused: {}",
+                    refusal.message
+                ));
+                self.record(&audit::refused(entry, refusal.message.as_str()));
+                Err(refusal)
+            }
+        }
+    }
+
+    /// The steps of [`Self::put_routes`] under `reloading`, filling the hashes and backup of
+    /// `entry`.
+    fn write_routes(
+        &self,
+        if_match: Option<&str>,
+        body: &[u8],
+        entry: &mut AuditEntry,
+    ) -> Result<ConfigRoutesWritten, Refusal> {
+        let file = &self.startup.file;
+        let failed = |message: String| Refusal::new(500, ErrorClass::Unavailable, message);
+        let invalid = |message: String| Refusal::new(400, ErrorClass::BadRequest, message);
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| failed(format!("cannot read {}: {e}", file.display())))?;
+        let before = sha256::hex(sha256::digest(text.as_bytes()));
+        entry.config_sha256_before = Some(before.clone());
+        entry.config_sha256_after = Some(before.clone());
+        let Some(tag) = if_match else {
+            let message = "`If-Match` with the config file's sha256 is required".to_owned();
+            return Err(Refusal::new(428, ErrorClass::BadRequest, message));
+        };
+        if tag.trim_matches('"') != before {
+            let message = format!("`If-Match` is not the config file's sha256 {before}");
+            return Err(Refusal::new(412, ErrorClass::BadRequest, message));
+        }
+        let put: ConfigRoutesPut =
+            serde_json::from_slice(body).map_err(|e| invalid(e.to_string()))?;
+        let items = config_edit::render(&put.routes);
+        let refused = |e: String| invalid(format!("routes refused: {e}"));
+        let candidate =
+            config_edit::splice(file, &text, &items).map_err(|e| refused(e.to_string()))?;
+        let (config, current) = self
+            .admissible(super::config::parse(file, &candidate))
+            .map_err(refused)?;
+        let backup = config_edit::backup(file, text.as_bytes(), unix_now())
+            .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
+        if let Err(e) = write_atomic(file, candidate.as_bytes()) {
+            let _ = std::fs::remove_file(&backup);
+            return Err(failed(format!("cannot write {}: {e}", file.display())));
+        }
+        let after = sha256::hex(config.sha256);
+        self.install(config, current);
+        let backup = backup.display().to_string();
+        entry.config_sha256_after = Some(after.clone());
+        entry.backup = Some(backup.clone());
+        Ok(ConfigRoutesWritten {
+            sha256: after,
+            backup,
+        })
     }
 
     /// Writes a fresh token to the `token_file` of the named loopback client `name` for `actor`;

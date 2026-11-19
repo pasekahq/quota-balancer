@@ -6,6 +6,7 @@
 //! what happened. qbd itself stays without secrets and network.
 //!
 //! - [`config`]: the gateway's TOML config;
+//! - [`config_edit`]: the `[[routes]]` of the config file rendered and spliced for an edit;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
 //! - [`import`]: `qb login import`, a credential of another client copied into a login's file;
 //! - [`signin`]: `qb login`, an OAuth login signed in from scratch with PKCE;
@@ -27,12 +28,15 @@
 //! - [`messages`]: the Messages front;
 //! - [`openai`]: the Chat Completions and Responses fronts.
 
+use qb_proto::ErrorClass;
+
 pub mod answer;
 pub mod anthropic;
 pub mod audit;
 mod base64url;
 pub mod chat_upstream;
 pub mod config;
+pub mod config_edit;
 pub mod core;
 pub mod creds;
 pub mod front;
@@ -47,3 +51,25 @@ pub mod tokens;
 pub mod upstream;
 pub mod usage;
 pub mod vendor;
+
+/// Why an admin action was refused: the answer's status and class, and a message without a
+/// secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// HTTP status of the answer.
+    pub status: u16,
+    /// Class of the answer's error.
+    pub class: ErrorClass,
+    /// What went wrong.
+    pub message: String,
+}
+
+impl Refusal {
+    pub(crate) fn new(status: u16, class: ErrorClass, message: String) -> Self {
+        Self {
+            status,
+            class,
+            message,
+        }
+    }
+}
