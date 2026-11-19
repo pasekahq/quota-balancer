@@ -458,6 +458,9 @@ token_sha256 = "<64 hex characters>"
 routes = ["chat"]
 ```
 
+Moving the consumers of the listener from `fronts.token_sha256` to named clients, one at a time:
+[runbooks/named-clients-cutover.md](runbooks/named-clients-cutover.md).
+
 Every request on `listen` carries a client token of `[fronts]` in `x-api-key` or
 `Authorization: Bearer`, so a client switches to the gateway with its base URL and API key: an
 Anthropic SDK with `http://127.0.0.1:<port>`, an OpenAI SDK with `http://127.0.0.1:<port>/v1`. Generate the token and its hash with:
