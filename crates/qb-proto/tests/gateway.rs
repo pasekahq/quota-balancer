@@ -4,12 +4,13 @@
 #![allow(clippy::unwrap_used)]
 
 use qb_proto::{
-    AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, ClientRotateAnswer,
-    ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Elsewhere, ErrorClass, GatewayError,
-    LoginKey, LoginKeyAnswer, LoginOauthCode, LoginOauthSigned, LoginOauthStarted, Message,
-    OauthPaste, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer, SpendAnswer, SpendReset,
-    StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine,
-    UsageQuery, UsdSource,
+    AuditAction, AuditAnswer, AuditResult, Block, CacheMode, CancelAnswer, CancelRequest,
+    ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Effort, Elsewhere,
+    ErrorClass, GatewayError, HealthStatus, LoginKey, LoginKeyAnswer, LoginOauthCode,
+    LoginOauthSigned, LoginOauthStarted, MediaType, Message, NativeApi, OauthPaste, Object,
+    Outcome, ReloadAnswer, Role, RouteInfo, RouteState, RoutesAnswer, SpendAnswer, SpendReset,
+    StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer, UsageBucket,
+    UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -524,22 +525,187 @@ fn names<T: Serialize>(values: &[T]) -> Vec<String> {
         .collect()
 }
 
+/// The `type` tags `values` serialize with.
+fn tags<T: Serialize>(values: &[T]) -> Vec<String> {
+    values
+        .iter()
+        .map(|v| {
+            serde_json::to_value(v).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The JSON pointer and the values of every `enum` in `v` at `at`.
+fn enums(at: &str, v: &Value, out: &mut Vec<(String, Vec<String>)>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(values) = map.get("enum") {
+                let values = values.as_array().unwrap();
+                let values = values.iter().map(|v| v.as_str().unwrap().to_owned());
+                out.push((at.to_owned(), values.collect()));
+            }
+            for (key, v) in map {
+                enums(&format!("{at}/{key}"), v, out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                enums(&format!("{at}/{i}"), v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One block of each kind.
+fn every_block() -> Vec<Block> {
+    let text = || "t".to_owned();
+    vec![
+        Block::Text { text: text() },
+        Block::Image {
+            media_type: MediaType::Png,
+            path: None,
+            base64: Some(text()),
+        },
+        Block::ToolUse {
+            id: text(),
+            name: text(),
+            input: Object::new(),
+        },
+        Block::ToolResult {
+            id: text(),
+            content: text(),
+            is_error: None,
+        },
+        Block::Thinking {
+            vendor: text(),
+            opaque: text(),
+        },
+    ]
+}
+
+/// One stream event of each type.
+fn every_event() -> Vec<StreamEvent> {
+    let text = || "t".to_owned();
+    vec![
+        StreamEvent::Route {
+            route: RouteInfo {
+                vendor: text(),
+                model: text(),
+                login_label: text(),
+                lease: text(),
+            },
+        },
+        StreamEvent::TextDelta { text: text() },
+        StreamEvent::Thinking {
+            thinking: Thinking {
+                vendor: text(),
+                opaque: text(),
+            },
+        },
+        StreamEvent::ToolCall {
+            tool_call: ToolCall {
+                id: text(),
+                name: text(),
+                input: Object::new(),
+            },
+        },
+        StreamEvent::Usage {
+            usage: Usage::default(),
+        },
+        StreamEvent::Stop {
+            reason: StopReason::End,
+        },
+        StreamEvent::Error {
+            error: GatewayError::new(ErrorClass::Auth, false, text()),
+        },
+    ]
+}
+
+/// The JSON pointer of each `enum` of `docs/openapi-gateway.json` and the names of its
+/// qb-proto type, `classes` being every [`ErrorClass`].
+fn typed_enums(classes: &[ErrorClass]) -> Vec<(String, Vec<String>)> {
+    use qb_proto::{RouteState as R, StopReason as S};
+    let schema = |name: &str| format!("/components/schemas/{name}");
+    vec![
+        (
+            schema("Effort"),
+            names(&[Effort::Low, Effort::Medium, Effort::High, Effort::Max]),
+        ),
+        (schema("CacheMode"), names(&[CacheMode::Auto])),
+        (
+            schema("Role"),
+            names(&[Role::User, Role::Assistant, Role::System]),
+        ),
+        (schema("BlockType"), tags(&every_block())),
+        (
+            schema("MediaType"),
+            names(&[
+                MediaType::Png,
+                MediaType::Jpeg,
+                MediaType::Gif,
+                MediaType::Webp,
+            ]),
+        ),
+        (
+            schema("NativeTool/properties/api"),
+            names(&[NativeApi::OpenaiResponses]),
+        ),
+        (
+            schema("NativeTool/properties/elsewhere"),
+            names(&[Elsewhere::Function, Elsewhere::Omit, Elsewhere::Refuse]),
+        ),
+        (schema("EventType"), tags(&every_event())),
+        (
+            schema("StopReason"),
+            names(&[S::End, S::ToolUse, S::MaxTokens, S::Refusal]),
+        ),
+        (schema("ErrorClass"), names(classes)),
+        (
+            schema("RouteState"),
+            names(&[R::Ready, R::Degraded, R::Exhausted, R::Unavailable]),
+        ),
+        (
+            schema("OauthPaste"),
+            names(&[OauthPaste::CodeState, OauthPaste::RedirectUrl]),
+        ),
+        (
+            schema("AuditAction"),
+            names(&[
+                AuditAction::Reload,
+                AuditAction::SpendReset,
+                AuditAction::ClientRotate,
+                AuditAction::ConfigRoutes,
+                AuditAction::ConfigSpendCaps,
+                AuditAction::LoginKey,
+                AuditAction::LoginOauthStart,
+                AuditAction::LoginOauthCode,
+            ]),
+        ),
+        (
+            schema("AuditResult"),
+            names(&[AuditResult::Ok, AuditResult::Refused]),
+        ),
+        (schema("UsageGroupBy"), names(&UsageGroupBy::ALL)),
+        (schema("UsageBucket"), names(&UsageBucket::ALL)),
+        (
+            schema("Health/properties/status"),
+            names(&[HealthStatus::Ok]),
+        ),
+    ]
+}
+
 #[test]
 fn openapi_enums_match_the_types() {
-    use qb_proto::{ErrorClass as C, RouteState as R, StopReason as S};
+    use qb_proto::ErrorClass as C;
     let path = format!(
         "{}/../../docs/openapi-gateway.json",
         env!("CARGO_MANIFEST_DIR")
     );
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let schema = |name: &str| -> Vec<String> {
-        doc["components"]["schemas"][name]["enum"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{name}"))
-            .iter()
-            .map(|v| v.as_str().unwrap().to_owned())
-            .collect()
-    };
     let classes = [
         C::QuotaExhausted,
         C::Auth,
@@ -550,33 +716,22 @@ fn openapi_enums_match_the_types() {
         C::Cancelled,
         C::NoRoute,
     ];
-    assert_eq!(schema("ErrorClass"), names(&classes));
     for c in classes {
         assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
     }
-    let stops = [S::End, S::ToolUse, S::MaxTokens, S::Refusal];
-    assert_eq!(schema("StopReason"), names(&stops));
-    let states = [R::Ready, R::Degraded, R::Exhausted, R::Unavailable];
-    assert_eq!(schema("RouteState"), names(&states));
-    assert_eq!(
-        schema("Role"),
-        names(&[Role::User, Role::Assistant, Role::System])
-    );
-    let tool: Value = doc["components"]["schemas"]["NativeTool"]["properties"].clone();
-    let listed = |field: &str| -> Vec<String> {
-        tool[field]["enum"]
-            .as_array()
-            .unwrap()
+    let typed = typed_enums(&classes);
+    let mut found = Vec::new();
+    enums("", &doc, &mut found);
+    for (at, values) in &found {
+        let (_, want) = typed
             .iter()
-            .map(|v| v.as_str().unwrap().to_owned())
-            .collect()
-    };
-    assert_eq!(
-        listed("elsewhere"),
-        names(&[Elsewhere::Function, Elsewhere::Omit, Elsewhere::Refuse])
-    );
-    assert_eq!(
-        listed("api"),
-        names(&[qb_proto::NativeApi::OpenaiResponses])
-    );
+            .find(|(path, _)| path == at)
+            .unwrap_or_else(|| panic!("the enum at {at} maps to no qb-proto type"));
+        assert_eq!(values, want, "{at}");
+    }
+    let mut paths: Vec<&str> = found.iter().map(|(at, _)| at.as_str()).collect();
+    let mut mapped: Vec<&str> = typed.iter().map(|(at, _)| at.as_str()).collect();
+    paths.sort_unstable();
+    mapped.sort_unstable();
+    assert_eq!(paths, mapped, "every mapped type has its enum");
 }

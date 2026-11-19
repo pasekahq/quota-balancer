@@ -46,10 +46,12 @@ At start the gateway reads its config, creates its listeners, clears its dumpabl
 (`PR_SET_DUMPABLE`), and only then restricts itself with landlock (target ABI V4; the ruleset
 handles every file and network right of that ABI):
 
-- read and write beneath the directory of each configured credential file: read files and
-  directories, write and truncate files, create regular files, remove files. The directory,
-  not the file, because a refresh replaces the file by a rename inside that directory. No
-  `REFER` right: renames never cross directories.
+- read and write beneath the directory of the config file and of each file the gateway
+  writes: credential files, `spend_file`, `audit_file`, `usage.file`, named clients'
+  `token_file`s and `fronts.grace_file`. Read files and directories, write and truncate files,
+  create regular files, remove files. The directory, not the file, because a write replaces
+  the file by a rename inside that directory and a backup is a new file beside it. No `REFER`
+  right: renames never cross directories.
 - read-only `/etc/resolv.conf` and `/etc/hosts`, the files the musl resolver reads.
 - TCP connect to port 443 only.
 - TCP bind only on the configured port of the HTTP fronts, and no bind right without it.
@@ -82,7 +84,7 @@ Secrets:
   the same file would race it for a rotating refresh token, so the gateway's config points at
   a copy that only the gateway writes.
 - Tokens never appear in logs, error messages, stream events or `qbd` reports. The gateway
-  writes no file but credential files and logs no request or response content.
+  writes no file outside the directories above and logs no request or response content.
 
 ### `qbd` stays as it is
 
