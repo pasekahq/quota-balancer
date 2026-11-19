@@ -269,7 +269,8 @@ vendor and role to keep them apart from logins used elsewhere.
 A credential file is the gateway's own copy, never a vendor CLI's file (two refreshers would race
 for one rotating refresh token); `qb login` makes one from a new sign-in of an OAuth login
 ([Signing in](#signing-in)), `qb login import` from an existing credential
-([Importing credentials](#importing-credentials)). It is JSON, a regular file owned by the
+([Importing credentials](#importing-credentials)), and the running gateway replaces an `api_key`
+login's key on request ([Replacing a key](#replacing-a-key)). It is JSON, a regular file owned by the
 gateway's user with mode 0600; anything else is refused:
 
 ```json
@@ -738,6 +739,24 @@ no error carries the code, the verifier, a token or the account id. It confines 
 reads stdin ([design.md](design.md#roles-and-privilege-separation)): like the gateway, it
 connects to TCP port 443 only, so a loopback `token_url` must name port 443. A refused sign-in
 exits 1, a usage error 2.
+
+### Replacing a key
+
+The gateway's own uid replaces the key of an `api_key` login of the running config through
+`POST /v1/model/logins/<name>/key` with the body `{"key": "..."}`
+([api.md](api.md#post-v1modelloginsnamekey)). The key travels only in the request body over the
+gateway's socket. The gateway copies the old credential file to `<file>.bak-<unix s>` (mode
+0600, never over a file), writes the new file in the format above atomically with mode 0600,
+and the login's next attempt sends the new key; no reload or restart is needed. Neither the
+answer, the audit, the log nor the usage ledger holds the key; they show the first 12 hex
+characters of its SHA-256. The gateway never removes a backup: delete the old ones when the new
+key works.
+
+The gateway cannot read a key from a path: its sandbox opens no directory after startup. To
+replace a key from a file, run `qb login import --force` on that file as the gateway's user
+([Importing credentials](#importing-credentials)); the login's next attempt reads the new file,
+and `qb --socket <gateway socket> reload` is needed only when the config changed as well. An
+OAuth login is signed in again with `qb login --force` ([Signing in](#signing-in)).
 
 ### Reload
 

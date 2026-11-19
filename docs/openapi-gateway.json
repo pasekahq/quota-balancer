@@ -373,6 +373,55 @@
         }
       }
     },
+    "/v1/model/logins/{name}/key": {
+      "post": {
+        "operationId": "loginKey",
+        "summary": "Write the body's key to the credential file of the `api_key` login `name` of the running config: the old file, when there is one, is copied to `<file>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, never over a file, and `{\"type\": \"api_key\", \"key\": \"<key>\"}` is written atomically with mode 0600; the login's next attempt sends the new key, without a reload or restart. Serialised with reloads, config edits and client token rotations. The answer, the log, the audit and the usage ledger never hold the key. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. Every request of a caller of the gateway is audited as `login_key`. 404 `bad_request` for an unknown login, 409 `bad_request` for a login that is not `api_key`, 400 `bad_request` for a body or key that does not validate, 413 `bad_request` for a body over 8 KiB, no message quoting the key or the body; 500 `unavailable` when a file cannot be read or written, the old file staying in force, except that a write which failed after replacing the file answers 500 `<file> was replaced but the write failed: <error>; the old file is kept as <backup>` and keeps the backup.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The login's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The login's credential file holds the new key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginKeyAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/model/config/routes": {
       "get": {
         "operationId": "configRoutes",
@@ -1391,15 +1440,60 @@
           "grace_until"
         ]
       },
+      "LoginKey": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/logins/{name}/key`: the login's new key.",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[!-~]+$",
+            "description": "The key: 1 to 4096 bytes of visible ASCII, no whitespace or control character."
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      },
+      "LoginKeyAnswer": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/logins/{name}/key`. It never holds the key.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Name of the `[[logins]]` entry whose key was replaced."
+          },
+          "backup": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Path of the copy of the credential file it replaced; `null` when the login had none."
+          },
+          "key_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "The first 12 hex characters of the new key's SHA-256."
+          }
+        },
+        "required": [
+          "login",
+          "backup",
+          "key_sha256_prefix"
+        ]
+      },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`.",
         "enum": [
           "reload",
           "spend_reset",
           "client_rotate",
           "config_routes",
-          "config_spend_caps"
+          "config_spend_caps",
+          "login_key"
         ]
       },
       "AuditResult": {
@@ -1429,7 +1523,7 @@
           },
           "object": {
             "type": "string",
-            "description": "The config file of a reload or a routes edit, the login of a spend reset, the client of a rotation; absent when a refused request named none."
+            "description": "The config file of a reload or a routes edit, the login of a spend reset or a key replacement, the client of a rotation; absent when a refused request named none."
           },
           "result": {
             "$ref": "#/components/schemas/AuditResult"
@@ -1450,12 +1544,17 @@
           },
           "backup": {
             "type": "string",
-            "description": "A routes edit that went through: path of the copy of the file it replaced."
+            "description": "A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none."
           },
           "token_sha256_prefix": {
             "type": "string",
             "pattern": "^[0-9a-f]{12}$",
             "description": "A rotation that went through: the first 12 hex characters of the new token's SHA-256."
+          },
+          "key_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "A key replacement that went through: the first 12 hex characters of the new key's SHA-256."
           }
         },
         "required": [

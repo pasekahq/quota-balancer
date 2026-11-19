@@ -5,11 +5,16 @@
 
 use std::io::{self, Read, Write};
 
+use zeroize::Zeroizing;
+
 /// Maximum size of the request line plus headers.
 pub const MAX_HEAD: usize = 8 * 1024;
 /// Maximum request body size.
 pub const MAX_BODY: usize = 64 * 1024;
 const MAX_HEADERS: usize = 32;
+/// Most bytes one read takes from the stream: a head buffer of capacity
+/// `MAX_HEAD + READ_CHUNK` never reallocates.
+pub const READ_CHUNK: usize = 2048;
 
 /// Request method. Only `GET`, `POST` and `PUT` are routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +42,8 @@ pub struct Request {
     pub bearer: Option<String>,
     /// Value of `If-Match`, if any.
     pub if_match: Option<String>,
-    /// Body (`Content-Length` bytes).
-    pub body: Vec<u8>,
+    /// Body (`Content-Length` bytes), zeroized on drop since it may carry a credential.
+    pub body: Zeroizing<Vec<u8>>,
 }
 
 /// Why a request could not be read.
@@ -105,7 +110,7 @@ pub fn read_request_limited<R: Read>(
     max_body: &dyn Fn(&Head<'_>) -> Option<usize>,
 ) -> Result<Request, ReadError> {
     buf.clear();
-    let mut chunk = [0u8; 2048];
+    let mut chunk = Zeroizing::new([0u8; READ_CHUNK]);
     loop {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut req = httparse::Request::new(&mut headers);
@@ -165,11 +170,11 @@ pub fn read_request_limited<R: Read>(
                     Some(max) if want > max => return Err(ReadError::BodyTooLarge { unread }),
                     Some(_) => {}
                 }
-                let mut body = Vec::with_capacity(want);
+                let mut body = Zeroizing::new(Vec::with_capacity(want));
                 let already = &buf[head_len..];
                 body.extend_from_slice(&already[..already.len().min(want)]);
                 while body.len() < want {
-                    let n = r.read(&mut chunk)?;
+                    let n = r.read(&mut *chunk)?;
                     if n == 0 {
                         return Err(ReadError::Malformed);
                     }
@@ -189,7 +194,7 @@ pub fn read_request_limited<R: Read>(
                 if buf.len() >= MAX_HEAD {
                     return Err(ReadError::HeadTooLarge);
                 }
-                let n = r.read(&mut chunk)?;
+                let n = r.read(&mut *chunk)?;
                 if n == 0 {
                     return Err(if buf.is_empty() {
                         ReadError::Closed
@@ -315,7 +320,7 @@ mod tests {
         assert_eq!(r.method, Method::Get);
         assert_eq!(r.path, "/v1/state");
         assert_eq!(r.query.as_deref(), Some("x=1"));
-        assert_eq!(r.body, b"");
+        assert_eq!(*r.body, b"");
     }
 
     #[test]
@@ -326,7 +331,7 @@ mod tests {
         .expect("valid");
         assert_eq!(r.method, Method::Post);
         assert_eq!(r.bearer.as_deref(), Some("abc"));
-        assert_eq!(r.body, b"{}");
+        assert_eq!(*r.body, b"{}");
     }
 
     #[test]
@@ -391,7 +396,7 @@ mod tests {
             Err(ReadError::BodyTooLarge { .. })
         ));
         let r = read_request_limited(&mut &raw[..], &mut buf, &|_| Some(5)).expect("fits");
-        assert_eq!(r.body, b"hello");
+        assert_eq!(*r.body, b"hello");
     }
 
     #[test]

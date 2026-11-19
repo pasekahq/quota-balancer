@@ -229,6 +229,7 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/clients/{name}/rotate` | — | 200 `ClientRotateAnswer`, 403 a caller other than the gateway's own uid, 404 no such named client, 409 a client with `token_sha256`, 500 a file could not be written |
 | `GET /v1/model/config/routes` | — | 200 `ConfigRoutes` with an `ETag`, 403 a caller other than the gateway's own uid, 500 the config file cannot be read or does not validate |
 | `PUT /v1/model/config/routes` | `ConfigRoutesPut` with `If-Match` | 200 `ConfigRoutesWritten`, 400 a body or candidate file that does not validate, 403 a caller other than the gateway's own uid, 412 `If-Match` is not the file's hash, 428 no `If-Match`, 500 a file could not be read or written |
+| `POST /v1/model/logins/{name}/key` | `LoginKey` | 200 `LoginKeyAnswer`, 400 a body or key that does not validate, 403 a caller other than the gateway's own uid, 404 no such login, 409 a login that is not `api_key`, 413 a body over 8 KiB, 500 a file could not be read or written |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -237,8 +238,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 Framing is `qbd`'s: HTTP/1.1, one request per connection, head ≤ 8 KiB, `Content-Length`
 required, chunked request bodies refused. The body of `POST /v1/model/turn` and of a `POST` to
 an HTTP front (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) may be up to the config's
-`max_request_bytes` (default 8 MiB), every other
-body up to 64 KiB; a request whose head and body have not arrived within 10 s is dropped
+`max_request_bytes` (default 8 MiB), that of `POST /v1/model/logins/{name}/key` up to 8 KiB,
+every other body up to 64 KiB; a request whose head and body have not arrived within 10 s is dropped
 without an answer. `/v1/model/*` requests reject unknown fields. Every non-200 answer of the
 gateway has the body `Error` below, whose `class` is authoritative and whose status is
 informative, except the answers of an HTTP front to a caller it serves, which use the error
@@ -490,18 +491,21 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 |---|---|
 | `at` | Unix time of the action |
 | `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
-| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse) or `config_spend_caps` (one with `spend_caps` only) |
-| `object` | the config file of a reload or a config edit, the login of a spend reset, the client of a rotation; absent when a refused request named none |
+| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse), `config_spend_caps` (one with `spend_caps` only) or `login_key` (a `POST /v1/model/logins/{name}/key`) |
+| `object` | the config file of a reload or a config edit, the login of a spend reset or a key replacement, the client of a rotation; absent when a refused request named none |
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
 | `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a config edit's of the file on disk before and after it; equal when it was refused, unless the edit replaced the file but could not install it |
-| `backup` | a config edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced |
+| `backup` | a config edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none |
 | `token_sha256_prefix` | a rotation that went through: the first 12 hex characters of the new token's SHA-256 |
+| `key_sha256_prefix` | a key replacement that went through: the first 12 hex characters of the new key's SHA-256 |
 
 Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/spend/reset`,
 `POST /v1/model/clients/{name}/rotate` and `PUT /v1/model/config/routes` that reaches its handler
 is recorded, refusals included: another uid's 403, a missing or stale `If-Match`, a body that does
-not parse, a config that does not validate, an unknown client. A peer that is not a caller of the gateway gets its 401
+not parse, a config that does not validate, an unknown client. Every request to
+`/v1/model/logins/{name}/key` of a caller of the gateway is recorded, also one whose body was
+too large or did not arrive and one with another method. A peer that is not a caller of the gateway gets its 401
 before any handler and leaves no line. No field holds a token, key or credential content. A
 line that cannot be appended is logged at error priority with the path; the action's answer
 stays as it was. The gateway neither rotates nor trims the file.
@@ -538,6 +542,45 @@ The previous token stays accepted until `grace_until`, the time of the rotation 
 `token_sha256_prefix` is the first 12 hex characters of the new token's SHA-256. An unknown
 name is 404 `bad_request`, a client with `token_sha256` 409 `bad_request`. A file that cannot be
 written is 500 `unavailable`: the token file and the accepted tokens stay as they were.
+
+### `POST /v1/model/logins/{name}/key`
+
+Writes a new key to the credential file of the `[[logins]]` entry `name` of the running config,
+an `api_key` login ([config.md](config.md#replacing-a-key)). Only the gateway's own uid may: any
+other caller gets 403 `auth`; the loopback listener answers 404. The body, at most 8 KiB, holds
+the key and nothing else, unknown fields refused:
+
+```json
+{"key": "synthetic-key-0002"}
+```
+
+The key must be 1 to 4096 bytes of visible ASCII: no whitespace, control character or other
+byte. The gateway holds its reload lock for the request, so reloads, config edits and client
+token rotations wait. It copies the credential file, when there is one, to
+`<file>.bak-<unix s>`, `-<n>` appended when a backup of that second exists, with mode 0600 and
+never over a file, then writes `{"type": "api_key", "key": "<key>"}` atomically with mode 0600
+(temporary file in the same directory, fsync, rename, fsync of the directory). The login's next
+attempt reads the new file; turns need no reload or restart. The request body, the key and the
+file's bytes are zeroized after use. The answer never holds the key:
+
+```json
+{"login": "key-1", "backup": "/etc/qb/credentials/key-1.json.bak-1800000480",
+ "key_sha256_prefix": "5bcc977b51d5"}
+```
+
+`backup` is `null` when the login had no credential file. `key_sha256_prefix` is the first 12
+hex characters of the new key's SHA-256; the audit line and the log line show it too.
+
+An unknown login is 404 `bad_request`, a login of another `kind` 409 `bad_request`, a body that
+is not JSON 400 `bad_request` naming the line and column, a body of another shape 400
+`bad_request` ``the body must be one object with the string `key` only``, a key that breaks a rule
+400 `bad_request` naming the rule, a body over 8 KiB 413 `bad_request`; no message quotes the key
+or the body. A file that cannot be read or a backup that cannot be written is 500 `unavailable`
+and the old file stays in force. A write that fails before the rename is 500 `unavailable` with
+`cannot write <file>: <error>; the old file stays`, the new backup removed; one that fails after
+the rename replaced the file is 500 `unavailable` with `<file> was replaced but the write failed:
+<error>; the old file is kept as <backup>`, the backup kept and the new key in force. The gateway
+removes no other backup.
 
 ### `GET` and `PUT /v1/model/config/routes`
 

@@ -1,10 +1,10 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
 //! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
-//! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes` and `/v1/health`, and the HTTP
-//! fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
-//! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
-//! clients with a client token.
+//! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`
+//! and `/v1/health`, and the HTTP fronts: `/v1/messages` ([`super::messages`]),
+//! `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the optional loopback TCP
+//! listener serves only the HTTP fronts, to clients with a client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
 //! peer takes one of these slots only once its head showed a client token, and before that one
 //! of [`LOOPBACK_UNCHECKED`] slots of its own, for at most [`LOOPBACK_HEAD_DEADLINE`]. On the C4
@@ -31,6 +31,7 @@ use qb_proto::{
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use super::answer::Keepalive;
 use super::audit;
@@ -513,6 +514,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
     let max_turn = gateway.config().max_request_bytes as usize;
     let limit = Cell::new(http::MAX_BODY);
     let dialect = Cell::new(Dialect::C4);
+    let key_login = Cell::new(None);
     let max_body = |head: &Head<'_>| {
         dialect.set(Dialect::of(head.path));
         if head.method == Method::Post
@@ -520,28 +522,25 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         {
             limit.set(max_turn);
         }
+        if let Some(name) = key_target(head.path) {
+            limit.set(MAX_KEY_BODY);
+            key_login.set(Some(name.to_owned()));
+        }
         Some(limit.get())
     };
     let req = match read(&stream, &max_body) {
         Ok(r) => r,
-        Err(e) => return unreadable(&mut stream, &e, limit.get(), dialect.get()),
-    };
-    if let Some(name) = rotate_target(&req.path) {
-        if req.method != Method::Post {
-            return reject(
-                &mut stream,
-                405,
-                ErrorClass::BadRequest,
-                "method not allowed",
-            );
+        Err(e) => {
+            if let Some(name) = key_login.take() {
+                let reason = unread(&e, limit.get())
+                    .map_or_else(|| "the request's body was not read".to_owned(), |(_, m)| m);
+                gateway.refuse_login_key(&audit::uid_actor(uid), &name, &reason);
+            }
+            return unreadable(&mut stream, &e, limit.get(), dialect.get());
         }
-        return rotate(
-            &mut stream,
-            gateway,
-            name,
-            &audit::uid_actor(uid),
-            uid == own_uid,
-        );
+    };
+    if named(&mut stream, gateway, &req, uid, own_uid) {
+        return;
     }
     match (req.method, req.path.as_str()) {
         (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, watch, &caller.name, req.body),
@@ -603,6 +602,31 @@ fn health(started: Instant) -> HealthResponse {
     }
 }
 
+/// Answers `req` from the peer of `uid` when its path names a client or a login, an admin
+/// endpoint of the gateway's own uid `own_uid`; false for another path.
+fn named(
+    stream: &mut Conn,
+    gateway: &Gateway,
+    req: &http::Request,
+    uid: u32,
+    own_uid: u32,
+) -> bool {
+    let actor = audit::uid_actor(uid);
+    let own = uid == own_uid;
+    if let Some(name) = key_target(&req.path) {
+        login_key(stream, gateway, name, req, &actor, own);
+    } else if let Some(name) = rotate_target(&req.path) {
+        if req.method == Method::Post {
+            rotate(stream, gateway, name, &actor, own);
+        } else {
+            reject(stream, 405, ErrorClass::BadRequest, "method not allowed");
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
 /// The client name of a `/v1/model/clients/{name}/rotate` path.
 fn rotate_target(path: &str) -> Option<&str> {
     let name = path
@@ -622,6 +646,45 @@ fn rotate(stream: &mut Conn, gateway: &Gateway, name: &str, actor: &str, own: bo
         return reject(stream, 403, ErrorClass::Auth, message);
     }
     match gateway.rotate_client(actor, name) {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(r) => reject(stream, r.status, r.class, &r.message),
+    }
+}
+
+/// Largest body of `POST /v1/model/logins/{name}/key`.
+const MAX_KEY_BODY: usize = 8 * 1024;
+
+/// The login name of a `/v1/model/logins/{name}/key` path.
+fn key_target(path: &str) -> Option<&str> {
+    let name = path
+        .strip_prefix(paths::MODEL_LOGINS)?
+        .strip_prefix('/')?
+        .strip_suffix("/key")?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
+/// Answers `req` of `actor` to `/v1/model/logins/{name}/key`, which only the gateway's `own` uid
+/// may `POST`.
+fn login_key(
+    stream: &mut Conn,
+    gateway: &Gateway,
+    name: &str,
+    req: &http::Request,
+    actor: &str,
+    own: bool,
+) {
+    let refuse = |stream: &mut Conn, status: u16, class: ErrorClass, message: &str| {
+        gateway.refuse_login_key(actor, name, message);
+        reject(stream, status, class, message);
+    };
+    if !own {
+        let message = "only the gateway's own uid may replace a login's key";
+        return refuse(stream, 403, ErrorClass::Auth, message);
+    }
+    if req.method != Method::Post {
+        return refuse(stream, 405, ErrorClass::BadRequest, "method not allowed");
+    }
+    match gateway.replace_login_key(actor, name, &req.body) {
         Ok(answer) => reply(stream, 200, &answer),
         Err(r) => reject(stream, r.status, r.class, &r.message),
     }
@@ -1026,7 +1089,9 @@ fn read_until(
     until: &Cell<Instant>,
     max_body: &dyn Fn(&Head<'_>) -> Option<usize>,
 ) -> Result<http::Request, ReadError> {
-    let mut buf = Vec::new();
+    // Sized so it never reallocates: the head's buffer holds the start of a body that may carry
+    // a credential.
+    let mut buf = Zeroizing::new(Vec::with_capacity(http::MAX_HEAD + http::READ_CHUNK));
     let mut reader = Deadline { stream, until };
     http::read_request_limited(&mut reader, &mut buf, max_body)
 }
@@ -1034,21 +1099,35 @@ fn read_until(
 /// Answers a request that could not be read, its body limit `limit`, in the error format
 /// `dialect`; a closed connection or a refused head gets no answer here.
 fn unreadable(stream: &mut Conn, e: &ReadError, limit: usize, dialect: Dialect) {
-    let (status, message) = match *e {
-        ReadError::Closed | ReadError::Io(_) | ReadError::Refused { .. } => return,
-        ReadError::Malformed => (400, "malformed HTTP request".into()),
-        ReadError::HeadTooLarge => (413, "request head too large".into()),
-        ReadError::BodyTooLarge { unread } => {
-            discard(&*stream, unread);
-            (413, format!("request body over {limit} bytes"))
-        }
-        ReadError::LengthRequired => (411, "Content-Length required".into()),
+    let Some((status, message)) = unread(e, limit) else {
+        return;
     };
+    if let ReadError::BodyTooLarge { unread } = *e {
+        discard(&*stream, unread);
+    }
     let e = GatewayError::new(ErrorClass::BadRequest, false, message);
     dialect.reject(stream, status, &e);
 }
 
-fn turn(mut stream: Conn, gateway: &Gateway, watch: &Watch, caller: &str, body: Vec<u8>) {
+/// The status and message of the answer to a request that could not be read, its body limit
+/// `limit`; `None` for a closed connection or a refused head, which get no answer.
+fn unread(e: &ReadError, limit: usize) -> Option<(u16, String)> {
+    Some(match *e {
+        ReadError::Closed | ReadError::Io(_) | ReadError::Refused { .. } => return None,
+        ReadError::Malformed => (400, "malformed HTTP request".into()),
+        ReadError::HeadTooLarge => (413, "request head too large".into()),
+        ReadError::BodyTooLarge { .. } => (413, format!("request body over {limit} bytes")),
+        ReadError::LengthRequired => (411, "Content-Length required".into()),
+    })
+}
+
+fn turn(
+    mut stream: Conn,
+    gateway: &Gateway,
+    watch: &Watch,
+    caller: &str,
+    body: Zeroizing<Vec<u8>>,
+) {
     let req: TurnRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return reject(&mut stream, 400, ErrorClass::BadRequest, &e.to_string()),

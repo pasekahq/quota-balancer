@@ -188,7 +188,7 @@ impl ClientTokens {
 }
 
 /// The first [`PREFIX_HEX`] hex characters of `hash`.
-fn prefix(hash: &BearerHash) -> String {
+pub(super) fn prefix(hash: &BearerHash) -> String {
     let mut hex = sha256::hex(hash.0);
     hex.truncate(PREFIX_HEX);
     hex

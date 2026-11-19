@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -13,17 +14,18 @@ use std::time::{Duration, Instant};
 
 use qb_proto::{
     Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut,
-    ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LoginSpend, LoginStatus, Outcome,
-    PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState, RouteStatus,
-    RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest, Usage, UsageLine,
-    WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
+    ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LoginKey, LoginKeyAnswer, LoginSpend,
+    LoginStatus, Outcome, PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo,
+    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest,
+    Usage, UsageLine, WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use super::Refusal;
 use super::config::{Api, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route};
-use super::creds::{CredentialStore, Refresher, write_atomic};
+use super::config_edit::Unwritten;
+use super::creds::{CredentialStore, Kind, Refresher, Written, write_atomic};
 use super::spend::{self, Ledger};
 use super::tokens::{self, ClientTokens};
 use super::upstream::{
@@ -172,6 +174,19 @@ fn login_scoped(kind: FailureKind) -> bool {
             | FailureKind::RateLimited { .. }
             | FailureKind::ModelUnavailable
     )
+}
+
+/// The message of a key body that does not decode; serde's own may quote the body.
+fn body_error(e: &serde_json::Error) -> String {
+    if e.is_data() {
+        "the body must be one object with the string `key` only".to_owned()
+    } else {
+        format!(
+            "the body is not valid JSON (line {}, column {})",
+            e.line(),
+            e.column()
+        )
+    }
 }
 
 /// The audit action of a config edit of body `put`: `config_spend_caps` when it carries only
@@ -666,6 +681,132 @@ impl Gateway {
                 Err(refusal)
             }
         }
+    }
+
+    /// Writes the key of the [`qb_proto::LoginKey`] `body` to the credential file of the
+    /// `api_key` login `name` for `actor`; the login's next attempt sends it. The old file is kept
+    /// as a 0600 backup, the new one written atomically. Serialised with reloads, config edits
+    /// and rotations; logs one line and records one audit entry either way, never the key.
+    ///
+    /// # Errors
+    /// 404 an unknown login, 409 a login of another kind, 400 a body that does not decode or a
+    /// key that does not validate, 500 a file that cannot be read or written; the old file stays
+    /// in force, unless the write failed after replacing it, which keeps the backup.
+    pub fn replace_login_key(
+        &self,
+        actor: &str,
+        name: &str,
+        body: &[u8],
+    ) -> Result<LoginKeyAnswer, Refusal> {
+        // A reload must not take a config whose credential file is half replaced.
+        let _one = lock(&self.reloading);
+        let mut entry = audit::entry(actor, AuditAction::LoginKey, Some(name.to_owned()));
+        match self.write_login_key(name, body, &mut entry) {
+            Ok(answer) => {
+                let backup = answer.backup.as_deref().unwrap_or("none");
+                log::info(&format!(
+                    "gateway: replaced the key of login `{name}`: sha256 {}…, backup {backup}",
+                    answer.key_sha256_prefix
+                ));
+                entry.key_sha256_prefix = Some(answer.key_sha256_prefix.clone());
+                entry.backup.clone_from(&answer.backup);
+                self.record(&entry);
+                Ok(answer)
+            }
+            Err(refusal) => {
+                log::warn(&format!(
+                    "gateway: key replacement of login `{name}` refused: {}",
+                    refusal.message
+                ));
+                self.record(&audit::refused(entry, refusal.message.as_str()));
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Records a key replacement of login `name` by `actor` refused for `reason` before
+    /// [`Self::replace_login_key`].
+    pub(crate) fn refuse_login_key(&self, actor: &str, name: &str, reason: &str) {
+        let entry = audit::entry(actor, AuditAction::LoginKey, Some(name.to_owned()));
+        self.record(&audit::refused(entry, reason));
+    }
+
+    /// The steps of [`Self::replace_login_key`] under `reloading`; a failure that replaced the
+    /// file sets the backup of `entry`.
+    fn write_login_key(
+        &self,
+        name: &str,
+        body: &[u8],
+        entry: &mut AuditEntry,
+    ) -> Result<LoginKeyAnswer, Refusal> {
+        let config = self.config();
+        let Some(login) = config.login(name) else {
+            let message = format!("no login `{name}`");
+            return Err(Refusal::new(404, ErrorClass::BadRequest, message));
+        };
+        if login.kind != CredentialKind::ApiKey {
+            let message = format!("login `{name}` is `{}`, not `api_key`", login.kind.as_str());
+            return Err(Refusal::new(409, ErrorClass::BadRequest, message));
+        }
+        let invalid = |message: String| Refusal::new(400, ErrorClass::BadRequest, message);
+        let decoded: LoginKey =
+            serde_json::from_slice(body).map_err(|e| invalid(body_error(&e)))?;
+        let valid = decoded.validate();
+        let key = Zeroizing::new(decoded.key);
+        valid.map_err(|e| invalid(e.to_owned()))?;
+        let file = login.credentials.as_path();
+        let failed = |message: String| Refusal::new(500, ErrorClass::Unavailable, message);
+        let old = match std::fs::read(file) {
+            Ok(bytes) => Some(Zeroizing::new(bytes)),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(failed(format!("cannot read {}: {e}", file.display()))),
+        };
+        let bytes = Written {
+            kind: Kind::ApiKey,
+            access_token: None,
+            refresh_token: None,
+            account_id: None,
+            expires_at: None,
+            key: Some(&key),
+        }
+        .encode(file)
+        .map_err(|e| failed(e.message))?;
+        let backup = old
+            .as_ref()
+            .map(|old| config_edit::backup(file, old, unix_now()))
+            .transpose()
+            .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
+        let written = match (&old, &backup) {
+            (Some(old), Some(backup)) => {
+                config_edit::replace(file, old, &bytes, backup, write_atomic)
+            }
+            _ => write_atomic(file, &bytes).map_err(|error| Unwritten {
+                replaced: std::fs::symlink_metadata(file).is_ok(),
+                error,
+            }),
+        };
+        let backup = backup.map(|b| b.display().to_string());
+        if let Err(u) = written {
+            let file = file.display();
+            if !u.replaced {
+                let message = format!("cannot write {file}: {}; the old file stays", u.error);
+                return Err(failed(message));
+            }
+            entry.backup.clone_from(&backup);
+            let kept = backup.map_or_else(
+                || "there was no old file".to_owned(),
+                |b| format!("the old file is kept as {b}"),
+            );
+            return Err(failed(format!(
+                "{file} was replaced but the write failed: {}; {kept}",
+                u.error
+            )));
+        }
+        Ok(LoginKeyAnswer {
+            login: name.to_owned(),
+            backup,
+            key_sha256_prefix: tokens::prefix(&BearerHash(sha256::digest(key.as_bytes()))),
+        })
     }
 
     /// Admits `client`'s turn `req`: valid, a known route, images inline, its `request_id` not

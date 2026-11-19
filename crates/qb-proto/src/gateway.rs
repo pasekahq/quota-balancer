@@ -718,6 +718,48 @@ pub struct ClientRotateAnswer {
     pub grace_until: u64,
 }
 
+/// `POST /v1/model/logins/{name}/key` request: the new key of an `api_key` login. It has no
+/// `Debug`, so no format of it shows the key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginKey {
+    /// The key: 1 to [`MAX_LOGIN_KEY`] bytes of visible ASCII.
+    pub key: String,
+}
+
+/// Longest key of a [`LoginKey`] in bytes.
+pub const MAX_LOGIN_KEY: usize = 4096;
+
+impl LoginKey {
+    /// Checks the key is 1 to [`MAX_LOGIN_KEY`] bytes of visible ASCII, so it fits in a header.
+    ///
+    /// # Errors
+    /// The rule it breaks, never the key.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.key.is_empty() {
+            return Err("`key` is empty");
+        }
+        if self.key.len() > MAX_LOGIN_KEY {
+            return Err("`key` is longer than 4096 bytes");
+        }
+        if !self.key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("`key` holds whitespace, a control character or non-ASCII");
+        }
+        Ok(())
+    }
+}
+
+/// `POST /v1/model/logins/{name}/key` response. It never holds the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginKeyAnswer {
+    /// Name of the `[[logins]]` entry whose key was replaced.
+    pub login: String,
+    /// Path of the copy of the credential file it replaced; `None` when there was no file.
+    pub backup: Option<String>,
+    /// The first 12 hex characters of the new key's SHA-256.
+    pub key_sha256_prefix: String,
+}
+
 /// One step of a chain route as `/v1/model/config/routes` carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -813,6 +855,9 @@ pub enum AuditAction {
     /// `PUT /v1/model/config/routes` with `spend_caps` only: logins' `spend_cap`s set or removed
     /// in the config file and reloaded.
     ConfigSpendCaps,
+    /// `POST /v1/model/logins/{name}/key`: a new key written to an `api_key` login's credential
+    /// file.
+    LoginKey,
 }
 
 /// Whether an admin action went through.
@@ -835,8 +880,8 @@ pub struct AuditEntry {
     pub actor: String,
     /// What was done.
     pub action: AuditAction,
-    /// The login of a spend reset, the config file of a reload or a config edit, the client of a
-    /// rotation; absent when a refused request named none.
+    /// The login of a spend reset or a key replacement, the config file of a reload or a config
+    /// edit, the client of a rotation; absent when a refused request named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// Whether it went through.
@@ -851,12 +896,17 @@ pub struct AuditEntry {
     /// when it was refused, unless a refused edit had replaced the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_after: Option<String>,
-    /// Path of the copy an action kept of what it replaced.
+    /// Path of the copy an action kept of what it replaced: the config file of a config edit,
+    /// the credential file of a key replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
     /// A rotation that went through: the first 12 hex characters of the new token's SHA-256.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_sha256_prefix: Option<String>,
+    /// A key replacement that went through: the first 12 hex characters of the new key's
+    /// SHA-256.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_sha256_prefix: Option<String>,
 }
 
 /// `GET /v1/model/audit` response.

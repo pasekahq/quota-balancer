@@ -4,6 +4,8 @@
 //!
 //! An item spans from its `[[routes]]` header to the end of the line of its last value, so
 //! comments and blank lines after that line stay, and comments inside an item go with it.
+//!
+//! [`backup`] and [`replace`] also keep and replace a credential file for a key replacement.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -16,6 +18,7 @@ use std::path::{Path, PathBuf};
 use qb_proto::{ConfigRoute, ConfigStep};
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
+use zeroize::Zeroizing;
 
 use super::config::{CredentialKind, GatewayLogin, Route};
 use crate::config::{Error, toml_error};
@@ -319,7 +322,8 @@ pub struct Unwritten {
 }
 
 /// Writes `candidate` over `file`, whose bytes were `old`, through `write`. On a failure the
-/// backup `backup` of `old` is removed only when `file` still reads back as `old`.
+/// backup `backup` of `old` is removed only when `file` still reads back as `old`; that read is
+/// zeroized, since `file` may be a credential file.
 ///
 /// # Errors
 /// `write` failed.
@@ -333,7 +337,7 @@ pub fn replace(
     let Err(error) = write(file, candidate) else {
         return Ok(());
     };
-    let replaced = std::fs::read(file).map_or(true, |now| now != old);
+    let replaced = std::fs::read(file).map_or(true, |now| *Zeroizing::new(now) != old);
     if !replaced {
         let _ = std::fs::remove_file(backup);
     }

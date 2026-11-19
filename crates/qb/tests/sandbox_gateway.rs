@@ -61,6 +61,7 @@ fn signal_reload(at: u64) -> AuditEntry {
         config_sha256_after: None,
         backup: None,
         token_sha256_prefix: None,
+        key_sha256_prefix: None,
     }
 }
 
@@ -202,6 +203,10 @@ fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
         assert_eq!(gateway.config().routes[0].expected_minutes, Some(3));
         let answer = gateway.rotate_client("uid:1", "client-f").unwrap();
         assert_eq!(answer.client, "client-f");
+        let replaced = gateway
+            .replace_login_key("uid:1", "login-1", br#"{"key":"k3"}"#)
+            .unwrap();
+        let key_backup = PathBuf::from(replaced.backup.unwrap());
         assert!(UnixStream::connect(&qbd).is_ok(), "qbd stays reachable");
         let (accepted, _) = tcp.accept().unwrap();
         assert_eq!(
@@ -234,7 +239,7 @@ fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
             let gaps = &applied.gaps;
             assert!(gaps.iter().any(|g| g.contains("landlock")), "{gaps:?}");
         }
-        edit.backup
+        (edit.backup, key_backup)
     });
     // An editor replaces the config by rename while the sandboxed gateway runs.
     if edit.recv().is_ok() {
@@ -243,7 +248,8 @@ fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
         std::fs::rename(&replaced, &file).unwrap();
         let _ = edited.send(());
     }
-    let backup = PathBuf::from(gateway.join().unwrap());
+    let (backup, key_backup) = gateway.join().unwrap();
+    let backup = PathBuf::from(backup);
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), text);
     let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "the backup written in the sandbox");
@@ -251,8 +257,15 @@ fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
     assert!(edited.contains("expected_minutes = 3\n"), "{edited}");
     assert_eq!(
         std::fs::read_to_string(&credential).unwrap(),
+        r#"{"type":"api_key","key":"k3"}"#,
+        "the key replaced in the sandbox"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&key_backup).unwrap(),
         r#"{"type":"api_key","key":"k2"}"#
     );
+    let mode = std::fs::metadata(&key_backup).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "the key backup written in the sandbox");
     assert!(spend_file.exists(), "written in the sandbox");
     let token = std::fs::read_to_string(&token_file).unwrap();
     assert_ne!(token, "qb-client-f-token", "rotated in the sandbox");

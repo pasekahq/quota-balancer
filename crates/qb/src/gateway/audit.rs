@@ -41,6 +41,7 @@ pub(crate) fn entry(actor: &str, action: AuditAction, object: Option<String>) ->
         config_sha256_after: None,
         backup: None,
         token_sha256_prefix: None,
+        key_sha256_prefix: None,
     }
 }
 
