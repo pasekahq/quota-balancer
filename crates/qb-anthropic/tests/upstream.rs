@@ -4,8 +4,11 @@
 mod common;
 
 use common::{Answer, NOW, VENDOR, fixture, run};
-use qb_anthropic::limits::{FailureKind, classify_response, rate_limits};
-use qb_anthropic::request::{AuthMode, BuildError, Target, build, identity, tool_id};
+use qb_anthropic::limits::{FailureKind, RateLimits, classify_response, rate_limits};
+use qb_anthropic::request::{
+    AuthMode, BuildError, Target, build, identity, tool_id, wire_tool_names,
+};
+use qb_anthropic::stream::Reader;
 use qb_proto::{
     Block, CacheMode, Effort, Elsewhere, ErrorClass, Message, NativeApi, NativeTool, Object,
     Outcome, Role, StopReason, StreamEvent, Thinking, Tool, ToolCall, TurnRequest, Usage,
@@ -290,6 +293,71 @@ fn oauth_mode_adds_the_identity_prefix_and_headers() {
         api.iter()
             .all(|(k, _)| *k != "anthropic-beta" && *k != "x-app")
     );
+}
+
+#[test]
+fn oauth_mode_prefixes_client_tool_names_and_maps_them_back() {
+    // Bare tool names on a subscription login are billed as a third-party app: 400 "You're
+    // out of extra usage" (19.11.2026, Hermes' tool set); `mcp__` names go against the plan.
+    let mut req = turn();
+    req.tools.push(Tool {
+        name: "mcp__linear_get".into(),
+        description: "Already prefixed.".into(),
+        input_schema: obj(json!({"type": "object"})),
+        native: None,
+    });
+    let body =
+        serde_json::to_value(build(&req, &target(AuthMode::Oauth), &mut load).expect("builds"))
+            .expect("serialises");
+    let names: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, ["mcp__read", "mcp__linear_get"]);
+    assert_eq!(body["messages"][1]["content"][1]["name"], "mcp__read");
+
+    let api =
+        serde_json::to_value(build(&req, &target(AuthMode::ApiKey), &mut load).expect("builds"))
+            .expect("serialises");
+    assert_eq!(api["tools"][0]["name"], "read");
+    assert_eq!(api["messages"][1]["content"][1]["name"], "read");
+    assert!(wire_tool_names(&req, AuthMode::ApiKey).is_empty());
+
+    // A client tool that already holds the prefixed name keeps both names as they are.
+    req.tools.push(Tool {
+        name: "mcp__read".into(),
+        description: "Clash.".into(),
+        input_schema: obj(json!({"type": "object"})),
+        native: None,
+    });
+    assert!(wire_tool_names(&req, AuthMode::Oauth).is_empty());
+
+    // A name the prefix would take past the vendor's 64 characters stays bare.
+    let mut long = turn();
+    long.tools[0].name = "t".repeat(60);
+    assert!(wire_tool_names(&long, AuthMode::Oauth).is_empty());
+
+    let sse = fixture("upstream_tool_use.sse");
+    let sse = String::from_utf8(sse)
+        .expect("utf-8")
+        .replace("\"name\":\"read\"", "\"name\":\"mcp__read\"");
+    let back = wire_tool_names(&turn(), AuthMode::Oauth)
+        .into_iter()
+        .map(|(client, wire)| (wire, client))
+        .collect();
+    let mut reader = Reader::new(VENDOR, RateLimits::default()).with_tool_names(back);
+    let mut events = Vec::new();
+    reader.feed(sse.as_bytes(), &mut events).expect("feeds");
+    let called: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolCall { tool_call } => Some(tool_call.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(called, ["read", "list"]);
 }
 
 #[test]
@@ -641,6 +709,12 @@ fn vendor_answers_classify() {
         ),
         (
             "answer_400_credit_balance.json",
+            FailureKind::UsageLimit { resets_at: None },
+            ErrorClass::QuotaExhausted,
+            Outcome::UsageLimit,
+        ),
+        (
+            "answer_400_out_of_extra_usage.json",
             FailureKind::UsageLimit { resets_at: None },
             ErrorClass::QuotaExhausted,
             Outcome::UsageLimit,

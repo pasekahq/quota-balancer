@@ -1,0 +1,11 @@
+{
+  "status": 400,
+  "headers": [],
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "invalid_request_error",
+      "message": "You're out of extra usage. Add more at claude.ai/settings/usage and keep going."
+    }
+  }
+}

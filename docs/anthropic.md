@@ -82,7 +82,15 @@ result); thinking blocks cannot. Without `cache` the request has no breakpoints.
 | `api_key` | `x-api-key: <key>` | `anthropic-version`, `content-type`, `accept: text/event-stream`, `user-agent: qb-gateway` | the client's |
 | `oauth` | `authorization: Bearer <access token>` | as `api_key`, plus `anthropic-beta: oauth-2025-04-20,claude-code-20250219`, the vendor CLI's `user-agent` and `x-app: cli` | the vendor CLI's identity line as the first block, then the client's |
 
-All identity values (version, betas, user agent, `x-app`, identity line) are constants in
+In `oauth` mode every client tool name also goes on the wire with the prefix `mcp__`
+(`identity::OAUTH_TOOL_PREFIX`), in `tools` and in the `tool_use` blocks of the history, unless it
+already starts with it or the prefixed name is another client tool; tool calls of the answer get
+the client's name back (`request::wire_tool_names`). The subscription endpoint bills a request
+whose tools carry bare names as a third-party app: with extra usage off it answers 400 "You're out
+of extra usage" even with the plan windows free (seen 19.11.2026 with Hermes' tool set), while the
+same request with `mcp__` names goes against the plan.
+
+All identity values (version, betas, user agent, `x-app`, identity line, tool prefix) are constants in
 `request::identity`, the one place to change them. Clients of the gateway never see or send them.
 The subscription endpoint refuses newer models for an old CLI version in the user agent
 (HTTP 400 `version 2.1.280 or newer is required` for `claude-opus-5-5`), so the version in
@@ -154,7 +162,7 @@ depending on it. The client class and outcome are the gateway core's mapping:
 | Answer | Failure kind | Client class | `qbd` outcome |
 |---|---|---|---|
 | 401, 403, `authentication_error`, `permission_error` | `auth` | `auth` | `http_401` |
-| 429 with unified status `rejected`, or a message about a usage limit (`usage limit`, `hit your limit`, `limit reached`) | `usage_limit{resets_at}` | `quota_exhausted` | `usage_limit` |
+| 429 with unified status `rejected`, or a 400 or 429 whose message is about a usage limit (`usage limit`, `hit your limit`, `limit reached`, `out of extra usage`, the 400 a subscription login past its plan limits gets when extra usage is off or spent) | `usage_limit{resets_at}` | `quota_exhausted` | `usage_limit` |
 | other 429, `rate_limit_error` | `rate_limited{retry_after}` | `overloaded` | `http_429` |
 | 402, `billing_error`, or a 400 whose message is about credit or billing (`credit balance`, `billing`), as an API key out of prepaid credit gets | `usage_limit` without reset | `quota_exhausted` | `usage_limit` |
 | 529, `overloaded_error` | `overloaded{retry_after}` | `overloaded` | `error` |

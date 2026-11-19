@@ -4,6 +4,8 @@
 //! in front of it so the caller feeds raw response bytes. Neither emits `route`, `stop` or
 //! `error`: the core owns those, and gets the stop reason or a [`Failure`] back instead.
 
+use std::collections::HashMap;
+
 use qb_proto::{Object, StopReason, StreamEvent, Thinking, ToolCall, Usage};
 use serde_json::Value;
 
@@ -81,6 +83,7 @@ pub struct Translator {
     stop: Option<StopReason>,
     started: bool,
     finished: Option<StopReason>,
+    tool_names: HashMap<String, String>,
 }
 
 fn malformed(what: &str) -> Failure {
@@ -102,7 +105,16 @@ impl Translator {
             stop: None,
             started: false,
             finished: None,
+            tool_names: HashMap::new(),
         }
+    }
+
+    /// The same translator, giving a tool call named by a key of `wire_to_client` the value
+    /// instead: the inverse of [`crate::request::wire_tool_names`].
+    #[must_use]
+    pub fn with_tool_names(mut self, wire_to_client: HashMap<String, String>) -> Self {
+        self.tool_names = wire_to_client;
+        self
     }
 
     /// Translates one event, appending canonical events to `out`.
@@ -298,6 +310,7 @@ impl Translator {
         match open {
             Open::Text | Open::Skipped => {}
             Open::ToolUse { id, name, json } => {
+                let name = self.tool_names.get(&name).cloned().unwrap_or(name);
                 let input = if json.trim().is_empty() {
                     Object::new()
                 } else {
@@ -350,6 +363,13 @@ impl Reader {
             frames: Vec::new(),
             translator: Translator::new(vendor, limits),
         }
+    }
+
+    /// The same reader, mapping tool call names back as [`Translator::with_tool_names`].
+    #[must_use]
+    pub fn with_tool_names(mut self, wire_to_client: HashMap<String, String>) -> Self {
+        self.translator = self.translator.with_tool_names(wire_to_client);
+        self
     }
 
     /// Feeds response bytes, appending canonical events to `out`.

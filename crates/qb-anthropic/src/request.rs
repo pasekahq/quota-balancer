@@ -2,6 +2,7 @@
 //! [`CreateMessage`] body and a set of request headers for one of two [`AuthMode`]s.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 
 use qb_proto::{Block, CacheMode, Effort, Elsewhere, MediaType, Role, TurnRequest};
@@ -23,6 +24,11 @@ pub mod identity {
     pub const OAUTH_USER_AGENT: &str = "claude-cli/2.1.319 (external, cli)";
     /// `x-app` of the OAuth mode.
     pub const OAUTH_X_APP: &str = "cli";
+    /// Prefix of every client tool name on the wire of an OAuth request. The subscription
+    /// endpoint bills a request whose tools carry bare names as a third-party app (extra usage,
+    /// a 400 "You're out of extra usage" when that is off), and one whose tools carry this
+    /// prefix, as Claude Code's MCP tools do, against the plan.
+    pub const OAUTH_TOOL_PREFIX: &str = "mcp__";
     /// First system block of every OAuth request, ahead of the client's system prompt.
     pub const OAUTH_SYSTEM_PREFIX: &str =
         "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -98,6 +104,28 @@ pub struct Target<'a> {
     pub auth: AuthMode,
     /// Send `thinking: {type: adaptive}`; off for models that do not accept it.
     pub adaptive_thinking: bool,
+}
+
+/// Longest tool name the vendor takes.
+const MAX_TOOL_NAME: usize = 64;
+
+/// Wire names of the client tools of `req` under `auth`, client name to wire name: under
+/// [`AuthMode::Oauth`] each name without [`identity::OAUTH_TOOL_PREFIX`] gets it, unless the
+/// prefixed name is a client tool too or longer than the vendor's 64 characters; empty under [`AuthMode::ApiKey`]. The inverse map goes
+/// to [`crate::stream::Reader::with_tool_names`] so the client sees its own names.
+pub fn wire_tool_names(req: &TurnRequest, auth: AuthMode) -> HashMap<String, String> {
+    if auth != AuthMode::Oauth {
+        return HashMap::new();
+    }
+    let p = identity::OAUTH_TOOL_PREFIX;
+    req.tools
+        .iter()
+        .filter(|t| !t.name.starts_with(p))
+        .map(|t| (t.name.clone(), format!("{p}{}", t.name)))
+        .filter(|(_, wire)| {
+            wire.len() <= MAX_TOOL_NAME && !req.tools.iter().any(|t| &t.name == wire)
+        })
+        .collect()
 }
 
 /// Why a request cannot be sent; the core reports it as `bad_request`.
@@ -178,6 +206,20 @@ pub fn build(
     }
     system.extend(lifted.iter().map(|s| text_block(s)));
 
+    let renamed = wire_tool_names(req, at.auth);
+    if !renamed.is_empty() {
+        for m in &mut messages {
+            if let Content::Blocks(blocks) = &mut m.content {
+                for b in blocks {
+                    if let ContentBlock::ToolUse { name, .. } = b {
+                        if let Some(wire) = renamed.get(name.as_str()) {
+                            name.clone_from(wire);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut tools = Vec::with_capacity(req.tools.len());
     for t in &req.tools {
         match t.native.as_ref().map(|n| n.elsewhere) {
@@ -186,7 +228,7 @@ pub fn build(
             Some(Elsewhere::Refuse) => return Err(BuildError::Tool(t.name.clone())),
         }
         tools.push(ToolParam {
-            name: t.name.clone(),
+            name: renamed.get(&t.name).unwrap_or(&t.name).clone(),
             description: Some(t.description.clone()),
             input_schema: t.input_schema.clone(),
             cache_control: None,
