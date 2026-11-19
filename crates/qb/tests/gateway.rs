@@ -3626,6 +3626,38 @@ fn the_loopback_listener_serves_messages_to_the_client_token_only() {
     assert_eq!(status, 200, "the unix socket needs no token");
 }
 
+#[test]
+fn a_refused_loopback_request_logs_its_reason_method_and_path_but_no_token() {
+    let (listener, addr, front) = loopback_front("");
+    let _r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let logged = stderr_until("/v1/models", || {
+        let s = tcp_send(
+            addr,
+            "POST",
+            paths::MESSAGES,
+            "X-Api-Key: qb-wrong-token\r\n",
+            "{}",
+        );
+        assert_eq!(error_type(s).0, 401);
+        let auth = format!("Authorization: Bearer {CLIENT_TOKEN}\r\n");
+        let s = tcp_send(addr, "GET", "/v1/models", &auth, "");
+        assert_eq!(error_type(s).0, 404);
+    });
+    assert!(
+        logged.contains(&format!(
+            "gateway: loopback refused POST {}: token",
+            paths::MESSAGES
+        )),
+        "{logged}"
+    );
+    assert!(
+        logged.contains("gateway: loopback refused GET /v1/models: path"),
+        "{logged}"
+    );
+    assert!(!logged.contains("qb-wrong-token"), "{logged}");
+    assert!(!logged.contains(CLIENT_TOKEN), "{logged}");
+}
+
 /// A request an official vendor Python SDK sent with the base URL `http://127.0.0.1:8080` and
 /// the key [`CLIENT_TOKEN`], recorded byte for byte in the fixture `name` of `krate`.
 fn recorded_sdk_request(krate: &str, name: &str) -> Vec<u8> {
