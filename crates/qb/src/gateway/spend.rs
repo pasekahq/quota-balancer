@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use qb_proto::{Usage, WindowReport};
+use qb_proto::{Usage, UsdSource, WindowReport};
 use qb_vendors::rfc3339::days_in_month;
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +133,20 @@ impl Ledger {
         };
         let bytes = serde_json::to_vec(&stored).map_err(|e| e.to_string())?;
         write_atomic(&self.file, &bytes).map_err(|e| format!("{}: {e}", self.file.display()))
+    }
+}
+
+/// USD of an attempt and where it comes from: the vendor's `cost`, else `usage` at `price`,
+/// none counting as zero tokens; `None` without either.
+pub fn attempt_usd(
+    cost: Option<f64>,
+    price: Option<&Price>,
+    usage: Option<&Usage>,
+) -> Option<(f64, UsdSource)> {
+    match (cost, price) {
+        (Some(usd), _) => Some((usd, UsdSource::Vendor)),
+        (None, Some(price)) => Some((usage.map_or(0.0, |u| priced(u, price)), UsdSource::Prices)),
+        (None, None) => None,
     }
 }
 

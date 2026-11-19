@@ -765,6 +765,62 @@ pub struct AuditAnswer {
     pub skipped: u64,
 }
 
+/// Where a usage line's `usd` comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsdSource {
+    /// The cost the vendor reported for the attempt.
+    Vendor,
+    /// The attempt's usage at the model's entry of the config's `[prices]`.
+    Prices,
+}
+
+/// Most tool names a usage line lists.
+pub const MAX_USAGE_TOOLS: usize = 64;
+
+/// One line of the gateway's usage ledger: one attempt of a turn that reached a vendor adapter.
+/// No field holds prompt or answer text, thinking, tool arguments or results, headers or
+/// credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageLine {
+    /// Unix time the attempt ended.
+    pub at: u64,
+    /// Milliseconds from the credential load to the attempt's end.
+    pub duration_ms: u64,
+    /// The turn's `request_id`.
+    pub request_id: String,
+    /// The turn's caller name.
+    pub client: String,
+    /// The turn's route alias.
+    pub route: String,
+    /// Index of the chain step the attempt ran on; 0 on a route without a chain.
+    pub step: u32,
+    /// Login the attempt ran on.
+    pub login: String,
+    /// Model id the attempt ran.
+    pub model: String,
+    /// Outcome the gateway reported to qbd for the attempt.
+    pub outcome: crate::Outcome,
+    /// Why the vendor finished; absent when the attempt failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StopReason>,
+    /// Failure class of an attempt that failed or was cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorClass>,
+    /// The attempt's last `usage`; zeros when the vendor reported none.
+    #[serde(flatten)]
+    pub usage: Usage,
+    /// USD of the attempt; absent when the vendor reported no cost and the model has no price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+    /// Where `usd` comes from; present with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_source: Option<UsdSource>,
+    /// Sorted unique names of the attempt's tool calls, each at most [`MAX_NAME`] bytes, at most
+    /// [`MAX_USAGE_TOOLS`].
+    pub tools: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

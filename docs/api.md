@@ -512,3 +512,43 @@ out:
 
 A missing file answers no entries. Another query parameter, one given twice or a value out of
 range is 400 `bad_request`; without `audit_file` the answer is 404 `bad_request`.
+
+### Usage ledger
+
+With the `[usage]` table ([config.md](config.md#gateway-config)) the gateway appends one JSON
+line per adapter attempt to `usage.file`, creating it with mode 0600, in one `write` per line, as
+the attempt ends. An attempt is a pick whose login's adapter was called: each chain step and each
+move to another login within a turn has its own line, whether the attempt finished, failed or
+was cancelled; a 401 retried after a token refresh stays one attempt. A pick that never reaches
+an adapter (a login at its spend cap, a credential that does not load, a step `qbd` cannot run)
+leaves no line. A line is a `UsageLine`:
+
+```json
+{"at": 1800000004, "duration_ms": 3870, "request_id": "turn-1", "client": "client-a",
+ "route": "chat", "step": 1, "login": "login-2", "model": "model-b", "outcome": "ok",
+ "stop": "tool_use", "input": 1200, "output": 340, "cache_read": 8000, "cache_write": 0,
+ "usd": 0.00564, "usd_source": "prices", "tools": ["read_file", "search"]}
+```
+
+| Field | Meaning |
+|---|---|
+| `at` | Unix time the attempt ended |
+| `duration_ms` | milliseconds from the attempt's credential load to its end, a refresh's retry included |
+| `request_id` | the turn's `request_id` |
+| `client` | the turn's caller: `uid:<n>` for the gateway's own uid, a `[[clients]]` name, `client-token` or a `[[fronts.clients]]` name |
+| `route` | the turn's route alias |
+| `step` | index of the chain step the attempt ran on; 0 on a route without a chain |
+| `login`, `model` | the login and model `qbd` picked |
+| `outcome` | the outcome reported to `qbd` for the attempt (`ok`, `usage_limit`, `http_401`, `http_429`, `model_unavailable`, `error`); a failure after the stream started reports `ok` |
+| `stop` | the vendor's stop reason, when the attempt finished and was not cancelled |
+| `error` | otherwise the failure class, `cancelled` for a cancelled attempt |
+| `input`, `output`, `cache_read`, `cache_write` | the attempt's last `usage`; 0 when the vendor reported none |
+| `usd`, `usd_source` | USD of the attempt: the cost the vendor reported (`vendor`), else its usage at the model's `[prices]` entry (`prices`); both absent when there is neither |
+| `tools` | the sorted unique names of the attempt's tool calls, each cut to 64 bytes, at most 64 |
+
+No field holds prompt or answer text, thinking, tool arguments or results, headers or
+credentials. A line that cannot be appended is logged at error priority with the path; the turn
+goes on as it was. Before a line would take the file past `rotate_bytes`, the file is renamed to
+`<file>.<unix s>` and rotated files older than `keep_days` are removed
+([config.md](config.md#gateway-config)), so a reader finds the whole ledger as `file` and the files
+`<file>.<digits>` beside it, older stamps holding older lines.

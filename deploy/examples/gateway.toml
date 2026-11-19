@@ -90,13 +90,21 @@ model = "model-small"
 [openai_models."model-plain"]
 reasoning = false
 
-# USD per million tokens, for turns of capped logins whose vendor reports no cost (key-2 here;
-# key-3's vendor reports each turn's cost, which wins over a price).
+# USD per million tokens, for attempts whose vendor reports no cost: the count of capped logins
+# (key-2 here; key-3's vendor reports each turn's cost, which wins over a price) and the usage
+# ledger's usd.
 [prices."model-large"]
 input = 2.0
 output = 8.0
 cache_read = 0.5
 cache_write = 0.0
+
+# One JSON line per adapter attempt (who, which login and model, tokens, USD, tool names; no
+# content), rotated to usage.jsonl.<unix s> past 16 MiB; rotated files go after 90 days.
+[usage]
+file = "/var/lib/qb-gateway/usage/usage.jsonl"
+rotate_bytes = 16777216
+keep_days = 90
 
 # The HTTP fronts for SDK clients: the model names clients send mapped to route aliases (a model
 # equal to an alias needs no entry), the same on every front.

@@ -219,7 +219,7 @@ Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml), with
 and route shapes out of them one at a time.
 
 Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`,
-`[openai_models]`, `[prices]`, `[fronts]`):
+`[openai_models]`, `[prices]`, `[usage]`, `[fronts]`):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -289,8 +289,8 @@ vendor rejects makes the login unusable: the attempt is reported to `qbd` as `ht
 turn moves to the next login. A field of another type (`key` in an OAuth file, `account_id` in
 an `oauth_anthropic` or `api_key` file, an OAuth field in an `api_key` file) or any other field
 is refused, and the error names the field, never a value. The gateway may create, write and
-remove files in the credential files' directories and the directories of `spend_file` and
-`audit_file`, and nowhere else.
+remove files in the credential files' directories and the directories of `spend_file`,
+`audit_file` and `usage.file`, and nowhere else.
 
 `[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to a `qbd` pick target: a
 ladder step, a pin, or a chain of pins.
@@ -324,8 +324,8 @@ reasoning = false
 | `reasoning` | boolean | Required. `false`: the model's Responses requests carry no `reasoning`, no effort (of the request or the pick) and no `include`, for a model that refuses the parameter ([openai.md](openai.md#serving-the-upstream)). `true` is the default. |
 
 `[prices]`, optional: USD per million tokens of a model id as `qbd` picks it, at most 256. A
-price is all four keys, each a number ≥ 0; it prices a turn of a capped login whose vendor
-reports no cost.
+price is all four keys, each a number ≥ 0; it prices an attempt whose vendor reports no cost,
+for the count of a capped login and the `usd` of the usage ledger.
 
 ```toml
 [prices."model-large"]
@@ -341,6 +341,24 @@ cache_write = 3.75
 | `output` | number | Output tokens. |
 | `cache_read` | number | Input tokens read from the prompt cache. |
 | `cache_write` | number | Input tokens written to the prompt cache. |
+
+`[usage]`, optional: the usage ledger, one JSON line per adapter attempt, who used what and what
+it cost, without content ([api.md](api.md#usage-ledger)); without it no ledger is kept.
+
+```toml
+[usage]
+file = "/var/lib/qb-gateway/usage/usage.jsonl"
+keep_days = 90
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `file` | string | Required. Absolute path of the live ledger file, created with mode 0600 in an existing directory. |
+| `rotate_bytes` | integer 1024..=1073741824 | Default 16777216. Before a line would take a non-empty `file` past this size, `file` is renamed to `<file>.<unix s>`, stamped with the time of the rotation (the next free second when that name exists), and a new `file` starts. |
+| `keep_days` | integer 1..=3660 | Required. At each rotation the rotated files whose stamp lies more than this many days back are removed. |
+
+The ledger is `file` and the files `<file>.<digits>` beside it; rotation and pruning touch no
+other file of the directory.
 
 ### Spend caps
 
@@ -702,11 +720,11 @@ included; its stream is not cut. Refresh locks of the credential files carry ove
 
 These keys need a restart: `socket`, `socket_mode`, `fronts.listen` (the listeners exist before
 the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup),
-`spend_file` and `audit_file` (the sandbox opens their directories once), and a
+`spend_file`, `audit_file` and `[usage]` (the sandbox opens their directories once), and a
 login whose `credentials` lies in a directory the sandbox did not open at startup (it opens the
-directories of the startup config's credential files, `spend_file` and `audit_file` once; one
-missing then stays closed until a restart). A file that cannot be read, does not validate or
-changes one of them is refused: the running config stays, the gateway logs one line
+directories of the startup config's credential files, `spend_file`, `audit_file` and `usage.file`
+once; one missing then stays closed until a restart). A file that cannot be read, does not
+validate or changes one of them is refused: the running config stays, the gateway logs one line
 `gateway: reload refused: <file>: <field>: <reason>` with the line where the file has one, and
 `qb reload` exits 1 with the same reason. The sandbox lets the gateway read the files of its
 config file's directory, so an editor may replace the file by rename; give the config a

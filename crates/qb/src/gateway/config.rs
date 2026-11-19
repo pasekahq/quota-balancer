@@ -36,9 +36,17 @@ pub const PING_INTERVAL_S: u32 = 10;
 pub const MAX_PING_INTERVAL_S: u32 = 30;
 /// Caller name of the loopback requests that carry the token of `fronts.token_sha256`.
 pub const TOKEN_CALLER: &str = "client-token";
+/// Default of `usage.rotate_bytes`.
+pub const USAGE_ROTATE_BYTES: u64 = 16 << 20;
+/// Smallest `usage.rotate_bytes`.
+pub const MIN_USAGE_ROTATE_BYTES: u64 = 1 << 10;
+/// Largest `usage.rotate_bytes`.
+pub const MAX_USAGE_ROTATE_BYTES: u64 = 1 << 30;
+/// Largest `usage.keep_days`.
+pub const MAX_USAGE_KEEP_DAYS: u32 = 3660;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
-/// `[[routes]]`, `[openai_models]`, `[prices]` and `[fronts]` tables.
+/// `[[routes]]`, `[openai_models]`, `[prices]`, `[usage]` and `[fronts]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// The file the config was read from; a reload reads it again.
@@ -74,6 +82,8 @@ pub struct GatewayConfig {
     pub audit_file: Option<PathBuf>,
     /// Token prices by model id, at most [`MAX_MODELS`].
     pub prices: Vec<Price>,
+    /// The usage ledger; without it no attempt is recorded.
+    pub usage: Option<UsageLedger>,
     /// The HTTP fronts; without it their endpoints answer 404.
     pub fronts: Option<Fronts>,
 }
@@ -100,6 +110,17 @@ pub struct Price {
     pub cache_read: f64,
     /// Input tokens written to the prompt cache.
     pub cache_write: f64,
+}
+
+/// Where the usage ledger is kept: one JSON line per adapter attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageLedger {
+    /// Absolute path of the live file; rotated files are `<file>.<unix s>` beside it.
+    pub file: PathBuf,
+    /// Size the live file stays within before it is rotated.
+    pub rotate_bytes: u64,
+    /// Days a rotated file is kept after its stamp, 1 to [`MAX_USAGE_KEEP_DAYS`].
+    pub keep_days: u32,
 }
 
 /// The settings the HTTP fronts share and the fronts this gateway serves; at least one is set.
@@ -466,6 +487,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         spend_file: None,
         audit_file: None,
         prices: Vec::new(),
+        usage: None,
         fronts: None,
     };
     let known = [
@@ -483,6 +505,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         "spend_file",
         "audit_file",
         "prices",
+        "usage",
         "fronts",
     ];
     let required = ["socket", "logins", "routes"];
@@ -514,6 +537,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
             "spend_file" => c.spend_file = Some(string(at, v)?.into()),
             "audit_file" => c.audit_file = Some(string(at, v)?.into()),
             "prices" => c.prices = walk_prices(at, table(at, v)?)?,
+            "usage" => c.usage = Some(walk_usage(at, table(at, v)?)?),
             _ => c.fronts = Some(walk_fronts(at, table(at, v)?)?),
         }
         Ok(())
@@ -566,6 +590,37 @@ fn walk_prices(at: &str, t: &DeTable<'_>) -> Result<Vec<Price>, WalkError> {
         prices.push(p);
     }
     Ok(prices)
+}
+
+fn walk_usage(at: &str, t: &DeTable<'_>) -> Result<UsageLedger, WalkError> {
+    let mut u = UsageLedger {
+        file: PathBuf::new(),
+        rotate_bytes: USAGE_ROTATE_BYTES,
+        keep_days: 0,
+    };
+    let keys = ["file", "rotate_bytes", "keep_days"];
+    fields(at, t, &keys, &["file", "keep_days"], |key, at, v| {
+        let bad = |reason: String| (at.to_owned(), reason, Some(v.span().start));
+        match key {
+            "file" => u.file = string(at, v)?.into(),
+            "rotate_bytes" => {
+                u.rotate_bytes = integer(at, v)?;
+                let range = MIN_USAGE_ROTATE_BYTES..=MAX_USAGE_ROTATE_BYTES;
+                if !range.contains(&u.rotate_bytes) {
+                    let (min, max) = range.into_inner();
+                    return Err(bad(format!("must be {min} to {max}")));
+                }
+            }
+            _ => {
+                u.keep_days = integer(at, v)?;
+                if !(1..=MAX_USAGE_KEEP_DAYS).contains(&u.keep_days) {
+                    return Err(bad(format!("must be 1 to {MAX_USAGE_KEEP_DAYS}")));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(u)
 }
 
 /// A finite amount of USD of at least 0, written as an integer or a float.
@@ -1078,6 +1133,9 @@ impl GatewayConfig {
         }
         if let Some(f) = &self.audit_file {
             absolute("audit_file", f)?;
+        }
+        if let Some(u) = &self.usage {
+            absolute("usage.file", &u.file)?;
         }
         self.validate_routes()?;
         if self.openai_models.len() > MAX_MODELS {
@@ -2071,6 +2129,52 @@ difficulty = 1
             let err = check(top, &extra).unwrap_err();
             assert!(err.contains(want), "{top}{extra}: {err}");
         }
+    }
+
+    #[test]
+    fn the_usage_table_takes_a_file_bounded_rotation_and_retention() {
+        let table = "[usage]\nfile = \"/var/lib/qb-gateway/usage.jsonl\"\nkeep_days = 90\n";
+        let c = check("", table).unwrap();
+        assert_eq!(
+            c.usage,
+            Some(UsageLedger {
+                file: "/var/lib/qb-gateway/usage.jsonl".into(),
+                rotate_bytes: USAGE_ROTATE_BYTES,
+                keep_days: 90,
+            })
+        );
+        assert_eq!(check("", "").unwrap().usage, None);
+        let with = |extra: &str| check("", &format!("{table}{extra}")).map(|c| c.usage.unwrap());
+        assert_eq!(with("rotate_bytes = 1024\n").unwrap().rotate_bytes, 1024);
+        for (bad, says) in [
+            (
+                "rotate_bytes = 1023\n",
+                "usage.rotate_bytes: must be 1024 to 1073741824",
+            ),
+            (
+                "rotate_bytes = 1073741825\n",
+                "usage.rotate_bytes: must be 1024 to 1073741824",
+            ),
+            ("rotate_bytes = -1\n", "usage.rotate_bytes: is out of range"),
+            ("stamp = 1\n", "usage.stamp: unknown field"),
+        ] {
+            let err = with(bad).unwrap_err();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
+        for (bad, says) in [
+            ("keep_days = 0", "usage.keep_days: must be 1 to 3660"),
+            ("keep_days = 3661", "usage.keep_days: must be 1 to 3660"),
+            ("", "usage.keep_days: is missing"),
+        ] {
+            let text = format!("[usage]\nfile = \"/var/lib/qb-gateway/usage.jsonl\"\n{bad}\n");
+            let err = check("", &text).unwrap_err();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
+        let err = check("", "[usage]\nfile = \"usage.jsonl\"\nkeep_days = 1\n").unwrap_err();
+        assert!(
+            err.contains("usage.file: must be an absolute path"),
+            "{err}"
+        );
     }
 
     #[test]

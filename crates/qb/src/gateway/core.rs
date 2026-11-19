@@ -5,6 +5,7 @@
 //! left, the turn ends with `error`.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -13,19 +14,19 @@ use std::time::{Duration, Instant};
 use qb_proto::{
     Attempt, AuditAction, AuditEntry, Block, Decision, ErrorClass, GatewayError, LoginSpend,
     LoginStatus, Outcome, PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo,
-    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StreamEvent, TurnRequest, Usage,
-    WindowReport, paths,
+    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest,
+    Usage, UsageLine, WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::audit;
 use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::creds::{CredentialStore, Refresher};
 use super::spend::{self, Ledger};
 use super::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Upstream,
 };
+use super::{audit, usage};
 use crate::config::Error;
 use crate::sandbox::file_dir;
 use crate::server::unix_now;
@@ -126,6 +127,8 @@ pub struct Gateway {
     spend: Option<Mutex<Ledger>>,
     /// The credential directories the sandbox opened; without a sandbox, those of `startup`.
     opened: Vec<PathBuf>,
+    /// The ledger of the startup `[usage]`.
+    usage: Option<usage::Ledger>,
 }
 
 fn bad_request(message: impl Into<String>) -> GatewayError {
@@ -187,6 +190,10 @@ struct Relay<'e> {
     emitted: bool,
     /// The last `usage` of the attempt, whether or not it reached the client.
     usage: Option<Usage>,
+    /// Names of the attempt's tool calls, each cut to [`MAX_NAME`] bytes.
+    tools: BTreeSet<String>,
+    /// When the attempt began, before its credential was loaded.
+    started: Instant,
     /// The client is gone: nothing more reaches it.
     gone: bool,
     emit: &'e mut dyn FnMut(StreamEvent) -> Flow,
@@ -205,8 +212,16 @@ impl Relay<'_> {
     }
 
     fn pass(&mut self, mut event: StreamEvent, vendor: &str, cancel: &CancelToken) -> Flow {
-        if let StreamEvent::Usage { usage } = &event {
-            self.usage = Some(*usage);
+        match &event {
+            StreamEvent::Usage { usage } => self.usage = Some(*usage),
+            StreamEvent::ToolCall { tool_call } => {
+                let mut end = tool_call.name.len().min(MAX_NAME);
+                while !tool_call.name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.tools.insert(tool_call.name[..end].to_owned());
+            }
+            _ => {}
         }
         if cancel.is_cancelled() {
             return Flow::Stop;
@@ -230,6 +245,17 @@ impl Relay<'_> {
         self.emitted = true;
         self.send(event)
     }
+}
+
+/// How an adapter attempt ended, as its usage line says.
+#[derive(Clone, Copy)]
+struct Ended {
+    /// What the gateway reported to qbd.
+    outcome: Outcome,
+    /// The vendor's stop reason, or the failure class the turn saw.
+    end: Result<StopReason, ErrorClass>,
+    /// The cost the vendor reported.
+    cost: Option<f64>,
 }
 
 /// What a turn carries from one attempt to the next.
@@ -307,6 +333,7 @@ impl Gateway {
             Some(f) => Some(Mutex::new(Ledger::open(f, unix_now())?)),
             None => None,
         };
+        let usage = config.usage.clone().map(usage::Ledger::new);
         let startup = Arc::new(sorted(config));
         let opened = startup
             .logins
@@ -327,6 +354,7 @@ impl Gateway {
             }),
             spend,
             opened,
+            usage,
         })
     }
 
@@ -672,6 +700,7 @@ impl Gateway {
             return Next::Retry;
         }
         let mut refreshed = false;
+        let started = Instant::now();
         loop {
             let loaded = self.store.load(entry, now, refreshed);
             let credential = match loaded {
@@ -712,6 +741,8 @@ impl Gateway {
                 }),
                 emitted: false,
                 usage: None,
+                tools: BTreeSet::new(),
+                started,
                 gone: false,
                 emit: &mut *emit,
             };
@@ -758,10 +789,19 @@ impl Gateway {
         };
         let usage = relay.usage.as_ref();
         windows.extend(self.count(&turn.config, &login, &attempt.model, cost, usage));
+        let step = progress.step;
         let failure = match result {
             Ok(done) => {
                 self.report(lease, Outcome::Ok, done.windows);
-                if turn.cancel.is_cancelled() {
+                let stopped = turn.cancel.is_cancelled();
+                let end = if stopped {
+                    Err(ErrorClass::Cancelled)
+                } else {
+                    Ok(done.stop)
+                };
+                let outcome = Outcome::Ok;
+                self.record_usage(turn, &relay, &attempt, step, Ended { outcome, end, cost });
+                if stopped {
                     relay.send(StreamEvent::Error { error: cancelled() });
                     return Next::Done("cancelled".into());
                 }
@@ -781,10 +821,17 @@ impl Gateway {
             outcome
         };
         self.report(lease, outcome, failure.windows);
+        let stopped = turn.cancel.is_cancelled();
+        let end = Err(if stopped {
+            ErrorClass::Cancelled
+        } else {
+            class
+        });
+        self.record_usage(turn, &relay, &attempt, step, Ended { outcome, end, cost });
         if relay.gone {
             return Next::Done("client gone".into());
         }
-        if turn.cancel.is_cancelled() || failure.kind == FailureKind::Cancelled {
+        if stopped || failure.kind == FailureKind::Cancelled {
             relay.send(StreamEvent::Error { error: cancelled() });
             return Next::Done("cancelled".into());
         }
@@ -838,6 +885,44 @@ impl Gateway {
         Next::Done(class.as_str().to_owned())
     }
 
+    /// Appends the usage line of `attempt` on chain step `step` of `turn`, which ended as
+    /// `ended` with `relay`'s usage and tool calls; without a `[usage]` ledger it is dropped.
+    fn record_usage(
+        &self,
+        turn: &Admitted,
+        relay: &Relay<'_>,
+        attempt: &Attempt,
+        step: usize,
+        ended: Ended,
+    ) {
+        let Some(ledger) = &self.usage else {
+            return;
+        };
+        let usage = relay.usage.unwrap_or_default();
+        let price = turn.config.price(&attempt.model);
+        let usd = spend::attempt_usd(ended.cost, price, relay.usage.as_ref())
+            .filter(|(usd, _)| usd.is_finite());
+        let now = unix_now();
+        let line = UsageLine {
+            at: now,
+            duration_ms: u64::try_from(relay.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            request_id: turn.request_id.clone(),
+            client: turn.client.clone(),
+            route: turn.route.alias.clone(),
+            step: u32::try_from(step).unwrap_or(u32::MAX),
+            login: attempt.login_label.clone().unwrap_or_default(),
+            model: attempt.model.clone(),
+            outcome: ended.outcome,
+            stop: ended.end.ok(),
+            error: ended.end.err(),
+            usage,
+            usd: usd.map(|u| u.0),
+            usd_source: usd.map(|u| u.1),
+            tools: relay.tools.iter().take(MAX_USAGE_TOOLS).cloned().collect(),
+        };
+        ledger.append(&line, now);
+    }
+
     /// The spend window of `entry` when it has a `spend_cap` and spent it by `now`.
     fn over_cap(&self, entry: &GatewayLogin, now: u64) -> Option<WindowReport> {
         let cap = entry.spend_cap?;
@@ -864,19 +949,14 @@ impl Gateway {
     ) -> Option<WindowReport> {
         let cap = config.login(login)?.spend_cap?;
         let mut ledger = lock(self.ledger());
-        let usd = match (cost, config.price(model)) {
-            (Some(usd), _) => usd,
-            (None, Some(price)) => usage.map_or(0.0, |u| spend::priced(u, price)),
-            (None, None) => {
-                if ledger.first_unpriced(model) {
-                    log::warn(&format!(
-                        "gateway: model `{model}` has no price and its vendor reports no cost; \
-                         turns on capped logins count nothing for it"
-                    ));
-                }
-                0.0
-            }
-        };
+        let usd = spend::attempt_usd(cost, config.price(model), usage).map(|(usd, _)| usd);
+        if usd.is_none() && ledger.first_unpriced(model) {
+            log::warn(&format!(
+                "gateway: model `{model}` has no price and its vendor reports no cost; \
+                 turns on capped logins count nothing for it"
+            ));
+        }
+        let usd = usd.unwrap_or(0.0);
         let now = unix_now();
         if usd.is_finite() && usd > 0.0 {
             if let Err(e) = ledger.add(login, usd, now) {
@@ -1202,8 +1282,8 @@ fn sorted(mut config: GatewayConfig) -> GatewayConfig {
 }
 
 /// The first restart-only change of `new` against the startup config `old`, naming its file
-/// and field: the listeners, the qbd connection, the spend and audit files, and a credential
-/// file outside the directories `opened` the sandbox opened at startup.
+/// and field: the listeners, the qbd connection, the spend and audit files, the usage ledger, and
+/// a credential file outside the directories `opened` the sandbox opened at startup.
 fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) -> Option<String> {
     let fail = |field: String, reason: &str| {
         let e = Error {
@@ -1224,6 +1304,7 @@ fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) ->
         ),
         ("spend_file", old.spend_file != new.spend_file),
         ("audit_file", old.audit_file != new.audit_file),
+        ("usage", old.usage != new.usage),
         ("fronts.listen", listen(old) != listen(new)),
     ];
     if let Some((field, _)) = changed.into_iter().find(|(_, c)| *c) {

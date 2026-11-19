@@ -5,8 +5,8 @@
 
 use qb_proto::{
     AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, Elsewhere,
-    ErrorClass, GatewayError, Message, ReloadAnswer, Role, RouteState, RoutesAnswer, SpendAnswer,
-    SpendReset, StopReason, StreamEvent, TurnRequest,
+    ErrorClass, GatewayError, Message, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer,
+    SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageLine, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -182,6 +182,44 @@ fn errors_routes_cancel() {
         ]
     );
     assert_eq!(audit.skipped, 1);
+}
+
+#[test]
+fn usage_lines() {
+    let lines: Vec<UsageLine> = roundtrip("gateway_usage_lines.json");
+    let ends: Vec<_> = lines
+        .iter()
+        .map(|l| (l.step, l.outcome, l.stop, l.error, l.usd_source))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            (
+                0,
+                Outcome::UsageLimit,
+                None,
+                Some(ErrorClass::QuotaExhausted),
+                None
+            ),
+            (
+                1,
+                Outcome::Ok,
+                Some(StopReason::ToolUse),
+                None,
+                Some(UsdSource::Prices)
+            ),
+            (
+                0,
+                Outcome::Error,
+                None,
+                Some(ErrorClass::Cancelled),
+                Some(UsdSource::Vendor)
+            ),
+        ]
+    );
+    assert_eq!(lines[1].usage.cache_read, 8000);
+    assert_eq!(lines[1].tools, ["read_file", "search"]);
+    assert_eq!(lines[0].usd, None);
 }
 
 /// A turn request around one block, for the block fixtures.

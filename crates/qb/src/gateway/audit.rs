@@ -1,13 +1,14 @@
 //! The admin audit: each admin action of the gateway appended to its `audit_file` as one JSON
 //! line, and those lines read back for `GET /v1/model/audit`.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use qb_proto::{AuditAction, AuditAnswer, AuditEntry, AuditResult};
+use serde::Serialize;
 
+use crate::journal::open_append;
 use crate::log;
 use crate::server::unix_now;
 
@@ -51,28 +52,33 @@ pub(crate) fn refused(mut entry: AuditEntry, reason: impl Into<String>) -> Audit
 /// failure is logged at error priority with the path and never returned, so the action's answer
 /// does not depend on it.
 pub fn append(file: &Path, entry: &AuditEntry) {
-    let written = serde_json::to_vec(entry)
-        .map_err(io::Error::from)
-        .and_then(|mut line| {
-            line.push(b'\n');
-            let mut f = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .mode(0o600)
-                .open(file)?;
-            let n = f.write(&line)?;
-            if n == line.len() {
-                Ok(())
-            } else {
-                let short = format!("wrote {n} of {} bytes", line.len());
-                Err(io::Error::new(ErrorKind::WriteZero, short))
-            }
-        });
+    let written = json_line(entry).and_then(|line| write_line(&mut open_append(file)?, &line));
     if let Err(e) = written {
         log::error(&format!(
             "gateway: audit line not appended to {}: {e}",
             file.display()
         ));
+    }
+}
+
+/// `value` as one JSON line, newline included.
+pub(crate) fn json_line<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+/// Writes `line` to `f` in one `write`, so lines appended at once never interleave.
+///
+/// # Errors
+/// The write failed or was short.
+pub(crate) fn write_line(f: &mut File, line: &[u8]) -> io::Result<()> {
+    let n = f.write(line)?;
+    if n == line.len() {
+        Ok(())
+    } else {
+        let short = format!("wrote {n} of {} bytes", line.len());
+        Err(io::Error::new(ErrorKind::WriteZero, short))
     }
 }
 

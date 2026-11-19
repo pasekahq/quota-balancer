@@ -282,7 +282,8 @@ struct Appender {
     open: fn(&Path) -> io::Result<File>,
 }
 
-fn open_append(path: &Path) -> io::Result<File> {
+/// Opens `path` for appending, creating it with mode 0600.
+pub(crate) fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .create(true)
         .append(true)
