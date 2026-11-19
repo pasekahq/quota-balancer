@@ -2,11 +2,11 @@
 //! touch a secret: the process becomes non-dumpable, and landlock limits it to the credential
 //! directories (read-only for the agent; for the others also writing, creating and removing
 //! regular files, as a credential file is written by rename, and the same in the directories of
-//! the gateway's spend, audit and usage files). The agent, the gateway and `qb login` may also read the resolver files
-//! and connect over TCP to port 443; the import has no network. The gateway and `qb login` may
-//! read the files of their config's directory, the gateway for a reload, and the import those of
-//! its config's and its source's directories. The only TCP bind allowed is the gateway's on the
-//! port of its loopback Messages listener.
+//! the gateway's spend, audit, usage, client token and grace files). The agent, the gateway and
+//! `qb login` may also read the resolver files and connect over TCP to port 443; the import has
+//! no network. The gateway and `qb login` may read the files of their config's directory, the
+//! gateway for a reload, and the import those of its config's and its source's directories. The
+//! only TCP bind allowed is the gateway's on the port of its loopback Messages listener.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ use landlock::{
 use rustix::process::{DumpableBehavior, set_dumpable_behavior};
 
 use crate::config::AgentConfig;
-use crate::gateway::config::GatewayConfig;
+use crate::gateway::config::{ClientToken, GatewayConfig};
 
 /// Files the musl resolver reads for each lookup.
 pub const RESOLVER_FILES: [&str; 2] = ["/etc/resolv.conf", "/etc/hosts"];
@@ -56,32 +56,46 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
     confine(&files, false, &[], None, true).map(|c| c.gaps)
 }
 
-/// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
-/// truncate files, create regular files and remove files, so a refreshed token can be written
-/// back by a rename inside the directory; no `REFER`, so nothing moves across directories. The
-/// same beneath the directories of `spend_file`, `audit_file` and `usage.file`, where the ledger
-/// rotates by rename and prunes. Read files beneath the directory of `config.file`, so a reload
-/// sees the file an editor replaced.
+/// [`harden`] for `qb gateway`: beneath the directory of each of [`gateway_files`] also write
+/// and truncate files, create regular files and remove files, so a refreshed or rotated token can
+/// be written back by a rename inside the directory and the usage ledger rotates by rename and
+/// prunes; no `REFER`, so nothing moves across directories. Read files beneath the directory of
+/// `config.file`, so a reload sees the file an editor replaced.
 /// TCP bind only on the port of `fronts.listen`, whose listener must exist before. Call it
 /// before starting any thread.
 ///
 /// # Errors
 /// The dumpable flag cannot be cleared.
 pub fn harden_gateway(config: &GatewayConfig) -> Result<Confined, String> {
-    let files: Vec<&Path> = config
-        .logins
-        .iter()
-        .map(|l| l.credentials.as_path())
-        .chain(config.spend_file.as_deref())
-        .chain(config.audit_file.as_deref())
-        .chain(config.usage.as_ref().map(|u| u.file.as_path()))
-        .collect();
+    let files: Vec<&Path> = gateway_files(config).collect();
     let bind = config
         .fronts
         .as_ref()
         .and_then(|f| f.listen)
         .map(|a| a.port());
     confine(&files, true, &[&config.file], bind, true)
+}
+
+/// The files `qb gateway` owns and writes: each login's credential file, `spend_file`,
+/// `audit_file`, `usage.file`, each named client's `token_file` and `fronts.grace_file`.
+pub fn gateway_files(config: &GatewayConfig) -> impl Iterator<Item = &Path> {
+    let fronts = config.fronts.as_ref();
+    let token_files = fronts
+        .into_iter()
+        .flat_map(|f| &f.clients)
+        .filter_map(|c| match &c.token {
+            ClientToken::File(file) => Some(file.as_path()),
+            ClientToken::Sha256(_) => None,
+        });
+    config
+        .logins
+        .iter()
+        .map(|l| l.credentials.as_path())
+        .chain(config.spend_file.as_deref())
+        .chain(config.audit_file.as_deref())
+        .chain(config.usage.as_ref().map(|u| u.file.as_path()))
+        .chain(token_files)
+        .chain(fronts.and_then(|f| f.grace_file.as_deref()))
 }
 
 /// [`harden`] for `qb login import`: read files beneath the directories of `config_file` and

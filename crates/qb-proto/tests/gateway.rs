@@ -4,10 +4,10 @@
 #![allow(clippy::unwrap_used)]
 
 use qb_proto::{
-    AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, Elsewhere,
-    ErrorClass, GatewayError, Message, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer,
-    SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket,
-    UsageGroupBy, UsageLine, UsageQuery, UsdSource,
+    AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, ClientRotateAnswer,
+    Elsewhere, ErrorClass, GatewayError, Message, Outcome, ReloadAnswer, Role, RouteState,
+    RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageAnswer,
+    UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -180,9 +180,35 @@ fn errors_routes_cancel() {
                 AuditResult::Refused,
                 None
             ),
+            (
+                "uid:1000",
+                AuditAction::ClientRotate,
+                AuditResult::Ok,
+                Some("client-a")
+            ),
+            (
+                "uid:1000",
+                AuditAction::ClientRotate,
+                AuditResult::Refused,
+                Some("client-b")
+            ),
         ]
     );
+    let prefixes: Vec<_> = audit
+        .entries
+        .iter()
+        .map(|e| e.token_sha256_prefix.as_deref())
+        .collect();
+    assert_eq!(
+        prefixes,
+        [None, None, None, None, Some("5d35a058cf51"), None]
+    );
     assert_eq!(audit.skipped, 1);
+    let rotated: ClientRotateAnswer = roundtrip("gateway_client_rotate_answer.json");
+    assert_eq!(
+        (rotated.client.as_str(), rotated.grace_until),
+        ("client-a", 1_800_003_600)
+    );
 }
 
 #[test]

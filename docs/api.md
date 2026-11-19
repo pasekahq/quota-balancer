@@ -226,6 +226,7 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/spend/reset` | `SpendReset` | 200 `LoginSpend`, 400 a login without `spend_cap`, 403 a caller other than the gateway's own uid, 500 the spend file could not be written |
 | `GET /v1/model/audit` | — | 200 `AuditAnswer`, 400 a bad query, 403 a caller other than the gateway's own uid, 404 no `audit_file` |
 | `GET /v1/model/usage` | — | 200 `UsageAnswer`, 400 a bad query or more than 10 000 rows, 403 a caller other than the gateway's own uid, 404 no `[usage]` |
+| `POST /v1/model/clients/{name}/rotate` | — | 200 `ClientRotateAnswer`, 403 a caller other than the gateway's own uid, 404 no such named client, 409 a client with `token_sha256`, 500 a file could not be written |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -248,7 +249,9 @@ is read. The socket file is
 serves only the HTTP fronts, to requests with a client token of `[fronts]`
 ([config.md](config.md#gateway-config), [openai.md](openai.md#serving-the-fronts)): the unnamed
 `fronts.token_sha256`, whose turns run as the caller `client-token`, or a named
-`[[fronts.clients]]` entry, whose turns run as its `name`. A named client with `routes` that asks
+`[[fronts.clients]]` entry, whose turns run as its `name`; a named client's token is the one
+its `token_sha256` hashes or the one in its `token_file`, and after a rotation also the previous
+one within its grace. A named client with `routes` that asks
 for a model resolving (through `fronts.models` or as an alias) to a route outside that list gets
 403 in its front's error format before any pick: Messages `permission_error`, OpenAI
 `permission_error` with code `route_not_allowed`, the message
@@ -485,16 +488,18 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 |---|---|
 | `at` | Unix time of the action |
 | `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
-| `action` | `reload` or `spend_reset` |
-| `object` | the config file of a reload, the login of a spend reset; absent when a refused request named none |
+| `action` | `reload`, `spend_reset` or `client_rotate` |
+| `object` | the config file of a reload, the login of a spend reset, the client of a rotation; absent when a refused request named none |
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
 | `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it; equal when it was refused |
 | `backup` | path of the copy an action kept of what it replaced; no current action sets it |
+| `token_sha256_prefix` | a rotation that went through: the first 12 hex characters of the new token's SHA-256 |
 
-Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/spend/reset` that
-reaches its handler is recorded, refusals included: another uid's 403, a body that does not
-parse, a config that does not validate. A peer that is not a caller of the gateway gets its 401
+Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/spend/reset` and
+`POST /v1/model/clients/{name}/rotate` that reaches its handler is recorded, refusals included:
+another uid's 403, a body that does not parse, a config that does not validate, an unknown
+client. A peer that is not a caller of the gateway gets its 401
 before any handler and leaves no line. No field holds a token, key or credential content. A
 line that cannot be appended is logged at error priority with the path; the action's answer
 stays as it was. The gateway neither rotates nor trims the file.
@@ -513,6 +518,24 @@ and in `skipped` the number of lines of the file that do not parse as an entry o
 
 A missing file answers no entries. Another query parameter, one given twice or a value out of
 range is 400 `bad_request`; without `audit_file` the answer is 404 `bad_request`.
+
+### `POST /v1/model/clients/{name}/rotate`
+
+Writes a fresh token to the `token_file` of the `[[fronts.clients]]` entry `name`, the name as
+the config has it ([config.md](config.md#client-token-rotation)). Only the gateway's own uid may:
+any other caller gets 403 `auth`; the loopback listener answers 404. The body is ignored. The
+gateway takes 32 bytes from the kernel's random source, writes them base64url-encoded to the
+file atomically with mode 0600, and accepts the new token from the next loopback connection.
+The previous token stays accepted until `grace_until`, the time of the rotation plus
+`fronts.rotate_grace_s`, across reloads and restarts. The answer never holds the token:
+
+```json
+{"client": "client-a", "token_sha256_prefix": "5d35a058cf51", "grace_until": 1800003600}
+```
+
+`token_sha256_prefix` is the first 12 hex characters of the new token's SHA-256. An unknown
+name is 404 `bad_request`, a client with `token_sha256` 409 `bad_request`. A file that cannot be
+written is 500 `unavailable`: the token file and the accepted tokens stay as they were.
 
 ### Usage ledger
 

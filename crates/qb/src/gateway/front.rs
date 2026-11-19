@@ -1,6 +1,7 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
-//! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage` and `/v1/health`, and the HTTP
+//! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
+//! `/v1/model/clients/{name}/rotate` and `/v1/health`, and the HTTP
 //! fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
 //! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
 //! clients with a client token.
@@ -35,6 +36,7 @@ use super::answer::Keepalive;
 use super::audit;
 use super::config::{Fronts, TOKEN_CALLER};
 use super::core::{Cancel, Gateway};
+use super::tokens::ClientTokens;
 use super::upstream::{CancelToken, Flow};
 use super::usage::{self, AggregateError};
 use super::{messages, openai};
@@ -445,9 +447,9 @@ fn caller(gateway: &Gateway, uid: u32, own_uid: u32) -> Option<Caller> {
     Some(Caller { name, routes: None })
 }
 
-/// The caller of a loopback request that carries `token`: the unnamed client token's or a named
-/// client's, each hash compared in constant time.
-fn token_caller(fronts: &Fronts, token: &str) -> Option<Caller> {
+/// The caller of a loopback request that carries `token` at `now`: the unnamed client token's or
+/// a named client's as `tokens` accepts it, each hash compared in constant time.
+fn token_caller(fronts: &Fronts, tokens: &ClientTokens, token: &str, now: u64) -> Option<Caller> {
     if fronts
         .token_sha256
         .is_some_and(|hash| token_matches(token, &hash))
@@ -458,7 +460,7 @@ fn token_caller(fronts: &Fronts, token: &str) -> Option<Caller> {
     let client = fronts
         .clients
         .iter()
-        .find(|c| token_matches(token, &c.token_sha256))?;
+        .find(|c| tokens.accepts(c, token, now))?;
     Some(Caller {
         name: client.name.clone(),
         routes: client.routes.clone(),
@@ -519,6 +521,23 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         Ok(r) => r,
         Err(e) => return unreadable(&mut stream, &e, limit.get(), dialect.get()),
     };
+    if let Some(name) = rotate_target(&req.path) {
+        if req.method != Method::Post {
+            return reject(
+                &mut stream,
+                405,
+                ErrorClass::BadRequest,
+                "method not allowed",
+            );
+        }
+        return rotate(
+            &mut stream,
+            gateway,
+            name,
+            &audit::uid_actor(uid),
+            uid == own_uid,
+        );
+    }
     match (req.method, req.path.as_str()) {
         (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, watch, &caller.name, req.body),
         (Method::Post, path) if HTTP_FRONTS.contains(&path) => {
@@ -544,15 +563,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             read_usage(&mut stream, gateway, req.query.as_deref(), uid == own_uid);
         }
         (Method::Post, paths::MODEL_CANCEL) => cancel(&mut stream, gateway, &caller, &req.body),
-        (Method::Get, paths::HEALTH) => {
-            let health = HealthResponse {
-                status: HealthStatus::Ok,
-                api_version: API_VERSION.to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                uptime_s: started.elapsed().as_secs(),
-            };
-            reply(&mut stream, 200, &health);
-        }
+        (Method::Get, paths::HEALTH) => reply(&mut stream, 200, &health(started)),
         (
             _,
             paths::MODEL_TURN
@@ -573,6 +584,40 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             );
         }
         _ => reject(&mut stream, 404, ErrorClass::BadRequest, "no such endpoint"),
+    }
+}
+
+/// The answer of `GET /v1/health` of a gateway that started at `started`.
+fn health(started: Instant) -> HealthResponse {
+    HealthResponse {
+        status: HealthStatus::Ok,
+        api_version: API_VERSION.to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        uptime_s: started.elapsed().as_secs(),
+    }
+}
+
+/// The client name of a `/v1/model/clients/{name}/rotate` path.
+fn rotate_target(path: &str) -> Option<&str> {
+    let name = path
+        .strip_prefix(paths::MODEL_CLIENTS)?
+        .strip_prefix('/')?
+        .strip_suffix("/rotate")?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
+/// Answers `POST /v1/model/clients/{name}/rotate` of `actor`, which only the gateway's `own` uid
+/// may send.
+fn rotate(stream: &mut Conn, gateway: &Gateway, name: &str, actor: &str, own: bool) {
+    if !own {
+        let message = "only the gateway's own uid may rotate a client token";
+        let entry = audit::entry(actor, AuditAction::ClientRotate, Some(name.to_owned()));
+        gateway.record(&audit::refused(entry, message));
+        return reject(stream, 403, ErrorClass::Auth, message);
+    }
+    match gateway.rotate_client(actor, name) {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(r) => reject(stream, r.status, r.class, &r.message),
     }
 }
 
@@ -823,6 +868,8 @@ fn serve_loopback(
     }
     let config = gateway.config();
     let fronts = config.fronts.as_ref();
+    let tokens = gateway.client_tokens();
+    let now = unix_now();
     let max_turn = config.max_request_bytes as usize;
     let refusal = Cell::new(None);
     let dialect = Cell::new(Dialect::Messages);
@@ -837,7 +884,8 @@ fn serve_loopback(
             dialect.set(Dialect::Openai);
         }
         let mut presented = [head.api_key, head.bearer].into_iter().flatten();
-        let Some(caller) = fronts.and_then(|f| presented.find_map(|t| token_caller(f, t))) else {
+        let caller = fronts.and_then(|f| presented.find_map(|t| token_caller(f, &tokens, t, now)));
+        let Some(caller) = caller else {
             refuse_head(&refusal, Refusal::Token, head);
             return None;
         };

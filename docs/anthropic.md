@@ -235,7 +235,8 @@ config has a `[fronts.messages]` table ([config.md](config.md#gateway-config)), 
 `crates/qb/src/gateway/answer.rs`, shared with the OpenAI fronts. With `fronts.listen` it also
 serves it on that loopback TCP address, where the request head must carry a client token of
 `[fronts]` in `x-api-key` or `Authorization: Bearer`; the token's SHA-256 is compared in constant
-time with `fronts.token_sha256` and each `fronts.clients[].token_sha256` before the body is read.
+time with `fronts.token_sha256` and each named client's hash (its `token_sha256`, or that of
+its `token_file` and the previous one within its grace) before the body is read.
 A missing or wrong token is 401 `authentication_error`, any other method or path 404
 `not_found_error`, a route outside the named client's `routes` 403 `permission_error`
 ([api.md](api.md#model-gateway-v1model)), all in the Messages error format, except on the paths of the OpenAI fronts, which answer in theirs

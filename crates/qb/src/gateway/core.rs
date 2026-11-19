@@ -12,23 +12,25 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_proto::{
-    Attempt, AuditAction, AuditEntry, Block, Decision, ErrorClass, GatewayError, LoginSpend,
-    LoginStatus, Outcome, PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo,
-    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest,
-    Usage, UsageLine, WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
+    Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, Decision, ErrorClass,
+    GatewayError, LoginSpend, LoginStatus, Outcome, PickRequest, PickResponse, ReloadAnswer,
+    ReportRequest, RouteInfo, RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StopReason,
+    StreamEvent, TurnRequest, Usage, UsageLine, WindowReport, gateway::MAX_NAME,
+    gateway::MAX_USAGE_TOOLS, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
+use super::config::{Api, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::creds::{CredentialStore, Refresher};
 use super::spend::{self, Ledger};
+use super::tokens::{self, ClientTokens, Refusal};
 use super::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Upstream,
 };
 use super::{audit, usage};
 use crate::config::Error;
-use crate::sandbox::file_dir;
+use crate::sandbox::{file_dir, gateway_files};
 use crate::server::unix_now;
 use crate::{client, log, sha256};
 
@@ -125,8 +127,11 @@ pub struct Gateway {
     running: Arc<Running>,
     /// The counts of the startup `spend_file`; every snapshot with a `spend_cap` has that file.
     spend: Option<Mutex<Ledger>>,
-    /// The credential directories the sandbox opened; without a sandbox, those of `startup`.
+    /// The directories of the gateway's own files that the sandbox opened; without a sandbox,
+    /// those of `startup`.
     opened: Vec<PathBuf>,
+    /// The hashes of the `token_file` clients; a reload or a rotation swaps them.
+    tokens: Mutex<Arc<ClientTokens>>,
     /// The ledger of the startup `[usage]`.
     usage: Option<usage::Ledger>,
 }
@@ -322,7 +327,8 @@ impl Gateway {
     /// `refresher` and `qbd_bearer` for qbd, if qbd knows the gateway by token.
     ///
     /// # Errors
-    /// The config's `spend_file` exists but cannot be read as one.
+    /// The config's `spend_file` exists but cannot be read as one, a `token_file` cannot be read
+    /// as a token, or the `grace_file` exists but cannot be read as one.
     pub fn new(
         config: GatewayConfig,
         upstreams: Upstreams,
@@ -334,12 +340,14 @@ impl Gateway {
             None => None,
         };
         let usage = config.usage.clone().map(usage::Ledger::new);
+        let tokens = ClientTokens::load(&config, unix_now())?;
         let startup = Arc::new(sorted(config));
-        let opened = startup
-            .logins
-            .iter()
-            .filter_map(|l| file_dir(&l.credentials).ok())
-            .collect();
+        let mut opened: Vec<PathBuf> = Vec::new();
+        for dir in gateway_files(&startup).filter_map(|f| file_dir(f).ok()) {
+            if !opened.contains(&dir) {
+                opened.push(dir);
+            }
+        }
         Ok(Self {
             config: Mutex::new(Arc::clone(&startup)),
             startup,
@@ -355,11 +363,12 @@ impl Gateway {
             spend,
             opened,
             usage,
+            tokens: Mutex::new(Arc::new(tokens)),
         })
     }
 
-    /// The gateway under a sandbox that opened the credential directories `opened`: a reload
-    /// may add credential files in these only.
+    /// The gateway under a sandbox that opened the directories `opened`: a reload may add
+    /// credential and token files in these only.
     #[must_use]
     pub fn sandboxed(mut self, opened: Vec<PathBuf>) -> Self {
         self.opened = opened;
@@ -369,6 +378,11 @@ impl Gateway {
     /// The current config snapshot.
     pub fn config(&self) -> Arc<GatewayConfig> {
         Arc::clone(&lock(&self.config))
+    }
+
+    /// The current hashes of the `token_file` clients.
+    pub fn client_tokens(&self) -> Arc<ClientTokens> {
+        Arc::clone(&lock(&self.tokens))
     }
 
     /// Appends `entry` to the `audit_file`; without one it is dropped. Every admin action
@@ -396,21 +410,23 @@ impl Gateway {
         self.record(&audit::refused(entry, reason));
     }
 
-    /// Reads the config file again for `actor`. A config that parses and validates as at
-    /// startup and keeps every restart-only field becomes the snapshot of later admissions;
-    /// admitted turns keep theirs. Logs one line and records one audit entry either way.
+    /// Reads the config file and its `token_file`s again for `actor`. A config that parses and
+    /// validates as at startup, keeps every restart-only field and whose token files read
+    /// becomes the snapshot of later admissions; admitted turns keep theirs. Logs one line and
+    /// records one audit entry either way.
     ///
     /// # Errors
-    /// The file is unreadable or invalid, or changes a restart-only field; the running config
-    /// stays.
+    /// The file is unreadable or invalid, changes a restart-only field, or a token file cannot
+    /// be read as a token; the running config stays.
     pub fn reload(&self, actor: &str) -> Result<ReloadAnswer, String> {
         let _one = lock(&self.reloading);
         let before = self.config().sha256;
         let loaded = super::config::load(&self.startup.file)
             .map_err(|e| e.to_string())
-            .and_then(|c| restart_only(&self.startup, &c, &self.opened).map_or(Ok(c), Err));
-        let config = match loaded {
-            Ok(c) => sorted(c),
+            .and_then(|c| restart_only(&self.startup, &c, &self.opened).map_or(Ok(c), Err))
+            .and_then(|c| tokens::read(&c).map(|t| (c, t)).map_err(|e| e.to_string()));
+        let (config, current) = match loaded {
+            Ok((c, current)) => (sorted(c), current),
             Err(e) => {
                 log::warn(&format!("gateway: reload refused: {e}"));
                 let entry = self.reload_entry(actor, before, before);
@@ -423,6 +439,10 @@ impl Gateway {
             logins: config.logins.len(),
         };
         let config = Arc::new(config);
+        // The hashes go first: a connection that takes the old config meanwhile finds no hash
+        // of a client the new one adds.
+        let tokens = self.client_tokens().with_current(current);
+        *lock(&self.tokens) = Arc::new(tokens);
         let old = std::mem::replace(&mut *lock(&self.config), Arc::clone(&config));
         for login in &config.logins {
             let before = old.login(&login.name).and_then(|l| l.spend_cap);
@@ -438,6 +458,43 @@ impl Gateway {
         ));
         self.record(&self.reload_entry(actor, before, config.sha256));
         Ok(answer)
+    }
+
+    /// Writes a fresh token to the `token_file` of the named loopback client `name` for `actor`;
+    /// the next loopback connection accepts it, and the previous token stays accepted for
+    /// `rotate_grace_s`. Logs one line and records one audit entry either way, never the token.
+    ///
+    /// # Errors
+    /// As [`ClientTokens::rotate`]; the token file and the accepted tokens stay as they were.
+    pub fn rotate_client(&self, actor: &str, name: &str) -> Result<ClientRotateAnswer, Refusal> {
+        // A reload reads the token files; it must not read one a rotation is replacing.
+        let _one = lock(&self.reloading);
+        let config = self.config();
+        let rotated = self
+            .client_tokens()
+            .rotate(config.fronts.as_ref(), name, unix_now());
+        let mut entry = audit::entry(actor, AuditAction::ClientRotate, Some(name.to_owned()));
+        match rotated {
+            Ok((tokens, answer)) => {
+                *lock(&self.tokens) = Arc::new(tokens);
+                log::info(&format!(
+                    "gateway: rotated the token of client `{name}`: sha256 {}…, the previous \
+                     one accepted until {}",
+                    answer.token_sha256_prefix, answer.grace_until
+                ));
+                entry.token_sha256_prefix = Some(answer.token_sha256_prefix.clone());
+                self.record(&entry);
+                Ok(answer)
+            }
+            Err(refusal) => {
+                log::warn(&format!(
+                    "gateway: rotation of client `{name}` refused: {}",
+                    refusal.message
+                ));
+                self.record(&audit::refused(entry, refusal.message.as_str()));
+                Err(refusal)
+            }
+        }
     }
 
     /// Admits `client`'s turn `req`: valid, a known route, images inline, its `request_id` not
@@ -1282,8 +1339,9 @@ fn sorted(mut config: GatewayConfig) -> GatewayConfig {
 }
 
 /// The first restart-only change of `new` against the startup config `old`, naming its file
-/// and field: the listeners, the qbd connection, the spend and audit files, the usage ledger, and
-/// a credential file outside the directories `opened` the sandbox opened at startup.
+/// and field: the listeners, the qbd connection, the spend, audit and grace files, the usage
+/// ledger, and a credential or token file outside the directories `opened` the sandbox opened
+/// at startup.
 fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) -> Option<String> {
     let fail = |field: String, reason: &str| {
         let e = Error {
@@ -1294,6 +1352,7 @@ fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) ->
         Some(e.to_string())
     };
     let listen = |c: &GatewayConfig| c.fronts.as_ref().and_then(|f| f.listen);
+    let grace = |c: &GatewayConfig| c.fronts.as_ref().and_then(|f| f.grace_file.clone());
     let changed = [
         ("socket", old.socket != new.socket),
         ("socket_mode", old.socket_mode != new.socket_mode),
@@ -1306,14 +1365,26 @@ fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) ->
         ("audit_file", old.audit_file != new.audit_file),
         ("usage", old.usage != new.usage),
         ("fronts.listen", listen(old) != listen(new)),
+        ("fronts.grace_file", grace(old) != grace(new)),
     ];
     if let Some((field, _)) = changed.into_iter().find(|(_, c)| *c) {
         return fail(field.to_owned(), "changed");
     }
+    let outside = |file: &std::path::Path| !file_dir(file).is_ok_and(|d| opened.contains(&d));
     for (i, login) in new.logins.iter().enumerate() {
-        if !file_dir(&login.credentials).is_ok_and(|d| opened.contains(&d)) {
+        if outside(&login.credentials) {
             let reason = "lies outside the credential directories the sandbox opened";
             return fail(format!("logins[{i}].credentials"), reason);
+        }
+    }
+    let clients = new.fronts.iter().flat_map(|f| f.clients.iter().enumerate());
+    for (i, client) in clients {
+        let ClientToken::File(file) = &client.token else {
+            continue;
+        };
+        if outside(file) {
+            let reason = "lies outside the directories the sandbox opened";
+            return fail(format!("fronts.clients[{i}].token_file"), reason);
         }
     }
     None

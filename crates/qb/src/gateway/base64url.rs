@@ -1,6 +1,12 @@
-//! Base64url (RFC 4648, section 5) without padding, for PKCE values and JWT payloads.
+//! Base64url (RFC 4648, section 5) without padding, for PKCE values, JWT payloads and client
+//! tokens.
 
+use rustix::io::Errno;
+use rustix::rand::{GetRandomFlags, getrandom};
 use zeroize::Zeroizing;
+
+/// Random bytes behind a [`random`] value: 43 base64url characters.
+const RANDOM_BYTES: usize = 32;
 
 const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -17,6 +23,20 @@ pub(super) fn encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// [`RANDOM_BYTES`] from the kernel's random source, base64url-encoded.
+pub(super) fn random() -> Result<Zeroizing<String>, String> {
+    let mut bytes = Zeroizing::new([0u8; RANDOM_BYTES]);
+    let mut filled = 0;
+    while filled < RANDOM_BYTES {
+        match getrandom(&mut bytes[filled..], GetRandomFlags::empty()) {
+            Ok(n) => filled += n,
+            Err(Errno::INTR) => {}
+            Err(e) => return Err(format!("getrandom: {e}")),
+        }
+    }
+    Ok(Zeroizing::new(encode(&*bytes)))
 }
 
 /// `text` decoded, padded or not, in a buffer zeroized on drop; `None` for a byte outside the

@@ -337,7 +337,8 @@ written by `crates/qb/src/gateway/answer.rs`, shared with the Messages front. Wi
 `fronts.listen` it serves them, and `/v1/messages`, on that loopback TCP address too, to
 requests whose head carries a client token of `[fronts]` in `Authorization: Bearer` (what OpenAI
 SDKs send) or `x-api-key`; the token's SHA-256 is compared in constant time with
-`fronts.token_sha256` and each `fronts.clients[].token_sha256` before the body is read. On these
+`fronts.token_sha256` and each named client's hash (its `token_sha256`, or that of its
+`token_file` and the previous one within its grace) before the body is read. On these
 two paths a missing or wrong token is 401 `invalid_request_error` with code `invalid_api_key`,
 another method 404 `invalid_request_error` with code `unknown_url`, and a route outside the
 named client's `routes` 403 `permission_error` with code `route_not_allowed`

@@ -334,6 +334,45 @@
         }
       }
     },
+    "/v1/model/clients/{name}/rotate": {
+      "post": {
+        "operationId": "clientRotate",
+        "summary": "Write 32 random bytes from the kernel, base64url-encoded, to the `token_file` of the `[[fronts.clients]]` entry `name` atomically with mode 0600; the next loopback connection accepts the new token, and the previous one stays accepted until `grace_until`, across reloads and restarts. The answer never holds the token. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 404 `bad_request` for an unknown client, 409 `bad_request` for a client with `token_sha256`, 500 `unavailable` when a file cannot be written, the token file and the accepted tokens staying as they were.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The client's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The client's token file holds a fresh token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientRotateAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -1243,12 +1282,39 @@
         ],
         "additionalProperties": false
       },
+      "ClientRotateAnswer": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/clients/{name}/rotate`. It never holds the token.",
+        "properties": {
+          "client": {
+            "type": "string",
+            "description": "Name of the `[[fronts.clients]]` entry whose token was rotated."
+          },
+          "token_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "The first 12 hex characters of the new token's SHA-256."
+          },
+          "grace_until": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time until which the previous token stays accepted."
+          }
+        },
+        "required": [
+          "client",
+          "token_sha256_prefix",
+          "grace_until"
+        ]
+      },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`.",
         "enum": [
           "reload",
-          "spend_reset"
+          "spend_reset",
+          "client_rotate"
         ]
       },
       "AuditResult": {
@@ -1278,7 +1344,7 @@
           },
           "object": {
             "type": "string",
-            "description": "The config file of a reload, the login of a spend reset; absent when a refused request named none."
+            "description": "The config file of a reload, the login of a spend reset, the client of a rotation; absent when a refused request named none."
           },
           "result": {
             "$ref": "#/components/schemas/AuditResult"
@@ -1300,6 +1366,11 @@
           "backup": {
             "type": "string",
             "description": "Path of the copy an action kept of what it replaced; no current action sets it."
+          },
+          "token_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "A rotation that went through: the first 12 hex characters of the new token's SHA-256."
           }
         },
         "required": [
