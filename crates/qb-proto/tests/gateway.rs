@@ -6,9 +6,10 @@
 use qb_proto::{
     AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, ClientRotateAnswer,
     ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Elsewhere, ErrorClass, GatewayError,
-    LoginKey, LoginKeyAnswer, Message, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer,
-    SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket,
-    UsageGroupBy, UsageLine, UsageQuery, UsdSource,
+    LoginKey, LoginKeyAnswer, LoginOauthCode, LoginOauthSigned, LoginOauthStarted, Message,
+    OauthPaste, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer, SpendAnswer, SpendReset,
+    StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine,
+    UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -286,6 +287,61 @@ fn audit_lines_of_key_replacements() {
 }
 
 #[test]
+fn sign_ins() {
+    let started: LoginOauthStarted = roundtrip("gateway_login_oauth_started.json");
+    assert_eq!(
+        (started.paste, started.expires_at),
+        (OauthPaste::CodeState, 1_800_000_600)
+    );
+    let redirect: LoginOauthStarted = roundtrip("gateway_login_oauth_started_redirect.json");
+    assert_eq!(redirect.paste, OauthPaste::RedirectUrl);
+    let code: LoginOauthCode = roundtrip("gateway_login_oauth_code_request.json");
+    assert!(code.pasted.starts_with("synthetic-code-0001#"));
+    let signed: LoginOauthSigned = roundtrip("gateway_login_oauth_signed.json");
+    assert_eq!(
+        signed.backup.as_deref(),
+        Some("/etc/qb/credentials/login-1.json.bak-1800000300")
+    );
+    let first: LoginOauthSigned = roundtrip("gateway_login_oauth_signed_first.json");
+    assert_eq!(first.backup, None);
+    let audit: AuditAnswer = roundtrip("gateway_audit_answer_sign_in.json");
+    let lines: Vec<_> = audit
+        .entries
+        .iter()
+        .map(|e| (e.action, e.result, e.object.as_deref(), e.backup.as_deref()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                AuditAction::LoginOauthStart,
+                AuditResult::Ok,
+                Some("login-1"),
+                None
+            ),
+            (
+                AuditAction::LoginOauthCode,
+                AuditResult::Refused,
+                Some("login-1"),
+                None
+            ),
+            (
+                AuditAction::LoginOauthCode,
+                AuditResult::Ok,
+                Some("login-1"),
+                Some("/etc/qb/credentials/login-1.json.bak-1800000300")
+            ),
+            (
+                AuditAction::LoginOauthStart,
+                AuditResult::Refused,
+                Some("login-2"),
+                None
+            ),
+        ]
+    );
+}
+
+#[test]
 fn config_routes() {
     let read: ConfigRoutes = roundtrip("gateway_config_routes.json");
     let shapes: Vec<_> = read
@@ -444,6 +500,7 @@ fn invalid_fixtures_are_rejected() {
             "CancelRequest" => rejected(&raw, |_: CancelRequest| true),
             "ConfigRoutesPut" => rejected(&raw, |_: ConfigRoutesPut| true),
             "LoginKey" => rejected(&raw, |k: LoginKey| k.validate().is_ok()),
+            "LoginOauthCode" => rejected(&raw, |_: LoginOauthCode| true),
             "Error" => rejected(&raw, |_: GatewayError| true),
             other => panic!("{name}: no type {other}"),
         };

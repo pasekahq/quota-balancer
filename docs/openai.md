@@ -299,8 +299,9 @@ cannot show: the `usage.cost` field and the in-stream error chunk.
 
 ## OAuth sign-in
 
-`qb login` (`crates/qb/src/gateway/signin.rs`, [config.md](config.md#signing-in)) signs a
-`chatgpt_oauth` login in with the Codex CLI's authorization code grant and PKCE (RFC 7636, S256),
+`qb login` (`crates/qb/src/gateway/signin.rs`, [config.md](config.md#signing-in)) and the
+gateway's `/v1/model/logins/{name}/oauth/*` endpoints
+([config.md](config.md#signing-in-through-the-gateway)) sign a `chatgpt_oauth` login in with the Codex CLI's authorization code grant and PKCE (RFC 7636, S256),
 without its local callback listener:
 
 - the authorize URL is `identity::OAUTH_AUTHORIZE_URL` (`https://auth.openai.com/oauth/authorize`)

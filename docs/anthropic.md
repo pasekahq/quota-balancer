@@ -204,8 +204,9 @@ or token.
 
 ## OAuth sign-in
 
-`qb login` (`crates/qb/src/gateway/signin.rs`, [config.md](config.md#signing-in)) signs an
-`oauth_anthropic` login in with the authorization code grant and PKCE (RFC 7636, S256), the
+`qb login` (`crates/qb/src/gateway/signin.rs`, [config.md](config.md#signing-in)) and the
+gateway's `/v1/model/logins/{name}/oauth/*` endpoints
+([config.md](config.md#signing-in-through-the-gateway)) sign an `oauth_anthropic` login in with the authorization code grant and PKCE (RFC 7636, S256), the
 vendor CLI's flow for a host without a browser:
 
 - the authorize URL is `https://claude.ai/oauth/authorize` (`identity::OAUTH_AUTHORIZE_URL`)

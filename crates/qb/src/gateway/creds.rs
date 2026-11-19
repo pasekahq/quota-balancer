@@ -169,7 +169,7 @@ impl Written<'_> {
 /// time.
 pub struct CredentialStore {
     refresher: Box<dyn Refresher>,
-    /// The refresh lock of each credential file that refreshed so far.
+    /// The write lock of each credential file that was refreshed or written so far.
     refreshing: Mutex<Vec<(PathBuf, Arc<Mutex<()>>)>>,
 }
 
@@ -182,7 +182,8 @@ impl CredentialStore {
         }
     }
 
-    fn refresh_lock(&self, file: &Path) -> Arc<Mutex<()>> {
+    /// The lock of `file` that its refresh and every other write of it by the gateway hold.
+    pub(super) fn write_lock(&self, file: &Path) -> Arc<Mutex<()>> {
         let mut locks = self
             .refreshing
             .lock()
@@ -236,7 +237,7 @@ impl CredentialStore {
         if !stale && (!expiring || as_is) {
             return Ok(oauth(token, account_id));
         }
-        let lock = self.refresh_lock(file);
+        let lock = self.write_lock(file);
         let _one = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let again = read(file)?;
         let current = secret(file, "access_token", again.access_token.as_ref())?;

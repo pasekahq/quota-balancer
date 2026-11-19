@@ -760,6 +760,48 @@ pub struct LoginKeyAnswer {
     pub key_sha256_prefix: String,
 }
 
+/// What the operator pastes back after signing in at the URL of a [`LoginOauthStarted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OauthPaste {
+    /// An `oauth_anthropic` login: the `code#state` the vendor's page shows.
+    CodeState,
+    /// A `chatgpt_oauth` login: the full address of the localhost page the browser then fails to
+    /// load.
+    RedirectUrl,
+}
+
+/// `POST /v1/model/logins/{name}/oauth/start` response: a PKCE sign-in waiting for the paste.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginOauthStarted {
+    /// Name of the `[[logins]]` entry signing in.
+    pub login: String,
+    /// The vendor's authorize URL with the S256 challenge and the state.
+    pub url: String,
+    /// What to send back as `pasted` of a [`LoginOauthCode`].
+    pub paste: OauthPaste,
+    /// Unix time after which the sign-in takes no code.
+    pub expires_at: u64,
+}
+
+/// `POST /v1/model/logins/{name}/oauth/code` request: what the operator pasted back. It has no
+/// `Debug`, so no format of it shows the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginOauthCode {
+    /// The `code#state` or the redirect URL, as [`LoginOauthStarted::paste`] says.
+    pub pasted: String,
+}
+
+/// `POST /v1/model/logins/{name}/oauth/code` response. It never holds a code or a token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginOauthSigned {
+    /// Name of the `[[logins]]` entry signed in.
+    pub login: String,
+    /// Path of the copy of the credential file it replaced; `None` when there was no file.
+    pub backup: Option<String>,
+}
+
 /// One step of a chain route as `/v1/model/config/routes` carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -858,6 +900,11 @@ pub enum AuditAction {
     /// `POST /v1/model/logins/{name}/key`: a new key written to an `api_key` login's credential
     /// file.
     LoginKey,
+    /// `POST /v1/model/logins/{name}/oauth/start`: a PKCE sign-in of an OAuth login started.
+    LoginOauthStart,
+    /// `POST /v1/model/logins/{name}/oauth/code`: the code of a sign-in exchanged and the new
+    /// tokens written to the login's credential file.
+    LoginOauthCode,
 }
 
 /// Whether an admin action went through.
@@ -880,8 +927,8 @@ pub struct AuditEntry {
     pub actor: String,
     /// What was done.
     pub action: AuditAction,
-    /// The login of a spend reset or a key replacement, the config file of a reload or a config
-    /// edit, the client of a rotation; absent when a refused request named none.
+    /// The login of a spend reset, a key replacement or a sign-in, the config file of a reload or
+    /// a config edit, the client of a rotation; absent when a refused request named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// Whether it went through.
@@ -897,7 +944,7 @@ pub struct AuditEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_after: Option<String>,
     /// Path of the copy an action kept of what it replaced: the config file of a config edit,
-    /// the credential file of a key replacement.
+    /// the credential file of a key replacement or a sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
     /// A rotation that went through: the first 12 hex characters of the new token's SHA-256.

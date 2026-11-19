@@ -38,15 +38,17 @@ use qb_openai::request::identity as openai_identity;
 use qb_proto::{
     AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ClientRotateAnswer,
     ConfigRoute, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, ConfigStep, ErrorClass,
-    GatewayError, LoginKeyAnswer, LoginSpend, LoginStatus, Outcome, ReloadAnswer, RouteState,
-    RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking,
-    ToolCall, TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
+    GatewayError, LoginKeyAnswer, LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus,
+    OauthPaste, Outcome, ReloadAnswer, RouteState, RouteStatus, RoutesAnswer, SpendAnswer,
+    StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer,
+    UsageLine, UsageRow, UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 mod common;
 
+use common::pkce::{param, params, s256};
 use common::vendor::{Answer, Received, Vendor, fixture_of};
 use common::{Daemon, line_with, start_daemon, stderr_lines, temp_dir, wait_for};
 
@@ -458,12 +460,24 @@ fn serve_gateway(
     gateway_uid: u32,
     loopback: Option<TcpListener>,
 ) -> PathBuf {
+    serve_gateway_with(text, upstreams, refresher, gateway_uid, loopback, |g| g)
+}
+
+/// [`serve_gateway`] of the gateway `configure` makes of the one the config gives.
+fn serve_gateway_with(
+    text: &str,
+    upstreams: Upstreams,
+    refresher: Box<dyn Refresher>,
+    gateway_uid: u32,
+    loopback: Option<TcpListener>,
+    configure: impl FnOnce(Gateway) -> Gateway,
+) -> PathBuf {
     let parsed = qb::gateway::config::parse(Path::new("gateway.toml"), text).unwrap();
     let file = parsed.socket.with_file_name("gateway.toml");
     std::fs::write(&file, text).unwrap();
     let config = qb::gateway::config::load(&file).unwrap();
     let gw = config.socket.clone();
-    let gateway = Gateway::new(config, upstreams, refresher, None).unwrap();
+    let gateway = configure(Gateway::new(config, upstreams, refresher, None).unwrap());
     let listener = UnixListener::bind(&gw).unwrap();
     std::thread::spawn(move || {
         front::serve(
@@ -9023,5 +9037,757 @@ fn a_backup_that_cannot_be_written_keeps_the_old_key_in_force() {
             last.backup
         ),
         (AuditAction::LoginKey, AuditResult::Refused, None, None)
+    );
+}
+
+/// Part of every synthetic secret of the sign-in tests: codes, tokens and account ids. No
+/// answer, log line, audit line or usage line may hold it.
+const SIGN_MARK: &str = "mk-5e2c";
+
+/// A gateway whose login-1 is an OAuth login of `kind` that exchanges codes at its own scripted
+/// token endpoint and holds an old credential, and whose login-2 is an `api_key` login; with an
+/// audit file and a usage ledger, sign-ins expiring after `expiry` s, served as `gateway_uid`.
+struct SignRig {
+    r: Rig,
+    tokens: Vendor,
+    audit: PathBuf,
+    ledger: PathBuf,
+    file: PathBuf,
+    /// login-1's credential file as the rig wrote it.
+    old: String,
+    kind: &'static str,
+}
+
+/// The action, object, result, reason and backup of an audit line.
+type SignAudit = (
+    AuditAction,
+    Option<String>,
+    AuditResult,
+    Option<String>,
+    Option<String>,
+);
+
+const SIGN_KINDS: [&str; 2] = ["oauth_anthropic", "chatgpt_oauth"];
+
+fn old_credential(kind: &str) -> String {
+    let account = if kind == "chatgpt_oauth" {
+        format!(r#""account_id":"acct-old-{SIGN_MARK}","#)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"{{"type":"{kind}","access_token":"access-old-{SIGN_MARK}",{account}"refresh_token":"refresh-old-{SIGN_MARK}","expires_at":{}}}"#,
+        unix_now() + 86_400
+    )
+}
+
+fn sign_rig(kind: &'static str, expiry: u64, extra: &str, gateway_uid: u32) -> SignRig {
+    let tokens = Vendor::start();
+    let dir = temp_dir("gw");
+    let (audit, ledger) = (audit_path(), temp_dir("ledger").join("usage.jsonl"));
+    let old = old_credential(kind);
+    credentials(
+        &dir,
+        &[
+            ("login-1", old.clone(), 0o600),
+            ("login-2", api_key("test-key-two-5c3d"), 0o600),
+        ],
+    );
+    let qbd = start_qbd(&dir, QBD);
+    let login_1 = format!(
+        "kind = \"{kind}\"\ntoken_url = \"{}/oauth/token\"",
+        tokens.base_url
+    );
+    let extra = format!(
+        "{}{extra}{}",
+        audit_key(&audit),
+        usage_table(&ledger, 1 << 20)
+    );
+    let (top, tables) = split_top(&extra);
+    let toml = gateway_toml(&dir, &qbd, 4, [&login_1, ANTHROPIC_KEY], tables);
+    let text = format!("{top}\n{toml}");
+    let fake = Arc::new(Fake::default());
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let gw = serve_gateway_with(
+        &text,
+        vec![
+            (Api::Anthropic, Box::new(Shared(Arc::clone(&fake)))),
+            (Api::Openai, Box::new(Shared(Arc::clone(&fake)))),
+        ],
+        Box::new(Counting(Arc::clone(&refreshes))),
+        gateway_uid,
+        None,
+        |g| g.sign_in_expiry(expiry),
+    );
+    let file = dir.join("creds/login-1.json");
+    let r = Rig {
+        dir,
+        qbd,
+        gw,
+        fake,
+        refreshes,
+    };
+    SignRig {
+        r,
+        tokens,
+        audit,
+        ledger,
+        file,
+        old,
+        kind,
+    }
+}
+
+impl SignRig {
+    /// `POST /v1/model/logins/<login>/oauth/<step>` with `body`: the status and the answer body.
+    fn post(&self, login: &str, step: &str, body: &str) -> (u16, Vec<u8>) {
+        let path = format!("{}/{login}/oauth/{step}", paths::MODEL_LOGINS);
+        call(&self.r.gw, "POST", &path, body)
+    }
+
+    /// Starts a sign-in of login-1: the answer.
+    fn start(&self) -> LoginOauthStarted {
+        let (status, body) = self.post("login-1", "start", "");
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Sends `pasted` as the code of login-1's sign-in.
+    fn code(&self, pasted: &str) -> (u16, Vec<u8>) {
+        self.post("login-1", "code", &json!({ "pasted": pasted }).to_string())
+    }
+
+    /// What the operator pastes back for `code` and `state`, as the login's kind asks.
+    fn paste(&self, code: &str, state: &str) -> String {
+        if self.kind == "chatgpt_oauth" {
+            format!(
+                "http://localhost:1455/auth/callback?code={code}&scope=openid+offline_access&state={state}"
+            )
+        } else {
+            format!("{code}#{state}")
+        }
+    }
+
+    /// Scripts the token endpoint's 200 answer with fresh tokens for the login's kind.
+    fn grant(&self) {
+        let mut body = json!({
+            "access_token": format!("access-new-{SIGN_MARK}"),
+            "refresh_token": format!("refresh-new-{SIGN_MARK}"),
+            "expires_in": 3600,
+        });
+        if self.kind == "chatgpt_oauth" {
+            let claims = json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": format!("acct-new-{SIGN_MARK}")}
+            });
+            body["id_token"] = Value::String(common::credentials::jwt(&claims, SIGN_MARK));
+        }
+        self.tokens.answer(token_answer(200, &body));
+    }
+
+    /// The secrets login-1's adapter calls sent, in order.
+    fn sent(&self) -> Vec<String> {
+        login_1_secrets(&self.r)
+    }
+
+    /// Asserts that the sign-in `signed` kept login-1's old file as its backup and wrote the
+    /// tokens of [`Self::grant`].
+    fn assert_signed_in(&self, signed: &LoginOauthSigned) {
+        assert_eq!(signed.login, "login-1");
+        let backup = PathBuf::from(signed.backup.clone().unwrap());
+        assert_eq!(backups_of(&self.file), std::slice::from_ref(&backup));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), self.old);
+        assert_eq!(mode_of(&backup), 0o600);
+        let written = common::credentials::written(&self.file);
+        assert_eq!(written["type"], self.kind);
+        assert_eq!(written["access_token"], format!("access-new-{SIGN_MARK}"));
+        assert_eq!(written["refresh_token"], format!("refresh-new-{SIGN_MARK}"));
+        if self.kind == "chatgpt_oauth" {
+            assert_eq!(written["account_id"], format!("acct-new-{SIGN_MARK}"));
+        }
+    }
+
+    /// The verifier of the one code grant the token endpoint received, after checking that its
+    /// S256 challenge is the one of the URL of `started` and its code the marked one.
+    fn exchanged(&self, started: &LoginOauthStarted) -> String {
+        let received = self.tokens.received();
+        assert_eq!(received.len(), 1, "{}: one exchange", self.kind);
+        assert_eq!(received[0].path, "/oauth/token");
+        let (verifier, code) = granted_code(&received[0]);
+        assert_eq!(code, format!("code-{SIGN_MARK}"));
+        assert_eq!(param(&started.url, "code_challenge_method"), "S256");
+        assert_eq!(
+            s256(&verifier),
+            param(&started.url, "code_challenge"),
+            "{}: the challenge is the verifier's",
+            self.kind
+        );
+        assert!(
+            !started.url.contains(&verifier),
+            "the URL carries only the challenge"
+        );
+        verifier
+    }
+
+    /// The `(action, object, result, reason, backup)` of every audit line.
+    fn audited(&self) -> Vec<SignAudit> {
+        audit_answer(&self.r.gw, "")
+            .entries
+            .into_iter()
+            .map(|e| (e.action, e.object, e.result, e.reason, e.backup))
+            .collect()
+    }
+
+    /// Asserts that none of `answers`, `logged`, the audit file and the ledger holds a marked
+    /// value or one of `hidden`.
+    fn assert_hidden(&self, answers: &[(u16, Vec<u8>)], logged: &str, hidden: &[&str]) {
+        let read = |f: &Path| std::fs::read_to_string(f).unwrap_or_default();
+        let mut texts = vec![
+            ("stderr", logged.to_owned()),
+            ("audit", read(&self.audit)),
+            ("ledger", read(&self.ledger)),
+        ];
+        texts.extend(
+            answers
+                .iter()
+                .map(|(_, a)| ("answer", String::from_utf8_lossy(a).into_owned())),
+        );
+        for (what, text) in &texts {
+            for value in hidden.iter().copied().chain([SIGN_MARK]) {
+                assert!(!text.contains(value), "{what} holds `{value}`: {text}");
+            }
+        }
+    }
+}
+
+fn token_answer(status: u16, body: &Value) -> Answer {
+    Answer::Full(
+        status,
+        vec![("content-type".into(), "application/json".into())],
+        body.to_string().into_bytes(),
+    )
+}
+
+/// The PKCE verifier and the code of the code grant the token endpoint received.
+fn granted_code(req: &Received) -> (String, String) {
+    match &req.body {
+        Value::String(form) => {
+            let fields = params(&format!("?{form}"));
+            let field = |k: &str| fields.iter().find(|(n, _)| n == k).unwrap().1.clone();
+            (field("code_verifier"), field("code"))
+        }
+        body => (
+            body["code_verifier"].as_str().unwrap().to_owned(),
+            body["code"].as_str().unwrap().to_owned(),
+        ),
+    }
+}
+
+#[test]
+fn a_sign_in_through_the_socket_writes_the_new_tokens_and_the_next_attempt_sends_them() {
+    for kind in SIGN_KINDS {
+        let s = sign_rig(kind, 600, "", own_uid());
+        let (status, _, _) = turn(&s.r.gw, &turn_body("turn-1"));
+        assert_eq!(status, 200);
+        let mut answers = Vec::new();
+        let mut started = None;
+        let before = unix_now();
+        let logged = stderr_until("signed in login `login-1`", || {
+            let (status, body) = s.post("login-1", "start", "");
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            started = Some(serde_json::from_slice::<LoginOauthStarted>(&body).unwrap());
+            let state = param(&started.as_ref().unwrap().url, "state");
+            s.grant();
+            answers.push(s.code(&format!(
+                "  {}\n",
+                s.paste(&format!("code-{SIGN_MARK}"), &state)
+            )));
+        });
+        let after = unix_now();
+        let started = started.unwrap();
+        let paste = if kind == "chatgpt_oauth" {
+            OauthPaste::RedirectUrl
+        } else {
+            OauthPaste::CodeState
+        };
+        assert_eq!((started.login.as_str(), started.paste), ("login-1", paste));
+        assert!((before + 600..=after + 600).contains(&started.expires_at));
+        let state = param(&started.url, "state");
+
+        let (status, body) = answers[0].clone();
+        assert_eq!(status, 200, "{kind}: {}", String::from_utf8_lossy(&body));
+        let signed: LoginOauthSigned = serde_json::from_slice(&body).unwrap();
+        s.assert_signed_in(&signed);
+        let verifier = s.exchanged(&started);
+
+        let (status, _, _) = turn(&s.r.gw, &turn_body("turn-2"));
+        assert_eq!(status, 200);
+        assert_eq!(
+            s.sent(),
+            [
+                format!("access-old-{SIGN_MARK}"),
+                format!("access-new-{SIGN_MARK}")
+            ],
+            "{kind}: the attempt after the sign-in sends the new token, without a restart"
+        );
+        assert_eq!(s.r.refreshes.load(Ordering::SeqCst), 0);
+
+        let (status, again) = s.code(&s.paste(&format!("code-{SIGN_MARK}"), &state));
+        let e: GatewayError = serde_json::from_slice(&again).unwrap();
+        assert_eq!(
+            (status, e.class),
+            (409, ErrorClass::BadRequest),
+            "the sign-in is used up"
+        );
+        answers.push((status, again));
+        assert_eq!(s.tokens.received().len(), 1);
+
+        let login = Some("login-1".to_owned());
+        let audited = s.audited();
+        assert_eq!(
+            audited[..2],
+            [
+                (
+                    AuditAction::LoginOauthStart,
+                    login.clone(),
+                    AuditResult::Ok,
+                    None,
+                    None
+                ),
+                (
+                    AuditAction::LoginOauthCode,
+                    login,
+                    AuditResult::Ok,
+                    None,
+                    signed.backup.clone()
+                ),
+            ]
+        );
+        assert_eq!(
+            usage_lines(&s.ledger).len(),
+            2,
+            "both turns are in the ledger"
+        );
+        assert!(
+            logged.contains("sign-in of login `login-1` started"),
+            "{logged}"
+        );
+        s.assert_hidden(&answers, &logged, &[&state, &verifier]);
+    }
+}
+
+#[test]
+fn a_wrong_state_or_a_paste_without_a_code_is_400_and_the_sign_in_stays_pending() {
+    for kind in SIGN_KINDS {
+        let s = sign_rig(kind, 600, "", own_uid());
+        let started = s.start();
+        let state = param(&started.url, "state");
+        let code = format!("code-{SIGN_MARK}");
+        let mut cases = vec![
+            (
+                s.paste(&code, &format!("not-{state}")),
+                "the pasted state is not the one this sign-in sent",
+            ),
+            (
+                s.paste(&code, ""),
+                "the pasted state is not the one this sign-in sent",
+            ),
+        ];
+        if kind == "chatgpt_oauth" {
+            cases.push((
+                format!("http://localhost:1455/auth/callback?scope=openid&state={state}"),
+                "the pasted URL has no `code`",
+            ));
+            cases.push((code.clone(), "the pasted line is not a URL with a query"));
+        } else {
+            cases.push((
+                format!("#{state}"),
+                "the pasted code is not a non-empty visible ASCII string",
+            ));
+            cases.push((code.clone(), "the pasted line is not `code#state`"));
+        }
+        let mut answers = Vec::new();
+        let logged = stderr_of(|| {
+            for (pasted, message) in &cases {
+                let (status, body) = s.code(pasted);
+                let e: GatewayError = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    (status, e.class, e.message.as_deref()),
+                    (400, ErrorClass::BadRequest, Some(*message)),
+                    "{kind}"
+                );
+                answers.push((status, body));
+            }
+        });
+        assert!(
+            s.tokens.received().is_empty(),
+            "{kind}: nothing was exchanged"
+        );
+        assert_eq!(std::fs::read_to_string(&s.file).unwrap(), s.old);
+        assert_eq!(backups_of(&s.file), Vec::<PathBuf>::new());
+
+        s.grant();
+        let (status, body) = s.code(&s.paste(&code, &state));
+        assert_eq!(
+            status,
+            200,
+            "{kind}: the sign-in stayed pending: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let refused: Vec<_> = s.audited()[1..=cases.len()]
+            .iter()
+            .map(|(action, _, result, reason, _)| (*action, *result, reason.clone().unwrap()))
+            .collect();
+        let want: Vec<_> = cases
+            .iter()
+            .map(|(_, m)| {
+                (
+                    AuditAction::LoginOauthCode,
+                    AuditResult::Refused,
+                    (*m).to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(refused, want);
+        s.assert_hidden(&answers, &logged, &[&state]);
+    }
+}
+
+#[test]
+fn a_code_without_a_live_sign_in_is_409_and_reaches_no_endpoint() {
+    let s = sign_rig("oauth_anthropic", 0, "", own_uid());
+    let code = format!("code-{SIGN_MARK}");
+    let (status, e) = {
+        let (status, body) = s.code(&s.paste(&code, "state-1"));
+        (
+            status,
+            serde_json::from_slice::<GatewayError>(&body).unwrap(),
+        )
+    };
+    assert_eq!((status, e.class), (409, ErrorClass::BadRequest));
+    assert_eq!(
+        e.message.as_deref(),
+        Some(
+            "no sign-in of login `login-1` is pending; start one with POST /v1/model/logins/login-1/oauth/start"
+        )
+    );
+    let started = s.start();
+    assert!(
+        started.expires_at <= unix_now(),
+        "a sign-in of expiry 0 has expired at once"
+    );
+    let state = param(&started.url, "state");
+    let mut answers = Vec::new();
+    let logged = stderr_of(|| {
+        answers.push(s.code(&s.paste(&code, &state)));
+        answers.push(s.code(&s.paste(&code, &state)));
+    });
+    let messages: Vec<_> = answers
+        .iter()
+        .map(|(status, body)| {
+            let e: GatewayError = serde_json::from_slice(body).unwrap();
+            (*status, e.message.unwrap())
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            (
+                409,
+                format!(
+                    "the sign-in of login `login-1` expired at {}; start a new one",
+                    started.expires_at
+                )
+            ),
+            (
+                409,
+                "no sign-in of login `login-1` is pending; start one with POST \
+                 /v1/model/logins/login-1/oauth/start"
+                    .to_owned()
+            ),
+        ],
+        "an expired sign-in is dropped"
+    );
+    assert!(s.tokens.received().is_empty());
+    let results: Vec<_> = s
+        .audited()
+        .into_iter()
+        .map(|(a, _, r, _, _)| (a, r))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            (AuditAction::LoginOauthCode, AuditResult::Refused),
+            (AuditAction::LoginOauthStart, AuditResult::Ok),
+            (AuditAction::LoginOauthCode, AuditResult::Refused),
+            (AuditAction::LoginOauthCode, AuditResult::Refused),
+        ]
+    );
+    s.assert_hidden(&answers, &logged, &[&state]);
+}
+
+#[test]
+fn a_new_start_replaces_the_pending_sign_in_of_the_login() {
+    let s = sign_rig("oauth_anthropic", 600, "", own_uid());
+    let first = param(&s.start().url, "state");
+    let second = s.start();
+    let state = param(&second.url, "state");
+    assert_ne!(first, state);
+    let code = format!("code-{SIGN_MARK}");
+    let (status, body) = s.code(&s.paste(&code, &first));
+    let e: GatewayError = serde_json::from_slice(&body).unwrap();
+    assert_eq!((status, e.class), (400, ErrorClass::BadRequest), "{e:?}");
+    s.grant();
+    let (status, body) = s.code(&s.paste(&code, &state));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (verifier, _) = granted_code(&s.tokens.received()[0]);
+    assert_eq!(s256(&verifier), param(&second.url, "code_challenge"));
+}
+
+#[test]
+fn a_refused_or_failed_exchange_is_502_names_no_value_and_uses_the_sign_in_up() {
+    let refusal = json!({
+        "error": "invalid_grant",
+        "error_description": format!("code code-{SIGN_MARK} is spent"),
+    });
+    let no_refresh = json!({"access_token": format!("access-new-{SIGN_MARK}"), "expires_in": 3600});
+    let down = json!({"error": format!("down {SIGN_MARK}")});
+    let cases = [
+        (
+            token_answer(400, &refusal),
+            ErrorClass::Auth,
+            "the token endpoint refused the code: ",
+        ),
+        (
+            token_answer(200, &no_refresh),
+            ErrorClass::Unavailable,
+            "the token answer has no `refresh_token`",
+        ),
+        (
+            token_answer(503, &down),
+            ErrorClass::Unavailable,
+            "the token exchange failed: ",
+        ),
+    ];
+    for (answer, class, says) in cases {
+        let s = sign_rig("oauth_anthropic", 600, "", own_uid());
+        let state = param(&s.start().url, "state");
+        let pasted = s.paste(&format!("code-{SIGN_MARK}"), &state);
+        s.tokens.answer(answer);
+        let mut answers = Vec::new();
+        let logged = stderr_of(|| {
+            answers.push(s.code(&pasted));
+            answers.push(s.code(&pasted));
+        });
+        let e: GatewayError = serde_json::from_slice(&answers[0].1).unwrap();
+        assert_eq!((answers[0].0, e.class), (502, class), "{e:?}");
+        let message = e.message.unwrap();
+        assert!(message.starts_with(says), "{message}");
+        let e: GatewayError = serde_json::from_slice(&answers[1].1).unwrap();
+        assert_eq!(
+            answers[1].0, 409,
+            "the failed exchange used the sign-in up: {e:?}"
+        );
+        assert_eq!(s.tokens.received().len(), 1);
+        assert_eq!(std::fs::read_to_string(&s.file).unwrap(), s.old);
+        assert_eq!(backups_of(&s.file), Vec::<PathBuf>::new());
+        let (status, _, _) = turn(&s.r.gw, &turn_body("turn-1"));
+        assert_eq!(status, 200);
+        assert_eq!(s.sent(), [format!("access-old-{SIGN_MARK}")]);
+        let audited = s.audited();
+        assert_eq!(
+            audited[1],
+            (
+                AuditAction::LoginOauthCode,
+                Some("login-1".to_owned()),
+                AuditResult::Refused,
+                Some(message),
+                None
+            )
+        );
+        s.assert_hidden(&answers, &logged, &[&state]);
+    }
+}
+
+/// A refused sign-in request: method, login, step, body, status and message of the answer.
+type SignCase = (
+    &'static str,
+    &'static str,
+    &'static str,
+    String,
+    u16,
+    &'static str,
+);
+
+/// A paste that names a state no sign-in sent.
+fn some_code() -> String {
+    json!({ "pasted": format!("code-{SIGN_MARK}#state-1") }).to_string()
+}
+
+/// Sends each of `cases` to `rig` and checks its answer, then that nothing was exchanged or
+/// written and that each left its refused audit line and no value anywhere.
+fn refused_sign_ins(rig: &SignRig, cases: &[SignCase]) {
+    let mut answers = Vec::new();
+    let logged = stderr_of(|| {
+        for (method, login, step, body, status, message) in cases {
+            let path = format!("{}/{login}/oauth/{step}", paths::MODEL_LOGINS);
+            let (got, answer) = call(&rig.r.gw, method, &path, body);
+            let e: GatewayError = serde_json::from_slice(&answer).unwrap();
+            assert_eq!(
+                (got, e.message.as_deref()),
+                (*status, Some(*message)),
+                "{method} {login} {step}"
+            );
+            let class = if *status == 403 {
+                ErrorClass::Auth
+            } else {
+                ErrorClass::BadRequest
+            };
+            assert_eq!(e.class, class);
+            answers.push((got, answer));
+        }
+    });
+    assert!(rig.tokens.received().is_empty());
+    assert_eq!(std::fs::read_to_string(&rig.file).unwrap(), rig.old);
+    assert_eq!(backups_of(&rig.file), Vec::<PathBuf>::new());
+    let audited: Vec<_> = std::fs::read_to_string(&rig.audit)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap())
+        .map(|e| (e.action, e.object, e.result, e.reason))
+        .collect();
+    let want: Vec<_> = cases
+        .iter()
+        .map(|(_, login, step, _, _, message)| {
+            let action = if *step == "start" {
+                AuditAction::LoginOauthStart
+            } else {
+                AuditAction::LoginOauthCode
+            };
+            let reason = Some((*message).to_owned());
+            (
+                action,
+                Some((*login).to_owned()),
+                AuditResult::Refused,
+                reason,
+            )
+        })
+        .collect();
+    assert_eq!(audited, want);
+    rig.assert_hidden(&answers, &logged, &[]);
+}
+
+#[test]
+fn a_sign_in_is_refused_to_other_uids_and_on_the_loopback_listener() {
+    let others = format!("\n[[clients]]\nname = \"client-u\"\nuid = {}\n", own_uid());
+    let foreign = sign_rig("chatgpt_oauth", 600, &others, own_uid() + 1);
+    let only = "only the gateway's own uid may sign a login in";
+    refused_sign_ins(
+        &foreign,
+        &[
+            ("POST", "login-1", "start", String::new(), 403, only),
+            ("POST", "login-1", "code", some_code(), 403, only),
+        ],
+    );
+    let (listener, addr, front) = loopback_front("");
+    let served = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    for step in ["start", "code"] {
+        let path = format!("{}/login-1/oauth/{step}", paths::MODEL_LOGINS);
+        let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+        let sent = tcp_send(addr, "POST", &path, &auth, &some_code());
+        let (status, _, answer) = finish(sent, Vec::new());
+        assert_eq!(status, 404, "the loopback listener does not serve `{step}`");
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(!answer.contains(SIGN_MARK), "{answer}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(served.dir.join("creds/login-1.json")).unwrap(),
+        api_key("test-token-1")
+    );
+}
+
+#[test]
+fn a_bad_sign_in_request_is_refused_and_audited_without_echoing_the_body() {
+    let s = sign_rig("oauth_anthropic", 600, "", own_uid());
+    let api_key_login = "login `login-2` is `api_key`, not an OAuth login";
+    let extra = json!({"pasted": format!("code-{SIGN_MARK}"), "code": SIGN_MARK}).to_string();
+    let cut = format!(r#"{{"pasted": "code-{SIGN_MARK}""#);
+    let over = json!({ "pasted": format!("code-{SIGN_MARK}#{}", "s".repeat(8192)) }).to_string();
+    refused_sign_ins(
+        &s,
+        &[
+            (
+                "POST",
+                "login-9",
+                "start",
+                String::new(),
+                404,
+                "no login `login-9`",
+            ),
+            (
+                "POST",
+                "login-9",
+                "code",
+                some_code(),
+                404,
+                "no login `login-9`",
+            ),
+            (
+                "POST",
+                "login-2",
+                "start",
+                String::new(),
+                409,
+                api_key_login,
+            ),
+            ("POST", "login-2", "code", some_code(), 409, api_key_login),
+            (
+                "POST",
+                "login-1",
+                "start",
+                "{}".into(),
+                400,
+                "this request takes no body",
+            ),
+            (
+                "GET",
+                "login-1",
+                "start",
+                String::new(),
+                405,
+                "method not allowed",
+            ),
+            (
+                "PUT",
+                "login-1",
+                "code",
+                some_code(),
+                405,
+                "method not allowed",
+            ),
+            (
+                "POST",
+                "login-1",
+                "code",
+                extra,
+                400,
+                "the body must be one object with the string `pasted` only",
+            ),
+            (
+                "POST",
+                "login-1",
+                "code",
+                cut,
+                400,
+                "the body is not valid JSON (line 1, column 25)",
+            ),
+            (
+                "POST",
+                "login-1",
+                "code",
+                over,
+                413,
+                "request body over 8192 bytes",
+            ),
+        ],
     );
 }

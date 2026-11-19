@@ -422,6 +422,94 @@
         }
       }
     },
+    "/v1/model/logins/{name}/oauth/start": {
+      "post": {
+        "operationId": "loginOauthStart",
+        "summary": "Start a PKCE (S256) sign-in of the `oauth_anthropic` or `chatgpt_oauth` login `name` of the running config, with no request body: the answer holds the vendor's authorize URL, what to paste back and the Unix time the sign-in expires, 600 s later. The verifier and the state come from the kernel's random source and stay in the gateway's memory only, zeroized when the sign-in ends; the state leaves the gateway only as a parameter of the URL. One pending sign-in per login: a new start replaces it. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. Every request of a caller of the gateway is audited as `login_oauth_start`; neither the log nor the audit holds the URL. 404 `bad_request` for an unknown login, 409 `bad_request` for an `api_key` login, 400 `bad_request` for a request with a body, 500 `unavailable` when the random source fails.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The login's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The sign-in waits for the paste.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginOauthStarted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/logins/{name}/oauth/code": {
+      "post": {
+        "operationId": "loginOauthCode",
+        "summary": "Take what the operator pasted back after signing in at the URL of the login's pending sign-in, exchange its code at the login's `token_url`, else the vendor's token endpoints, and write the new tokens to the login's credential file: the old file, when there is one, is copied to `<file>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, never over a file, and the new file is written atomically with mode 0600; the login's next attempt sends the new token, without a reload or restart. The file write is serialised with reloads, config edits, client token rotations, key replacements and the login's token refreshes; the exchange is not. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. Every request of a caller of the gateway is audited as `login_oauth_code`. 404 `bad_request` for an unknown login; 409 `bad_request` for an `api_key` login, when no sign-in of the login is pending or it expired, or when the login's kind or credential file changed since the start; 400 `bad_request` for a body that does not validate, a paste without a code or with another state, the sign-in staying pending; 413 `bad_request` for a body over 8 KiB. Any exchange consumes the sign-in: 502 `auth` when the token endpoint refused the code, 502 `unavailable` when it could not be asked or its answer lacks a token or the account. 500 `unavailable` when a file cannot be read or written, as for `POST /v1/model/logins/{name}/key`. No answer, log line, audit line or usage line holds the code, the verifier, the state, a token or the account id.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The login's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginOauthCode"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The login's credential file holds the new tokens.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginOauthSigned"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/model/config/routes": {
       "get": {
         "operationId": "configRoutes",
@@ -1484,16 +1572,90 @@
           "key_sha256_prefix"
         ]
       },
+      "OauthPaste": {
+        "type": "string",
+        "description": "What the operator pastes back: `code_state` for an `oauth_anthropic` login, the `code#state` the vendor's page shows; `redirect_url` for a `chatgpt_oauth` login, the full address of the localhost page the browser then fails to load.",
+        "enum": [
+          "code_state",
+          "redirect_url"
+        ]
+      },
+      "LoginOauthStarted": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/logins/{name}/oauth/start`.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Name of the `[[logins]]` entry signing in."
+          },
+          "url": {
+            "type": "string",
+            "description": "The vendor's authorize URL with the S256 challenge and the state."
+          },
+          "paste": {
+            "$ref": "#/components/schemas/OauthPaste"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time after which the sign-in takes no code."
+          }
+        },
+        "required": [
+          "login",
+          "url",
+          "paste",
+          "expires_at"
+        ]
+      },
+      "LoginOauthCode": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/logins/{name}/oauth/code`.",
+        "properties": {
+          "pasted": {
+            "type": "string",
+            "description": "What the operator pasted back, as `paste` of the start's answer says; surrounding whitespace is ignored."
+          }
+        },
+        "required": [
+          "pasted"
+        ],
+        "additionalProperties": false
+      },
+      "LoginOauthSigned": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/logins/{name}/oauth/code`. It never holds a code or a token.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Name of the `[[logins]]` entry signed in."
+          },
+          "backup": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Path of the copy of the credential file it replaced; `null` when the login had none."
+          }
+        },
+        "required": [
+          "login",
+          "backup"
+        ]
+      },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`.",
         "enum": [
           "reload",
           "spend_reset",
           "client_rotate",
           "config_routes",
           "config_spend_caps",
-          "login_key"
+          "login_key",
+          "login_oauth_start",
+          "login_oauth_code"
         ]
       },
       "AuditResult": {
@@ -1523,7 +1685,7 @@
           },
           "object": {
             "type": "string",
-            "description": "The config file of a reload or a routes edit, the login of a spend reset or a key replacement, the client of a rotation; absent when a refused request named none."
+            "description": "The config file of a reload or a routes edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation; absent when a refused request named none."
           },
           "result": {
             "$ref": "#/components/schemas/AuditResult"
@@ -1544,7 +1706,7 @@
           },
           "backup": {
             "type": "string",
-            "description": "A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none."
+            "description": "A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none."
           },
           "token_sha256_prefix": {
             "type": "string",

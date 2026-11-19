@@ -1,8 +1,9 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
 //! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
-//! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`
-//! and `/v1/health`, and the HTTP fronts: `/v1/messages` ([`super::messages`]),
+//! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`,
+//! `/v1/model/logins/{name}/oauth/start`, `/v1/model/logins/{name}/oauth/code` and
+//! `/v1/health`, and the HTTP fronts: `/v1/messages` ([`super::messages`]),
 //! `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the optional loopback TCP
 //! listener serves only the HTTP fronts, to clients with a client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
@@ -514,7 +515,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
     let max_turn = gateway.config().max_request_bytes as usize;
     let limit = Cell::new(http::MAX_BODY);
     let dialect = Cell::new(Dialect::C4);
-    let key_login = Cell::new(None);
+    let login_target = Cell::new(None);
     let max_body = |head: &Head<'_>| {
         dialect.set(Dialect::of(head.path));
         if head.method == Method::Post
@@ -522,19 +523,19 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         {
             limit.set(max_turn);
         }
-        if let Some(name) = key_target(head.path) {
-            limit.set(MAX_KEY_BODY);
-            key_login.set(Some(name.to_owned()));
+        if let Some((name, action)) = login_target_of(head.path) {
+            limit.set(MAX_LOGIN_BODY);
+            login_target.set(Some((name.to_owned(), action)));
         }
         Some(limit.get())
     };
     let req = match read(&stream, &max_body) {
         Ok(r) => r,
         Err(e) => {
-            if let Some(name) = key_login.take() {
+            if let Some((name, action)) = login_target.take() {
                 let reason = unread(&e, limit.get())
                     .map_or_else(|| "the request's body was not read".to_owned(), |(_, m)| m);
-                gateway.refuse_login_key(&audit::uid_actor(uid), &name, &reason);
+                gateway.refuse_login(&audit::uid_actor(uid), action, &name, &reason);
             }
             return unreadable(&mut stream, &e, limit.get(), dialect.get());
         }
@@ -613,8 +614,8 @@ fn named(
 ) -> bool {
     let actor = audit::uid_actor(uid);
     let own = uid == own_uid;
-    if let Some(name) = key_target(&req.path) {
-        login_key(stream, gateway, name, req, &actor, own);
+    if let Some((name, action)) = login_target_of(&req.path) {
+        login(stream, gateway, name, action, req, &actor, own);
     } else if let Some(name) = rotate_target(&req.path) {
         if req.method == Method::Post {
             rotate(stream, gateway, name, &actor, own);
@@ -645,46 +646,72 @@ fn rotate(stream: &mut Conn, gateway: &Gateway, name: &str, actor: &str, own: bo
         gateway.record(&audit::refused(entry, message));
         return reject(stream, 403, ErrorClass::Auth, message);
     }
-    match gateway.rotate_client(actor, name) {
-        Ok(answer) => reply(stream, 200, &answer),
-        Err(r) => reject(stream, r.status, r.class, &r.message),
-    }
+    respond(stream, gateway.rotate_client(actor, name));
 }
 
-/// Largest body of `POST /v1/model/logins/{name}/key`.
-const MAX_KEY_BODY: usize = 8 * 1024;
+/// Largest body of a `POST` to `/v1/model/logins/{name}/key` or `.../oauth/*`.
+const MAX_LOGIN_BODY: usize = 8 * 1024;
 
-/// The login name of a `/v1/model/logins/{name}/key` path.
-fn key_target(path: &str) -> Option<&str> {
-    let name = path
-        .strip_prefix(paths::MODEL_LOGINS)?
-        .strip_prefix('/')?
-        .strip_suffix("/key")?;
-    (!name.is_empty() && !name.contains('/')).then_some(name)
+/// The login name of a `/v1/model/logins/{name}/key`, `.../oauth/start` or `.../oauth/code`
+/// path and the audit action of a request to it.
+fn login_target_of(path: &str) -> Option<(&str, AuditAction)> {
+    let rest = path.strip_prefix(paths::MODEL_LOGINS)?.strip_prefix('/')?;
+    let (name, action) = [
+        ("/key", AuditAction::LoginKey),
+        ("/oauth/start", AuditAction::LoginOauthStart),
+        ("/oauth/code", AuditAction::LoginOauthCode),
+    ]
+    .into_iter()
+    .find_map(|(suffix, action)| Some((rest.strip_suffix(suffix)?, action)))?;
+    (!name.is_empty() && !name.contains('/')).then_some((name, action))
 }
 
-/// Answers `req` of `actor` to `/v1/model/logins/{name}/key`, which only the gateway's `own` uid
-/// may `POST`.
-fn login_key(
+/// Answers `req` of `actor` to the login `name`'s endpoint of `action`, which only the gateway's
+/// `own` uid may `POST`.
+fn login(
     stream: &mut Conn,
     gateway: &Gateway,
     name: &str,
+    action: AuditAction,
     req: &http::Request,
     actor: &str,
     own: bool,
 ) {
     let refuse = |stream: &mut Conn, status: u16, class: ErrorClass, message: &str| {
-        gateway.refuse_login_key(actor, name, message);
+        gateway.refuse_login(actor, action, name, message);
         reject(stream, status, class, message);
     };
     if !own {
-        let message = "only the gateway's own uid may replace a login's key";
+        let message = if action == AuditAction::LoginKey {
+            "only the gateway's own uid may replace a login's key"
+        } else {
+            "only the gateway's own uid may sign a login in"
+        };
         return refuse(stream, 403, ErrorClass::Auth, message);
     }
     if req.method != Method::Post {
         return refuse(stream, 405, ErrorClass::BadRequest, "method not allowed");
     }
-    match gateway.replace_login_key(actor, name, &req.body) {
+    match action {
+        AuditAction::LoginOauthStart if !req.body.is_empty() => {
+            refuse(
+                stream,
+                400,
+                ErrorClass::BadRequest,
+                "this request takes no body",
+            );
+        }
+        AuditAction::LoginOauthStart => respond(stream, gateway.start_sign_in(actor, name)),
+        AuditAction::LoginOauthCode => {
+            respond(stream, gateway.finish_sign_in(actor, name, &req.body));
+        }
+        _ => respond(stream, gateway.replace_login_key(actor, name, &req.body)),
+    }
+}
+
+/// Answers 200 with the answer of an admin action, or its refusal.
+fn respond<T: Serialize>(stream: &mut Conn, result: Result<T, super::Refusal>) {
+    match result {
         Ok(answer) => reply(stream, 200, &answer),
         Err(r) => reject(stream, r.status, r.class, &r.message),
     }
