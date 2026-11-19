@@ -9,6 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, LandlockStatus, Ruleset, RulesetAttr};
+use qb_proto::{AuditAction, AuditEntry, AuditResult};
 use rustix::process::{DumpableBehavior, dumpable_behavior};
 
 fn kernel_abi() -> Option<ABI> {
@@ -29,20 +30,36 @@ fn kernel_abi() -> Option<ABI> {
     .unwrap()
 }
 
-/// The enforced ruleset: no gaps; its startup line names the credential, spend and config
+/// The enforced ruleset: no gaps; its startup line names the credential, spend, audit and config
 /// directories and the two resolver files, TCP connect to 443 and bind on `port`; `opened` are
-/// the credential and spend directories.
+/// the credential, spend and audit directories.
 fn assert_applied(applied: &qb::sandbox::Confined, port: u16, opened: &[PathBuf]) {
     assert_eq!(applied.gaps, Vec::<String>::new());
     let want = format!(
-        "non-dumpable; landlock V4: files beneath 5 paths only, TCP connect 443, bind {port} only"
+        "non-dumpable; landlock V4: files beneath 6 paths only, TCP connect 443, bind {port} only"
     );
     assert_eq!(applied.summary, want);
     assert_eq!(applied.opened, opened);
 }
 
+/// An audit entry of a SIGHUP reload at `at`.
+fn signal_reload(at: u64) -> AuditEntry {
+    AuditEntry {
+        at,
+        actor: "signal".into(),
+        action: AuditAction::Reload,
+        object: None,
+        result: AuditResult::Ok,
+        reason: None,
+        config_sha256_before: None,
+        config_sha256_after: None,
+        backup: None,
+    }
+}
+
 #[test]
-fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_qbd_only() {
+#[allow(clippy::too_many_lines)] // the dumpable flag is process-wide, so one test covers it all
+fn gateway_may_write_its_credentials_spend_and_audit_read_its_config_and_reach_qbd_only() {
     let dir = Path::new("/tmp").join(format!("qb-gw-sandbox-{}", std::process::id()));
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
@@ -51,6 +68,9 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
     let state = dir.join("state");
     std::fs::create_dir_all(&state).unwrap();
     let spend_file = state.join("spend.json");
+    let audit = dir.join("audit");
+    std::fs::create_dir_all(&audit).unwrap();
+    let audit_file = audit.join("audit.jsonl");
     let outside = dir.join("outside.txt");
     std::fs::write(&outside, "outside").unwrap();
     let qbd = dir.join("qb.sock");
@@ -63,7 +83,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
     std::fs::create_dir_all(&etc).unwrap();
     let file = etc.join("gateway.toml");
     let text = format!(
-        "socket = \"{}\"\nqbd_socket = \"{}\"\nspend_file = \"{}\"\n\
+        "socket = \"{}\"\nqbd_socket = \"{}\"\nspend_file = \"{}\"\naudit_file = \"{}\"\n\
              [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\napi = \"anthropic\"\ncredentials = \"{}\"\n\
              [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n\
              [fronts]\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\n\
@@ -71,6 +91,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
         dir.join("gw.sock").display(),
         qbd.display(),
         spend_file.display(),
+        audit_file.display(),
         credential.display(),
         "0".repeat(64)
     );
@@ -82,6 +103,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
     }
     let (written, unreadable) = (credential.clone(), outside.clone());
     let counted = spend_file.clone();
+    let audited = audit_file.clone();
     let (hardened, edit) = std::sync::mpsc::channel();
     let (edited, reload) = std::sync::mpsc::channel();
     let reread = file.clone();
@@ -99,6 +121,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
         let now = qb::server::unix_now();
         let mut ledger = qb::gateway::spend::Ledger::open(&counted, now).unwrap();
         ledger.add("login-1", 1.5, now).unwrap();
+        qb::gateway::audit::append(&audited, &signal_reload(now));
         assert!(UnixStream::connect(&qbd).is_ok(), "qbd stays reachable");
         let (accepted, _) = tcp.accept().unwrap();
         assert_eq!(
@@ -108,7 +131,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
         );
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
-            assert_applied(&applied, port, &[creds, state]);
+            assert_applied(&applied, port, &[creds, state, audit]);
             let denied = std::fs::read(&unreadable).unwrap_err();
             assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
             let denied = std::fs::write(unreadable.with_extension("new"), "x").unwrap_err();
@@ -144,5 +167,7 @@ fn gateway_may_rewrite_credentials_and_its_spend_file_read_its_config_and_reach_
         r#"{"type":"api_key","key":"k2"}"#
     );
     assert!(spend_file.exists(), "written in the sandbox");
+    let appended = std::fs::read_to_string(&audit_file).unwrap();
+    assert!(appended.contains(r#""action":"reload""#), "{appended}");
     let _ = std::fs::remove_dir_all(&dir);
 }

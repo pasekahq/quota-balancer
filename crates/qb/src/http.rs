@@ -29,6 +29,8 @@ pub struct Request {
     pub method: Method,
     /// Path without the query string.
     pub path: String,
+    /// The query string after `?`, if any.
+    pub query: Option<String>,
     /// Bearer token from `Authorization`, if any.
     pub bearer: Option<String>,
     /// Body (`Content-Length` bytes).
@@ -111,7 +113,10 @@ pub fn read_request_limited<R: Read>(
                     _ => Method::Other,
                 };
                 let raw_path = req.path.unwrap_or("/");
-                let path = raw_path.split('?').next().unwrap_or("/");
+                let (path, query) = match raw_path.split_once('?') {
+                    Some((path, query)) => (path, Some(query)),
+                    None => (raw_path, None),
+                };
                 let mut content_length = None;
                 let mut bearer = None;
                 let mut api_key = None;
@@ -165,6 +170,7 @@ pub fn read_request_limited<R: Read>(
                 return Ok(Request {
                     method,
                     path: path.to_owned(),
+                    query: query.map(str::to_owned),
                     bearer: bearer.map(str::to_owned),
                     body,
                 });
@@ -292,10 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_get_and_strips_query() {
+    fn parses_get_and_splits_off_the_query() {
         let r = parse(b"GET /v1/state?x=1 HTTP/1.1\r\nHost: qb\r\n\r\n").expect("valid");
         assert_eq!(r.method, Method::Get);
         assert_eq!(r.path, "/v1/state");
+        assert_eq!(r.query.as_deref(), Some("x=1"));
         assert_eq!(r.body, b"");
     }
 

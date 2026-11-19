@@ -224,6 +224,7 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/reload` | — | 200 `ReloadAnswer`, 400 refused, 403 a caller other than the gateway's own uid |
 | `GET /v1/model/spend` | — | 200 `SpendAnswer`, 403 a caller other than the gateway's own uid |
 | `POST /v1/model/spend/reset` | `SpendReset` | 200 `LoginSpend`, 400 a login without `spend_cap`, 403 a caller other than the gateway's own uid, 500 the spend file could not be written |
+| `GET /v1/model/audit` | — | 200 `AuditAnswer`, 400 a bad query, 403 a caller other than the gateway's own uid, 404 no `audit_file` |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -467,3 +468,47 @@ the gateway reports its `spend` window to `qbd` so the login runs again, and the
 login's entry as above. A login without a `spend_cap` in the current config is 400
 `bad_request`; a spend file that cannot be written is 500 `unavailable`, with the count zero
 until the next restart.
+
+### `GET /v1/model/audit`
+
+With the top-level config key `audit_file` ([config.md](config.md#gateway-config)) the gateway
+appends one JSON line per admin action to that file, creating it with mode 0600, in one
+`write` per line. A line is an `AuditEntry`:
+
+```json
+{"at": 1800000000, "actor": "uid:1000", "action": "reload", "object": "/etc/qb/gateway.toml",
+ "result": "ok", "config_sha256_before": "5f0e…", "config_sha256_after": "a1b2…"}
+```
+
+| Field | Meaning |
+|---|---|
+| `at` | Unix time of the action |
+| `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
+| `action` | `reload` or `spend_reset` |
+| `object` | the config file of a reload, the login of a spend reset; absent when a refused request named none |
+| `result` | `ok` when the action answered 200, else `refused` |
+| `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
+| `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it; equal when it was refused |
+| `backup` | path of the copy an action kept of what it replaced; no current action sets it |
+
+Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/spend/reset` that
+reaches its handler is recorded, refusals included: another uid's 403, a body that does not
+parse, a config that does not validate. A peer that is not a caller of the gateway gets its 401
+before any handler and leaves no line. No field holds a token, key or credential content. A
+line that cannot be appended is logged at error priority with the path; the action's answer
+stays as it was. The gateway neither rotates nor trims the file.
+
+`GET /v1/model/audit?since=<unix s>&limit=<n>` reads the lines back, only for the gateway's own
+uid (any other caller gets 403 `auth`); the loopback listener does not serve it. It answers the
+first `limit` entries (default 100, 1 to 1000) with `at` ≥ `since` (default 0), oldest first,
+and in `skipped` the number of lines of the file that do not parse as an entry, which are left
+out:
+
+```json
+{"entries": [{"at": 1800000120, "actor": "uid:1000", "action": "spend_reset",
+              "object": "key-1", "result": "ok"}],
+ "skipped": 0}
+```
+
+A missing file answers no entries. Another query parameter, one given twice or a value out of
+range is 400 `bad_request`; without `audit_file` the answer is 404 `bad_request`.

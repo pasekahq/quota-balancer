@@ -8,6 +8,8 @@ max_turns = 4
 max_attempts = 4
 # Counts the monthly spend of the logins with a spend_cap; only the gateway writes it.
 spend_file = "/var/lib/qb-gateway/spend.json"
+# Each admin action (reload, spend reset) is appended here as one JSON line.
+audit_file = "/var/lib/qb-gateway/audit.jsonl"
 
 [[logins]]
 name = "login-1"

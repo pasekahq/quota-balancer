@@ -18,6 +18,7 @@
 //!   refreshes and sign-ins;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`spend`]: the monthly spend count of capped logins;
+//! - [`audit`]: the admin audit file, appended to and read back;
 //! - [`front`]: the listeners and the C4 front;
 //! - [`answer`]: how the HTTP fronts answer a turn, SSE or one body;
 //! - [`messages`]: the Messages front;
@@ -25,6 +26,7 @@
 
 pub mod answer;
 pub mod anthropic;
+pub mod audit;
 mod base64url;
 pub mod chat_upstream;
 pub mod config;

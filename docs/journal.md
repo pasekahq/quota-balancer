@@ -18,10 +18,10 @@ exactly one record key. Unknown keys are rejected.
 | `issued` | a rotation starts a new file | `{"at":1800000600,"issued":12}` |
 
 - `lease`: `id` is the number in the wire id `l-<id>`; `run_id` and `on_behalf_of` are omitted
-  when the pick had none, and a line without them replays as a lease without them; `cost` is the reserved fraction of each window of the login's vendor, in declaration
-  order; `reason` is the pick's `reason` (see [api.md](api.md)). A line without `reason`
-  replays as a lease whose reason is unknown; a `reason` that is not a pick reason does not
-  decode.
+  when the pick had none, and a line without them replays as a lease without them; `cost` is
+  the reserved fraction of each window of the login's vendor, in declaration order; `reason` is
+  the pick's `reason` (see [api.md](api.md)). A line without `reason` replays as a lease whose
+  reason is unknown; a `reason` that is not a pick reason does not decode.
 - `marks`: all marks of the login after the change. `auth` is `ok`, `stale` or `dead` and is
   omitted when `ok`; `exhausted_until` and `rate_limited_until` are omitted when unset;
   `model_dead` maps a model to the end of its dead mark and is omitted when empty. A missing

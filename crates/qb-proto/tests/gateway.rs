@@ -4,8 +4,9 @@
 #![allow(clippy::unwrap_used)]
 
 use qb_proto::{
-    Block, CancelAnswer, CancelRequest, Elsewhere, ErrorClass, GatewayError, Message, ReloadAnswer,
-    Role, RouteState, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest,
+    AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, Elsewhere,
+    ErrorClass, GatewayError, Message, ReloadAnswer, Role, RouteState, RoutesAnswer, SpendAnswer,
+    SpendReset, StopReason, StreamEvent, TurnRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -145,6 +146,42 @@ fn errors_routes_cancel() {
     assert_eq!(spend.logins[0].period_end, 1_800_000_000);
     let reset: SpendReset = roundtrip("gateway_spend_reset_request.json");
     assert_eq!(reset.login, "key-1");
+    let audit: AuditAnswer = roundtrip("gateway_audit_answer.json");
+    let lines: Vec<_> = audit
+        .entries
+        .iter()
+        .map(|e| (e.actor.as_str(), e.action, e.result, e.object.as_deref()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "uid:1000",
+                AuditAction::Reload,
+                AuditResult::Ok,
+                Some("/etc/qb/gateway.toml")
+            ),
+            (
+                "signal",
+                AuditAction::Reload,
+                AuditResult::Refused,
+                Some("/etc/qb/gateway.toml")
+            ),
+            (
+                "uid:1000",
+                AuditAction::SpendReset,
+                AuditResult::Ok,
+                Some("key-1")
+            ),
+            (
+                "uid:1001",
+                AuditAction::SpendReset,
+                AuditResult::Refused,
+                None
+            ),
+        ]
+    );
+    assert_eq!(audit.skipped, 1);
 }
 
 /// A turn request around one block, for the block fixtures.

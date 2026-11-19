@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use qb::client::call;
-use qb_proto::{Decision, PickResponse, ReportResponse, paths};
+use qb_proto::{AuditEntry, AuditResult, Decision, PickResponse, ReportResponse, paths};
 use serde_json::json;
 
 mod common;
@@ -391,6 +391,7 @@ impl Gateway {
         let text = format!(
             r#"socket = "{sock}"
 qbd_socket = "{qbd}"
+audit_file = "{audit}"
 
 [[logins]]
 name = "login-1"
@@ -411,6 +412,7 @@ vendor = "vendor-a"
 "#,
             sock = sock.display(),
             qbd = qbd.display(),
+            audit = dir.join("audit.jsonl").display(),
             login = vendor.login("kind = \"api_key\"\napi = \"anthropic\""),
             credentials = credentials.display(),
             hash = "0".repeat(64),
@@ -605,5 +607,21 @@ fn the_gateway_reloads_its_config_on_sighup_and_on_qb_reload() {
         aliases(&gw.sock),
         ["chat", "cli", "hup"],
         "the running config stays"
+    );
+    let audit = std::fs::read_to_string(gw.config.with_file_name("audit.jsonl")).unwrap();
+    let reloads: Vec<(String, AuditResult)> = audit
+        .lines()
+        .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap())
+        .map(|e| (e.actor, e.result))
+        .collect();
+    let uid = format!("uid:{}", own_uid());
+    assert_eq!(
+        reloads,
+        [
+            ("signal".to_owned(), AuditResult::Ok),
+            (uid.clone(), AuditResult::Ok),
+            (uid, AuditResult::Refused),
+        ],
+        "{audit}"
     );
 }
