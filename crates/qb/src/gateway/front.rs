@@ -639,6 +639,46 @@ enum Refusal {
     Busy,
 }
 
+impl Refusal {
+    /// Its name in the log.
+    fn class(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::Path => "path",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+/// Records `why` in `refusal` and logs it with the head's method and path, never a header value.
+fn refuse_head(refusal: &Cell<Option<Refusal>>, why: Refusal, head: &Head<'_>) {
+    refusal.set(Some(why));
+    let method = match head.method {
+        Method::Get => "GET",
+        Method::Post => "POST",
+        Method::Other => "other",
+    };
+    // The path is the peer's: cap it and escape control characters so it cannot forge a line.
+    let path: String = head
+        .path
+        .chars()
+        .take(PATH_LOG_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    let more = if head.path.chars().nth(PATH_LOG_CHARS).is_some() {
+        "…"
+    } else {
+        ""
+    };
+    log::warn(&format!(
+        "gateway: loopback refused {method} {path}{more}: {}",
+        why.class()
+    ));
+}
+
+/// Characters of a refused path that reach the log.
+const PATH_LOG_CHARS: usize = 64;
+
 /// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] with the
 /// client token in `x-api-key` or `Authorization: Bearer`, checked before the body is read. Every
 /// answer is in the OpenAI format for the OpenAI endpoints, else in the Messages format.
@@ -672,15 +712,15 @@ fn serve_loopback(
         }
         let mut presented = [head.api_key, head.bearer].into_iter().flatten();
         if !token.is_some_and(|hash| presented.any(|t| token_matches(t, &hash))) {
-            refusal.set(Some(Refusal::Token));
+            refuse_head(&refusal, Refusal::Token, head);
             return None;
         }
         if head.method != Method::Post || !HTTP_FRONTS.contains(&head.path) {
-            refusal.set(Some(Refusal::Path));
+            refuse_head(&refusal, Refusal::Path, head);
             return None;
         }
         let Some(held) = Slot::take(live, connection_cap(gateway)) else {
-            refusal.set(Some(Refusal::Busy));
+            refuse_head(&refusal, Refusal::Busy, head);
             return None;
         };
         slot.set(Some(held));
