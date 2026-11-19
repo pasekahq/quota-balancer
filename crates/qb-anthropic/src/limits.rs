@@ -281,6 +281,9 @@ fn says_usage_limit(message: &str) -> bool {
         "hit your limit",
         "limit reached",
         "rate_limit_rejected",
+        // A subscription login past its plan limits with extra usage off or spent: Anthropic
+        // answers a 400 `invalid_request_error`, "You're out of extra usage. Add more at …".
+        "out of extra usage",
     ]
     .iter()
     .any(|p| m.contains(p))

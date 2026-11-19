@@ -117,7 +117,12 @@ impl Upstream for Anthropic {
                 &body,
             )));
         }
-        let mut reader = Reader::new(at.vendor, limits::rate_limits(&answer.headers()));
+        let wire_to_client = request::wire_tool_names(req, auth)
+            .into_iter()
+            .map(|(client, wire)| (wire, client))
+            .collect();
+        let mut reader = Reader::new(at.vendor, limits::rate_limits(&answer.headers()))
+            .with_tool_names(wire_to_client);
         let stop = answer.stream(cancel, sink, |chunk, events| {
             let progress = if chunk.is_empty() {
                 reader.finish().map(Progress::Finished)
