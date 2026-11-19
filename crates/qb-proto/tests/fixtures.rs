@@ -30,6 +30,7 @@ fn pick_requests() {
     assert!(d.validate().is_ok());
     let p: PickRequest = roundtrip("pick_request_pin.json");
     assert_eq!(p.pin.as_ref().map(|p| p.vendor.as_str()), Some("vendor-b"));
+    assert_eq!(p.on_behalf_of.as_deref(), Some("client-a"));
     assert!(p.validate().is_ok());
 }
 
@@ -55,6 +56,7 @@ fn reports() {
 fn state_health_error() {
     let s: StateResponse = roundtrip("state_response.json");
     assert_eq!(s.logins.len(), 1);
+    assert_eq!(s.leases[0].on_behalf_of.as_deref(), Some("client-a"));
     let _: HealthResponse = roundtrip("health_response.json");
     let _: ErrorBody = roundtrip("error_body.json");
 }

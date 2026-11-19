@@ -204,6 +204,7 @@ pub fn decide(
         client: client.to_owned(),
         expected_minutes: req.expected_minutes,
         run_id: req.run_id,
+        on_behalf_of: req.on_behalf_of,
     };
     Ok(match core.pick(&input, now) {
         Verdict::Run(grant, reason) => {
@@ -447,6 +448,7 @@ pub fn state(core: &mut Core, now: u64) -> StateResponse {
                 model: l.model,
                 client: l.client,
                 run_id: l.run_id,
+                on_behalf_of: l.on_behalf_of,
                 expires_at: l.expires_at,
             })
             .collect(),
@@ -497,6 +499,7 @@ fn why(core: &mut Core, lease: &str, now: u64) -> Reply {
             model: lease.model,
             client: lease.client,
             run_id: lease.run_id,
+            on_behalf_of: lease.on_behalf_of,
             expires_at: lease.expires_at,
             cost: login
                 .windows

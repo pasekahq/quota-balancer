@@ -37,6 +37,8 @@ struct LeaseLine {
     client: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_behalf_of: Option<String>,
     cost: Vec<f64>,
     expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +94,7 @@ pub fn encode(record: &Record, at: u64) -> Result<Vec<u8>, serde_json::Error> {
                 model: l.model.clone(),
                 client: l.client.clone(),
                 run_id: l.run_id.clone(),
+                on_behalf_of: l.on_behalf_of.clone(),
                 cost: l.cost.clone(),
                 expires_at: l.expires_at,
                 reason: l.reason.map(|r| r.as_str().to_owned()),
@@ -138,6 +141,7 @@ pub fn decode(line: &[u8]) -> Result<(Record, u64), String> {
             model: l.model,
             client: l.client,
             run_id: l.run_id,
+            on_behalf_of: l.on_behalf_of,
             cost: l.cost,
             expires_at: l.expires_at,
         }),

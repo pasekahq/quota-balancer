@@ -274,6 +274,8 @@ pub struct PickInput {
     pub expected_minutes: Option<u32>,
     /// Caller's id of the run, kept in the lease.
     pub run_id: Option<String>,
+    /// End client a relaying caller picks for, kept in the lease; no decision reads it.
+    pub on_behalf_of: Option<String>,
 }
 
 /// Declares [`Reason`] from one table, so `as_str`, `from_name` and `ALL` cannot disagree.
@@ -483,6 +485,8 @@ pub struct LeaseView {
     pub client: String,
     /// Caller's run id.
     pub run_id: Option<String>,
+    /// End client the pick named.
+    pub on_behalf_of: Option<String>,
     /// Expiry time.
     pub expires_at: UnixSecs,
 }
@@ -534,6 +538,8 @@ pub struct LeaseRecord {
     pub client: String,
     /// Caller's run id.
     pub run_id: Option<String>,
+    /// End client the pick named.
+    pub on_behalf_of: Option<String>,
     /// Reserved fraction per window of the login's vendor, in declaration order.
     pub cost: Vec<f64>,
     /// Expiry time.
@@ -686,6 +692,7 @@ struct Lease {
     model_index: Option<usize>,
     client: String,
     run_id: Option<String>,
+    on_behalf_of: Option<String>,
     cost: PerWindow,
     expires_at: UnixSecs,
     reason: Option<Reason>,
@@ -947,6 +954,7 @@ impl Core {
             model_index: settled.model_index,
             client: input.client.clone(),
             run_id: input.run_id.clone(),
+            on_behalf_of: input.on_behalf_of.clone(),
             cost: c.cost,
             expires_at,
             reason: Some(settled.reason),
@@ -1535,6 +1543,7 @@ impl Core {
                     model: l.model.clone(),
                     client: l.client.clone(),
                     run_id: l.run_id.clone(),
+                    on_behalf_of: l.on_behalf_of.clone(),
                     expires_at: l.expires_at,
                 })
                 .collect(),
@@ -1551,6 +1560,7 @@ impl Core {
             model: l.model.clone(),
             client: l.client.clone(),
             run_id: l.run_id.clone(),
+            on_behalf_of: l.on_behalf_of.clone(),
             cost: l.cost[..windows].to_vec(),
             expires_at: l.expires_at,
             reason: l.reason,
@@ -1671,6 +1681,7 @@ impl Core {
             model_index: self.models.iter().position(|m| *m == r.model),
             client: r.client.clone(),
             run_id: r.run_id.clone(),
+            on_behalf_of: r.on_behalf_of.clone(),
             cost,
             expires_at: r.expires_at,
             reason: r.reason,

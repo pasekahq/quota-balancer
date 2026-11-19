@@ -1,1 +1,1 @@
-{"role": "reviewer", "pin": {"vendor": "vendor-b", "model": "model-large", "effort": "high"}, "avoid_vendor": "vendor-a"}
+{"role": "reviewer", "pin": {"vendor": "vendor-b", "model": "model-large", "effort": "high"}, "avoid_vendor": "vendor-a", "on_behalf_of": "client-a"}

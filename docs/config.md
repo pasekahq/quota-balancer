@@ -240,7 +240,7 @@ or put the socket in a directory outside it.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `name` | string | Caller name in the log. |
+| `name` | string | Caller name in the log; 1 to 128 bytes. |
 | `uid` | integer | Peer uid (`SO_PEERCRED`); unique. |
 
 `[[logins]]`, 1 to 32: the logins this gateway holds credentials for.
@@ -405,11 +405,11 @@ without its sub-table answers 404.
 the clients of the loopback listener apart. Each entry's turns run as its `name`, the caller in
 the gateway's admissions and log lines. The unnamed `token_sha256` and named clients coexist: a
 request with the unnamed token runs as `client-token` on every route, one with a named client's
-token as that client.
+token as that client. An empty `clients = []` is a config error.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `name` | string | Required, non-empty and unique. Neither a `[[clients]]` name nor `client-token`. |
+| `name` | string | Required, 1 to 128 bytes and unique. Neither a `[[clients]]` name, nor `client-token`, nor of the form `uid:<digits>`. |
 | `token_sha256` | string | Required. SHA-256 of the client's token as 64 hex characters, made as below; no other named client and not `fronts.token_sha256` may have the same hash. |
 | `routes` | array of strings | Route aliases the client may run on, at least one; absent means every route. A request whose `model` resolves, through `models` or as an alias, to another route is answered 403 before any pick ([api.md](api.md#model-gateway-v1model)). |
 

@@ -102,6 +102,12 @@ fn pick_rejects_invalid_requests() {
         br#"{"role":"worker"}"#,
         br#"{"role":"worker","difficulty":1,"pin":{"vendor":"v","model":"m"}}"#,
         br#"{"role":"worker","difficulty":1,"unknown":true}"#,
+        br#"{"role":"worker","difficulty":1,"on_behalf_of":""}"#,
+        format!(
+            r#"{{"role":"worker","difficulty":1,"on_behalf_of":"{}"}}"#,
+            "c".repeat(129)
+        )
+        .as_bytes(),
     ] {
         let (status, resp) = call(&sock, "POST", paths::PICK, Some(body), None).unwrap();
         assert_eq!(status, 400, "{}", String::from_utf8_lossy(body));
@@ -1081,6 +1087,43 @@ fn a_lease_line_without_reason_replays() {
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let w: WhyResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!((w.login.as_str(), w.reason), ("login-1", None));
+    assert_eq!(state(&sock).leases[0].on_behalf_of, None);
+}
+
+#[test]
+fn on_behalf_of_stays_on_the_lease_in_state_the_journal_and_a_restart() {
+    let dir = temp_dir("behalf");
+    let config = journaled_config(&dir, 1 << 20);
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    let task =
+        r#"{"role":"worker","difficulty":1,"expected_minutes":30,"on_behalf_of":"client-x"}"#;
+    let p: PickResponse = post(&sock, paths::PICK, task);
+    assert_eq!(p.decision, Decision::Run, "{p:?}");
+    let held = |sock: &Path| {
+        let l = state(sock).leases.remove(0);
+        (l.lease_id, l.client, l.on_behalf_of)
+    };
+    let before = held(&sock);
+    assert_eq!(
+        before,
+        (
+            p.lease_id.clone().unwrap(),
+            "client-a".to_owned(),
+            Some("client-x".to_owned())
+        )
+    );
+    let journal = std::fs::read_to_string(dir.join("journal")).unwrap();
+    let lease: serde_json::Value = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+    assert_eq!(lease["lease"]["on_behalf_of"], "client-x", "{journal}");
+    drop(d);
+
+    let _d = start(&config, &sock);
+    assert_eq!(held(&sock), before);
+    let (status, body) = why(&sock, &before.0);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let w: WhyResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(w.on_behalf_of.as_deref(), Some("client-x"));
 }
 
 fn rate_limit_line(status: &str, five_hour: f64, seven_day: f64, now: u64) -> String {

@@ -285,23 +285,40 @@ struct Rig {
 }
 
 /// A qbd of config `text` on a fresh socket in `dir`.
+/// A qbd on `dir/qb.sock` that journals to [`qbd_journal`] of `dir`.
 fn start_qbd(dir: &Path, text: &str) -> PathBuf {
     let sock = dir.join("qb.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     let config = qb::config::parse(Path::new("qbd.toml"), text).unwrap();
+    let mut journal = Journal::open(&qbd_journal(dir), u64::MAX, 0).unwrap();
     std::thread::spawn(move || {
         let mut core = Core::new(config.core_spec()).unwrap();
         let mut gate = Gate::new(&[], &config.limits);
         qb::server::serve(
             &listener,
             &mut core,
-            &mut Journal::off(),
+            &mut journal,
             &mut Runner::default(),
             &mut gate,
             &[],
         )
     });
     sock
+}
+
+fn qbd_journal(dir: &Path) -> PathBuf {
+    dir.join("qbd.journal")
+}
+
+/// The `on_behalf_of` of every lease line in the journal of the qbd in `dir`, in order.
+fn leased_on_behalf_of(dir: &Path) -> Vec<Option<String>> {
+    std::fs::read_to_string(qbd_journal(dir))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|l| l.get("lease").is_some())
+        .map(|l| l["lease"]["on_behalf_of"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The keys of an `api_key` login of the `anthropic` API family.
@@ -4488,6 +4505,47 @@ fn named_loopback_clients_run_under_their_names_and_within_their_routes() {
     let auth = "X-Api-Key: qb-client-d-token\r\n";
     let s = tcp_send(addr, "POST", paths::MESSAGES, auth, &messages.to_string());
     assert_eq!(error_type(s), (401, "authentication_error".into()));
+}
+
+#[test]
+fn every_pick_names_the_turn_s_caller_on_behalf_of() {
+    let client_a = front_client("client-a", CLIENT_A.1, "");
+    let (listener, addr, front) = loopback_front(&client_a);
+    let r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let messages = sdk_body("model-2025-01-01", false);
+    for token in [CLIENT_A.0, CLIENT_TOKEN] {
+        let (status, answer) = loopback_post(addr, paths::MESSAGES, token, &messages);
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    }
+    turn(&r.gw, &turn_body("turn-1"));
+    let own = format!("uid:{}", own_uid());
+    assert_eq!(
+        leased_on_behalf_of(&r.dir),
+        [Some("client-a"), Some("client-token"), Some(own.as_str())].map(|c| c.map(str::to_owned))
+    );
+}
+
+#[test]
+fn a_route_refusal_logs_the_client_and_the_route_but_no_token() {
+    let client = front_client("client-refused", CLIENT_C.1, "routes = [\"spare\"]\n");
+    let (listener, addr, front) = loopback_front(&client);
+    let _r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let messages = sdk_body("model-2025-01-01", false);
+    let mut status = 0;
+    let logged = stderr_until("client `client-refused`", || {
+        status = loopback_post(addr, paths::MESSAGES, CLIENT_C.0, &messages).0;
+    });
+    assert_eq!(status, 403);
+    let refusals: Vec<&str> = logged
+        .lines()
+        .filter(|l| l.contains("client `client-refused`"))
+        .collect();
+    let line = "gateway: loopback refused client `client-refused` route `chat`: route";
+    assert!(
+        refusals.len() == 1 && refusals[0].ends_with(line),
+        "{logged}"
+    );
+    assert!(!logged.contains(CLIENT_C.0), "{logged}");
 }
 
 #[test]

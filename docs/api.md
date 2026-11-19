@@ -48,7 +48,9 @@ is 403 `forbidden` and changes nothing; a report by `login` is open to every cal
 ```
 
 Exactly one of `difficulty` / `pin`. Optional: `resume_of`, `avoid_vendor`, `need` (capabilities),
-`expected_minutes`, `run_id`.
+`expected_minutes`, `run_id`, `on_behalf_of`. `on_behalf_of` names the end client a relaying
+caller such as `qb gateway` picks for: 1 to 128 bytes, else 400 `bad_request`. It is kept on the
+lease and in the journal; no decision, rate limit or report check reads it.
 
 ```json
 {"decision": "run", "reason": "spend_before_reset", "lease_id": "l-17", "vendor": "vendor-a",
@@ -123,10 +125,11 @@ of `auth_dead`, `exhausted`, `rate_limited`, `auth_stale` shows.
 Logins with their status, `dead_until` (end of an `exhausted` or `rate_limited` mark, the later
 of the two) and windows (`used`, `reserved`, `resets_at`, `observed_at`, `source` =
 `stream|probe|assumed`, `stale`), and live leases (`lease_id`, `login`, `model`, `client`,
-`run_id`, `expires_at`). See `state_response.json`. `reserved` is the sum of the live leases'
-costs in that window. A window never reported shows `used = 0`, `observed_at = 0`,
-`source = assumed`, `stale = true`; once its `resets_at` has passed it shows `used = 0`,
-`source = assumed` and no `resets_at`.
+`run_id`, `on_behalf_of`, `expires_at`; `run_id` and `on_behalf_of` absent when the pick had
+none). `client` is the caller that took the lease, `on_behalf_of` the end client it named. See
+`state_response.json`. `reserved` is the sum of the live leases' costs in that window. A window
+never reported shows `used = 0`, `observed_at = 0`, `source = assumed`, `stale = true`; once its
+`resets_at` has passed it shows `used = 0`, `source = assumed` and no `resets_at`.
 
 ## `GET /v1/why/{lease_id}`
 
@@ -255,7 +258,8 @@ that cap only once its head showed a client token (429 in its front's format whe
 full then); before that it holds one of 4 slots of its own, also answered 429 when full, and must
 send its head within 2 s or is dropped without an answer. Peers without a token never hold the
 slots of the unix socket's clients. Each refused loopback request logs one warning line with
-its reason (`token`, `path` or `busy`), method and path, never a header value.
+its reason (`token`, `path` or `busy`), method and path, or with the reason `route`, the client
+name and the route alias; never a header value.
 
 ### `POST /v1/model/turn`
 
@@ -325,7 +329,9 @@ exactly one `stop` or `error`; one that ends without either was cut by a transpo
 Each attempt is one `POST /v1/pick` to `qbd` with the route's target (`role` and `difficulty`,
 or `role` and a `pin` of `vendor`, `model` and `effort`, on a chain route the current step's
 pin), `run_id` = `session_key` or else
-`request_id`, `resume_of` = `session_key` when given, `expected_minutes` of the route, and
+`request_id`, `on_behalf_of` = the turn's caller name (`uid:<n>`, a `[[clients]]` name,
+`client-token` or a `[[fronts.clients]]` name), `resume_of` = `session_key` when given,
+`expected_minutes` of the route, and
 `avoid_vendor` after a vendor failure on a ladder or pin route. A `wait` caused by `resume_of` is asked again once
 without it. `qbd` accepts `resume_of` but does not use it yet, so `session_key` only names the
 run: turns of one session are not kept on one login for the prompt cache. The picked login's credential entry gives the credential kind, which selects the
