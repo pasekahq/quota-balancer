@@ -376,10 +376,10 @@
     "/v1/model/config/routes": {
       "get": {
         "operationId": "configRoutes",
-        "summary": "The `[[routes]]` items of the gateway's config file as it is on disk, in file order, which a reload has not necessarily taken, and the file's hex SHA-256, also sent as the strong `ETag` `\"<sha256>\"`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 500 `unavailable` when the file cannot be read or does not validate.",
+        "summary": "The `[[routes]]` items of the gateway's config file as it is on disk, in file order, which a reload has not necessarily taken, the `spend_cap` of every `api_key` login, and the file's hex SHA-256, also sent as the strong `ETag` `\"<sha256>\"`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 500 `unavailable` when the file cannot be read or does not validate.",
         "responses": {
           "200": {
-            "description": "The file's routes and hash.",
+            "description": "The file's routes, spend caps and hash.",
             "headers": {
               "ETag": {
                 "description": "The file's hex SHA-256 in double quotes.",
@@ -410,7 +410,7 @@
       },
       "put": {
         "operationId": "configRoutesPut",
-        "summary": "Replace the `[[routes]]` items of the config file and reload it. The new items are rendered as `[[routes]]` tables at the place of the first old item, the other old items are removed, and every byte outside the old items stays; comments inside them go. The candidate file is validated as a reload validates the file. On success the old file is copied to `<config>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, the candidate is written atomically with mode 0600 and serves every later turn. Serialised with reloads and client token rotations. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 428 `bad_request` without `If-Match`, 412 `bad_request` when it is not the file's current hash, 400 `bad_request` for a body or candidate that does not validate (`routes refused: <file>: <field>: <reason>`, the line being the candidate's), 500 `unavailable` when a file cannot be read or written; on every refusal the file, its backups and the running config stay as they were.",
+        "summary": "Edit the config file and reload it: `routes` replace its `[[routes]]` items, `spend_caps` set or remove the `spend_cap` of `api_key` logins, a body needs one of them or both. The new items are rendered as `[[routes]]` tables at the place of the first old item, the other old items are removed, and every byte outside the old items stays; comments inside them go. A file whose `routes` are an inline array, or with a table outside `routes` between an item and its `[[routes.chain]]`, is refused. An amount replaces the login's `spend_cap` value in place or adds a `spend_cap = <amount>` line after the login's last line, written so it parses back to the same number; `null` removes the `spend_cap` line; logins not named keep theirs; a login that is not a `[[logins]]` table of the file or not `api_key` is refused by name. The candidate file is validated as a reload validates the file. On success the old file is copied to `<config>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, the candidate is written atomically with mode 0600 and serves every later turn, and the spend view and qbd's `spend` windows follow the new caps. Serialised with reloads and client token rotations. Audited as `config_spend_caps` for a body of `spend_caps` only, else `config_routes`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 428 `bad_request` without `If-Match`, 412 `bad_request` when it is not the file's current hash, 400 `bad_request` for a body or candidate that does not validate (`routes refused: <file>: <field>: <reason>`, `spend_caps refused: …` for a body of `spend_caps` only, the line being the candidate's), 500 `unavailable` when a file cannot be read or written; on every refusal the file, its backups and the running config stay as they were, except that a write which failed after replacing the file answers 500 `<file> was replaced but not installed: <error>; the old file is kept as <backup>`, keeps the backup and installs nothing.",
         "parameters": [
           {
             "name": "If-Match",
@@ -434,7 +434,7 @@
         },
         "responses": {
           "200": {
-            "description": "The file holds the new routes and the gateway serves them.",
+            "description": "The file holds the edit and the gateway serves it.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1393,12 +1393,13 @@
       },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced by `PUT /v1/model/config/routes` and reloaded.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded.",
         "enum": [
           "reload",
           "spend_reset",
           "client_rotate",
-          "config_routes"
+          "config_routes",
+          "config_spend_caps"
         ]
       },
       "AuditResult": {
@@ -1749,6 +1750,17 @@
               "$ref": "#/components/schemas/ConfigRoute"
             },
             "description": "The items in file order."
+          },
+          "spend_caps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "exclusiveMinimum": 0
+            },
+            "description": "Every `api_key` login by name with its `spend_cap` in USD, `null` for one without; logins of other kinds are not listed. Absent in an answer of an older gateway."
           }
         },
         "required": [
@@ -1766,12 +1778,20 @@
             "items": {
               "$ref": "#/components/schemas/ConfigRoute"
             },
-            "description": "The items that replace the file's `[[routes]]`, in file order."
+            "description": "The items that replace the file's `[[routes]]`, in file order; absent keeps them."
+          },
+          "spend_caps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "description": "USD `spend_cap` of `api_key` logins by name, `null` to remove it; logins not named keep theirs. The candidate's validation refuses an amount that is not more than 0 or a cap without a top-level `spend_file`."
           }
         },
-        "required": [
-          "routes"
-        ]
+        "minProperties": 1
       },
       "ConfigRoutesWritten": {
         "type": "object",

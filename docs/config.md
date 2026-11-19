@@ -231,7 +231,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
 | `spend_file` | string | Absolute path of the file that counts the spend of the logins with a `spend_cap`; required when one has it ([Spend caps](#spend-caps)). |
-| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation, routes edit) is appended to as one JSON line, created with mode 0600 in an existing directory; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
+| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation, config edit) is appended to as one JSON line, created with mode 0600 in an existing directory; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
 the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
@@ -310,8 +310,9 @@ A chain across vendors: [Examples](#a-route-chaining-subscription-key-and-openro
 `GET` and `PUT /v1/model/config/routes` read and replace these items as JSON
 ([api.md](api.md#get-and-put-v1modelconfigroutes)). A `PUT` rewrites only the `[[routes]]` items,
 from each header to the line of its last value: the rest of the file stays byte for byte, and
-comments inside the items are lost. It keeps the old file as `<config>.bak-<unix s>` and never
-removes one. `routes` given as an inline array cannot be edited this way.
+comments inside the items are lost. It keeps the old file as `<config>.bak-<unix s>`. `routes`
+given as an inline array, or an item whose `[[routes.chain]]` follows another table, cannot be
+edited this way.
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
@@ -401,6 +402,8 @@ observed: a usage limit on one of them would mark it exhausted until that window
 `period_end`; `qb --socket <gateway socket> spend reset <login>` sets its count to zero
 ([api.md](api.md#get-v1modelspend-and-post-v1modelspendreset)). A reset, or a cap raised by a
 reload, makes the login run again: the gateway reports the new `spend` window to `qbd` at once.
+`GET` and `PUT /v1/model/config/routes` read and set or remove the `spend_cap`s of the `api_key`
+logins in the file and reload it ([api.md](api.md#get-and-put-v1modelconfigroutes)).
 
 `[fronts]`, optional: the HTTP fronts, `POST /v1/messages`
 ([anthropic.md](anthropic.md#the-v1messages-front)), `POST /v1/chat/completions` and

@@ -208,6 +208,12 @@ fn audit_lines() {
                 AuditResult::Ok,
                 Some("/etc/qb/gateway.toml")
             ),
+            (
+                "uid:1000",
+                AuditAction::ConfigSpendCaps,
+                AuditResult::Refused,
+                Some("/etc/qb/gateway.toml")
+            ),
         ]
     );
     let prefixes: Vec<_> = audit
@@ -217,9 +223,18 @@ fn audit_lines() {
         .collect();
     assert_eq!(
         prefixes,
-        [None, None, None, None, Some("5d35a058cf51"), None, None]
+        [
+            None,
+            None,
+            None,
+            None,
+            Some("5d35a058cf51"),
+            None,
+            None,
+            None
+        ]
     );
-    let edit = audit.entries.last().unwrap();
+    let edit = &audit.entries[6];
     assert_eq!(
         edit.backup.as_deref(),
         Some("/etc/qb/gateway.toml.bak-1800000360")
@@ -249,9 +264,16 @@ fn config_routes() {
             (None, false, Some(2))
         ]
     );
+    let caps: Vec<_> = read.spend_caps.into_iter().collect();
+    assert_eq!(caps, [("key-1".into(), Some(25.0)), ("key-2".into(), None)]);
     let put: ConfigRoutesPut = roundtrip("gateway_config_routes_put.json");
-    let chain = put.routes[0].chain.as_ref().unwrap();
+    let chain = put.routes.unwrap()[0].chain.clone().unwrap();
     assert_eq!(chain[1].effort.as_deref(), Some("low"));
+    assert_eq!(put.spend_caps, None);
+    let put: ConfigRoutesPut = roundtrip("gateway_config_spend_caps_put.json");
+    assert_eq!(put.routes, None);
+    let caps: Vec<_> = put.spend_caps.unwrap().into_iter().collect();
+    assert_eq!(caps, [("key-1".into(), Some(40.5)), ("key-2".into(), None)]);
     let written: ConfigRoutesWritten = roundtrip("gateway_config_routes_written.json");
     assert_eq!(written.backup, "/etc/qb/gateway.toml.bak-1800000360");
 }

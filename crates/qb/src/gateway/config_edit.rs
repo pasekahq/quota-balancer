@@ -1,9 +1,11 @@
 //! The config file edit of `PUT /v1/model/config/routes`: routes rendered as `[[routes]]` tables
-//! and spliced over the file's `[[routes]]` items, every byte outside those items kept.
+//! and spliced over the file's `[[routes]]` items, and `spend_cap` values of `[[logins]]` set,
+//! added or removed in place; every other byte is kept.
 //!
 //! An item spans from its `[[routes]]` header to the end of the line of its last value, so
 //! comments and blank lines after that line stay, and comments inside an item go with it.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Write as _};
@@ -15,7 +17,7 @@ use qb_proto::{ConfigRoute, ConfigStep};
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
-use super::config::Route;
+use super::config::{CredentialKind, GatewayLogin, Route};
 use crate::config::{Error, toml_error};
 
 /// `routes` key for key, as `/v1/model/config/routes` carries them.
@@ -143,16 +145,21 @@ pub fn splice(file: &Path, text: &str, items: &str) -> Result<String, Error> {
 }
 
 /// The byte ranges of the `[[routes]]` items of `text`, in file order.
+///
+/// # Errors
+/// `text` is not TOML, its `routes` are not `[[routes]]` tables, or a key outside `routes` lies
+/// within an item, as a table placed between an item and its sub-tables does.
 fn item_ranges(file: &Path, text: &str) -> Result<Vec<Range<usize>>, Error> {
-    let doc = DeTable::parse(text).map_err(|e| toml_error(file, text, String::new(), &e))?;
+    let doc = parse(file, text)?;
     let Some(routes) = doc.get_ref().get("routes") else {
         return Ok(Vec::new());
     };
-    let not_tables = || Error {
+    let refused = |reason: &str| Error {
         file: file.to_owned(),
         field: "routes".into(),
-        reason: "only `[[routes]]` tables can be replaced".into(),
+        reason: reason.into(),
     };
+    let not_tables = || refused("only `[[routes]]` tables can be replaced");
     let items = routes.get_ref().as_array().ok_or_else(not_tables)?;
     let mut ranges = Vec::with_capacity(items.len());
     for item in items {
@@ -160,11 +167,52 @@ fn item_ranges(file: &Path, text: &str) -> Result<Vec<Range<usize>>, Error> {
         if item.get_ref().as_table().is_none() || !text[start..].starts_with("[[") {
             return Err(not_tables());
         }
-        let last = last_end(item);
-        let end = text[last..].find('\n').map_or(text.len(), |n| last + n + 1);
-        ranges.push(start..end);
+        ranges.push(start..line_end(text, last_end(item)));
+    }
+    let mut others = Vec::new();
+    for (k, v) in doc
+        .get_ref()
+        .iter()
+        .filter(|(k, _)| k.get_ref() != "routes")
+    {
+        others.push(k.span().start);
+        starts(v, &mut others);
+    }
+    if others
+        .iter()
+        .any(|at| ranges.iter().any(|r| r.contains(at)))
+    {
+        return Err(refused(
+            "a table outside `routes` lies between a `[[routes]]` item and its sub-tables",
+        ));
     }
     Ok(ranges)
+}
+
+fn parse<'t>(file: &Path, text: &'t str) -> Result<Spanned<DeTable<'t>>, Error> {
+    DeTable::parse(text).map_err(|e| toml_error(file, text, String::new(), &e))
+}
+
+/// The end of the line of `text` that holds byte `at`, past its newline.
+fn line_end(text: &str, at: usize) -> usize {
+    text[at..].find('\n').map_or(text.len(), |n| at + n + 1)
+}
+
+/// Pushes onto `out` the start of every key and non-empty value beneath `v`.
+fn starts(v: &Spanned<DeValue<'_>>, out: &mut Vec<usize>) {
+    if !v.span().is_empty() {
+        out.push(v.span().start);
+    }
+    match v.get_ref() {
+        DeValue::Table(t) => {
+            for (k, v) in t {
+                out.push(k.span().start);
+                starts(v, out);
+            }
+        }
+        DeValue::Array(a) => a.iter().for_each(|v| starts(v, out)),
+        _ => {}
+    }
 }
 
 /// The end of the last byte of `v` and of everything beneath it.
@@ -178,6 +226,118 @@ fn last_end(v: &Spanned<DeValue<'_>>) -> usize {
         DeValue::Array(a) => a.iter().map(last_end).fold(own, usize::max),
         _ => own,
     }
+}
+
+/// `spend_cap` of each `api_key` login of `logins` by name.
+pub fn spend_caps_of(logins: &[GatewayLogin]) -> BTreeMap<String, Option<f64>> {
+    logins
+        .iter()
+        .filter(|l| l.kind == CredentialKind::ApiKey)
+        .map(|l| (l.name.clone(), l.spend_cap))
+        .collect()
+}
+
+/// `text`, the config file `file`, with the `spend_cap` of each login named in `caps` set to its
+/// value in place, added as a line at the end of the login's table, or its line removed for
+/// `None`.
+///
+/// # Errors
+/// `text` is not TOML, a named login is not a `[[logins]]` table of the file, or its `kind` is
+/// not `api_key`.
+pub fn set_spend_caps(
+    file: &Path,
+    text: &str,
+    caps: &BTreeMap<String, Option<f64>>,
+) -> Result<String, Error> {
+    let doc = parse(file, text)?;
+    let refused = |reason: String| Error {
+        file: file.to_owned(),
+        field: "logins".into(),
+        reason,
+    };
+    let logins: Vec<_> = match doc.get_ref().get("logins") {
+        Some(l) => l.get_ref().as_array(),
+        None => None,
+    }
+    .into_iter()
+    .flatten()
+    .filter_map(|l| Some((l, l.get_ref().as_table()?)))
+    .collect();
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for (name, cap) in caps {
+        let named = |(_, t): &&(_, &DeTable<'_>)| {
+            t.get("name").and_then(|n| n.get_ref().as_str()) == Some(name.as_str())
+        };
+        let Some(&(login, table)) = logins.iter().find(named) else {
+            return Err(refused(format!("no login `{name}`")));
+        };
+        let kind = table.get("kind").and_then(|k| k.get_ref().as_str());
+        if kind != Some(CredentialKind::ApiKey.as_str()) {
+            return Err(refused(format!("login `{name}` is not an `api_key` login")));
+        }
+        if !text[login.span().start..].starts_with("[[") {
+            return Err(refused(format!(
+                "login `{name}` is not a `[[logins]]` table"
+            )));
+        }
+        let key = table.iter().find(|(k, _)| k.get_ref() == "spend_cap");
+        match (key, cap) {
+            (Some((_, v)), Some(cap)) => edits.push((v.span(), usd(*cap))),
+            (Some((k, v)), None) => {
+                let start = text[..k.span().start].rfind('\n').map_or(0, |n| n + 1);
+                edits.push((start..line_end(text, v.span().end), String::new()));
+            }
+            (None, Some(cap)) => {
+                let at = line_end(text, last_end(login));
+                let newline = if text[..at].ends_with('\n') { "" } else { "\n" };
+                edits.push((at..at, format!("{newline}spend_cap = {}\n", usd(*cap))));
+            }
+            (None, None) => {}
+        }
+    }
+    edits.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+    let mut out = text.to_owned();
+    for (range, with) in edits {
+        out.replace_range(range, &with);
+    }
+    Ok(out)
+}
+
+/// `v` as a TOML float that parses back to the same `f64`.
+fn usd(v: f64) -> String {
+    format!("{v:?}")
+}
+
+/// Why [`replace`] failed: the write's error and whether the file may no longer hold its old
+/// bytes.
+#[derive(Debug)]
+pub struct Unwritten {
+    /// The write's error.
+    pub error: io::Error,
+    /// The file does not read back as its old bytes.
+    pub replaced: bool,
+}
+
+/// Writes `candidate` over `file`, whose bytes were `old`, through `write`. On a failure the
+/// backup `backup` of `old` is removed only when `file` still reads back as `old`.
+///
+/// # Errors
+/// `write` failed.
+pub fn replace(
+    file: &Path,
+    old: &[u8],
+    candidate: &[u8],
+    backup: &Path,
+    write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+) -> Result<(), Unwritten> {
+    let Err(error) = write(file, candidate) else {
+        return Ok(());
+    };
+    let replaced = std::fs::read(file).map_or(true, |now| now != old);
+    if !replaced {
+        let _ = std::fs::remove_file(backup);
+    }
+    Err(Unwritten { error, replaced })
 }
 
 /// Most backups of one second; one more is refused.
@@ -302,6 +462,123 @@ mod tests {
         );
         let e = splice(file, "[[routes]\n", "").unwrap_err().to_string();
         assert!(e.starts_with("gw.toml: "), "{e}");
+    }
+
+    #[test]
+    fn a_table_between_an_item_and_its_sub_tables_is_refused() {
+        let text = "[[routes]]\nalias = \"a\"\nrole = \"r\"\n[usage]\nfile = \"/u\"\n\
+                    [[routes.chain]]\nvendor = \"v\"\nmodel = \"m\"\n";
+        let e = splice(Path::new("gw.toml"), text, "")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "gw.toml: routes: a table outside `routes` lies between a `[[routes]]` item and its \
+             sub-tables"
+        );
+    }
+
+    const LOGINS: &str = "spend_file = \"/s.json\"\n[[logins]]\nname = \"key-1\" # one\n\
+                          kind = \"api_key\"\nspend_cap = 25 # monthly\ncredentials = \"/c1\"\n\n\
+                          # between\n[[logins]]\nname = \"key-2\"\nkind = \"api_key\"\n\
+                          credentials = \"/c2\" # two\n# after key-2\n[[logins]]\n\
+                          name = \"oauth-1\"\nkind = \"oauth_anthropic\"\ncredentials = \"/c3\"";
+
+    fn capped(text: &str, caps: &[(&str, Option<f64>)]) -> Result<String, String> {
+        let caps = caps.iter().map(|(n, c)| ((*n).to_owned(), *c)).collect();
+        set_spend_caps(Path::new("gw.toml"), text, &caps).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn caps_are_set_in_place_added_after_the_login_s_last_line_or_removed_with_their_line() {
+        let got = capped(LOGINS, &[("key-1", Some(0.1)), ("key-2", Some(1e21))]).unwrap();
+        let want = LOGINS
+            .replace("spend_cap = 25 #", "spend_cap = 0.1 #")
+            .replace(
+                "credentials = \"/c2\" # two\n",
+                "credentials = \"/c2\" # two\nspend_cap = 1e21\n",
+            );
+        assert_eq!(got, want);
+        let got = capped(&got, &[("key-1", None), ("key-2", None)]).unwrap();
+        assert_eq!(got, LOGINS.replace("spend_cap = 25 # monthly\n", ""));
+        assert_eq!(capped(LOGINS, &[("key-2", None)]).unwrap(), LOGINS);
+    }
+
+    #[test]
+    fn a_cap_added_to_a_last_line_without_newline_gets_its_own_line() {
+        let text = "[[logins]]\nname = \"key-1\"\nkind = \"api_key\"";
+        assert_eq!(
+            capped(text, &[("key-1", Some(3.5))]).unwrap(),
+            format!("{text}\nspend_cap = 3.5\n")
+        );
+    }
+
+    #[test]
+    fn written_amounts_parse_back_to_the_same_f64() {
+        for v in [25.0, 0.1, 1.0 / 3.0, 1e21, 1e-7, 123_456.789, f64::MAX] {
+            let text = format!("x = {}\n", usd(v));
+            let read: BTreeMap<String, f64> = toml::from_str(&text).unwrap();
+            assert_eq!(read["x"].to_bits(), v.to_bits(), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_inline_or_other_kind_login_is_refused_by_name() {
+        let refused = |caps: &[(&str, Option<f64>)]| capped(LOGINS, caps).unwrap_err();
+        assert_eq!(
+            refused(&[("key-9", Some(1.0))]),
+            "gw.toml: logins: no login `key-9`"
+        );
+        assert_eq!(
+            refused(&[("oauth-1", None)]),
+            "gw.toml: logins: login `oauth-1` is not an `api_key` login"
+        );
+        let inline = "logins = [{ name = \"key-1\", kind = \"api_key\", credentials = \"/c\" }]\n";
+        assert_eq!(
+            capped(inline, &[("key-1", Some(1.0))]).unwrap_err(),
+            "gw.toml: logins: login `key-1` is not a `[[logins]]` table"
+        );
+    }
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("qb-edit-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_failed_write_that_replaced_the_file_keeps_the_backup() {
+        let file = dir("replaced").join("gw.toml");
+        std::fs::write(&file, "old").unwrap();
+        let backup = backup(&file, b"old", 7).unwrap();
+        let after_rename = |f: &Path, bytes: &[u8]| {
+            std::fs::write(f, bytes).unwrap();
+            Err(io::Error::other("directory sync failed"))
+        };
+        let u = replace(&file, b"old", b"new", &backup, after_rename).unwrap_err();
+        assert_eq!(
+            (u.replaced, u.error.to_string().as_str()),
+            (true, "directory sync failed")
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_failed_write_that_left_the_file_alone_removes_the_backup() {
+        let file = dir("unchanged").join("gw.toml");
+        std::fs::write(&file, "old").unwrap();
+        let backup = backup(&file, b"old", 7).unwrap();
+        let before_rename = |_: &Path, _: &[u8]| Err(io::Error::other("disk full"));
+        let u = replace(&file, b"old", b"new", &backup, before_rename).unwrap_err();
+        assert!(!u.replaced);
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read(&file).unwrap(), b"old");
+        let ok = |f: &Path, bytes: &[u8]| std::fs::write(f, bytes);
+        let backup = super::backup(&file, b"old", 7).unwrap();
+        replace(&file, b"old", b"new", &backup, ok).unwrap();
+        assert!(backup.exists());
     }
 
     #[test]
