@@ -233,11 +233,12 @@ the OAuth `error` code, never the code, the verifier or a token.
 config has a `[fronts.messages]` table ([config.md](config.md#gateway-config)), in
 `crates/qb/src/gateway/messages.rs`; the answer itself is written by
 `crates/qb/src/gateway/answer.rs`, shared with the OpenAI fronts. With `fronts.listen` it also
-serves it on that loopback TCP address, where the request head must carry the local client token
-in `x-api-key` or `Authorization: Bearer`; the token's SHA-256 is compared in constant time with
-`fronts.token_sha256` before the body is read. A missing or wrong token is 401
-`authentication_error`, any other method or path 404 `not_found_error`, both in the Messages
-error format, except on the paths of the OpenAI fronts, which answer in theirs
+serves it on that loopback TCP address, where the request head must carry a client token of
+`[fronts]` in `x-api-key` or `Authorization: Bearer`; the token's SHA-256 is compared in constant
+time with `fronts.token_sha256` and each `fronts.clients[].token_sha256` before the body is read.
+A missing or wrong token is 401 `authentication_error`, any other method or path 404
+`not_found_error`, a route outside the named client's `routes` 403 `permission_error`
+([api.md](api.md#model-gateway-v1model)), all in the Messages error format, except on the paths of the OpenAI fronts, which answer in theirs
 ([openai.md](openai.md#serving-the-fronts)). `model` is a client model name of `fronts.models`
 or a route alias; `native_vendor` is `fronts.messages.vendor`. Other request headers are
 ignored: `anthropic-version`, `anthropic-beta`, `x-api-key` on the unix socket and the SDK's own
@@ -329,4 +330,4 @@ A `quota_exhausted` answer whose `retry-after` is more than 300 s also carries
 
 `auth` here is the vendor rejecting the gateway's own credential. To an SDK client a 401 means
 its own key is wrong, and some clients then discard that key, so the front answers 502. A bad
-local client token is the gateway's own check and stays 401 there.
+client token is the gateway's own check and stays 401 there.

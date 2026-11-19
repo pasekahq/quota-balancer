@@ -14,7 +14,7 @@ use rustix::net::SendFlags;
 use serde::Serialize;
 
 use super::core::{Admitted, Gateway};
-use super::front::{Conn, STREAM_WRITE_TIMEOUT, Watch};
+use super::front::{Caller, Conn, STREAM_WRITE_TIMEOUT, Watch};
 use super::upstream::Flow;
 use crate::http;
 use crate::log;
@@ -33,6 +33,9 @@ pub(super) fn next_id(now: u64) -> String {
 /// Writes a canonical error as an HTTP error answer in a front's format; `Some` status replaces
 /// the status of the error's class.
 pub(super) type Reject = fn(&mut Conn, Option<u16>, &GatewayError);
+
+/// Writes a 403 answer with `message` in a front's format.
+pub(super) type Forbid = fn(&mut Conn, &str);
 
 /// A front's SSE encoder of canonical events.
 pub(super) trait Encoder {
@@ -100,6 +103,8 @@ pub(super) enum Answer<E, A> {
 pub(super) struct Format {
     /// Its error answer.
     pub reject: Reject,
+    /// Its answer to a caller outside its routes.
+    pub forbid: Forbid,
     /// Its SSE keep-alive.
     pub ping: Vec<u8>,
     /// Silence in a started stream before a keep-alive.
@@ -107,17 +112,25 @@ pub(super) struct Format {
 }
 
 /// Runs `turn` of `caller` through `gateway` and answers it on `stream` as `answer` says;
-/// `watch` cancels the turn when the client hangs up and pings its silent stream.
+/// `watch` cancels the turn when the client hangs up and pings its silent stream. A route the
+/// caller may not run is refused before admission.
 pub(super) fn serve<E: Encoder, A: Assembler>(
     mut stream: Conn,
     gateway: &Gateway,
     watch: &Watch,
-    caller: &str,
+    caller: &Caller,
     turn: &TurnRequest,
     answer: Answer<E, A>,
     format: Format,
 ) {
-    let admitted = match gateway.admit(caller, turn) {
+    if !caller.may_run(&turn.route) {
+        let message = format!(
+            "client `{}` may not use route `{}`",
+            caller.name, turn.route
+        );
+        return (format.forbid)(&mut stream, &message);
+    }
+    let admitted = match gateway.admit(&caller.name, turn) {
         Ok(a) => a,
         Err(e) => return (format.reject)(&mut stream, None, &e),
     };

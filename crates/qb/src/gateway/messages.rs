@@ -11,7 +11,7 @@ use qb_proto::{ErrorClass, GatewayError};
 
 use super::answer::{self, Answer, Format};
 use super::core::Gateway;
-use super::front::{Conn, Watch};
+use super::front::{Caller, Conn, Watch};
 use crate::http;
 use crate::log;
 use crate::server::{drain_pending, unix_now};
@@ -39,6 +39,11 @@ pub(super) fn refuse(stream: &mut Conn, status: u16, kind: &str, message: &str) 
     write_error(stream, status, &[], &ErrorBody::new(kind, message));
 }
 
+/// Answers 403 with a Messages `permission_error` saying `message`.
+fn forbid(stream: &mut Conn, message: &str) {
+    refuse(stream, 403, "permission_error", message);
+}
+
 fn write_error(stream: &mut Conn, status: u16, headers: &[(&str, &str)], body: &ErrorBody) {
     drain_pending(&*stream);
     let body = serde_json::to_vec(body).unwrap_or_default();
@@ -54,7 +59,7 @@ pub(super) fn turn(
     mut stream: Conn,
     gateway: &Gateway,
     watch: &Watch,
-    caller: &str,
+    caller: &Caller,
     body: Vec<u8>,
 ) {
     let config = gateway.config();
@@ -82,6 +87,7 @@ pub(super) fn turn(
     };
     let format = Format {
         reject,
+        forbid,
         ping: SseEncoder::ping(),
         ping_interval: Duration::from_secs(fronts.ping_interval_s.into()),
     };

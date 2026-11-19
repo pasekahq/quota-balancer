@@ -34,6 +34,8 @@ pub const MAX_MODELS: usize = 256;
 pub const PING_INTERVAL_S: u32 = 10;
 /// Largest `fronts.ping_interval_s`.
 pub const MAX_PING_INTERVAL_S: u32 = 30;
+/// Caller name of the loopback requests that carry the token of `fronts.token_sha256`.
+pub const TOKEN_CALLER: &str = "client-token";
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
 /// `[[routes]]`, `[openai_models]`, `[prices]` and `[fronts]` tables.
@@ -103,14 +105,29 @@ pub struct Fronts {
     pub models: Vec<(String, String)>,
     /// Loopback TCP address that serves the fronts besides the unix socket.
     pub listen: Option<SocketAddr>,
-    /// SHA-256 of the local client token every TCP request carries; set exactly when `listen` is.
+    /// SHA-256 of the unnamed client token, whose requests run as [`TOKEN_CALLER`]; only with
+    /// `listen`.
     pub token_sha256: Option<BearerHash>,
+    /// Named client tokens of the loopback listener; only with `listen`, which needs this or
+    /// `token_sha256`.
+    pub clients: Vec<FrontClient>,
     /// Seconds of silence in a started stream before a keep-alive, 1 to [`MAX_PING_INTERVAL_S`].
     pub ping_interval_s: u32,
     /// `/v1/messages`; without it that endpoint answers 404.
     pub messages: Option<MessagesFront>,
     /// `/v1/chat/completions` and `/v1/responses`; without it they answer 404.
     pub openai: Option<OpenaiFront>,
+}
+
+/// A named client of the loopback listener, known by its token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontClient {
+    /// Caller name of its turns.
+    pub name: String,
+    /// SHA-256 of its token.
+    pub token_sha256: BearerHash,
+    /// Route aliases it may run on; `None` for every route.
+    pub routes: Option<Vec<String>>,
 }
 
 /// The `/v1/messages` front's settings.
@@ -582,15 +599,17 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
         models: Vec::new(),
         listen: None,
         token_sha256: None,
+        clients: Vec::new(),
         ping_interval_s: PING_INTERVAL_S,
         messages: None,
         openai: None,
     };
-    let (mut listen_at, mut token_at) = (None, None);
+    let (mut listen_at, mut token_at, mut clients_at) = (None, None, None);
     let keys = [
         "models",
         "listen",
         "token_sha256",
+        "clients",
         "ping_interval_s",
         "messages",
         "openai",
@@ -615,6 +634,12 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
                 let hash = BearerHash::from_hex(&string(at, v)?);
                 f.token_sha256 = Some(hash.ok_or_else(|| bad(BEARER_HASH_EXPECTED))?);
                 token_at = Some(v.span().start);
+            }
+            "clients" => {
+                for (at, t) in tables(at, v)? {
+                    f.clients.push(walk_front_client(&at, t)?);
+                }
+                clients_at = Some(v.span().start);
             }
             "ping_interval_s" => {
                 f.ping_interval_s = integer(at, v)?;
@@ -657,19 +682,64 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
         }
         Ok(())
     })?;
-    match (listen_at, token_at) {
-        (Some(line), None) => Err((
-            format!("{at}.token_sha256"),
-            "is missing; `listen` needs the client token's hash".into(),
-            Some(line),
-        )),
-        (None, Some(line)) => Err((
-            format!("{at}.token_sha256"),
-            "belongs to a `listen` address".into(),
-            Some(line),
-        )),
-        _ => Ok(f),
-    }
+    tokens_need_listen(at, listen_at, token_at, clients_at)?;
+    Ok(f)
+}
+
+/// `listen` needs `token_sha256` or `clients`, and each of them needs `listen`; the arguments are
+/// the offsets of the keys present.
+fn tokens_need_listen(
+    at: &str,
+    listen: Option<usize>,
+    token: Option<usize>,
+    clients: Option<usize>,
+) -> Result<(), WalkError> {
+    let (key, reason, line) = match (listen, token, clients) {
+        (Some(line), None, None) => (
+            "token_sha256",
+            "is missing; `listen` needs the client token's hash",
+            line,
+        ),
+        (None, Some(line), _) => ("token_sha256", "belongs to a `listen` address", line),
+        (None, None, Some(line)) => ("clients", "belongs to a `listen` address", line),
+        _ => return Ok(()),
+    };
+    Err((format!("{at}.{key}"), reason.into(), Some(line)))
+}
+
+fn walk_front_client(at: &str, t: &DeTable<'_>) -> Result<FrontClient, WalkError> {
+    let mut c = FrontClient {
+        name: String::new(),
+        token_sha256: BearerHash([0; 32]),
+        routes: None,
+    };
+    let keys = ["name", "token_sha256", "routes"];
+    fields(at, t, &keys, &keys[..2], |key, at, v| {
+        match key {
+            "name" => c.name = string(at, v)?,
+            "token_sha256" => {
+                let hash = BearerHash::from_hex(&string(at, v)?);
+                let bad = || {
+                    (
+                        at.to_owned(),
+                        BEARER_HASH_EXPECTED.into(),
+                        Some(v.span().start),
+                    )
+                };
+                c.token_sha256 = hash.ok_or_else(bad)?;
+            }
+            _ => {
+                let items = v
+                    .get_ref()
+                    .as_array()
+                    .ok_or_else(|| wrong(at, v, "an array of strings"))?;
+                let routes = items.iter().map(|item| string(at, item));
+                c.routes = Some(routes.collect::<Result<_, _>>()?);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(c)
 }
 
 fn walk_client(at: &str, t: &DeTable<'_>) -> Result<GatewayClient, WalkError> {
@@ -1041,6 +1111,45 @@ impl GatewayConfig {
             }
             if self.route(alias).is_none() {
                 return Err((at, format!("unknown route alias `{alias}`")));
+            }
+        }
+        self.validate_front_clients(f)
+    }
+
+    /// The named clients of `f`: their names apart from every other caller name, their hashes
+    /// apart from each other and the unnamed token's, their routes declared.
+    fn validate_front_clients(&self, f: &Fronts) -> Result<(), Fault> {
+        declare("fronts.clients", f.clients.iter().map(|c| c.name.as_str()))?;
+        for (i, c) in f.clients.iter().enumerate() {
+            let at = |key: &str| format!("fronts.clients[{i}].{key}");
+            if self.clients.iter().any(|o| o.name == c.name) {
+                return Err((at("name"), format!("`{}` is a `[[clients]]` name", c.name)));
+            }
+            if c.name == TOKEN_CALLER {
+                let reason =
+                    format!("`{TOKEN_CALLER}` is the caller name of `fronts.token_sha256`");
+                return Err((at("name"), reason));
+            }
+            if let Some(j) = f.clients[..i]
+                .iter()
+                .position(|o| o.token_sha256 == c.token_sha256)
+            {
+                let reason = format!("is the hash of `fronts.clients[{j}]` too");
+                return Err((at("token_sha256"), reason));
+            }
+            if f.token_sha256 == Some(c.token_sha256) {
+                let reason = "is the hash of `fronts.token_sha256` too".into();
+                return Err((at("token_sha256"), reason));
+            }
+            let Some(routes) = &c.routes else {
+                continue;
+            };
+            if routes.is_empty() {
+                let reason = "is empty; leave it out to allow every route".into();
+                return Err((at("routes"), reason));
+            }
+            if let Some(alias) = routes.iter().find(|a| self.route(a).is_none()) {
+                return Err((at("routes"), format!("unknown route alias `{alias}`")));
             }
         }
         Ok(())
@@ -1654,6 +1763,138 @@ difficulty = 1
             let err = check("", &front(&keys)).unwrap_err();
             assert!(err.contains(want), "{keys}: {err}");
             assert!(!err.contains("qb-plaintext-token"), "{err}");
+        }
+    }
+
+    #[test]
+    fn named_front_clients_carry_a_name_a_hash_and_optional_routes() {
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        let front = |keys: &str, clients: &str| {
+            format!("[fronts]\n{keys}\n[fronts.messages]\nvendor = \"vendor-a\"\n{clients}")
+        };
+        let listen = "listen = \"127.0.0.1:8080\"";
+        let client = |name: &str, hash: &str, rest: &str| {
+            format!("[[fronts.clients]]\nname = \"{name}\"\ntoken_sha256 = \"{hash}\"\n{rest}")
+        };
+        let two = format!(
+            "{}{}",
+            client("client-a", &a, "routes = [\"chat\"]\n"),
+            client("client-b", &b, "")
+        );
+        let f = check("", &front(listen, &two)).unwrap().fronts.unwrap();
+        assert_eq!(
+            f.token_sha256, None,
+            "named clients stand in for the unnamed token"
+        );
+        assert_eq!(
+            f.clients,
+            [
+                FrontClient {
+                    name: "client-a".into(),
+                    token_sha256: BearerHash([0xab; 32]),
+                    routes: Some(vec!["chat".into()]),
+                },
+                FrontClient {
+                    name: "client-b".into(),
+                    token_sha256: BearerHash([0xcd; 32]),
+                    routes: None,
+                },
+            ]
+        );
+        let legacy = format!("{listen}\ntoken_sha256 = \"{}\"", "ef".repeat(32));
+        let both = check("", &front(&legacy, &two)).unwrap().fronts.unwrap();
+        assert_eq!(
+            (both.token_sha256, both.clients.len()),
+            (Some(BearerHash([0xef; 32])), 2)
+        );
+    }
+
+    #[test]
+    fn a_named_front_client_error_names_its_field() {
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        let front = |keys: &str, clients: &str| {
+            format!("[fronts]\n{keys}\n[fronts.messages]\nvendor = \"vendor-a\"\n{clients}")
+        };
+        let listen = "listen = \"127.0.0.1:8080\"";
+        let client = |name: &str, hash: &str, rest: &str| {
+            format!("[[fronts.clients]]\nname = \"{name}\"\ntoken_sha256 = \"{hash}\"\n{rest}")
+        };
+        let one = |rest: &str| client("client-a", &a, rest);
+        let uid_client = "[[clients]]\nname = \"client-a\"\nuid = 1001\n";
+        let cases = [
+            (
+                front(listen, &one("role = \"r\"\n")),
+                "fronts.clients[0].role: unknown field, expected one of name, token_sha256, routes",
+            ),
+            (
+                front(listen, "[[fronts.clients]]\nname = \"client-a\"\n"),
+                "fronts.clients[0].token_sha256: is missing",
+            ),
+            (
+                front(
+                    listen,
+                    &format!("[[fronts.clients]]\ntoken_sha256 = \"{a}\"\n"),
+                ),
+                "fronts.clients[0].name: is missing",
+            ),
+            (
+                front(listen, &client("", &a, "")),
+                "fronts.clients[0].name: is empty",
+            ),
+            (
+                front(
+                    listen,
+                    &format!("{}{}", one(""), client("client-a", &b, "")),
+                ),
+                "fronts.clients[1].name: duplicate name `client-a`",
+            ),
+            (
+                format!("{uid_client}{}", front(listen, &one(""))),
+                "fronts.clients[0].name: `client-a` is a `[[clients]]` name",
+            ),
+            (
+                front(listen, &client("client-token", &a, "")),
+                "fronts.clients[0].name: `client-token` is the caller name of `fronts.token_sha256`",
+            ),
+            (
+                front(listen, &client("client-a", "qb-plaintext-token", "")),
+                "fronts.clients[0].token_sha256: expected the token's SHA-256 as 64 hex characters",
+            ),
+            (
+                front(
+                    listen,
+                    &format!("{}{}", one(""), client("client-b", &a, "")),
+                ),
+                "fronts.clients[1].token_sha256: is the hash of `fronts.clients[0]` too",
+            ),
+            (
+                front(&format!("{listen}\ntoken_sha256 = \"{a}\""), &one("")),
+                "fronts.clients[0].token_sha256: is the hash of `fronts.token_sha256` too",
+            ),
+            (
+                front(listen, &one("routes = [\"chat\", \"nope\"]\n")),
+                "fronts.clients[0].routes: unknown route alias `nope`",
+            ),
+            (
+                front(listen, &one("routes = []\n")),
+                "fronts.clients[0].routes: is empty; leave it out to allow every route",
+            ),
+            (
+                front(listen, &one("routes = \"chat\"\n")),
+                "fronts.clients[0].routes: expected an array of strings, found string",
+            ),
+            (
+                front("", &one("")),
+                "fronts.clients: belongs to a `listen` address",
+            ),
+        ];
+        for (text, want) in cases {
+            let err = check("", &text).unwrap_err();
+            assert!(err.contains(want), "{text}: {err}");
+            assert!(
+                !err.contains("qb-plaintext-token") && !err.contains(&a),
+                "{err}"
+            );
         }
     }
 

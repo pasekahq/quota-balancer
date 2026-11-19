@@ -4383,6 +4383,134 @@ fn the_loopback_listener_serves_openai_clients_with_the_client_token_only() {
     assert_eq!(state(&r.qbd).leases, Vec::new());
 }
 
+/// Named loopback client tokens and their SHA-256, `printf %s <token> | sha256sum`.
+const CLIENT_A: (&str, &str) = (
+    "qb-client-a-token",
+    "5d35a058cf5118a9e66c11dc7b4b1ccb5b1931d453a64ff4e100a619bf2a824f",
+);
+const CLIENT_B: (&str, &str) = (
+    "qb-client-b-token",
+    "1d97fabc1bc79ad582c1a433e58d2aef7295984a71aff4f8b119c4d82c34c342",
+);
+const CLIENT_C: (&str, &str) = (
+    "qb-client-c-token",
+    "a5a906a0ceafdaa8f69134b59baaf877ff00268c53eb6a6cb405ebe5c8ef8a6c",
+);
+
+/// A `[[fronts.clients]]` entry `name` with the token hash `hash`, `rest` added.
+fn front_client(name: &str, hash: &str, rest: &str) -> String {
+    format!("[[fronts.clients]]\nname = \"{name}\"\ntoken_sha256 = \"{hash}\"\n{rest}")
+}
+
+/// Posts `body` to `path` on the loopback listener `addr` with `token` in `x-api-key`: the
+/// status and the answer body.
+fn loopback_post(addr: SocketAddr, path: &str, token: &str, body: &Value) -> (u16, Vec<u8>) {
+    let auth = format!("X-Api-Key: {token}\r\n");
+    let (status, _, answer) = finish(
+        tcp_send(addr, "POST", path, &auth, &body.to_string()),
+        Vec::new(),
+    );
+    (status, answer)
+}
+
+#[test]
+fn named_loopback_clients_run_under_their_names_and_within_their_routes() {
+    let clients = [
+        front_client("client-a", CLIENT_A.1, "routes = [\"chat\"]\n"),
+        front_client("client-b", CLIENT_B.1, "routes = [\"spare\"]\n"),
+        front_client("client-c", CLIENT_C.1, ""),
+    ];
+    let (listener, addr, front) = loopback_front(&clients.concat());
+    let r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let messages = sdk_body("model-2025-01-01", false);
+    for (token, name) in [
+        (CLIENT_TOKEN, "client-token"),
+        (CLIENT_A.0, "client-a"),
+        (CLIENT_C.0, "client-c"),
+    ] {
+        let mut answer = (0, Vec::new());
+        let needle = format!(" of {name}: ");
+        let logged = stderr_until(&needle, || {
+            answer = loopback_post(addr, paths::MESSAGES, token, &messages);
+        });
+        assert_eq!(
+            answer.0,
+            200,
+            "{name}: {}",
+            String::from_utf8_lossy(&answer.1)
+        );
+        assert!(logged.contains(&needle), "{name}: {logged}");
+    }
+    let served = r.fake.calls().len();
+    assert_eq!(served, 3);
+
+    for (token, path, body, kind, message) in [
+        (
+            CLIENT_B.0,
+            paths::MESSAGES,
+            sdk_body("model-2025-01-01", false),
+            "permission_error",
+            "client `client-b` may not use route `chat`",
+        ),
+        (
+            CLIENT_A.0,
+            paths::CHAT_COMPLETIONS,
+            chat_body("spare", false),
+            "permission_error",
+            "client `client-a` may not use route `spare`",
+        ),
+        (
+            CLIENT_B.0,
+            paths::RESPONSES,
+            responses_body("model-2025-01-01", false),
+            "permission_error",
+            "client `client-b` may not use route `chat`",
+        ),
+    ] {
+        let (status, answer) = loopback_post(addr, path, token, &body);
+        let text = String::from_utf8_lossy(&answer).into_owned();
+        assert_eq!(status, 403, "{path}: {text}");
+        assert!(!text.contains(token), "{text}");
+        let answer: Value = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(answer["error"]["type"], kind, "{text}");
+        assert_eq!(answer["error"]["message"], message, "{text}");
+        if path != paths::MESSAGES {
+            assert_eq!(answer["error"]["code"], "route_not_allowed", "{text}");
+        }
+    }
+    assert_eq!(
+        r.fake.calls().len(),
+        served,
+        "a refused route reaches no vendor"
+    );
+    assert_eq!(state(&r.qbd).leases, Vec::new());
+
+    let auth = "X-Api-Key: qb-client-d-token\r\n";
+    let s = tcp_send(addr, "POST", paths::MESSAGES, auth, &messages.to_string());
+    assert_eq!(error_type(s), (401, "authentication_error".into()));
+}
+
+#[test]
+fn a_reload_adds_removes_and_changes_named_loopback_clients_for_the_next_connection() {
+    let client_a = front_client("client-a", CLIENT_A.1, "");
+    let (listener, addr, front) = loopback_front(&client_a);
+    let r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let body = sdk_body("model-2025-01-01", false);
+    let status = |token: &str| loopback_post(addr, paths::MESSAGES, token, &body).0;
+    assert_eq!((status(CLIENT_A.0), status(CLIENT_B.0)), (200, 401));
+
+    let client_b = front_client("client-b", CLIENT_B.1, "");
+    let (reloaded, answer) = reload_with(&r.gw, |t| t.replace(&client_a, &client_b));
+    assert_eq!(reloaded, 200, "{}", String::from_utf8_lossy(&answer));
+    assert_eq!((status(CLIENT_A.0), status(CLIENT_B.0)), (401, 200));
+
+    let limited = front_client("client-b", CLIENT_B.1, "routes = [\"spare\"]\n");
+    let (reloaded, answer) = reload_with(&r.gw, |t| t.replace(&client_b, &limited));
+    assert_eq!(reloaded, 200, "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(status(CLIENT_B.0), 403);
+    assert_eq!(status(CLIENT_TOKEN), 200, "the unnamed token keeps serving");
+}
+
 #[test]
 fn a_silent_openai_stream_gets_keepalives_and_a_hang_up_cancels_it() {
     let (listener, addr, front) = loopback_front("ping_interval_s = 1");
