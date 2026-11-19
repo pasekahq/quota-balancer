@@ -2,9 +2,9 @@
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
 //! `/v1/model/spend/reset` and `/v1/health`, and the HTTP fronts: `/v1/messages`
 //! ([`super::messages`]), `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the
-//! optional loopback TCP listener serves only the HTTP fronts, to clients with the client token.
+//! optional loopback TCP listener serves only the HTTP fronts, to clients with a client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
-//! peer takes one of these slots only once its head showed the client token, and before that one
+//! peer takes one of these slots only once its head showed a client token, and before that one
 //! of [`LOOPBACK_UNCHECKED`] slots of its own, for at most [`LOOPBACK_HEAD_DEADLINE`]. On the C4
 //! front every rejection is a non-200 [`GatewayError`], every admitted turn a `200` with a chunked
 //! NDJSON stream whose head goes out with its first event; an HTTP front answers its errors in
@@ -30,6 +30,7 @@ use rustix::io::Errno;
 use serde::Serialize;
 
 use super::answer::Keepalive;
+use super::config::{Fronts, TOKEN_CALLER};
 use super::core::{Cancel, Gateway};
 use super::upstream::{CancelToken, Flow};
 use super::{messages, openai};
@@ -52,24 +53,37 @@ pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long reading one request, head and body, may take.
 pub const READ_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Loopback connections whose head has not shown the client token yet, served at once; they never
+/// Loopback connections whose head has not shown a client token yet, served at once; they never
 /// hold the slots of the unix socket's clients.
 pub const LOOPBACK_UNCHECKED: usize = 4;
 
-/// How long a loopback peer may take to send the head that shows the client token.
+/// How long a loopback peer may take to send the head that shows a client token.
 pub const LOOPBACK_HEAD_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Content type of the turn stream.
 pub const NDJSON: &str = "application/x-ndjson";
 
-/// Caller name of the requests on the loopback listener, which carry the client token, not a uid.
-const TOKEN_CALLER: &str = "client-token";
+/// Who sends a request: the name its turns run under and the route aliases it may run on.
+pub(super) struct Caller {
+    pub(super) name: String,
+    /// `None` for every route.
+    pub(super) routes: Option<Vec<String>>,
+}
+
+impl Caller {
+    /// Whether it may run a turn on the route `alias`.
+    pub(super) fn may_run(&self, alias: &str) -> bool {
+        self.routes
+            .as_ref()
+            .is_none_or(|routes| routes.iter().any(|r| r == alias))
+    }
+}
 
 /// A client connection: a peer of the unix socket or of the loopback TCP listener.
 pub(super) enum Conn {
     /// A unix socket peer, known by its uid.
     Unix(UnixStream),
-    /// A loopback TCP peer, known by its client token.
+    /// A loopback TCP peer, known by a client token.
     Tcp(TcpStream),
 }
 
@@ -292,7 +306,7 @@ impl Watch {
 }
 
 /// Serves `gateway` on `listener` to peers of uid `own_uid`, the gateway's own, and the
-/// configured clients, and its HTTP fronts on `loopback` to peers with the client token of
+/// configured clients, and its HTTP fronts on `loopback` to peers with a client token of
 /// `[fronts]`. The main thread accepts, watches the clients of running turns and reloads the
 /// config when `hangup` reads a signal; each connection runs on its own thread.
 ///
@@ -416,18 +430,36 @@ fn reject(stream: &mut Conn, status: u16, class: ErrorClass, message: &str) {
     reply(stream, status, &GatewayError::new(class, false, message));
 }
 
-/// The caller's name: the gateway's own uid, or a configured client's.
-fn caller(gateway: &Gateway, uid: Option<u32>, own_uid: u32) -> Option<String> {
+/// The caller of a unix socket peer: the gateway's own uid, or a configured client's.
+fn caller(gateway: &Gateway, uid: Option<u32>, own_uid: u32) -> Option<Caller> {
     let uid = uid?;
-    if uid == own_uid {
-        return Some(format!("uid:{uid}"));
+    let name = if uid == own_uid {
+        format!("uid:{uid}")
+    } else {
+        let config = gateway.config();
+        config.clients.iter().find(|c| c.uid == uid)?.name.clone()
+    };
+    Some(Caller { name, routes: None })
+}
+
+/// The caller of a loopback request that carries `token`: the unnamed client token's or a named
+/// client's, each hash compared in constant time.
+fn token_caller(fronts: &Fronts, token: &str) -> Option<Caller> {
+    if fronts
+        .token_sha256
+        .is_some_and(|hash| token_matches(token, &hash))
+    {
+        let name = TOKEN_CALLER.to_owned();
+        return Some(Caller { name, routes: None });
     }
-    let config = gateway.config();
-    config
+    let client = fronts
         .clients
         .iter()
-        .find(|c| c.uid == uid)
-        .map(|c| c.name.clone())
+        .find(|c| token_matches(token, &c.token_sha256))?;
+    Some(Caller {
+        name: client.name.clone(),
+        routes: client.routes.clone(),
+    })
 }
 
 /// Reads `stream` until `until`, each read bounded by [`IO_TIMEOUT`] and the time left.
@@ -484,7 +516,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         Err(e) => return unreadable(&mut stream, &e, limit.get(), dialect.get()),
     };
     match (req.method, req.path.as_str()) {
-        (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, watch, &caller, req.body),
+        (Method::Post, paths::MODEL_TURN) => turn(stream, gateway, watch, &caller.name, req.body),
         (Method::Post, path) if HTTP_FRONTS.contains(&path) => {
             front_turn(stream, gateway, watch, &caller, req);
         }
@@ -502,7 +534,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
                 Ok(c) => c,
                 Err(e) => return reject(&mut stream, 400, ErrorClass::BadRequest, &e.to_string()),
             };
-            match gateway.cancel(&caller, &c.request_id) {
+            match gateway.cancel(&caller.name, &c.request_id) {
                 Cancel::Cancelled => reply(&mut stream, 200, &CancelAnswer { cancelled: true }),
                 Cancel::Unknown => {
                     reject(
@@ -590,7 +622,7 @@ fn spend(stream: &mut Conn, gateway: &Gateway, req: &http::Request, own: bool) {
 const HTTP_FRONTS: [&str; 3] = [paths::MESSAGES, paths::CHAT_COMPLETIONS, paths::RESPONSES];
 
 /// Runs the HTTP front `req.path` names, one of [`HTTP_FRONTS`].
-fn front_turn(stream: Conn, gateway: &Gateway, watch: &Watch, caller: &str, req: http::Request) {
+fn front_turn(stream: Conn, gateway: &Gateway, watch: &Watch, caller: &Caller, req: http::Request) {
     match req.path.as_str() {
         paths::CHAT_COMPLETIONS => openai::chat_turn(stream, gateway, watch, caller, req.body),
         paths::RESPONSES => openai::responses_turn(stream, gateway, watch, caller, req.body),
@@ -679,9 +711,10 @@ fn refuse_head(refusal: &Cell<Option<Refusal>>, why: Refusal, head: &Head<'_>) {
 /// Characters of a refused path that reach the log.
 const PATH_LOG_CHARS: usize = 64;
 
-/// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] with the
-/// client token in `x-api-key` or `Authorization: Bearer`, checked before the body is read. Every
-/// answer is in the OpenAI format for the OpenAI endpoints, else in the Messages format.
+/// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] with a client
+/// token of `[fronts]` in `x-api-key` or `Authorization: Bearer`, checked before the body is read;
+/// the turn runs as that token's caller. Every answer is in the OpenAI format for the OpenAI
+/// endpoints, else in the Messages format.
 ///
 /// The connection holds `unchecked` until its head is read, which must happen within
 /// [`LOOPBACK_HEAD_DEADLINE`]; a head with the token then takes a slot of `live`, and the body
@@ -697,7 +730,7 @@ fn serve_loopback(
         return;
     }
     let config = gateway.config();
-    let token = config.fronts.as_ref().and_then(|f| f.token_sha256);
+    let fronts = config.fronts.as_ref();
     let max_turn = config.max_request_bytes as usize;
     let refusal = Cell::new(None);
     let dialect = Cell::new(Dialect::Messages);
@@ -705,16 +738,17 @@ fn serve_loopback(
     let until = Cell::new(started + LOOPBACK_HEAD_DEADLINE);
     let unchecked = Cell::new(Some(unchecked));
     let slot = Cell::new(None);
+    let matched = Cell::new(None);
     let check = |head: &Head<'_>| {
         drop(unchecked.take());
         if let Dialect::Openai = Dialect::of(head.path) {
             dialect.set(Dialect::Openai);
         }
         let mut presented = [head.api_key, head.bearer].into_iter().flatten();
-        if !token.is_some_and(|hash| presented.any(|t| token_matches(t, &hash))) {
+        let Some(caller) = fronts.and_then(|f| presented.find_map(|t| token_caller(f, t))) else {
             refuse_head(&refusal, Refusal::Token, head);
             return None;
-        }
+        };
         if head.method != Method::Post || !HTTP_FRONTS.contains(&head.path) {
             refuse_head(&refusal, Refusal::Path, head);
             return None;
@@ -724,6 +758,7 @@ fn serve_loopback(
             return None;
         };
         slot.set(Some(held));
+        matched.set(Some(caller));
         until.set(started + READ_DEADLINE);
         Some(max_turn)
     };
@@ -731,7 +766,12 @@ fn serve_loopback(
     drop(unchecked.take());
     let _slot = slot.take();
     let refused = match (read, refusal.get()) {
-        (Ok(req), _) => return front_turn(stream, gateway, watch, TOKEN_CALLER, req),
+        (Ok(req), _) => {
+            let caller = matched
+                .take()
+                .expect("`check` admits a head with its caller");
+            return front_turn(stream, gateway, watch, &caller, req);
+        }
         (Err(ReadError::Refused { .. }), Some(refusal)) => refusal,
         (Err(e), _) => return unreadable(&mut stream, &e, max_turn, dialect.get()),
     };
@@ -743,13 +783,13 @@ fn serve_loopback(
             401,
             "invalid_request_error",
             "invalid_api_key",
-            "invalid API key: not this gateway's client token",
+            "invalid API key: not a client token of this gateway",
         ),
         (Refusal::Token, _) => messages::refuse(
             &mut stream,
             401,
             "authentication_error",
-            "invalid x-api-key: not this gateway's client token",
+            "invalid x-api-key: not a client token of this gateway",
         ),
         (Refusal::Path, Dialect::Openai) => {
             openai::refuse(

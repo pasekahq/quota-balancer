@@ -240,14 +240,20 @@ format of that front's API.
 `[[clients]]` entry of the gateway config; any other peer gets 401 `auth` before its request
 is read. The socket file is
 0600, or 0660 with `socket_mode = 0o660`. The optional loopback listener (`fronts.listen`)
-serves only the HTTP fronts, to requests with the local client token
-([openai.md](openai.md#serving-the-fronts)).
+serves only the HTTP fronts, to requests with a client token of `[fronts]`
+([config.md](config.md#gateway-config), [openai.md](openai.md#serving-the-fronts)): the unnamed
+`fronts.token_sha256`, whose turns run as the caller `client-token`, or a named
+`[[fronts.clients]]` entry, whose turns run as its `name`. A named client with `routes` that asks
+for a model resolving (through `fronts.models` or as an alias) to a route outside that list gets
+403 in its front's error format before any pick: Messages `permission_error`, OpenAI
+`permission_error` with code `route_not_allowed`, the message
+``client `<name>` may not use route `<alias>` ``.
 
 **Connections.** The gateway serves at most `max_turns` + 2 connections at once; one more gets
 429 `overloaded` with `retry_after: 1` before its request is read. A loopback peer counts against
-that cap only once its head showed the client token (429 in its front's format when the cap is
+that cap only once its head showed a client token (429 in its front's format when the cap is
 full then); before that it holds one of 4 slots of its own, also answered 429 when full, and must
-send its head within 2 s or is dropped without an answer. Peers without the token never hold the
+send its head within 2 s or is dropped without an answer. Peers without a token never hold the
 slots of the unix socket's clients. Each refused loopback request logs one warning line with
 its reason (`token`, `path` or `busy`), method and path, never a header value.
 

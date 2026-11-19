@@ -13,7 +13,7 @@ use qb_proto::{ErrorClass, GatewayError};
 use super::answer::{self, Answer, Format};
 use super::config::{Fronts, OpenaiFront};
 use super::core::Gateway;
-use super::front::{Conn, Watch};
+use super::front::{Caller, Conn, Watch};
 use crate::http;
 use crate::log;
 use crate::server::{drain_pending, unix_now};
@@ -37,6 +37,17 @@ pub(super) fn refuse(stream: &mut Conn, status: u16, kind: &str, code: &str, mes
         status,
         &[],
         &ErrorBody::new(kind, Some(code), message),
+    );
+}
+
+/// Answers 403 with an OpenAI `permission_error` of code `route_not_allowed` saying `message`.
+fn forbid(stream: &mut Conn, message: &str) {
+    refuse(
+        stream,
+        403,
+        "permission_error",
+        "route_not_allowed",
+        message,
     );
 }
 
@@ -69,6 +80,7 @@ fn settings<'c>(
 fn format(fronts: &Fronts) -> Format {
     Format {
         reject,
+        forbid,
         ping: chat::SseEncoder::ping(),
         ping_interval: Duration::from_secs(fronts.ping_interval_s.into()),
     }
@@ -79,7 +91,7 @@ pub(super) fn chat_turn(
     mut stream: Conn,
     gateway: &Gateway,
     watch: &Watch,
-    caller: &str,
+    caller: &Caller,
     body: Vec<u8>,
 ) {
     let config = gateway.config();
@@ -122,7 +134,7 @@ pub(super) fn responses_turn(
     mut stream: Conn,
     gateway: &Gateway,
     watch: &Watch,
-    caller: &str,
+    caller: &Caller,
     body: Vec<u8>,
 ) {
     let config = gateway.config();

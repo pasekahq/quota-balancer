@@ -335,11 +335,13 @@ the peers of its C4 front, when its config has a `[fronts.openai]` table
 ([config.md](config.md#gateway-config)), in `crates/qb/src/gateway/openai.rs`; the answer is
 written by `crates/qb/src/gateway/answer.rs`, shared with the Messages front. With
 `fronts.listen` it serves them, and `/v1/messages`, on that loopback TCP address too, to
-requests whose head carries the local client token in `Authorization: Bearer` (what OpenAI SDKs
-send) or `x-api-key`; the token's SHA-256 is compared in constant time with
-`fronts.token_sha256` before the body is read. On these two paths a missing or wrong token is
-401 `invalid_request_error` with code `invalid_api_key`, and another method 404
-`invalid_request_error` with code `unknown_url`. An OpenAI SDK switches to the gateway with the
+requests whose head carries a client token of `[fronts]` in `Authorization: Bearer` (what OpenAI
+SDKs send) or `x-api-key`; the token's SHA-256 is compared in constant time with
+`fronts.token_sha256` and each `fronts.clients[].token_sha256` before the body is read. On these
+two paths a missing or wrong token is 401 `invalid_request_error` with code `invalid_api_key`,
+another method 404 `invalid_request_error` with code `unknown_url`, and a route outside the
+named client's `routes` 403 `permission_error` with code `route_not_allowed`
+([api.md](api.md#model-gateway-v1model)). An OpenAI SDK switches to the gateway with the
 base URL `http://127.0.0.1:<port>/v1` and the client token as its API key.
 
 `model` is a client model name of `fronts.models` or a route alias; any other model is a 400.

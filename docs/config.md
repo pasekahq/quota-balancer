@@ -384,8 +384,8 @@ without its sub-table answers 404.
 | Key | Type | Meaning |
 |---|---|---|
 | `models` | table of strings | Client `model` names, each mapped to a route alias, at most 256; for example `{ "claude-sonnet-4-5-20250929" = "chat", "gpt-5" = "chat" }`. A `model` equal to an alias needs no entry; a key may not be an alias, and a value must be one. Any other `model` is answered 400 `invalid_request_error`. |
-| `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves the HTTP fronts besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`. |
-| `token_sha256` | string | With `listen`, and only with it: SHA-256 of the local client token as 64 hex characters. Plaintext tokens are rejected. |
+| `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves the HTTP fronts besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`, at least one `[[fronts.clients]]` entry, or both. |
+| `token_sha256` | string | With `listen`, and only with it: SHA-256 of the unnamed client token as 64 hex characters; its turns run as the caller `client-token`. Plaintext tokens are rejected. |
 | `ping_interval_s` | integer 1..=30 | Seconds a started stream may stay silent before the front writes an SSE keep-alive, default 10. |
 
 `[fronts.messages]`: the `POST /v1/messages` front.
@@ -401,7 +401,26 @@ without its sub-table answers 404.
 | `vendor` | string | Required. The `qbd` vendor whose logins speak the OpenAI API: its thinking reaches Responses clients as their reasoning items, and the reasoning items clients send back count as its own. |
 | `max_tokens` | integer ≥ 1 | Required. The output bound of a request that names none (`max_completion_tokens`, `max_tokens`, `max_output_tokens`). |
 
-Every request on `listen` carries the local client token in `x-api-key` or
+`[[fronts.clients]]`, with `listen` and only with it: named client tokens, so the gateway tells
+the clients of the loopback listener apart. Each entry's turns run as its `name`, the caller in
+the gateway's admissions and log lines. The unnamed `token_sha256` and named clients coexist: a
+request with the unnamed token runs as `client-token` on every route, one with a named client's
+token as that client.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | Required, non-empty and unique. Neither a `[[clients]]` name nor `client-token`. |
+| `token_sha256` | string | Required. SHA-256 of the client's token as 64 hex characters, made as below; no other named client and not `fronts.token_sha256` may have the same hash. |
+| `routes` | array of strings | Route aliases the client may run on, at least one; absent means every route. A request whose `model` resolves, through `models` or as an alias, to another route is answered 403 before any pick ([api.md](api.md#model-gateway-v1model)). |
+
+```toml
+[[fronts.clients]]
+name = "client-a"
+token_sha256 = "<64 hex characters>"
+routes = ["chat"]
+```
+
+Every request on `listen` carries a client token of `[fronts]` in `x-api-key` or
 `Authorization: Bearer`, so a client switches to the gateway with its base URL and API key: an
 Anthropic SDK with `http://127.0.0.1:<port>`, an OpenAI SDK with `http://127.0.0.1:<port>/v1`. Generate the token and its hash with:
 
@@ -673,7 +692,8 @@ no restart-only key becomes the config of every turn admitted from then on: rout
 chains, logins and their credential files, `token_url`, `spend_cap`, `max_turns`,
 `max_request_bytes`, `max_attempts`, `[openai_models]`, `[prices]`, `[[clients]]`, and `[fronts]`
 but `listen`, so the fronts'
-`models`, the client token and the fronts served. The gateway logs
+`models`, the client tokens (`token_sha256` and `[[fronts.clients]]`) and the fronts served; a
+change to the client tokens applies to the next loopback connection. The gateway logs
 `gateway: reloaded <file>: <n> routes, <m> logins`.
 
 A turn already admitted finishes on the config of its admission, its retries and chain steps

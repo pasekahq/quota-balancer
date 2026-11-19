@@ -108,6 +108,13 @@ token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 # Seconds of silence in a started stream before an SSE keep-alive, at most 30.
 ping_interval_s = 10
 
+# A named client of the loopback listener: its own token, its turns run as `client-a` rather
+# than `client-token`, and only on the routes listed (absent: every route; others answer 403).
+[[fronts.clients]]
+name = "client-a"
+token_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+routes = ["compact"]
+
 # POST /v1/messages for Anthropic SDK clients: the qbd vendor of the Anthropic logins above.
 [fronts.messages]
 vendor = "vendor-a"
