@@ -211,10 +211,10 @@ pub fn build(
         for m in &mut messages {
             if let Content::Blocks(blocks) = &mut m.content {
                 for b in blocks {
-                    if let ContentBlock::ToolUse { name, .. } = b
-                        && let Some(wire) = renamed.get(name.as_str())
-                    {
-                        name.clone_from(wire);
+                    if let ContentBlock::ToolUse { name, .. } = b {
+                        if let Some(wire) = renamed.get(name.as_str()) {
+                            name.clone_from(wire);
+                        }
                     }
                 }
             }
