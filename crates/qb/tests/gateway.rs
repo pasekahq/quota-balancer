@@ -39,7 +39,7 @@ use qb_proto::{
     AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ErrorClass,
     GatewayError, LoginSpend, LoginStatus, Outcome, ReloadAnswer, RouteState, RouteStatus,
     RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall,
-    TurnRequest, Usage, UsageLine, UsdSource, WindowReport, paths,
+    TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -2809,6 +2809,445 @@ fn a_failed_usage_append_is_logged_and_leaves_the_turn_alone() {
         line.starts_with("error: ") || line.starts_with("<3>"),
         "{logged}"
     );
+}
+
+/// One ledger line at `at` as `edit` leaves it, starting from an unpriced `ok` attempt of
+/// `client-a` on `login-1`, `model-a` and route `chat` without usage or tools.
+fn ledger_line(at: u64, edit: impl FnOnce(&mut UsageLine)) -> String {
+    let mut line = UsageLine {
+        at,
+        duration_ms: 100,
+        request_id: format!("turn-{at}"),
+        client: "client-a".into(),
+        route: "chat".into(),
+        step: 0,
+        login: "login-1".into(),
+        model: "model-a".into(),
+        outcome: Outcome::Ok,
+        stop: Some(StopReason::End),
+        error: None,
+        usage: Usage::default(),
+        usd: None,
+        usd_source: None,
+        tools: Vec::new(),
+    };
+    edit(&mut line);
+    serde_json::to_string(&line).unwrap()
+}
+
+/// `GET /v1/model/usage` with `query` on `gw`: the status and the answer body.
+fn usage_of(gw: &Path, query: &str) -> (u16, Vec<u8>) {
+    call(gw, "GET", &format!("{}{query}", paths::MODEL_USAGE), "")
+}
+
+fn usage_answer(gw: &Path, query: &str) -> UsageAnswer {
+    let (status, body) = usage_of(gw, query);
+    assert_eq!(status, 200, "{query}: {}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// Start, group and attempts of each row.
+fn usage_rows(answer: &UsageAnswer) -> Vec<(u64, Option<&str>, u64)> {
+    answer
+        .rows
+        .iter()
+        .map(|r| (r.start, r.group.as_deref(), r.attempts))
+        .collect()
+}
+
+/// 2024-02-28T22:00:00Z and 2024-04-01T00:00:00Z.
+const USAGE_FROM: u64 = 1_709_157_600;
+const USAGE_TO: u64 = 1_711_929_600;
+
+/// A gateway whose ledger holds attempts from 2024-02-28 to 2024-04-01 in a rotated file and the
+/// current one, one line before [`USAGE_FROM`] and one at [`USAGE_TO`], beside a rotated file
+/// stamped before [`USAGE_FROM`] that holds only lines that do not parse.
+fn usage_rig() -> Rig {
+    let dir = temp_dir("usage");
+    let ledger = dir.join("usage.jsonl");
+    let lines = [
+        ledger_line(USAGE_FROM - 1, |l| l.usage.input = 1_000_000),
+        // 2024-02-28T23:59:59Z
+        ledger_line(1_709_164_799, |l| {
+            l.usage = Usage {
+                input: 100,
+                output: 10,
+                cache_read: 1000,
+                cache_write: 0,
+            };
+            l.usd = Some(0.5);
+            l.usd_source = Some(UsdSource::Prices);
+            l.tools = vec!["read_file".into(), "search".into()];
+            l.duration_ms = 1000;
+        }),
+        // 2024-02-29T00:00:00Z
+        ledger_line(1_709_164_800, |l| {
+            l.client = "client-b".into();
+            l.login = "login-2".into();
+            l.model = "model-b".into();
+            l.route = "code".into();
+            l.outcome = Outcome::UsageLimit;
+            l.stop = None;
+            l.error = Some(ErrorClass::QuotaExhausted);
+            l.duration_ms = 200;
+        }),
+        // 2024-02-29T23:30:00Z
+        ledger_line(1_709_249_400, |l| {
+            l.model = "model-b".into();
+            l.usage.input = 50;
+            l.usage.output = 5;
+            l.usage.cache_write = 20;
+            l.usd = Some(0.25);
+            l.usd_source = Some(UsdSource::Vendor);
+            l.tools = vec!["search".into()];
+            l.duration_ms = 300;
+        }),
+        // 2024-03-01T00:00:00Z
+        ledger_line(1_709_251_200, |l| {
+            l.login = "login-2".into();
+            l.route = "code".into();
+            l.outcome = Outcome::Error;
+            l.stop = None;
+            l.error = Some(ErrorClass::Unavailable);
+            l.usage.input = 10;
+            l.usd = Some(0.125);
+            l.usd_source = Some(UsdSource::Prices);
+            l.tools = vec!["search".into(), "search".into()];
+            l.duration_ms = 400;
+        }),
+        // 2024-03-31T23:59:59Z
+        ledger_line(1_711_929_599, |l| {
+            l.client = "client-b".into();
+            l.model = "model-c".into();
+            l.route = "code".into();
+            l.usage.input = 1;
+            l.duration_ms = 500;
+        }),
+        ledger_line(USAGE_TO, |l| l.usage.input = 1_000_000),
+    ];
+    let overlong = ledger_line(USAGE_FROM - 2, |l| l.tools = vec!["t".repeat(70_000)]);
+    let stamped = |s: u64| dir.join(format!("usage.jsonl.{s}"));
+    std::fs::write(stamped(USAGE_FROM - 1), format!("not json\n{overlong}\n")).unwrap();
+    std::fs::write(
+        stamped(1_709_164_800),
+        format!("{}\n", lines[..3].join("\n")),
+    )
+    .unwrap();
+    std::fs::write(&ledger, format!("{}\n", lines[3..].join("\n"))).unwrap();
+    rig_as(4, &key_files(), &usage_table(&ledger, 1 << 20), own_uid())
+}
+
+#[test]
+fn usage_sums_the_window_s_attempts_of_the_current_and_rotated_ledger_files() {
+    let r = usage_rig();
+    let window = format!("?from={USAGE_FROM}&to={USAGE_TO}");
+    let answer = usage_answer(&r.gw, &window);
+    assert_eq!(
+        (answer.from, answer.to, answer.group_by, answer.bucket),
+        (USAGE_FROM, USAGE_TO, None, None)
+    );
+    assert_eq!(
+        answer.rows,
+        [UsageRow {
+            start: USAGE_FROM,
+            group: None,
+            attempts: 5,
+            failed: 2,
+            input: 161,
+            output: 15,
+            cache_read: 1000,
+            cache_write: 20,
+            usd: 0.875,
+            unpriced: 2,
+            duration_ms: 2400,
+        }]
+    );
+    assert_eq!(
+        answer.skipped, 0,
+        "the rotated file older than `from` is not read"
+    );
+    let (_, raw) = usage_of(&r.gw, &window);
+    let raw: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(raw["rows"][0].get("group"), None);
+    assert_eq!(raw.get("group_by"), None);
+
+    let before_end = usage_answer(&r.gw, &format!("?from={USAGE_FROM}&to={}", USAGE_TO - 1));
+    assert_eq!(usage_rows(&before_end), [(USAGE_FROM, None, 4)]);
+    let past_end = usage_answer(&r.gw, &format!("?from={USAGE_FROM}&to={}", USAGE_TO + 1));
+    assert_eq!(
+        usage_rows(&past_end),
+        [(USAGE_FROM, None, 6)],
+        "`to` is exclusive"
+    );
+    let earlier = usage_answer(&r.gw, &format!("?to={USAGE_TO}&from={}", USAGE_FROM - 1));
+    assert_eq!(usage_rows(&earlier), [(USAGE_FROM - 1, None, 6)]);
+    assert_eq!(
+        earlier.skipped, 2,
+        "a rotated file stamped at `from` is read"
+    );
+}
+
+#[test]
+fn usage_rows_are_grouped_by_client_login_model_route_or_each_tool() {
+    let r = usage_rig();
+    let by = |group: &str| {
+        let query = format!("?from={USAGE_FROM}&to={USAGE_TO}&group_by={group}");
+        let answer = usage_answer(&r.gw, &query);
+        assert_eq!(answer.group_by.unwrap().as_str(), group);
+        assert_eq!(answer.skipped, 0);
+        answer
+    };
+    let rows = |answer: &UsageAnswer| -> Vec<(String, u64)> {
+        usage_rows(answer)
+            .into_iter()
+            .map(|(start, group, attempts)| {
+                assert_eq!(start, USAGE_FROM);
+                (group.unwrap().to_owned(), attempts)
+            })
+            .collect()
+    };
+    let named = |pairs: &[(&str, u64)]| -> Vec<(String, u64)> {
+        pairs.iter().map(|(g, n)| ((*g).to_owned(), *n)).collect()
+    };
+    assert_eq!(
+        rows(&by("client")),
+        named(&[("client-a", 3), ("client-b", 2)])
+    );
+    let logins = by("login");
+    assert_eq!(rows(&logins), named(&[("login-1", 3), ("login-2", 2)]));
+    let sums: Vec<_> = logins
+        .rows
+        .iter()
+        .map(|r| (r.failed, r.input, r.usd, r.unpriced, r.duration_ms))
+        .collect();
+    assert_eq!(sums, [(0, 151, 0.75, 1, 1800), (2, 10, 0.125, 1, 600)]);
+    assert_eq!(
+        rows(&by("model")),
+        named(&[("model-a", 2), ("model-b", 2), ("model-c", 1)])
+    );
+    assert_eq!(rows(&by("route")), named(&[("chat", 2), ("code", 3)]));
+    let tools = by("tool");
+    assert_eq!(rows(&tools), named(&[("read_file", 1), ("search", 3)]));
+    let input: Vec<u64> = tools.rows.iter().map(|r| r.input).collect();
+    assert_eq!(
+        input,
+        [100, 160],
+        "an attempt counts once under each of its tools"
+    );
+}
+
+#[test]
+fn usage_buckets_are_utc_hours_days_and_months() {
+    let r = usage_rig();
+    let bucketed = |bucket: &str, group: &str| {
+        let query = format!("?from={USAGE_FROM}&to={USAGE_TO}&bucket={bucket}{group}");
+        let answer = usage_answer(&r.gw, &query);
+        assert_eq!(answer.bucket.unwrap().as_str(), bucket);
+        answer
+    };
+    // 2024-02-28T23:00Z, 2024-02-29T00:00Z, 2024-02-29T23:00Z, 2024-03-01T00:00Z,
+    // 2024-03-31T23:00Z.
+    let hours = [
+        1_709_161_200,
+        1_709_164_800,
+        1_709_247_600,
+        1_709_251_200,
+        1_711_926_000,
+    ];
+    let one_each: Vec<_> = hours.iter().map(|h| (*h, None, 1)).collect();
+    assert_eq!(usage_rows(&bucketed("hour", "")), one_each);
+    // 2024-02-28, the leap day 2024-02-29, 2024-03-01, 2024-03-31.
+    let (eve, leap, march, last) = (1_709_078_400, 1_709_164_800, 1_709_251_200, 1_711_843_200);
+    assert_eq!(
+        usage_rows(&bucketed("day", "")),
+        [
+            (eve, None, 1),
+            (leap, None, 2),
+            (march, None, 1),
+            (last, None, 1)
+        ]
+    );
+    // 2024-02-01: the leap February, starting before `from`.
+    let february = 1_706_745_600;
+    assert_eq!(
+        usage_rows(&bucketed("month", "")),
+        [(february, None, 3), (march, None, 2)]
+    );
+    let (a, b) = (Some("client-a"), Some("client-b"));
+    assert_eq!(
+        usage_rows(&bucketed("day", "&group_by=client")),
+        [
+            (eve, a, 1),
+            (leap, a, 1),
+            (leap, b, 1),
+            (march, a, 1),
+            (last, b, 1)
+        ],
+        "ordered by start, then group"
+    );
+}
+
+#[test]
+fn bad_and_overlong_lines_are_skipped_and_counted_by_usage_and_audit() {
+    let audit = audit_path();
+    let ledger = temp_dir("usage").join("usage.jsonl");
+    let extra = format!("{}{}", audit_key(&audit), usage_table(&ledger, 1 << 20));
+    let r = rig_as(4, &key_files(), &extra, own_uid());
+    let at = USAGE_FROM;
+    let mut lines: Vec<Vec<u8>> = vec![
+        ledger_line(at, |_| {}).into(),
+        b"not json".to_vec(),
+        ledger_line(at + 1, |l| l.tools = vec!["t".repeat(70_000)]).into(),
+        format!("{{\"at\":{at}}}").into(),
+        vec![b'{', 0xff, b'}'],
+        ledger_line(at + 2, |_| {}).into(),
+    ];
+    std::fs::write(&ledger, lines.join(&b'\n')).unwrap();
+    let answer = usage_answer(&r.gw, &format!("?from={at}&to={}", at + 10));
+    assert_eq!(
+        (usage_rows(&answer), answer.skipped),
+        (vec![(at, None, 2)], 4)
+    );
+
+    let entry = |at: u64, object: &str| {
+        format!(
+            r#"{{"at":{at},"actor":"uid:1000","action":"spend_reset","object":"{object}","result":"ok"}}"#
+        )
+    };
+    lines = vec![
+        entry(at, "login-1").into(),
+        entry(at + 1, &"o".repeat(70_000)).into(),
+        vec![0xff, 0xfe],
+        entry(at + 2, "login-2").into(),
+    ];
+    std::fs::write(&audit, lines.join(&b'\n')).unwrap();
+    let answer = audit_answer(&r.gw, "");
+    let objects: Vec<_> = answer.entries.iter().map(|e| e.object.as_deref()).collect();
+    assert_eq!(
+        (objects, answer.skipped),
+        (vec![Some("login-1"), Some("login-2")], 2)
+    );
+}
+
+#[test]
+fn only_the_gateway_s_own_uid_reads_the_usage_and_only_on_the_unix_socket() {
+    let ledger = temp_dir("usage").join("usage.jsonl");
+    let extra = format!(
+        "[[clients]]\nname = \"client-a\"\nuid = {}\n{}",
+        own_uid(),
+        usage_table(&ledger, 1 << 20)
+    );
+    let other = rig_as(4, &key_files(), &extra, own_uid() + 1);
+    let (status, e) = rejection(
+        &other.gw,
+        "GET",
+        &format!("{}?from=0", paths::MODEL_USAGE),
+        "",
+    );
+    assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
+
+    let (listener, addr, front) = loopback_front("");
+    let extra = format!("{}{front}", usage_table(&ledger, 1 << 20));
+    let r = rig_on(4, &key_files(), &extra, own_uid(), Some(listener));
+    let from = unix_now() - 3600;
+    assert_eq!(
+        usage_answer(&r.gw, &format!("?from={from}")).rows,
+        Vec::new()
+    );
+    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+    let path = format!("{}?from={from}", paths::MODEL_USAGE);
+    let (status, _, body) = finish(tcp_send(addr, "GET", &path, &auth, ""), Vec::new());
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert!(!String::from_utf8_lossy(&body).contains("rows"));
+
+    let plain = rig();
+    let (status, e) = rejection(&plain.gw, "GET", &path, "");
+    assert_eq!((status, e.class), (404, ErrorClass::BadRequest), "{e:?}");
+    assert_eq!(
+        e.message.as_deref(),
+        Some("this gateway keeps no usage ledger: its config has no `[usage]` table")
+    );
+}
+
+#[test]
+fn a_bad_usage_query_or_too_many_rows_is_400_naming_the_cause() {
+    let ledger = temp_dir("usage").join("usage.jsonl");
+    let r = rig_as(4, &key_files(), &usage_table(&ledger, 1 << 20), own_uid());
+    let now = unix_now();
+    let mut lines: Vec<String> = (0..160)
+        .map(|i| {
+            ledger_line(USAGE_FROM, |l| {
+                l.tools = (0..64).map(|j| format!("tool-{i}-{j}")).collect();
+            })
+        })
+        .collect();
+    lines.push(ledger_line(now - 60, |_| {}));
+    std::fs::write(&ledger, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let recent = usage_answer(&r.gw, &format!("?from={}", now - 3600));
+    assert_eq!(usage_rows(&recent), [(now - 3600, None, 1)]);
+    assert!(
+        (now..=unix_now()).contains(&recent.to),
+        "`to` defaults to now"
+    );
+    let window = format!("?from={USAGE_FROM}&to={}", USAGE_FROM + 1);
+    let one = usage_answer(&r.gw, &format!("{window}&group_by=route"));
+    assert_eq!(usage_rows(&one), [(USAGE_FROM, Some("chat"), 160)]);
+
+    let later = now + 3600;
+    for (query, says) in [
+        (
+            window.clone() + "&group_by=tool",
+            "the answer would have more than 10000 rows; ask for a narrower window or a coarser bucket",
+        ),
+        (String::new(), "`from` is required"),
+        ("?to=5".into(), "`from` is required"),
+        ("?from=soon".into(), "`from` must be a whole number"),
+        ("?from=-1".into(), "`from` must be a whole number"),
+        ("?from=1&from=2".into(), "`from` is given twice"),
+        ("?from=1&to=x".into(), "`to` must be a whole number"),
+        ("?from=10&to=10".into(), "`to` must be after `from`"),
+        (
+            format!("?from={later}"),
+            "`from` must lie before now, the default `to`",
+        ),
+        (
+            "?from=0&to=34560001".into(),
+            "`from` and `to` must lie at most 400 days apart",
+        ),
+        (
+            "?from=1&to=2&group_by=user".into(),
+            "`group_by` must be one of client, login, model, route, tool",
+        ),
+        (
+            "?from=1&to=2&bucket=week".into(),
+            "`bucket` must be one of hour, day, month",
+        ),
+        (
+            "?from=1&to=2&bucket=day&bucket=day".into(),
+            "`bucket` is given twice",
+        ),
+        (
+            "?from=1&to=2&since=1".into(),
+            "unknown parameter `since`: the query takes `from`, `to`, `group_by` and `bucket`",
+        ),
+    ] {
+        let path = format!("{}{query}", paths::MODEL_USAGE);
+        let (status, e) = rejection(&r.gw, "GET", &path, "");
+        assert_eq!(
+            (status, e.class),
+            (400, ErrorClass::BadRequest),
+            "{query}: {e:?}"
+        );
+        assert_eq!(e.message.as_deref(), Some(says), "{query}");
+    }
+    assert_eq!(
+        usage_rows(&usage_answer(&r.gw, "?from=0&to=34560000")),
+        Vec::new(),
+        "a window of exactly 400 days"
+    );
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_USAGE, "");
+    assert_eq!(status, 405);
 }
 
 #[test]

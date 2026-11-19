@@ -1,7 +1,7 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
-//! `/v1/model/spend/reset`, `/v1/model/audit` and `/v1/health`, and the HTTP fronts:
-//! `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
+//! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage` and `/v1/health`, and the HTTP
+//! fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
 //! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
 //! clients with a client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use qb_proto::gateway::MAX_USAGE_ROWS;
 use qb_proto::{
     API_VERSION, AuditAction, CancelAnswer, CancelRequest, ErrorClass, GatewayError,
     HealthResponse, HealthStatus, SpendReset, StreamEvent, TurnRequest, paths,
@@ -35,12 +36,13 @@ use super::audit;
 use super::config::{Fronts, TOKEN_CALLER};
 use super::core::{Cancel, Gateway};
 use super::upstream::{CancelToken, Flow};
+use super::usage::{self, AggregateError};
 use super::{messages, openai};
 use crate::auth::token_matches;
 use crate::hangup::Hangup;
 use crate::http::{self, Head, Method, ReadError};
 use crate::log;
-use crate::server::{IO_TIMEOUT, discard, drain_pending};
+use crate::server::{IO_TIMEOUT, discard, drain_pending, unix_now};
 
 /// Connections beyond `max_turns` served at once, so routes, cancel and health get through
 /// while turns are at the cap.
@@ -538,6 +540,9 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         (Method::Get, paths::MODEL_AUDIT) => {
             read_audit(&mut stream, gateway, req.query.as_deref(), uid == own_uid);
         }
+        (Method::Get, paths::MODEL_USAGE) => {
+            read_usage(&mut stream, gateway, req.query.as_deref(), uid == own_uid);
+        }
         (Method::Post, paths::MODEL_CANCEL) => cancel(&mut stream, gateway, &caller, &req.body),
         (Method::Get, paths::HEALTH) => {
             let health = HealthResponse {
@@ -557,6 +562,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             | paths::MODEL_SPEND
             | paths::MODEL_SPEND_RESET
             | paths::MODEL_AUDIT
+            | paths::MODEL_USAGE
             | paths::HEALTH,
         ) => {
             reject(
@@ -657,6 +663,44 @@ fn read_audit(stream: &mut Conn, gateway: &Gateway, query: Option<&str>, own: bo
         Ok(answer) => reply(stream, 200, &answer),
         Err(e) => {
             let message = format!("cannot read the audit file {}: {e}", file.display());
+            log::error(&format!("gateway: {message}"));
+            reject(stream, 500, ErrorClass::Unavailable, &message);
+        }
+    }
+}
+
+/// Answers `GET /v1/model/usage` with the query string `query`, which only the gateway's `own`
+/// uid may send.
+fn read_usage(stream: &mut Conn, gateway: &Gateway, query: Option<&str>, own: bool) {
+    if !own {
+        let message = "only the gateway's own uid may read the usage";
+        return reject(stream, 403, ErrorClass::Auth, message);
+    }
+    let config = gateway.config();
+    let Some(ledger) = &config.usage else {
+        let message = "this gateway keeps no usage ledger: its config has no `[usage]` table";
+        return reject(stream, 404, ErrorClass::BadRequest, message);
+    };
+    let window =
+        usage::parse_query(query).and_then(|q| usage::window_end(&q, unix_now()).map(|to| (q, to)));
+    let (query, to) = match window {
+        Ok(w) => w,
+        Err(message) => return reject(stream, 400, ErrorClass::BadRequest, &message),
+    };
+    match usage::aggregate(&ledger.file, &query, to) {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(AggregateError::TooManyRows) => {
+            let message = format!(
+                "the answer would have more than {MAX_USAGE_ROWS} rows; ask for a narrower \
+                 window or a coarser bucket"
+            );
+            reject(stream, 400, ErrorClass::BadRequest, &message);
+        }
+        Err(AggregateError::Io(e)) => {
+            let message = format!(
+                "cannot read the usage ledger {}: {e}",
+                ledger.file.display()
+            );
             log::error(&format!("gateway: {message}"));
             reject(stream, 500, ErrorClass::Unavailable, &message);
         }

@@ -225,6 +225,7 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `GET /v1/model/spend` | — | 200 `SpendAnswer`, 403 a caller other than the gateway's own uid |
 | `POST /v1/model/spend/reset` | `SpendReset` | 200 `LoginSpend`, 400 a login without `spend_cap`, 403 a caller other than the gateway's own uid, 500 the spend file could not be written |
 | `GET /v1/model/audit` | — | 200 `AuditAnswer`, 400 a bad query, 403 a caller other than the gateway's own uid, 404 no `audit_file` |
+| `GET /v1/model/usage` | — | 200 `UsageAnswer`, 400 a bad query or more than 10 000 rows, 403 a caller other than the gateway's own uid, 404 no `[usage]` |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -501,8 +502,8 @@ stays as it was. The gateway neither rotates nor trims the file.
 `GET /v1/model/audit?since=<unix s>&limit=<n>` reads the lines back, only for the gateway's own
 uid (any other caller gets 403 `auth`); the loopback listener does not serve it. It answers the
 first `limit` entries (default 100, 1 to 1000) with `at` ≥ `since` (default 0), oldest first,
-and in `skipped` the number of lines of the file that do not parse as an entry, which are left
-out:
+and in `skipped` the number of lines of the file that do not parse as an entry or are longer than
+64 KiB, which are left out:
 
 ```json
 {"entries": [{"at": 1800000120, "actor": "uid:1000", "action": "spend_reset",
@@ -552,3 +553,50 @@ goes on as it was. Before a line would take the file past `rotate_bytes`, the fi
 `<file>.<unix s>` and rotated files older than `keep_days` are removed
 ([config.md](config.md#gateway-config)), so a reader finds the whole ledger as `file` and the files
 `<file>.<digits>` beside it, older stamps holding older lines.
+
+### `GET /v1/model/usage`
+
+`GET /v1/model/usage?from=<unix s>&to=<unix s>&group_by=<g>&bucket=<b>` sums the usage ledger,
+only for the gateway's own uid (any other caller gets 403 `auth`); the loopback listener does not
+serve it. The parameters are those of `UsageQuery`:
+
+| Parameter | Meaning |
+|---|---|
+| `from` | required; lines with an earlier `at` are left out |
+| `to` | default the time of the request; lines with `at` at or after it are left out; after `from` and at most 400 days later |
+| `group_by` | `client`, `login`, `model`, `route` or `tool`; absent, every line is one group |
+| `bucket` | `hour`, `day` or `month`, UTC; absent, the whole window is one bucket |
+
+The answer is a `UsageAnswer`: the window and grouping it used, one row per bucket and group that
+holds a line, ordered by `start`, then `group`, and in `skipped` the number of lines read that do
+not parse as a `UsageLine` or are longer than 64 KiB, which are left out:
+
+```json
+{"from": 1800000000, "to": 1800172800, "group_by": "login", "bucket": "day",
+ "rows": [{"start": 1799971200, "group": "login-1", "attempts": 12, "failed": 1,
+           "input": 48000, "output": 9100, "cache_read": 310000, "cache_write": 0,
+           "usd": 0.913, "unpriced": 2, "duration_ms": 61250}],
+ "skipped": 0}
+```
+
+| Row field | Meaning |
+|---|---|
+| `start` | start of the row's UTC hour, day or calendar month, which can lie before `from`; `from` without `bucket` |
+| `group` | the row's client, login, model, route or tool name; absent without `group_by` |
+| `attempts` | lines counted |
+| `failed` | lines whose `outcome` is not `ok` |
+| `input`, `output`, `cache_read`, `cache_write` | sums of the lines' token counts |
+| `usd` | sum of the lines' `usd`, priced lines only |
+| `unpriced` | lines without `usd` |
+| `duration_ms` | sum of the lines' `duration_ms` |
+
+With `group_by=tool` a line counts once under each of its `tools` and lines without tools are
+left out, so the rows' sums overlap and do not add up to the window's totals. Sums saturate at
+the largest value of their type.
+
+The gateway reads `usage.file` and the rotated files `<file>.<stamp>` whose stamp is at or after
+`from`; a rotated file holds only lines with `at` at or before its stamp, so one stamped before
+`from` has none in the window. A missing file counts as empty. An answer of more than 10 000 rows is 400 `bad_request`,
+asking for a narrower window or a coarser bucket; no answer is cut short. An unknown parameter,
+one given twice, a missing `from` or an invalid value is 400 `bad_request` naming the parameter;
+without `[usage]` the answer is 404 `bad_request`.

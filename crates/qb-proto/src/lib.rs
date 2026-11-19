@@ -21,7 +21,8 @@ pub use gateway::{
     CancelRequest, Effort, Elsewhere, ErrorClass, GatewayError, LoginSpend, MediaType, Message,
     NativeApi, NativeTool, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus,
     RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool, ToolCall,
-    TurnRequest, TurnRequestError, Usage, UsageLine, UsdSource,
+    TurnRequest, TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine,
+    UsageQuery, UsageRow, UsdSource,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.
@@ -57,6 +58,8 @@ pub mod paths {
     pub const MODEL_SPEND_RESET: &str = "/v1/model/spend/reset";
     /// Gateway, `GET`: the lines of the gateway's audit file; only the gateway's own uid.
     pub const MODEL_AUDIT: &str = "/v1/model/audit";
+    /// Gateway, `GET`: sums of the gateway's usage ledger; only the gateway's own uid.
+    pub const MODEL_USAGE: &str = "/v1/model/usage";
     /// Gateway, `POST`: an Anthropic Messages request, answered in the Messages format.
     pub const MESSAGES: &str = "/v1/messages";
     /// Gateway, `POST`: an OpenAI Chat Completions request, answered in that format.

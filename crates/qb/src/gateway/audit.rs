@@ -2,13 +2,15 @@
 //! line, and those lines read back for `GET /v1/model/audit`.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::io::{self, ErrorKind, Write};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use qb_proto::{AuditAction, AuditAnswer, AuditEntry, AuditResult};
 use serde::Serialize;
 
 use crate::journal::open_append;
+use crate::jsonl;
 use crate::log;
 use crate::server::unix_now;
 
@@ -130,36 +132,19 @@ impl Query {
 
 /// The first `query.limit` entries of `file` at or after `query.since`, in file order, which is
 /// oldest first; a missing file has none. Every line of the file that does not parse as an entry
-/// is counted in `skipped`.
+/// or is longer than [`jsonl::MAX_LINE`] is counted in `skipped`.
 ///
 /// # Errors
 /// The file cannot be opened or read.
 pub(crate) fn read(file: &Path, query: &Query) -> io::Result<AuditAnswer> {
-    let mut answer = AuditAnswer {
-        entries: Vec::new(),
-        skipped: 0,
-    };
-    let f = match File::open(file) {
-        Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(answer),
-        Err(e) => return Err(e),
-    };
-    let mut reader = BufReader::new(f);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(answer);
+    let mut entries = Vec::new();
+    let skipped = jsonl::read(file, |e: AuditEntry| {
+        if e.at >= query.since && entries.len() < query.limit {
+            entries.push(e);
         }
-        let text = line.strip_suffix(b"\n").unwrap_or(&line);
-        match serde_json::from_slice::<AuditEntry>(text) {
-            Ok(e) if e.at >= query.since && answer.entries.len() < query.limit => {
-                answer.entries.push(e);
-            }
-            Ok(_) => {}
-            Err(_) => answer.skipped += 1,
-        }
-    }
+        ControlFlow::Continue(())
+    })?;
+    Ok(AuditAnswer { entries, skipped })
 }
 
 #[cfg(test)]

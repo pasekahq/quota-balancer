@@ -794,13 +794,10 @@ impl Gateway {
             Ok(done) => {
                 self.report(lease, Outcome::Ok, done.windows);
                 let stopped = turn.cancel.is_cancelled();
-                let end = if stopped {
-                    Err(ErrorClass::Cancelled)
-                } else {
-                    Ok(done.stop)
-                };
+                let end = (!stopped).then_some(done.stop).ok_or(ErrorClass::Cancelled);
                 let outcome = Outcome::Ok;
-                self.record_usage(turn, &relay, &attempt, step, Ended { outcome, end, cost });
+                let ended = Ended { outcome, end, cost };
+                self.record_usage(turn, &relay, &attempt, &login, step, ended);
                 if stopped {
                     relay.send(StreamEvent::Error { error: cancelled() });
                     return Next::Done("cancelled".into());
@@ -827,7 +824,8 @@ impl Gateway {
         } else {
             class
         });
-        self.record_usage(turn, &relay, &attempt, step, Ended { outcome, end, cost });
+        let ended = Ended { outcome, end, cost };
+        self.record_usage(turn, &relay, &attempt, &login, step, ended);
         if relay.gone {
             return Next::Done("client gone".into());
         }
@@ -885,13 +883,15 @@ impl Gateway {
         Next::Done(class.as_str().to_owned())
     }
 
-    /// Appends the usage line of `attempt` on chain step `step` of `turn`, which ended as
-    /// `ended` with `relay`'s usage and tool calls; without a `[usage]` ledger it is dropped.
+    /// Appends the usage line of `attempt` on `login` and chain step `step` of `turn`, which
+    /// ended as `ended` with `relay`'s usage and tool calls; without a `[usage]` ledger it is
+    /// dropped.
     fn record_usage(
         &self,
         turn: &Admitted,
         relay: &Relay<'_>,
         attempt: &Attempt,
+        login: &str,
         step: usize,
         ended: Ended,
     ) {
@@ -910,7 +910,7 @@ impl Gateway {
             client: turn.client.clone(),
             route: turn.route.alias.clone(),
             step: u32::try_from(step).unwrap_or(u32::MAX),
-            login: attempt.login_label.clone().unwrap_or_default(),
+            login: login.to_owned(),
             model: attempt.model.clone(),
             outcome: ended.outcome,
             stop: ended.end.ok(),

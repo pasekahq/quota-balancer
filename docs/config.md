@@ -343,7 +343,9 @@ cache_write = 3.75
 | `cache_write` | number | Input tokens written to the prompt cache. |
 
 `[usage]`, optional: the usage ledger, one JSON line per adapter attempt, who used what and what
-it cost, without content ([api.md](api.md#usage-ledger)); without it no ledger is kept.
+it cost, without content ([api.md](api.md#usage-ledger)), summed by
+[`GET /v1/model/usage`](api.md#get-v1modelusage); without it no ledger is kept and that
+endpoint answers 404.
 
 ```toml
 [usage]
