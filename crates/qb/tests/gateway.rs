@@ -8045,7 +8045,11 @@ fn step(vendor: &str, model: &str, effort: Option<&str>) -> ConfigStep {
 
 /// The backups `<config>.bak-*` beside the config file of `gw`.
 fn backups(gw: &Path) -> Vec<PathBuf> {
-    let file = config_file(gw);
+    backups_of(&config_file(gw))
+}
+
+/// The backups `<file>.bak-*` beside `file`, sorted.
+fn backups_of(file: &Path) -> Vec<PathBuf> {
     let prefix = format!("{}.bak-", file.file_name().unwrap().to_str().unwrap());
     let mut found: Vec<PathBuf> = std::fs::read_dir(file.parent().unwrap())
         .unwrap()
@@ -8632,24 +8636,6 @@ fn put_key(gw: &Path, login: &str, body: &str) -> (u16, Vec<u8>) {
     call(gw, "POST", &path, body)
 }
 
-/// The backups of the credential file `file`, sorted.
-fn backups_of(file: &Path) -> Vec<PathBuf> {
-    let prefix = format!("{}.bak-", file.file_name().unwrap().to_str().unwrap());
-    let mut found: Vec<PathBuf> = std::fs::read_dir(file.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with(&prefix)
-        })
-        .collect();
-    found.sort();
-    found
-}
-
 /// The secret every adapter call of login-1 sent, in order.
 fn login_1_secrets(r: &Rig) -> Vec<String> {
     r.fake
@@ -8905,29 +8891,105 @@ fn a_key_replacement_is_refused_for_other_uids_and_on_loopback() {
     let others = format!("\n[[clients]]\nname = \"client-u\"\nuid = {}\n", own_uid());
     let (r, audit, _) = key_rig(api_key("test-key-two-5c3d"), &others, own_uid() + 1);
     let file = r.dir.join("creds/login-1.json");
-    let (status, body) = put_key(&r.gw, "login-1", &json!({"key": NEW_KEY}).to_string());
-    let e: GatewayError = serde_json::from_slice(&body).unwrap();
-    assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
+    let (listener, addr, front) = loopback_front("");
+    let served = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let body = json!({"key": NEW_KEY}).to_string();
+    let mut answers = Vec::new();
+    let logged = stderr_of(|| {
+        answers.push(put_key(&r.gw, "login-1", &body));
+        let path = format!("{}/login-1/key", paths::MODEL_LOGINS);
+        let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+        let (status, _, answer) = finish(tcp_send(addr, "POST", &path, &auth, &body), Vec::new());
+        answers.push((status, answer));
+    });
+    let e: GatewayError = serde_json::from_slice(&answers[0].1).unwrap();
+    assert_eq!((answers[0].0, e.class), (403, ErrorClass::Auth), "{e:?}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), api_key(OLD_KEY));
-    let line: AuditEntry =
-        serde_json::from_str(std::fs::read_to_string(&audit).unwrap().trim_end()).unwrap();
+    let audited = std::fs::read_to_string(&audit).unwrap();
+    let line: AuditEntry = serde_json::from_str(audited.trim_end()).unwrap();
     assert_eq!(
         (line.action, line.object.as_deref(), line.result),
         (AuditAction::LoginKey, Some("login-1"), AuditResult::Refused)
     );
-    assert!(!std::fs::read_to_string(&audit).unwrap().contains(NEW_KEY));
-
-    let (listener, addr, front) = loopback_front("");
-    let r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
-    let path = format!("{}/login-1/key", paths::MODEL_LOGINS);
-    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
-    let body = json!({"key": NEW_KEY}).to_string();
-    let (status, _) = error_type(tcp_send(addr, "POST", &path, &auth, &body));
-    assert_eq!(status, 404, "the loopback listener does not serve it");
+    assert_eq!(answers[1].0, 404, "the loopback listener does not serve it");
     assert_eq!(
-        std::fs::read_to_string(r.dir.join("creds/login-1.json")).unwrap(),
+        std::fs::read_to_string(served.dir.join("creds/login-1.json")).unwrap(),
         api_key("test-token-1")
     );
+    let texts = [
+        ("stderr", logged),
+        ("audit", audited),
+        (
+            "403 answer",
+            String::from_utf8_lossy(&answers[0].1).into_owned(),
+        ),
+        (
+            "loopback answer",
+            String::from_utf8_lossy(&answers[1].1).into_owned(),
+        ),
+    ];
+    for key in [OLD_KEY, NEW_KEY] {
+        for (what, text) in &texts {
+            assert!(!text.contains(key), "{what} holds a key: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_write_that_replaced_the_credential_file_and_then_failed_keeps_the_backup() {
+    let (r, audit, _) = key_rig(api_key("test-key-two-5c3d"), "", own_uid());
+    let file = r.dir.join("creds/login-1.json");
+    let dir = file.parent().unwrap();
+    // Without read permission the rename into the directory works, its sync after it does not.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::read_dir(dir).is_ok() {
+        // Running as root: directory modes do not bind, nothing to check.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let mut answer = (0, Vec::new());
+    let logged = stderr_until("key replacement of login `login-1` refused", || {
+        answer = put_key(&r.gw, "login-1", &json!({"key": NEW_KEY}).to_string());
+    });
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e: GatewayError = serde_json::from_slice(&answer.1).unwrap();
+    assert_eq!((answer.0, e.class), (500, ErrorClass::Unavailable), "{e:?}");
+    let message = e.message.unwrap();
+    let replaced = format!("{} was replaced but the write failed: ", file.display());
+    assert!(message.starts_with(&replaced), "{message}");
+    let kept = backups_of(&file);
+    assert_eq!(kept.len(), 1);
+    assert!(
+        message.ends_with(&format!("the old file is kept as {}", kept[0].display())),
+        "{message}"
+    );
+    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), api_key(OLD_KEY));
+    assert_eq!(mode_of(&kept[0]), 0o600);
+    let last = audit_answer(&r.gw, "").entries.pop().unwrap();
+    assert_eq!(
+        (
+            last.action,
+            last.object.as_deref(),
+            last.result,
+            last.backup
+        ),
+        (
+            AuditAction::LoginKey,
+            Some("login-1"),
+            AuditResult::Refused,
+            Some(kept[0].display().to_string())
+        )
+    );
+    let texts = [
+        ("stderr", logged),
+        ("audit", std::fs::read_to_string(&audit).unwrap()),
+        ("answer", String::from_utf8_lossy(&answer.1).into_owned()),
+    ];
+    for key in [OLD_KEY, NEW_KEY] {
+        for (what, text) in &texts {
+            assert!(!text.contains(key), "{what} holds a key: {text}");
+        }
+    }
 }
 
 #[test]
