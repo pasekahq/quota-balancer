@@ -19,11 +19,11 @@ pub mod gateway;
 pub use gateway::{
     Attempt, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CacheMode, CancelAnswer,
     CancelRequest, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
-    ConfigRoutesWritten, ConfigStep, Effort, Elsewhere, ErrorClass, GatewayError, LoginSpend,
-    MediaType, Message, NativeApi, NativeTool, Object, ReloadAnswer, Role, RouteInfo, RouteState,
-    RouteStatus, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool,
-    ToolCall, TurnRequest, TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy,
-    UsageLine, UsageQuery, UsageRow, UsdSource,
+    ConfigRoutesWritten, ConfigStep, Effort, Elsewhere, ErrorClass, GatewayError, LoginKey,
+    LoginKeyAnswer, LoginSpend, MediaType, Message, NativeApi, NativeTool, Object, ReloadAnswer,
+    Role, RouteInfo, RouteState, RouteStatus, RoutesAnswer, SpendAnswer, SpendReset, StopReason,
+    StreamEvent, Thinking, Tool, ToolCall, TurnRequest, TurnRequestError, Usage, UsageAnswer,
+    UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsageRow, UsdSource,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.
@@ -67,6 +67,9 @@ pub mod paths {
     /// Gateway, `GET` and `PUT`: the `[[routes]]` of the gateway's config file, read and
     /// replaced; only the gateway's own uid.
     pub const MODEL_CONFIG_ROUTES: &str = "/v1/model/config/routes";
+    /// Gateway, `POST` to `{MODEL_LOGINS}/{name}/key`: write a new key to an `api_key` login's
+    /// credential file; only the gateway's own uid.
+    pub const MODEL_LOGINS: &str = "/v1/model/logins";
     /// Gateway, `POST`: an Anthropic Messages request, answered in the Messages format.
     pub const MESSAGES: &str = "/v1/messages";
     /// Gateway, `POST`: an OpenAI Chat Completions request, answered in that format.

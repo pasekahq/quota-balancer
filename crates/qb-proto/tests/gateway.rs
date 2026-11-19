@@ -6,9 +6,9 @@
 use qb_proto::{
     AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, ClientRotateAnswer,
     ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Elsewhere, ErrorClass, GatewayError,
-    Message, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer, SpendAnswer, SpendReset,
-    StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine,
-    UsageQuery, UsdSource,
+    LoginKey, LoginKeyAnswer, Message, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer,
+    SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket,
+    UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -153,6 +153,15 @@ fn errors_routes_cancel() {
         (rotated.client.as_str(), rotated.grace_until),
         ("client-a", 1_800_003_600)
     );
+    let key: LoginKey = roundtrip("gateway_login_key_request.json");
+    assert_eq!(key.validate(), Ok(()));
+    let replaced: LoginKeyAnswer = roundtrip("gateway_login_key_answer.json");
+    assert_eq!(
+        replaced.backup.as_deref(),
+        Some("/etc/qb/credentials/key-1.json.bak-1800000480")
+    );
+    let first: LoginKeyAnswer = roundtrip("gateway_login_key_answer_first.json");
+    assert_eq!(first.backup, None);
 }
 
 #[test]
@@ -214,6 +223,18 @@ fn audit_lines() {
                 AuditResult::Refused,
                 Some("/etc/qb/gateway.toml")
             ),
+            (
+                "uid:1000",
+                AuditAction::LoginKey,
+                AuditResult::Ok,
+                Some("key-1")
+            ),
+            (
+                "uid:1000",
+                AuditAction::LoginKey,
+                AuditResult::Refused,
+                Some("login-1")
+            ),
         ]
     );
     let prefixes: Vec<_> = audit
@@ -231,6 +252,8 @@ fn audit_lines() {
             Some("5d35a058cf51"),
             None,
             None,
+            None,
+            None,
             None
         ]
     );
@@ -240,6 +263,26 @@ fn audit_lines() {
         Some("/etc/qb/gateway.toml.bak-1800000360")
     );
     assert_eq!(audit.skipped, 1);
+}
+
+#[test]
+fn audit_lines_of_key_replacements() {
+    let audit: AuditAnswer = roundtrip("gateway_audit_answer.json");
+    let keys: Vec<_> = audit
+        .entries
+        .iter()
+        .map(|e| (e.key_sha256_prefix.as_deref(), e.backup.as_deref()))
+        .collect();
+    assert_eq!(
+        keys[8..],
+        [
+            (
+                Some("5bcc977b51d5"),
+                Some("/etc/qb/credentials/key-1.json.bak-1800000480")
+            ),
+            (None, None)
+        ]
+    );
 }
 
 #[test]
@@ -400,6 +443,7 @@ fn invalid_fixtures_are_rejected() {
             }),
             "CancelRequest" => rejected(&raw, |_: CancelRequest| true),
             "ConfigRoutesPut" => rejected(&raw, |_: ConfigRoutesPut| true),
+            "LoginKey" => rejected(&raw, |k: LoginKey| k.validate().is_ok()),
             "Error" => rejected(&raw, |_: GatewayError| true),
             other => panic!("{name}: no type {other}"),
         };

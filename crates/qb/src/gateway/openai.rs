@@ -9,6 +9,7 @@ use qb_openai::front::error_response;
 use qb_openai::wire::ErrorBody;
 use qb_openai::{chat, responses};
 use qb_proto::{ErrorClass, GatewayError};
+use zeroize::Zeroizing;
 
 use super::answer::{self, Answer, Format};
 use super::config::{Fronts, OpenaiFront};
@@ -92,7 +93,7 @@ pub(super) fn chat_turn(
     gateway: &Gateway,
     watch: &Watch,
     caller: &Caller,
-    body: Vec<u8>,
+    body: Zeroizing<Vec<u8>>,
 ) {
     let config = gateway.config();
     let path = qb_proto::paths::CHAT_COMPLETIONS;
@@ -135,7 +136,7 @@ pub(super) fn responses_turn(
     gateway: &Gateway,
     watch: &Watch,
     caller: &Caller,
-    body: Vec<u8>,
+    body: Zeroizing<Vec<u8>>,
 ) {
     let config = gateway.config();
     let path = qb_proto::paths::RESPONSES;

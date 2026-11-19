@@ -68,6 +68,23 @@
       "reason": "spend_caps refused: /etc/qb/gateway.toml: logins: no login `key-9`",
       "config_sha256_before": "5f0e7c8d2b6a4e1f9c3d7a0b8e6f4c2d1a9b7e5c3f1d0a8b6c4e2f0d9b7a5c3e",
       "config_sha256_after": "5f0e7c8d2b6a4e1f9c3d7a0b8e6f4c2d1a9b7e5c3f1d0a8b6c4e2f0d9b7a5c3e"
+    },
+    {
+      "at": 1800000480,
+      "actor": "uid:1000",
+      "action": "login_key",
+      "object": "key-1",
+      "result": "ok",
+      "backup": "/etc/qb/credentials/key-1.json.bak-1800000480",
+      "key_sha256_prefix": "5bcc977b51d5"
+    },
+    {
+      "at": 1800000540,
+      "actor": "uid:1000",
+      "action": "login_key",
+      "object": "login-1",
+      "result": "refused",
+      "reason": "login `login-1` is `oauth_anthropic`, not `api_key`"
     }
   ],
   "skipped": 1

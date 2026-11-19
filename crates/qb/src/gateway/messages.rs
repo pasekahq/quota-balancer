@@ -8,6 +8,7 @@ use std::time::Duration;
 use qb_anthropic::front::{Assembler, SseEncoder, decode_request, error_response};
 use qb_anthropic::wire::ErrorBody;
 use qb_proto::{ErrorClass, GatewayError};
+use zeroize::Zeroizing;
 
 use super::answer::{self, Answer, Format};
 use super::core::Gateway;
@@ -60,7 +61,7 @@ pub(super) fn turn(
     gateway: &Gateway,
     watch: &Watch,
     caller: &Caller,
-    body: Vec<u8>,
+    body: Zeroizing<Vec<u8>>,
 ) {
     let config = gateway.config();
     let Some((fronts, front)) = config

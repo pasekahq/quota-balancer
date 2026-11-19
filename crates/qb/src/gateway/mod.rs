@@ -7,7 +7,7 @@
 //!
 //! - [`config`]: the gateway's TOML config;
 //! - [`config_edit`]: the `[[routes]]` of the config file rendered and spliced and the logins'
-//!   `spend_cap`s set for an edit;
+//!   `spend_cap`s set for an edit, and the backup and replacement of a config or credential file;
 //! - [`creds`]: credential files, OAuth refresh behind a trait, atomic write-back;
 //! - [`import`]: `qb login import`, a credential of another client copied into a login's file;
 //! - [`signin`]: `qb login`, an OAuth login signed in from scratch with PKCE;
