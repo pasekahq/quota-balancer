@@ -308,6 +308,10 @@ does not prove the route: the gateway line does, and for an `oauth_anthropic` lo
 3. `HERMES_HOME=<hermes-profile-dir> hermes auth list anthropic` lists the profile's OAuth
    entries again, and the next turn adds no `of client-token` line to the gateway log.
 
+A profile that has moved to a named client token
+([named-clients-cutover.md](named-clients-cutover.md)) holds that token in its
+`ANTHROPIC_API_KEY` line, without the `qb-` prefix after a rotation; delete that line by its name.
+
 Leave the gateway running. Stopping or restarting `qb-gateway.service`, or `qbd`, needs the
 owner's permission; the gateway holds no state Hermes depends on once Hermes no longer calls it.
 
