@@ -716,6 +716,74 @@ pub struct ClientRotateAnswer {
     pub grace_until: u64,
 }
 
+/// One step of a chain route as `/v1/model/config/routes` carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigStep {
+    /// Pinned vendor.
+    pub vendor: String,
+    /// Pinned model.
+    pub model: String,
+    /// Reasoning effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// One `[[routes]]` item of the gateway config file, key for key. Integers take any TOML
+/// integer: the gateway's config parser judges every value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigRoute {
+    /// Alias clients name in `route`.
+    pub alias: String,
+    /// qbd role of the pick.
+    pub role: String,
+    /// Ladder step of the role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<i64>,
+    /// Pinned vendor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// Pinned model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort of the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Pins a turn tries in order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Vec<ConfigStep>>,
+    /// Expected minutes of a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_minutes: Option<i64>,
+}
+
+/// `GET /v1/model/config/routes` response: the `[[routes]]` items of the config file on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigRoutes {
+    /// Hex SHA-256 of the config file; also the answer's `ETag`.
+    pub sha256: String,
+    /// The items in file order.
+    pub routes: Vec<ConfigRoute>,
+}
+
+/// `PUT /v1/model/config/routes` request: the items that replace the file's `[[routes]]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigRoutesPut {
+    /// The new items in file order.
+    pub routes: Vec<ConfigRoute>,
+}
+
+/// `PUT /v1/model/config/routes` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigRoutesWritten {
+    /// Hex SHA-256 of the config file written and now serving.
+    pub sha256: String,
+    /// Path of the copy of the file it replaced.
+    pub backup: String,
+}
+
 /// An admin action of the gateway, as its audit line names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -727,6 +795,8 @@ pub enum AuditAction {
     /// `POST /v1/model/clients/{name}/rotate`: a fresh token written to a named loopback
     /// client's `token_file`.
     ClientRotate,
+    /// `PUT /v1/model/config/routes`: the config file's `[[routes]]` replaced and reloaded.
+    ConfigRoutes,
 }
 
 /// Whether an admin action went through.
@@ -749,8 +819,8 @@ pub struct AuditEntry {
     pub actor: String,
     /// What was done.
     pub action: AuditAction,
-    /// The login of a spend reset, the config file of a reload, the client of a rotation; absent
-    /// when a refused request named none.
+    /// The login of a spend reset, the config file of a reload or a routes edit, the client of a
+    /// rotation; absent when a refused request named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// Whether it went through.
@@ -758,11 +828,11 @@ pub struct AuditEntry {
     /// Why it was refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// A reload: hex SHA-256 of the config file serving before the action.
+    /// A reload or a routes edit: hex SHA-256 of the config file before the action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_before: Option<String>,
-    /// A reload: hex SHA-256 of the config file serving after it; the same as before when it
-    /// was refused.
+    /// A reload or a routes edit: hex SHA-256 of the config file after it; the same as before
+    /// when it was refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_after: Option<String>,
     /// Path of the copy an action kept of what it replaced.

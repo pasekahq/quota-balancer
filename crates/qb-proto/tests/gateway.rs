@@ -5,9 +5,10 @@
 
 use qb_proto::{
     AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, ClientRotateAnswer,
-    Elsewhere, ErrorClass, GatewayError, Message, Outcome, ReloadAnswer, Role, RouteState,
-    RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageAnswer,
-    UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
+    ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Elsewhere, ErrorClass, GatewayError,
+    Message, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer, SpendAnswer, SpendReset,
+    StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine,
+    UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -147,6 +148,15 @@ fn errors_routes_cancel() {
     assert_eq!(spend.logins[0].period_end, 1_800_000_000);
     let reset: SpendReset = roundtrip("gateway_spend_reset_request.json");
     assert_eq!(reset.login, "key-1");
+    let rotated: ClientRotateAnswer = roundtrip("gateway_client_rotate_answer.json");
+    assert_eq!(
+        (rotated.client.as_str(), rotated.grace_until),
+        ("client-a", 1_800_003_600)
+    );
+}
+
+#[test]
+fn audit_lines() {
     let audit: AuditAnswer = roundtrip("gateway_audit_answer.json");
     let lines: Vec<_> = audit
         .entries
@@ -192,6 +202,12 @@ fn errors_routes_cancel() {
                 AuditResult::Refused,
                 Some("client-b")
             ),
+            (
+                "uid:1000",
+                AuditAction::ConfigRoutes,
+                AuditResult::Ok,
+                Some("/etc/qb/gateway.toml")
+            ),
         ]
     );
     let prefixes: Vec<_> = audit
@@ -201,14 +217,43 @@ fn errors_routes_cancel() {
         .collect();
     assert_eq!(
         prefixes,
-        [None, None, None, None, Some("5d35a058cf51"), None]
+        [None, None, None, None, Some("5d35a058cf51"), None, None]
+    );
+    let edit = audit.entries.last().unwrap();
+    assert_eq!(
+        edit.backup.as_deref(),
+        Some("/etc/qb/gateway.toml.bak-1800000360")
     );
     assert_eq!(audit.skipped, 1);
-    let rotated: ClientRotateAnswer = roundtrip("gateway_client_rotate_answer.json");
+}
+
+#[test]
+fn config_routes() {
+    let read: ConfigRoutes = roundtrip("gateway_config_routes.json");
+    let shapes: Vec<_> = read
+        .routes
+        .iter()
+        .map(|r| {
+            (
+                r.difficulty,
+                r.vendor.is_some(),
+                r.chain.as_ref().map(Vec::len),
+            )
+        })
+        .collect();
     assert_eq!(
-        (rotated.client.as_str(), rotated.grace_until),
-        ("client-a", 1_800_003_600)
+        shapes,
+        [
+            (Some(1), false, None),
+            (None, true, None),
+            (None, false, Some(2))
+        ]
     );
+    let put: ConfigRoutesPut = roundtrip("gateway_config_routes_put.json");
+    let chain = put.routes[0].chain.as_ref().unwrap();
+    assert_eq!(chain[1].effort.as_deref(), Some("low"));
+    let written: ConfigRoutesWritten = roundtrip("gateway_config_routes_written.json");
+    assert_eq!(written.backup, "/etc/qb/gateway.toml.bak-1800000360");
 }
 
 #[test]
@@ -332,6 +377,7 @@ fn invalid_fixtures_are_rejected() {
                 serde_json::to_value(e).unwrap() == serde_json::from_str::<Value>(&raw).unwrap()
             }),
             "CancelRequest" => rejected(&raw, |_: CancelRequest| true),
+            "ConfigRoutesPut" => rejected(&raw, |_: ConfigRoutesPut| true),
             "Error" => rejected(&raw, |_: GatewayError| true),
             other => panic!("{name}: no type {other}"),
         };

@@ -1,0 +1,1 @@
+{"routes": [{"alias": "chat", "role": "gateway", "chain": [{"vendor": "vendor-a", "model": "model-a", "login": "login-1"}]}]}

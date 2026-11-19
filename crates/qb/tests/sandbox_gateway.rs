@@ -13,7 +13,9 @@ use landlock::{ABI, Access, AccessFs, LandlockStatus, Ruleset, RulesetAttr};
 use qb::gateway::config::GatewayLogin;
 use qb::gateway::core::Gateway;
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
-use qb_proto::{AuditAction, AuditEntry, AuditResult, Outcome, StopReason, Usage, UsageLine};
+use qb_proto::{
+    AuditAction, AuditEntry, AuditResult, ConfigRoutesPut, Outcome, StopReason, Usage, UsageLine,
+};
 use rustix::process::{DumpableBehavior, dumpable_behavior};
 
 fn kernel_abi() -> Option<ABI> {
@@ -34,10 +36,9 @@ fn kernel_abi() -> Option<ABI> {
     .unwrap()
 }
 
-/// The enforced ruleset: no gaps; its startup line names the credential, spend, audit, usage,
-/// client token, grace and config directories and the two resolver files, TCP connect to 443 and
-/// bind on `port`; `opened` are the credential, spend, audit, usage, client token and grace
-/// directories.
+/// The enforced ruleset: no gaps; its startup line names the config, credential, spend, audit,
+/// usage, client token and grace directories and the two resolver files, TCP connect to 443 and
+/// bind on `port`; `opened` are those directories.
 fn assert_applied(applied: &qb::sandbox::Confined, port: u16, opened: &[PathBuf]) {
     assert_eq!(applied.gaps, Vec::<String>::new());
     let want = format!(
@@ -98,7 +99,7 @@ fn finished(at: u64) -> UsageLine {
 
 #[test]
 #[allow(clippy::too_many_lines)] // the dumpable flag is process-wide, so one test covers it all
-fn gateway_may_write_its_own_files_read_its_config_and_reach_qbd_only() {
+fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
     let dir = Path::new("/tmp").join(format!("qb-gw-sandbox-{}", std::process::id()));
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
@@ -187,6 +188,14 @@ fn gateway_may_write_its_own_files_read_its_config_and_reach_qbd_only() {
             ledger.append(&finished(now), now);
         }
         let gateway = Gateway::new(rotated, Vec::new(), Box::new(NoRefresh), None).unwrap();
+        let current = gateway.config_routes().unwrap();
+        let mut routes = current.routes;
+        routes[0].expected_minutes = Some(3);
+        let body = serde_json::to_vec(&ConfigRoutesPut { routes }).unwrap();
+        let edit = gateway
+            .put_routes("uid:1", Some(&current.sha256), &body)
+            .unwrap();
+        assert_eq!(gateway.config().routes[0].expected_minutes, Some(3));
         let answer = gateway.rotate_client("uid:1", "client-f").unwrap();
         assert_eq!(answer.client, "client-f");
         assert!(UnixStream::connect(&qbd).is_ok(), "qbd stays reachable");
@@ -198,7 +207,8 @@ fn gateway_may_write_its_own_files_read_its_config_and_reach_qbd_only() {
         );
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
-            assert_applied(&applied, port, &[creds, state, audit, usage, tokens, grace]);
+            let opened = [etc, creds, state, audit, usage, tokens, grace];
+            assert_applied(&applied, port, &opened);
             let denied = std::fs::read(&unreadable).unwrap_err();
             assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
             let denied = std::fs::write(unreadable.with_extension("new"), "x").unwrap_err();
@@ -220,6 +230,7 @@ fn gateway_may_write_its_own_files_read_its_config_and_reach_qbd_only() {
             let gaps = &applied.gaps;
             assert!(gaps.iter().any(|g| g.contains("landlock")), "{gaps:?}");
         }
+        edit.backup
     });
     // An editor replaces the config by rename while the sandboxed gateway runs.
     if edit.recv().is_ok() {
@@ -228,7 +239,12 @@ fn gateway_may_write_its_own_files_read_its_config_and_reach_qbd_only() {
         std::fs::rename(&replaced, &file).unwrap();
         let _ = edited.send(());
     }
-    gateway.join().unwrap();
+    let backup = PathBuf::from(gateway.join().unwrap());
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), text);
+    let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "the backup written in the sandbox");
+    let edited = std::fs::read_to_string(&file).unwrap();
+    assert!(edited.contains("expected_minutes = 3\n"), "{edited}");
     assert_eq!(
         std::fs::read_to_string(&credential).unwrap(),
         r#"{"type":"api_key","key":"k2"}"#

@@ -231,7 +231,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
 | `spend_file` | string | Absolute path of the file that counts the spend of the logins with a `spend_cap`; required when one has it ([Spend caps](#spend-caps)). |
-| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation) is appended to as one JSON line, created with mode 0600 in an existing directory; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
+| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation, routes edit) is appended to as one JSON line, created with mode 0600 in an existing directory; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
 the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
@@ -289,8 +289,8 @@ vendor rejects makes the login unusable: the attempt is reported to `qbd` as `ht
 turn moves to the next login. A field of another type (`key` in an OAuth file, `account_id` in
 an `oauth_anthropic` or `api_key` file, an OAuth field in an `api_key` file) or any other field
 is refused, and the error names the field, never a value. The gateway may create, write and
-remove files in the credential files' directories and the directories of `spend_file`,
-`audit_file` and `usage.file`, and nowhere else.
+remove files in its config file's directory, the credential files' directories and the
+directories of `spend_file`, `audit_file` and `usage.file`, and nowhere else.
 
 `[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to a `qbd` pick target: a
 ladder step, a pin, or a chain of pins.
@@ -306,6 +306,12 @@ ladder step, a pin, or a chain of pins.
 | `expected_minutes` | integer | Expected length of a turn, for the lease's cost. |
 
 A chain across vendors: [Examples](#a-route-chaining-subscription-key-and-openrouter).
+
+`GET` and `PUT /v1/model/config/routes` read and replace these items as JSON
+([api.md](api.md#get-and-put-v1modelconfigroutes)). A `PUT` rewrites only the `[[routes]]` items,
+from each header to the line of its last value: the rest of the file stays byte for byte, and
+comments inside the items are lost. It keeps the old file as `<config>.bak-<unix s>` and never
+removes one. `routes` given as an inline array cannot be edited this way.
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name.
@@ -751,13 +757,14 @@ These keys need a restart: `socket`, `socket_mode`, `fronts.listen` (the listene
 the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup),
 `spend_file`, `audit_file`, `[usage]` and `fronts.grace_file` (the sandbox opens their
 directories once), and a login whose `credentials` or a named client whose `token_file` lies in
-a directory the sandbox did not open at startup (it opens the directories of the startup
+a directory the sandbox did not open at startup (it opens the directories of the config file, the startup
 config's credential files, `spend_file`, `audit_file`, `usage.file`, token files and
 `grace_file` once; one missing then stays closed until a restart). A file that cannot be read,
 does not validate, changes one of them or names a token file that cannot be read is refused: the running config stays, the gateway logs one line
 `gateway: reload refused: <file>: <field>: <reason>` with the line where the file has one, and
-`qb reload` exits 1 with the same reason. The sandbox lets the gateway read the files of its
-config file's directory, so an editor may replace the file by rename; give the config a
-directory of its own (the shipped unit's is one). The gateway warns at startup when that
-directory is the root, its user's `$HOME` or a directory above it, where every file beneath it
-would be readable.
+`qb reload` exits 1 with the same reason. The sandbox lets the gateway read, create, write and
+remove files in its config file's directory, so an editor may replace the file by rename and
+`PUT /v1/model/config/routes` writes the file and its backups there, which needs that directory
+writable by the gateway's user; give the config a directory of its own (the shipped unit's is
+one). The gateway warns at startup when that directory is the root, its user's `$HOME` or a
+directory above it, where every file beneath it would be readable and replaceable.

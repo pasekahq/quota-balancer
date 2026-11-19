@@ -48,6 +48,16 @@
       "object": "client-b",
       "result": "refused",
       "reason": "client `client-b` has a `token_sha256`, not a `token_file` the gateway can write"
+    },
+    {
+      "at": 1800000360,
+      "actor": "uid:1000",
+      "action": "config_routes",
+      "object": "/etc/qb/gateway.toml",
+      "result": "ok",
+      "config_sha256_before": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "config_sha256_after": "5f0e7c8d2b6a4e1f9c3d7a0b8e6f4c2d1a9b7e5c3f1d0a8b6c4e2f0d9b7a5c3e",
+      "backup": "/etc/qb/gateway.toml.bak-1800000360"
     }
   ],
   "skipped": 1

@@ -37,9 +37,10 @@ use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
     AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ClientRotateAnswer,
-    ErrorClass, GatewayError, LoginSpend, LoginStatus, Outcome, ReloadAnswer, RouteState,
-    RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking,
-    ToolCall, TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
+    ConfigRoute, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, ConfigStep, ErrorClass,
+    GatewayError, LoginSpend, LoginStatus, Outcome, ReloadAnswer, RouteState, RouteStatus,
+    RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall,
+    TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -7981,4 +7982,357 @@ fn an_empty_or_unreadable_token_file_fails_start_and_is_refused_on_reload() {
     let refused = start(config);
     let missing = format!("fronts.clients[0].token_file: {}: ", f.token_file.display());
     assert!(refused.contains(&missing), "{refused}");
+}
+
+/// `GET /v1/model/config/routes` on `gw` that must answer 200: the answer and its `ETag`.
+fn config_routes(gw: &Path) -> (ConfigRoutes, String) {
+    let (status, head, body) = finish(send(gw, "GET", paths::MODEL_CONFIG_ROUTES, ""), Vec::new());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let etag = head
+        .lines()
+        .find_map(|l| l.strip_prefix("ETag: "))
+        .unwrap()
+        .to_owned();
+    (serde_json::from_slice(&body).unwrap(), etag)
+}
+
+/// `PUT /v1/model/config/routes` on `gw` with `If-Match: if_match` when given and `body`.
+fn put_routes(gw: &Path, if_match: Option<&str>, body: &str) -> (u16, Vec<u8>) {
+    let mut s = UnixStream::connect(gw).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let if_match = if_match.map_or(String::new(), |m| format!("If-Match: {m}\r\n"));
+    write!(
+        s,
+        "PUT {} HTTP/1.1\r\nHost: qb\r\n{if_match}Content-Length: {}\r\n\r\n{body}",
+        paths::MODEL_CONFIG_ROUTES,
+        body.len()
+    )
+    .unwrap();
+    let (status, _, body) = finish(s, Vec::new());
+    (status, body)
+}
+
+/// The body of a `PUT` of `routes`.
+fn routes_body(routes: &[ConfigRoute]) -> String {
+    serde_json::to_string(&ConfigRoutesPut {
+        routes: routes.to_vec(),
+    })
+    .unwrap()
+}
+
+/// A route of `alias` on ladder step 1 of the role `gateway`.
+fn ladder_route(alias: &str) -> ConfigRoute {
+    ConfigRoute {
+        alias: alias.into(),
+        role: "gateway".into(),
+        difficulty: Some(1),
+        vendor: None,
+        model: None,
+        effort: None,
+        chain: None,
+        expected_minutes: None,
+    }
+}
+
+fn step(vendor: &str, model: &str, effort: Option<&str>) -> ConfigStep {
+    ConfigStep {
+        vendor: vendor.into(),
+        model: model.into(),
+        effort: effort.map(str::to_owned),
+    }
+}
+
+/// The backups `<config>.bak-*` beside the config file of `gw`.
+fn backups(gw: &Path) -> Vec<PathBuf> {
+    let file = config_file(gw);
+    let prefix = format!("{}.bak-", file.file_name().unwrap().to_str().unwrap());
+    let mut found: Vec<PathBuf> = std::fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(&prefix)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn config_routes_answer_the_file_s_routes_and_hash_and_a_put_of_them_round_trips() {
+    let r = chain_rig();
+    let file = config_file(&r.gw);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let (got, etag) = config_routes(&r.gw);
+    assert_eq!(got.sha256, sha256_hex(&text));
+    assert_eq!(etag, format!("\"{}\"", got.sha256));
+    let chat = ConfigRoute {
+        difficulty: None,
+        chain: Some(vec![
+            step("vendor-a", "model-a", None),
+            step("vendor-b", "model-b", Some("high")),
+            step("vendor-c", "model-c", None),
+        ]),
+        ..ladder_route("chat")
+    };
+    assert_eq!(got.routes, [chat]);
+
+    let (status, body) = put_routes(&r.gw, Some(&etag), &routes_body(&got.routes));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (again, _) = config_routes(&r.gw);
+    assert_eq!(again.routes, got.routes);
+
+    let r = rig();
+    let (got, _) = config_routes(&r.gw);
+    let spare = ConfigRoute {
+        difficulty: None,
+        vendor: Some("vendor-b".into()),
+        model: Some("model-b".into()),
+        ..ladder_route("spare")
+    };
+    assert_eq!(got.routes, [ladder_route("chat"), spare]);
+}
+
+#[test]
+fn a_put_of_a_changed_chain_and_a_new_route_serves_the_next_turn_and_keeps_other_bytes() {
+    let audit = audit_path();
+    let extra = format!(
+        "# top comment\n{}[openai_models.\"model-z\"]\nreasoning = false # kept\n# tail comment\n",
+        audit_key(&audit)
+    );
+    let r = chain_rig_with(QBD_THREE_VENDORS, None, &extra);
+    let file = config_file(&r.gw);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let old = qb::gateway::config::load(&file).unwrap();
+    let (got, etag) = config_routes(&r.gw);
+    let chat = ConfigRoute {
+        difficulty: None,
+        chain: Some(vec![
+            step("vendor-c", "model-c", None),
+            step("vendor-a", "model-a", Some("low")),
+        ]),
+        ..ladder_route("chat")
+    };
+    let added = ConfigRoute {
+        expected_minutes: Some(7),
+        ..ladder_route("added")
+    };
+    let started = unix_now();
+    let (status, body) = put_routes(&r.gw, Some(&etag), &routes_body(&[chat, added]));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let written: ConfigRoutesWritten = serde_json::from_slice(&body).unwrap();
+
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(written.sha256, sha256_hex(&after));
+    let routes_at = before.find("[[routes]]").unwrap();
+    let tail_at = before.find("[openai_models").unwrap();
+    assert!(after.starts_with(&before[..routes_at]), "{after}");
+    assert!(after.ends_with(&before[tail_at..]), "{after}");
+    assert!(before[..routes_at].contains("# top comment\n"), "{before}");
+    assert!(before[tail_at..].contains("# tail comment\n"), "{before}");
+    assert_eq!(aliases(&r.gw), ["added", "chat"]);
+
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-3", "text_delta", "stop End"]);
+    assert_eq!(route_of(&events), ("vendor-c".into(), "model-c".into()));
+    let mut body = turn_body("turn-2");
+    body["route"] = json!("added");
+    let (_, _, events) = turn(&r.gw, &body);
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+
+    let backup = PathBuf::from(&written.backup);
+    assert_eq!(backups(&r.gw), std::slice::from_ref(&backup));
+    let stamp: u64 = written
+        .backup
+        .strip_prefix(&format!("{}.bak-", file.display()))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((started..=unix_now()).contains(&stamp), "{stamp}");
+    assert_eq!(mode_of(&backup), 0o600);
+    let kept = qb::gateway::config::load(&backup).unwrap();
+    assert_eq!((kept.sha256, kept.routes), (old.sha256, old.routes));
+
+    let last = audit_answer(&r.gw, "").entries.pop().unwrap();
+    let file_name = file.display().to_string();
+    assert_eq!(
+        audit_rows(std::slice::from_ref(&last)),
+        [(
+            format!("uid:{}", own_uid()).as_str(),
+            AuditAction::ConfigRoutes,
+            Some(file_name.as_str()),
+            AuditResult::Ok,
+            None
+        )]
+    );
+    assert_eq!(
+        (
+            last.config_sha256_before,
+            last.config_sha256_after,
+            last.backup
+        ),
+        (Some(got.sha256), Some(written.sha256), Some(written.backup))
+    );
+}
+
+#[test]
+fn a_put_without_or_with_a_stale_if_match_or_an_invalid_candidate_leaves_everything_alone() {
+    let audit = audit_path();
+    let r = rig_as(4, &key_files(), &audit_key(&audit), own_uid());
+    let file = config_file(&r.gw);
+    let (got, etag) = config_routes(&r.gw);
+    let valid = routes_body(&[ladder_route("other")]);
+
+    let (status, e) = put_error(&r.gw, None, &valid);
+    assert_eq!((status, e.class), (428, ErrorClass::BadRequest), "{e:?}");
+    let stale = "0".repeat(64);
+    let (status, e) = put_error(&r.gw, Some(&stale), &valid);
+    assert_eq!((status, e.class), (412, ErrorClass::BadRequest), "{e:?}");
+    let message = e.message.unwrap();
+    assert!(message.contains(&got.sha256), "{message}");
+
+    let mut bad = ladder_route("Bad\"Alias");
+    bad.role = "gateway".into();
+    let invalid = routes_body(&[ladder_route("chat"), bad]);
+    let (status, e) = put_error(&r.gw, Some(&got.sha256), &invalid);
+    assert_eq!((status, e.class), (400, ErrorClass::BadRequest), "{e:?}");
+    let refusal = e.message.unwrap();
+    let field = format!(
+        "routes refused: {}: routes[1].alias: must match ^[a-z][a-z0-9_-]{{0,63}}$ (line ",
+        file.display()
+    );
+    assert!(refusal.starts_with(&field), "{refusal}");
+    let mut pinned_and_laddered = ladder_route("chat");
+    pinned_and_laddered.vendor = Some("vendor-a".into());
+    let (status, e) = put_error(&r.gw, Some(&etag), &routes_body(&[pinned_and_laddered]));
+    assert_eq!(status, 400, "{e:?}");
+    let message = e.message.unwrap();
+    assert!(
+        message.contains(": routes[0]: needs `difficulty`"),
+        "{message}"
+    );
+    let unknown = r#"{"routes": [], "spend_cap": 1}"#;
+    let (status, e) = put_error(&r.gw, Some(&etag), unknown);
+    assert_eq!(status, 400, "{e:?}");
+    assert!(e.message.unwrap().contains("unknown field `spend_cap`"));
+
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(sha256_hex(&text), got.sha256, "the file is untouched");
+    assert_eq!(backups(&r.gw), Vec::<PathBuf>::new());
+    assert_eq!(aliases(&r.gw), ["chat", "spare"]);
+
+    std::fs::write(&file, format!("{text}# edited by hand\n")).unwrap();
+    let (status, e) = put_error(&r.gw, Some(&etag), &valid);
+    assert_eq!(status, 412, "an edit by hand changes the hash: {e:?}");
+    assert_eq!(aliases(&r.gw), ["chat", "spare"]);
+
+    let entries = audit_answer(&r.gw, "").entries;
+    let reasons: Vec<_> = entries
+        .iter()
+        .map(|e| (e.action, e.result, e.backup.is_some()))
+        .collect();
+    let refused = (AuditAction::ConfigRoutes, AuditResult::Refused, false);
+    assert_eq!(reasons, [refused; 6]);
+    let edited = sha256_hex(&format!("{text}# edited by hand\n"));
+    let hashes: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.config_sha256_before.clone(),
+                e.config_sha256_after.clone(),
+            )
+        })
+        .collect();
+    let unchanged = (Some(got.sha256.clone()), Some(got.sha256.clone()));
+    assert_eq!(hashes[..5], vec![unchanged; 5]);
+    assert_eq!(hashes[5], (Some(edited.clone()), Some(edited)));
+    assert_eq!(entries[2].reason.as_deref(), Some(refusal.as_str()));
+}
+
+/// [`put_routes`] that must be refused: the status and the error.
+fn put_error(gw: &Path, if_match: Option<&str>, body: &str) -> (u16, GatewayError) {
+    let (status, body) = put_routes(gw, if_match, body);
+    let e = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&body)));
+    (status, e)
+}
+
+#[test]
+fn string_values_needing_toml_escapes_round_trip() {
+    let r = rig();
+    let (_, etag) = config_routes(&r.gw);
+    let odd = ConfigRoute {
+        role: "role \"q\" \\ back\nslash\t\u{1}é".into(),
+        difficulty: None,
+        chain: Some(vec![
+            step("vendor-a", "model \\\"a\"", Some("high # not a comment")),
+            step("vendor-'b'", "model-b", None),
+        ]),
+        ..ladder_route("odd")
+    };
+    let routes = [ladder_route("chat"), odd];
+    let (status, body) = put_routes(&r.gw, Some(&etag), &routes_body(&routes));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (got, _) = config_routes(&r.gw);
+    assert_eq!(got.routes, routes);
+    assert_eq!(aliases(&r.gw), ["chat", "odd"]);
+}
+
+#[test]
+fn only_the_gateway_s_own_uid_reads_or_replaces_the_routes_and_only_on_the_unix_socket() {
+    let audit = audit_path();
+    let extra = format!(
+        "{}[[clients]]\nname = \"client-a\"\nuid = {}\n",
+        audit_key(&audit),
+        own_uid()
+    );
+    let r = rig_as(4, &key_files(), &extra, own_uid() + 1);
+    let file = config_file(&r.gw);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let (status, e) = rejection(&r.gw, "GET", paths::MODEL_CONFIG_ROUTES, "");
+    assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
+    let body = routes_body(&[ladder_route("other")]);
+    let (status, e) = put_error(&r.gw, Some(&sha256_hex(&text)), &body);
+    assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    let entries: Vec<AuditEntry> = std::fs::read_to_string(&audit)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let actor = format!("uid:{}", own_uid());
+    let config = file.display().to_string();
+    assert_eq!(
+        audit_rows(&entries),
+        [(
+            actor.as_str(),
+            AuditAction::ConfigRoutes,
+            Some(config.as_str()),
+            AuditResult::Refused,
+            Some("only the gateway's own uid may read or replace the config's routes"),
+        )]
+    );
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_CONFIG_ROUTES, "");
+    assert_eq!(status, 405);
+
+    let (listener, addr, front) = loopback_front("");
+    let r = rig_on(4, &key_files(), &front, own_uid(), Some(listener));
+    let (_, etag) = config_routes(&r.gw);
+    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\nIf-Match: {etag}\r\n");
+    for method in ["GET", "PUT"] {
+        let (status, _, answer) = finish(
+            tcp_send(addr, method, paths::MODEL_CONFIG_ROUTES, &auth, &body),
+            Vec::new(),
+        );
+        assert_eq!(
+            status,
+            404,
+            "{method}: {}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+    assert_eq!(aliases(&r.gw), ["chat", "spare"]);
 }

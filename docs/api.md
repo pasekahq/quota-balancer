@@ -227,6 +227,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `GET /v1/model/audit` | — | 200 `AuditAnswer`, 400 a bad query, 403 a caller other than the gateway's own uid, 404 no `audit_file` |
 | `GET /v1/model/usage` | — | 200 `UsageAnswer`, 400 a bad query or more than 10 000 rows, 403 a caller other than the gateway's own uid, 404 no `[usage]` |
 | `POST /v1/model/clients/{name}/rotate` | — | 200 `ClientRotateAnswer`, 403 a caller other than the gateway's own uid, 404 no such named client, 409 a client with `token_sha256`, 500 a file could not be written |
+| `GET /v1/model/config/routes` | — | 200 `ConfigRoutes` with an `ETag`, 403 a caller other than the gateway's own uid, 500 the config file cannot be read or does not validate |
+| `PUT /v1/model/config/routes` | `ConfigRoutesPut` with `If-Match` | 200 `ConfigRoutesWritten`, 400 a body or candidate file that does not validate, 403 a caller other than the gateway's own uid, 412 `If-Match` is not the file's hash, 428 no `If-Match`, 500 a file could not be read or written |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -488,18 +490,18 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 |---|---|
 | `at` | Unix time of the action |
 | `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
-| `action` | `reload`, `spend_reset` or `client_rotate` |
-| `object` | the config file of a reload, the login of a spend reset, the client of a rotation; absent when a refused request named none |
+| `action` | `reload`, `spend_reset`, `client_rotate` or `config_routes` |
+| `object` | the config file of a reload or a routes edit, the login of a spend reset, the client of a rotation; absent when a refused request named none |
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
-| `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it; equal when it was refused |
-| `backup` | path of the copy an action kept of what it replaced; no current action sets it |
+| `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a routes edit's of the file on disk before and after it; equal when it was refused |
+| `backup` | a routes edit that went through: path of the copy of the file it replaced |
 | `token_sha256_prefix` | a rotation that went through: the first 12 hex characters of the new token's SHA-256 |
 
-Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/spend/reset` and
-`POST /v1/model/clients/{name}/rotate` that reaches its handler is recorded, refusals included:
-another uid's 403, a body that does not parse, a config that does not validate, an unknown
-client. A peer that is not a caller of the gateway gets its 401
+Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/spend/reset`,
+`POST /v1/model/clients/{name}/rotate` and `PUT /v1/model/config/routes` that reaches its handler
+is recorded, refusals included: another uid's 403, a missing or stale `If-Match`, a body that does
+not parse, a config that does not validate, an unknown client. A peer that is not a caller of the gateway gets its 401
 before any handler and leaves no line. No field holds a token, key or credential content. A
 line that cannot be appended is logged at error priority with the path; the action's answer
 stays as it was. The gateway neither rotates nor trims the file.
@@ -536,6 +538,54 @@ The previous token stays accepted until `grace_until`, the time of the rotation 
 `token_sha256_prefix` is the first 12 hex characters of the new token's SHA-256. An unknown
 name is 404 `bad_request`, a client with `token_sha256` 409 `bad_request`. A file that cannot be
 written is 500 `unavailable`: the token file and the accepted tokens stay as they were.
+
+### `GET` and `PUT /v1/model/config/routes`
+
+The `[[routes]]` items of the gateway's config file ([config.md](config.md#gateway-config)), read
+and replaced as JSON. Only the gateway's own uid may call them: any other caller gets 403 `auth`;
+the loopback listener answers 404. Both read the file as it is on disk, which may differ from the
+running config until a reload.
+
+`GET` answers the file's hex SHA-256 and its items in file order, each key as the file has it
+and a chain as an array of steps; the same hash goes out as the strong `ETag: "<sha256>"`:
+
+```json
+{"sha256": "a1b2…",
+ "routes": [{"alias": "chat", "role": "gateway", "difficulty": 1, "expected_minutes": 10},
+            {"alias": "pinned", "role": "gateway", "vendor": "vendor-b", "model": "model-b"},
+            {"alias": "chain", "role": "gateway",
+             "chain": [{"vendor": "vendor-a", "model": "model-a"},
+                       {"vendor": "vendor-c", "model": "model-c", "effort": "low"}]}]}
+```
+
+A file that cannot be read or does not validate is 500 `unavailable`.
+
+`PUT` takes `{"routes": [...]}` with items of the same shape, unknown fields refused, and
+`If-Match` with the hash `GET` answered, quoted as in the `ETag` or bare. The gateway holds its
+reload lock for the whole request, so reloads and client token rotations wait, and reads the file
+again: no `If-Match` is 428 `bad_request`, one that is not the file's current hash 412
+`bad_request`, so an edit by hand since the `GET` is detected. It renders the items as
+`[[routes]]` tables, TOML basic strings escaped, puts them where the first old item starts and
+removes the other old items. An item spans from its `[[routes]]` header to the end of the line of
+its last value, its `[[routes.chain]]` tables included: every byte outside the old items stays,
+comments and other tables included, and comments inside them go. A file whose `routes` are an
+inline array cannot be edited. The candidate file must pass what a reload checks
+([config.md](config.md#reload)); otherwise the answer is 400 `bad_request` with the message
+`routes refused: <file>: <field>: <reason>`, the line being the candidate's, for example
+``routes[1].alias: duplicate `chat` ``. Integers of the body are not range-checked before that, so
+the parser names a `difficulty` out of range. On success the old file is copied to
+`<config>.bak-<unix s>`, `-<n>` appended when a backup of that second exists, with mode 0600; the
+candidate is written atomically with mode 0600 (temporary file in the same directory, fsync,
+rename, fsync of the directory) and becomes the running config as a reload makes it, logging
+`gateway: reloaded <file>: …`. The answer is
+
+```json
+{"sha256": "5f0e…", "backup": "/etc/qb/gateway.toml.bak-1800000360"}
+```
+
+with the hash of the file now on disk. A file that cannot be read or written is 500
+`unavailable`. On every refusal the file, its backups and the running config stay as they were.
+The gateway never removes a backup.
 
 ### Usage ledger
 

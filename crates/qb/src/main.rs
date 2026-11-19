@@ -704,8 +704,8 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(dir) = sandbox::broad_config_dir(&config.file, home.as_deref()) {
         log::warn(&format!(
-            "qb gateway: the sandbox lets a reload read every file beneath {}, the config's \
-             directory; give the config a directory of its own",
+            "qb gateway: the sandbox lets the gateway read and replace every file beneath {}, \
+             the config's directory; give the config a directory of its own",
             dir.display()
         ));
     }

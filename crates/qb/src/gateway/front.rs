@@ -1,7 +1,7 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
 //! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
-//! `/v1/model/clients/{name}/rotate` and `/v1/health`, and the HTTP
+//! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes` and `/v1/health`, and the HTTP
 //! fronts: `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
 //! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to
 //! clients with a client token.
@@ -423,11 +423,16 @@ impl Drop for Slot {
 
 /// Writes `body` as a JSON answer with `status`, first reading what the peer still sends.
 fn reply<T: Serialize>(stream: &mut Conn, status: u16, body: &T) {
+    reply_with(stream, status, &[], body);
+}
+
+/// [`reply`] with the further headers `headers`.
+fn reply_with<T: Serialize>(stream: &mut Conn, status: u16, headers: &[(&str, &str)], body: &T) {
     if status >= 400 {
         drain_pending(&*stream);
     }
     let bytes = serde_json::to_vec(body).unwrap_or_default();
-    if let Err(e) = http::write_response(stream, status, &bytes) {
+    if let Err(e) = http::write_response_with(stream, status, headers, &bytes) {
         log::warn(&format!("gateway: write of a {status} reply failed: {e}"));
     }
 }
@@ -562,6 +567,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         (Method::Get, paths::MODEL_USAGE) => {
             read_usage(&mut stream, gateway, req.query.as_deref(), uid == own_uid);
         }
+        (_, paths::MODEL_CONFIG_ROUTES) => config_routes(&mut stream, gateway, &req, uid, own_uid),
         (Method::Post, paths::MODEL_CANCEL) => cancel(&mut stream, gateway, &caller, &req.body),
         (Method::Get, paths::HEALTH) => reply(&mut stream, 200, &health(started)),
         (
@@ -616,6 +622,65 @@ fn rotate(stream: &mut Conn, gateway: &Gateway, name: &str, actor: &str, own: bo
         return reject(stream, 403, ErrorClass::Auth, message);
     }
     match gateway.rotate_client(actor, name) {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(r) => reject(stream, r.status, r.class, &r.message),
+    }
+}
+
+/// Who may read or replace the config's routes.
+const CONFIG_OWNER: &str = "only the gateway's own uid may read or replace the config's routes";
+
+/// Answers `req` to `/v1/model/config/routes` from the peer of `uid`.
+fn config_routes(
+    stream: &mut Conn,
+    gateway: &Gateway,
+    req: &http::Request,
+    uid: u32,
+    own_uid: u32,
+) {
+    let own = uid == own_uid;
+    match req.method {
+        Method::Get => read_config_routes(stream, gateway, own),
+        Method::Put => put_config_routes(stream, gateway, req, &audit::uid_actor(uid), own),
+        _ => reject(stream, 405, ErrorClass::BadRequest, "method not allowed"),
+    }
+}
+
+/// Answers `GET /v1/model/config/routes`, which only the gateway's `own` uid may send, with the
+/// file's hash also as a strong `ETag`.
+fn read_config_routes(stream: &mut Conn, gateway: &Gateway, own: bool) {
+    if !own {
+        return reject(stream, 403, ErrorClass::Auth, CONFIG_OWNER);
+    }
+    match gateway.config_routes() {
+        Ok(answer) => {
+            let etag = format!("\"{}\"", answer.sha256);
+            reply_with(stream, 200, &[("ETag", &etag)], &answer);
+        }
+        Err(e) => {
+            let message = format!("cannot read the config file: {e}");
+            log::error(&format!("gateway: {message}"));
+            reject(stream, 500, ErrorClass::Unavailable, &message);
+        }
+    }
+}
+
+/// Answers `PUT /v1/model/config/routes` of `actor` with `req`, which only the gateway's `own`
+/// uid may send.
+fn put_config_routes(
+    stream: &mut Conn,
+    gateway: &Gateway,
+    req: &http::Request,
+    actor: &str,
+    own: bool,
+) {
+    if !own {
+        let object = Some(gateway.config().file.display().to_string());
+        let entry = audit::entry(actor, AuditAction::ConfigRoutes, object);
+        gateway.record(&audit::refused(entry, CONFIG_OWNER));
+        return reject(stream, 403, ErrorClass::Auth, CONFIG_OWNER);
+    }
+    match gateway.put_routes(actor, req.if_match.as_deref(), &req.body) {
         Ok(answer) => reply(stream, 200, &answer),
         Err(r) => reject(stream, r.status, r.class, &r.message),
     }
@@ -822,6 +887,7 @@ fn refuse_head(refusal: &Cell<Option<Refusal>>, why: Refusal, head: &Head<'_>) {
     let method = match head.method {
         Method::Get => "GET",
         Method::Post => "POST",
+        Method::Put => "PUT",
         Method::Other => "other",
     };
     log::warn(&format!(

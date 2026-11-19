@@ -18,7 +18,8 @@ pub mod gateway;
 
 pub use gateway::{
     Attempt, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CacheMode, CancelAnswer,
-    CancelRequest, ClientRotateAnswer, Effort, Elsewhere, ErrorClass, GatewayError, LoginSpend,
+    CancelRequest, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
+    ConfigRoutesWritten, ConfigStep, Effort, Elsewhere, ErrorClass, GatewayError, LoginSpend,
     MediaType, Message, NativeApi, NativeTool, Object, ReloadAnswer, Role, RouteInfo, RouteState,
     RouteStatus, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool,
     ToolCall, TurnRequest, TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy,
@@ -63,6 +64,9 @@ pub mod paths {
     /// Gateway, `POST` to `{MODEL_CLIENTS}/{name}/rotate`: write a fresh token to a named
     /// loopback client's `token_file`; only the gateway's own uid.
     pub const MODEL_CLIENTS: &str = "/v1/model/clients";
+    /// Gateway, `GET` and `PUT`: the `[[routes]]` of the gateway's config file, read and
+    /// replaced; only the gateway's own uid.
+    pub const MODEL_CONFIG_ROUTES: &str = "/v1/model/config/routes";
     /// Gateway, `POST`: an Anthropic Messages request, answered in the Messages format.
     pub const MESSAGES: &str = "/v1/messages";
     /// Gateway, `POST`: an OpenAI Chat Completions request, answered in that format.

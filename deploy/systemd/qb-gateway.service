@@ -2,9 +2,9 @@
 # config, serves /v1/model/* and the HTTP fronts (/v1/messages, /v1/chat/completions,
 # /v1/responses) on its own socket, the HTTP fronts also on an optional loopback port, and asks
 # qbd where each turn runs. Install into ~/.config/systemd/user/ of that
-# user. The process makes itself non-dumpable and applies landlock itself (credential
-# directories and its spend, audit, usage, client token and grace files' directories, its
-# config's directory read-only, resolver files, TCP connect to 443, TCP bind on the loopback port only), so the
+# user. The process makes itself non-dumpable and applies landlock itself (its config's and
+# credential directories and its spend, audit, usage, client token and grace files' directories,
+# resolver files, TCP connect to 443, TCP bind on the loopback port only), so the
 # unit's system call filter allows the landlock calls on top of @system-service. The socket goes
 # into RuntimeDirectory, for example socket = "/run/user/<uid>/qb-gateway/gateway.sock" in the
 # config. Mode 0700 admits only this user; for [[clients]] of other uids use 0750 with a shared
