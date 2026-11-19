@@ -213,6 +213,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
         need: Vec::new(),
         expected_minutes: None,
         run_id: None,
+        on_behalf_of: None,
     };
     let (mut vendor, mut model, mut effort, mut pin_login) = (None, None, None, None);
     let mut report = ReportRequest {

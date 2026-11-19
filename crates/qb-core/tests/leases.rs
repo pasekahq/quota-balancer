@@ -33,6 +33,28 @@ fn reserved(c: &Core, login: &str) -> Vec<f64> {
 }
 
 #[test]
+fn on_behalf_of_changes_no_decision() {
+    let fresh = || {
+        core(spec(vec![role(
+            "worker",
+            vec![step(
+                1,
+                vec![cand("vendor-a", "a", 1), cand("vendor-b", "b", 1)],
+            )],
+            vec![],
+        )]))
+    };
+    let mut plain = input("worker", Target::Difficulty(1), None);
+    plain.expected_minutes = Some(30);
+    let mut relayed = plain.clone();
+    relayed.on_behalf_of = Some("client-a".into());
+    let (mut a, mut b) = (fresh(), fresh());
+    for _ in 0..4 {
+        assert_eq!(a.pick(&plain, NOW), b.pick(&relayed, NOW));
+    }
+}
+
+#[test]
 fn a_run_holds_a_lease_with_its_cost_until_release() {
     let mut c = core(spec(vec![role(
         "worker",
@@ -42,6 +64,7 @@ fn a_run_holds_a_lease_with_its_cost_until_release() {
     let mut req = input("worker", Target::Difficulty(1), None);
     req.expected_minutes = Some(30);
     req.run_id = Some("run-1".into());
+    req.on_behalf_of = Some("client-a".into());
     let verdict = c.pick(&req, NOW);
     let Verdict::Run(g, _) = &verdict else {
         panic!("expected run, got {verdict:?}")
@@ -55,6 +78,7 @@ fn a_run_holds_a_lease_with_its_cost_until_release() {
             model: "a".into(),
             client: "test".into(),
             run_id: Some("run-1".into()),
+            on_behalf_of: Some("client-a".into()),
             expires_at: NOW + HOUR + 30 * 60,
         }]
     );

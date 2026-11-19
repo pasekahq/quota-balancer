@@ -524,7 +524,7 @@ impl Gateway {
         progress: &mut Progress,
         emit: &mut dyn FnMut(StreamEvent) -> Flow,
     ) -> Result<Ready<'t>, Next> {
-        let pick = match self.pick(&turn.route, req, progress) {
+        let pick = match self.pick(turn, req, progress) {
             Ok(p) => p,
             Err(e) => return Err(fail(emit, e, progress, "qbd failed")),
         };
@@ -998,13 +998,15 @@ impl Gateway {
         }
     }
 
-    /// A pick for `route`; a `wait` caused by `resume_of` is asked again once without it.
+    /// A pick for `turn`'s route on behalf of its caller; a `wait` caused by `resume_of` is
+    /// asked again once without it.
     fn pick(
         &self,
-        route: &Route,
+        turn: &Admitted,
         req: &TurnRequest,
         progress: &mut Progress,
     ) -> Result<PickResponse, GatewayError> {
+        let route = &turn.route;
         let session = req.session_key.as_ref();
         let mut pick = PickRequest {
             role: route.role.clone(),
@@ -1015,6 +1017,7 @@ impl Gateway {
             need: Vec::new(),
             expected_minutes: route.expected_minutes,
             run_id: Some(session.unwrap_or(&req.request_id).clone()),
+            on_behalf_of: Some(turn.client.clone()),
         };
         let p = self.pick_once(&pick)?;
         if p.decision != Decision::Wait || pick.resume_of.is_none() {

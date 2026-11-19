@@ -32,6 +32,7 @@ fn lease(id: u64, login: &str, cost: Vec<f64>, expires_at: u64) -> Record {
         model: "a".into(),
         client: "test".into(),
         run_id: None,
+        on_behalf_of: None,
         cost,
         expires_at,
         reason: None,

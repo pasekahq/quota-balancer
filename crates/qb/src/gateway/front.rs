@@ -690,26 +690,29 @@ fn refuse_head(refusal: &Cell<Option<Refusal>>, why: Refusal, head: &Head<'_>) {
         Method::Post => "POST",
         Method::Other => "other",
     };
-    // The path is the peer's: cap it and escape control characters so it cannot forge a line.
-    let path: String = head
-        .path
-        .chars()
-        .take(PATH_LOG_CHARS)
-        .flat_map(char::escape_debug)
-        .collect();
-    let more = if head.path.chars().nth(PATH_LOG_CHARS).is_some() {
-        "…"
-    } else {
-        ""
-    };
     log::warn(&format!(
-        "gateway: loopback refused {method} {path}{more}: {}",
+        "gateway: loopback refused {method} {}: {}",
+        peer_text(head.path),
         why.class()
     ));
 }
 
-/// Characters of a refused path that reach the log.
-const PATH_LOG_CHARS: usize = 64;
+/// A peer's `text` fit for a log line: capped, and control characters escaped so it cannot
+/// forge a line.
+pub(super) fn peer_text(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .take(PEER_LOG_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if text.chars().nth(PEER_LOG_CHARS).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Characters of a peer's text that reach the log.
+const PEER_LOG_CHARS: usize = 64;
 
 /// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] with a client
 /// token of `[fronts]` in `x-api-key` or `Authorization: Bearer`, checked before the body is read;

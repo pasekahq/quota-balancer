@@ -91,7 +91,14 @@ pub struct PickRequest {
     /// Caller's id of the run, echoed into the lease and the journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// End client a relaying caller picks for, echoed into the lease and the journal; at most
+    /// [`ON_BEHALF_OF_MAX`] bytes, not empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
 }
+
+/// Longest accepted [`PickRequest::on_behalf_of`], in bytes.
+pub const ON_BEHALF_OF_MAX: usize = 128;
 
 /// Why a [`PickRequest`] is malformed beyond what JSON decoding catches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +109,8 @@ pub enum PickRequestError {
     AmbiguousTarget,
     /// `role` is empty.
     EmptyRole,
+    /// `on_behalf_of` is empty or longer than [`ON_BEHALF_OF_MAX`] bytes.
+    BadOnBehalfOf,
 }
 
 impl PickRequestError {
@@ -111,6 +120,7 @@ impl PickRequestError {
             Self::NoTarget => "one of `difficulty` or `pin` is required",
             Self::AmbiguousTarget => "`difficulty` and `pin` are mutually exclusive",
             Self::EmptyRole => "`role` must not be empty",
+            Self::BadOnBehalfOf => "`on_behalf_of` must be 1 to 128 bytes",
         }
     }
 }
@@ -123,6 +133,13 @@ impl PickRequest {
     pub fn validate(&self) -> Result<(), PickRequestError> {
         if self.role.trim().is_empty() {
             return Err(PickRequestError::EmptyRole);
+        }
+        if self
+            .on_behalf_of
+            .as_ref()
+            .is_some_and(|o| o.is_empty() || o.len() > ON_BEHALF_OF_MAX)
+        {
+            return Err(PickRequestError::BadOnBehalfOf);
         }
         match (&self.difficulty, &self.pin) {
             (None, None) => Err(PickRequestError::NoTarget),
@@ -395,6 +412,9 @@ pub struct LeaseState {
     /// Caller's run id from the pick request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// End client the pick request named in `on_behalf_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
     /// When the lease expires unless released first.
     pub expires_at: u64,
 }
@@ -422,6 +442,9 @@ pub struct WhyResponse {
     /// Caller's run id from the pick request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// End client the pick request named in `on_behalf_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
     /// When the lease expires unless released first.
     pub expires_at: u64,
     /// Reservation per window of the login's vendor, in declaration order.
@@ -531,6 +554,7 @@ mod tests {
             need: Vec::new(),
             expected_minutes: None,
             run_id: None,
+            on_behalf_of: None,
         }
     }
 
@@ -572,6 +596,21 @@ mod tests {
             ..req()
         };
         assert_eq!(blank.validate(), Err(PickRequestError::EmptyRole));
+    }
+
+    #[test]
+    fn validate_bounds_on_behalf_of() {
+        let with = |name: &str| PickRequest {
+            on_behalf_of: Some(name.into()),
+            ..req()
+        };
+        assert_eq!(with("client-1").validate(), Ok(()));
+        assert_eq!(with(&"a".repeat(128)).validate(), Ok(()));
+        assert_eq!(with("").validate(), Err(PickRequestError::BadOnBehalfOf));
+        assert_eq!(
+            with(&"a".repeat(129)).validate(),
+            Err(PickRequestError::BadOnBehalfOf)
+        );
     }
 
     #[test]

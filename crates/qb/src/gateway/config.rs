@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use qb_core::MAX_LOGINS;
 use qb_openai::chat_upstream;
-use qb_proto::Pin;
+use qb_proto::{ON_BEHALF_OF_MAX, Pin};
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
@@ -639,6 +639,9 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
                 for (at, t) in tables(at, v)? {
                     f.clients.push(walk_front_client(&at, t)?);
                 }
+                if f.clients.is_empty() {
+                    return Err(bad("is empty; name a client or leave it out"));
+                }
                 clients_at = Some(v.span().start);
             }
             "ping_interval_s" => {
@@ -1000,6 +1003,15 @@ fn walk_chain(at: &str, v: &Value<'_>) -> Result<Vec<Step>, WalkError> {
     Ok(steps)
 }
 
+/// A caller name fits the `on_behalf_of` of the picks its turns make.
+fn caller_name(field: &str, name: &str) -> Result<(), Fault> {
+    if name.len() > ON_BEHALF_OF_MAX {
+        let reason = format!("is longer than {ON_BEHALF_OF_MAX} bytes");
+        return Err((field.into(), reason));
+    }
+    Ok(())
+}
+
 fn absolute(field: &str, path: &Path) -> Result<(), Fault> {
     if path.is_absolute() {
         Ok(())
@@ -1033,6 +1045,7 @@ impl GatewayConfig {
         }
         declare("clients", self.clients.iter().map(|c| c.name.as_str()))?;
         for (i, c) in self.clients.iter().enumerate() {
+            caller_name(&format!("clients[{i}].name"), &c.name)?;
             if self.clients[..i].iter().any(|o| o.uid == c.uid) {
                 return Err((format!("clients[{i}].uid"), "duplicate uid".into()));
             }
@@ -1122,6 +1135,12 @@ impl GatewayConfig {
         declare("fronts.clients", f.clients.iter().map(|c| c.name.as_str()))?;
         for (i, c) in f.clients.iter().enumerate() {
             let at = |key: &str| format!("fronts.clients[{i}].{key}");
+            caller_name(&at("name"), &c.name)?;
+            let uid_form = c.name.strip_prefix("uid:");
+            if uid_form.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+                let reason = "`uid:<n>` is the caller name of a unix socket peer".into();
+                return Err((at("name"), reason));
+            }
             if self.clients.iter().any(|o| o.name == c.name) {
                 return Err((at("name"), format!("`{}` is a `[[clients]]` name", c.name)));
             }
@@ -1895,6 +1914,43 @@ difficulty = 1
                 !err.contains("qb-plaintext-token") && !err.contains(&a),
                 "{err}"
             );
+        }
+    }
+
+    #[test]
+    fn caller_names_fit_on_behalf_of_and_front_clients_are_named_apart_from_uids() {
+        let a = "ab".repeat(32);
+        let listen = "[fronts]\nlisten = \"127.0.0.1:8080\"\n";
+        let messages = "[fronts.messages]\nvendor = \"vendor-a\"\n";
+        let named = |name: &str| {
+            format!(
+                "{listen}{messages}[[fronts.clients]]\nname = \"{name}\"\ntoken_sha256 = \"{a}\"\n"
+            )
+        };
+        let long = "c".repeat(129);
+        assert!(check("", &named(&"c".repeat(128))).is_ok());
+        assert!(check("", &named("uid:")).is_ok());
+        let cases = [
+            (
+                format!("{listen}clients = []\n{messages}"),
+                "fronts.clients: is empty; name a client or leave it out (line 15)",
+            ),
+            (
+                named("uid:1001"),
+                "fronts.clients[0].name: `uid:<n>` is the caller name of a unix socket peer",
+            ),
+            (
+                named(&long),
+                "fronts.clients[0].name: is longer than 128 bytes",
+            ),
+            (
+                format!("[[clients]]\nname = \"{long}\"\nuid = 1001\n"),
+                "clients[0].name: is longer than 128 bytes",
+            ),
+        ];
+        for (text, want) in cases {
+            let err = check("", &text).unwrap_err();
+            assert!(err.contains(want), "{text}: {err}");
         }
     }
 

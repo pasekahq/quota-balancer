@@ -445,6 +445,7 @@ mod tests {
                 client: "client-a".into(),
                 expected_minutes: None,
                 run_id: None,
+                on_behalf_of: None,
             },
             NOW,
         );

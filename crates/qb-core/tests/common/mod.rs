@@ -131,6 +131,7 @@ pub fn input(role: &str, target: Target, avoid_vendor: Option<&str>) -> PickInpu
         client: "test".into(),
         expected_minutes: None,
         run_id: None,
+        on_behalf_of: None,
     }
 }
 
