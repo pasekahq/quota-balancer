@@ -20,6 +20,9 @@ use super::import::claimed_account;
 use super::oauth::{OauthRefresher, percent_encode, plain_code};
 use crate::sha256;
 
+/// The refusal of a paste whose state is not the one the sign-in sent.
+const WRONG_STATE: &str = "the pasted state is not the one this sign-in sent";
+
 /// A sign-in waiting for the pasted code.
 pub struct SignIn {
     login: GatewayLogin,
@@ -143,9 +146,13 @@ impl SignIn {
     /// mode 0600.
     ///
     /// # Errors
-    /// As [`Self::code`] and [`Self::credential`], or the write failed.
+    /// As [`Self::code`], a wrong state with the hint to run `qb login` again, and as
+    /// [`Self::credential`], or the write failed.
     pub fn finish(self, pasted: &str) -> Result<Signed, String> {
-        let code = self.code(pasted)?;
+        let code = self.code(pasted).map_err(|e| match e.as_str() {
+            WRONG_STATE => format!("{e}; run `qb login` again"),
+            _ => e,
+        })?;
         let body = self.credential(&code).map_err(|e| e.message)?;
         let file = self.login.credentials.as_path();
         creds::write_atomic(file, &body)
@@ -253,7 +260,7 @@ impl SignIn {
             )
         };
         if state.as_deref().map(String::as_str) != Some(self.state.as_str()) {
-            return Err("the pasted state is not the one this sign-in sent".into());
+            return Err(WRONG_STATE.into());
         }
         if let Some(error) = error {
             return Err(if plain_code(&error) {

@@ -874,10 +874,12 @@ pub struct ConfigRoutesPut {
 /// `PUT /v1/model/config/routes` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigRoutesWritten {
-    /// Hex SHA-256 of the config file written and now serving.
+    /// Hex SHA-256 of the config file written and now serving, or of the file left as it was.
     pub sha256: String,
-    /// Path of the copy of the file it replaced.
-    pub backup: String,
+    /// Path of the copy of the file it replaced; absent when the edit changed no byte and
+    /// nothing was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
 }
 
 /// An admin action of the gateway, as its audit line names it.

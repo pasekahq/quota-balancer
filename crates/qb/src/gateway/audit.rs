@@ -10,9 +10,9 @@ use qb_proto::{AuditAction, AuditAnswer, AuditEntry, AuditResult};
 use serde::Serialize;
 
 use crate::journal::open_append;
-use crate::jsonl;
 use crate::log;
 use crate::server::unix_now;
+use crate::{http, jsonl};
 
 /// Actor of a reload that SIGHUP asked for.
 pub const SIGNAL: &str = "signal";
@@ -102,31 +102,16 @@ impl Query {
     /// # Errors
     /// Another parameter, one given twice, or a value out of range.
     pub(crate) fn parse(query: Option<&str>) -> Result<Self, String> {
-        let (mut since, mut limit) = (None, None);
-        for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let slot = match key {
-                "since" => &mut since,
-                "limit" => &mut limit,
-                _ => return Err("the query takes only `since` and `limit`".into()),
-            };
-            if slot.is_some() {
-                return Err(format!("`{key}` is given twice"));
-            }
-            let n = value
-                .parse::<u64>()
-                .map_err(|_| format!("`{key}` must be a whole number"))?;
-            *slot = Some(n);
-        }
+        let [since, limit] = http::query_params(query, ["since", "limit"])?;
         let limit = match limit {
             None => DEFAULT_LIMIT,
-            Some(n) => usize::try_from(n)
+            Some(v) => usize::try_from(http::whole_number("limit", v)?)
                 .ok()
                 .filter(|n| (1..=MAX_LIMIT).contains(n))
                 .ok_or(format!("`limit` must be 1 to {MAX_LIMIT}"))?,
         };
         Ok(Self {
-            since: since.unwrap_or(0),
+            since: since.map_or(Ok(0), |v| http::whole_number("since", v))?,
             limit,
         })
     }
@@ -165,7 +150,10 @@ mod tests {
             ("since=-1", "`since` must be a whole number"),
             ("since", "`since` must be a whole number"),
             ("since=1&since=2", "`since` is given twice"),
-            ("until=5", "the query takes only `since` and `limit`"),
+            (
+                "until=5",
+                "unknown parameter `until`: the query takes `since` and `limit`",
+            ),
         ] {
             assert_eq!(parsed(Some(bad)), Err(says.to_owned()), "{bad}");
         }

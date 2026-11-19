@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8167,10 +8167,10 @@ fn a_put_of_a_changed_chain_and_a_new_route_serves_the_next_turn_and_keeps_other
     let (_, _, events) = turn(&r.gw, &body);
     assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
 
-    let backup = PathBuf::from(&written.backup);
+    let written_backup = written.backup.clone().unwrap();
+    let backup = PathBuf::from(&written_backup);
     assert_eq!(backups(&r.gw), std::slice::from_ref(&backup));
-    let stamp: u64 = written
-        .backup
+    let stamp: u64 = written_backup
         .strip_prefix(&format!("{}.bak-", file.display()))
         .unwrap()
         .parse()
@@ -8198,7 +8198,7 @@ fn a_put_of_a_changed_chain_and_a_new_route_serves_the_next_turn_and_keeps_other
             last.config_sha256_after,
             last.backup
         ),
-        (Some(got.sha256), Some(written.sha256), Some(written.backup))
+        (Some(got.sha256), Some(written.sha256), written.backup)
     );
 }
 
@@ -8336,7 +8336,7 @@ fn only_the_gateway_s_own_uid_reads_or_replaces_the_routes_and_only_on_the_unix_
             AuditAction::ConfigRoutes,
             Some(config.as_str()),
             AuditResult::Refused,
-            Some("only the gateway's own uid may read or replace the config's routes"),
+            Some("only the gateway's own uid may read or edit the config's routes and spend caps"),
         )]
     );
     let (status, _) = call(&r.gw, "POST", paths::MODEL_CONFIG_ROUTES, "");
@@ -8460,6 +8460,54 @@ fn spend_caps_are_set_changed_and_removed_in_place_and_the_spend_view_follows() 
 }
 
 #[test]
+fn a_put_that_changes_no_byte_answers_the_file_s_hash_and_neither_writes_nor_reloads() {
+    let audit = audit_path();
+    let extra = format!("{}{PRICES}", audit_key(&audit));
+    let r = chain_rig_with(&qbd_with_spend(), Some([1.0, 100.0, 100.0]), &extra);
+    let file = config_file(&r.gw);
+    let before = std::fs::read_to_string(&file).unwrap();
+    let by_hand = before.replace(
+        &chain_login(&r, "login-1", "spend_cap = 1.0\n"),
+        &chain_login(&r, "login-1", "spend_cap = 3.0\n"),
+    );
+    assert_ne!(by_hand, before);
+    std::fs::write(&file, &by_hand).unwrap();
+    let inode = std::fs::metadata(&file).unwrap().ino();
+    let (got, etag) = config_routes(&r.gw);
+
+    let (status, answer) = put_routes(&r.gw, Some(&etag), &caps_body(&[("login-1", Some(3.0))]));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let written: ConfigRoutesWritten = serde_json::from_slice(&answer).unwrap();
+    let unchanged = ConfigRoutesWritten {
+        sha256: got.sha256.clone(),
+        backup: None,
+    };
+    assert_eq!(written, unchanged);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), by_hand);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().ino(),
+        inode,
+        "not rewritten"
+    );
+    assert_eq!(backups(&r.gw), Vec::<PathBuf>::new());
+    assert_eq!(
+        caps_in_spend(&r.gw)[0],
+        ("login-1".into(), 1.0),
+        "the running config is not reloaded"
+    );
+
+    let last = audit_answer(&r.gw, "").entries.pop().unwrap();
+    assert_eq!(
+        (last.action, last.result, last.reason, last.backup),
+        (AuditAction::ConfigSpendCaps, AuditResult::Ok, None, None)
+    );
+    assert_eq!(
+        (last.config_sha256_before, last.config_sha256_after),
+        (Some(got.sha256.clone()), Some(got.sha256))
+    );
+}
+
+#[test]
 fn a_put_of_routes_and_caps_is_one_edit_audited_as_config_routes() {
     let audit = audit_path();
     let extra = format!("{}{PRICES}", audit_key(&audit));
@@ -8483,7 +8531,10 @@ fn a_put_of_routes_and_caps_is_one_edit_audited_as_config_routes() {
         text.contains(&chain_login(&r, "login-3", "spend_cap = 50.0\n")),
         "{text}"
     );
-    assert_eq!(backups(&r.gw), [PathBuf::from(&written.backup)]);
+    assert_eq!(
+        backups(&r.gw),
+        [PathBuf::from(written.backup.clone().unwrap())]
+    );
     let entries = audit_answer(&r.gw, "").entries;
     let rows: Vec<_> = entries
         .iter()
@@ -8491,11 +8542,7 @@ fn a_put_of_routes_and_caps_is_one_edit_audited_as_config_routes() {
         .collect();
     assert_eq!(
         rows,
-        [(
-            AuditAction::ConfigRoutes,
-            AuditResult::Ok,
-            Some(written.backup)
-        )]
+        [(AuditAction::ConfigRoutes, AuditResult::Ok, written.backup)]
     );
 }
 
@@ -9012,6 +9059,51 @@ fn a_write_that_replaced_the_credential_file_and_then_failed_keeps_the_backup() 
 }
 
 #[test]
+fn a_write_that_created_the_credential_file_and_then_failed_says_there_was_no_old_file() {
+    let (r, audit, _) = key_rig(api_key("test-key-two-5c3d"), "", own_uid());
+    let file = r.dir.join("creds/login-1.json");
+    std::fs::remove_file(&file).unwrap();
+    let dir = file.parent().unwrap();
+    // Without read permission the rename into the directory works, its sync after it does not.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::read_dir(dir).is_ok() {
+        // Running as root: directory modes do not bind, nothing to check.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let mut answer = (0, Vec::new());
+    stderr_until("key replacement of login `login-1` refused", || {
+        answer = put_key(&r.gw, "login-1", &json!({"key": NEW_KEY}).to_string());
+    });
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e: GatewayError = serde_json::from_slice(&answer.1).unwrap();
+    assert_eq!((answer.0, e.class), (500, ErrorClass::Unavailable), "{e:?}");
+    let message = e.message.unwrap();
+    let replaced = format!("{} was replaced but the write failed: ", file.display());
+    assert!(message.starts_with(&replaced), "{message}");
+    assert!(message.ends_with("; there was no old file"), "{message}");
+    assert!(!message.contains(NEW_KEY), "{message}");
+    assert_eq!(backups_of(&file), Vec::<PathBuf>::new());
+    let last = audit_answer(&r.gw, "").entries.pop().unwrap();
+    assert_eq!(
+        (
+            last.action,
+            last.object.as_deref(),
+            last.result,
+            last.backup
+        ),
+        (
+            AuditAction::LoginKey,
+            Some("login-1"),
+            AuditResult::Refused,
+            None
+        )
+    );
+    let audited = std::fs::read_to_string(&audit).unwrap();
+    assert!(!audited.contains(NEW_KEY), "{audited}");
+}
+
+#[test]
 fn a_backup_that_cannot_be_written_keeps_the_old_key_in_force() {
     let (r, _, _) = key_rig(api_key("test-key-two-5c3d"), "", own_uid());
     let file = r.dir.join("creds/login-1.json");
@@ -9253,16 +9345,15 @@ impl SignRig {
             .collect()
     }
 
-    /// Asserts that none of `answers`, `logged`, the audit file and the ledger files holds a
-    /// marked value or one of `hidden`.
+    /// Asserts that none of `answers`, `logged`, the audit file and the files of the ledger's
+    /// directory holds a marked value or one of `hidden`.
     fn assert_hidden(&self, answers: &[(u16, Vec<u8>)], logged: &str, hidden: &[&str]) {
-        let read = |f: &Path| std::fs::read_to_string(f).unwrap_or_default();
+        let read = |f: &Path| {
+            std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{}: {e}", f.display()))
+        };
         let mut texts = vec![("stderr", logged.to_owned()), ("audit", read(&self.audit))];
-        texts.extend(
-            ledger_files(&self.ledger)
-                .iter()
-                .map(|f| ("ledger", read(f))),
-        );
+        let ledger_dir = std::fs::read_dir(self.ledger.parent().unwrap()).unwrap();
+        texts.extend(ledger_dir.map(|f| ("ledger", read(&f.unwrap().path()))));
         texts.extend(
             answers
                 .iter()

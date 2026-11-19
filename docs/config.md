@@ -241,7 +241,7 @@ or put the socket in a directory outside it.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `name` | string | Caller name in the log; 1 to 128 bytes, not of the form `uid:<digits>`. |
+| `name` | string | Caller name in the log; 1 to 128 bytes of ASCII letters, digits, `.`, `-`, `_` and `:`, not `.` or `..`, not of the form `uid:<digits>`. |
 | `uid` | integer | Peer uid (`SO_PEERCRED`); unique. |
 
 `[[logins]]`, 1 to 32: the logins this gateway holds credentials for.
@@ -446,7 +446,7 @@ token as that client. An empty `clients = []` is a config error.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `name` | string | Required, 1 to 128 bytes and unique. Neither a `[[clients]]` name, nor `client-token`, nor of the form `uid:<digits>`. |
+| `name` | string | Required, 1 to 128 bytes of ASCII letters, digits, `.`, `-`, `_` and `:`, not `.` or `..`, and unique, so `POST /v1/model/clients/<name>/rotate` names it as it stands. Neither a `[[clients]]` name, nor `client-token`, nor of the form `uid:<digits>`. |
 | `token_sha256` | string | SHA-256 of the client's token as 64 hex characters, made as below; no other named client and not `fronts.token_sha256` may have the same hash. Exactly one of `token_sha256` and `token_file`. |
 | `token_file` | string | Absolute path of a file that holds the client's token, at most 4096 bytes, one trailing newline cut, not empty. The gateway reads it at start and on every reload, keeps only its SHA-256 and writes a fresh token to it on a rotation ([Client token rotation](#client-token-rotation)). An unreadable or empty file fails the start and refuses a reload, naming the field; no other client may hold the same token. Needs `grace_file`. |
 | `routes` | array of strings | Route aliases the client may run on, at least one; absent means every route. A request whose `model` resolves, through `models` or as an alias, to another route is answered 403 before any pick ([api.md](api.md#model-gateway-v1model)). |

@@ -375,7 +375,12 @@ fn config_routes() {
     let caps: Vec<_> = put.spend_caps.unwrap().into_iter().collect();
     assert_eq!(caps, [("key-1".into(), Some(40.5)), ("key-2".into(), None)]);
     let written: ConfigRoutesWritten = roundtrip("gateway_config_routes_written.json");
-    assert_eq!(written.backup, "/etc/qb/gateway.toml.bak-1800000360");
+    assert_eq!(
+        written.backup.as_deref(),
+        Some("/etc/qb/gateway.toml.bak-1800000360")
+    );
+    let unchanged: ConfigRoutesWritten = roundtrip("gateway_config_routes_unchanged.json");
+    assert_eq!(unchanged.backup, None);
 }
 
 #[test]
@@ -560,38 +565,49 @@ fn enums(at: &str, v: &Value, out: &mut Vec<(String, Vec<String>)>) {
     }
 }
 
+/// Every variant of the enum `$t`, built as given: the `match` stops compiling when `$t` gains a
+/// variant the listing lacks, and a variant listed twice is an unreachable pattern.
+macro_rules! every {
+    ($t:ident: $($v:ident $({ $($field:tt)* })?),+ $(,)?) => {{
+        let _exhaustive = |x: &$t| match x {
+            $($t::$v { .. } => ()),+
+        };
+        [$($t::$v $({ $($field)* })?),+]
+    }};
+}
+
 /// One block of each kind.
-fn every_block() -> Vec<Block> {
+fn every_block() -> [Block; 5] {
     let text = || "t".to_owned();
-    vec![
-        Block::Text { text: text() },
-        Block::Image {
+    every!(Block:
+        Text { text: text() },
+        Image {
             media_type: MediaType::Png,
             path: None,
             base64: Some(text()),
         },
-        Block::ToolUse {
+        ToolUse {
             id: text(),
             name: text(),
             input: Object::new(),
         },
-        Block::ToolResult {
+        ToolResult {
             id: text(),
             content: text(),
             is_error: None,
         },
-        Block::Thinking {
+        Thinking {
             vendor: text(),
             opaque: text(),
         },
-    ]
+    )
 }
 
-/// One stream event of each type.
-fn every_event() -> Vec<StreamEvent> {
+/// One event of each kind.
+fn every_event() -> [StreamEvent; 7] {
     let text = || "t".to_owned();
-    vec![
-        StreamEvent::Route {
+    every!(StreamEvent:
+        Route {
             route: RouteInfo {
                 vendor: text(),
                 model: text(),
@@ -599,127 +615,128 @@ fn every_event() -> Vec<StreamEvent> {
                 lease: text(),
             },
         },
-        StreamEvent::TextDelta { text: text() },
-        StreamEvent::Thinking {
+        TextDelta { text: text() },
+        Thinking {
             thinking: Thinking {
                 vendor: text(),
                 opaque: text(),
             },
         },
-        StreamEvent::ToolCall {
+        ToolCall {
             tool_call: ToolCall {
                 id: text(),
                 name: text(),
                 input: Object::new(),
             },
         },
-        StreamEvent::Usage {
+        Usage {
             usage: Usage::default(),
         },
-        StreamEvent::Stop {
+        Stop {
             reason: StopReason::End,
         },
-        StreamEvent::Error {
+        Error {
             error: GatewayError::new(ErrorClass::Auth, false, text()),
         },
-    ]
+    )
 }
 
-/// The JSON pointer of each `enum` of `docs/openapi-gateway.json` and the names of its
-/// qb-proto type, `classes` being every [`ErrorClass`].
-fn typed_enums(classes: &[ErrorClass]) -> Vec<(String, Vec<String>)> {
-    use qb_proto::{RouteState as R, StopReason as S};
+/// The JSON pointer of each `enum` of `docs/openapi-gateway.json` and the names of every variant
+/// of its qb-proto type.
+fn typed_enums() -> Vec<(String, Vec<String>)> {
     let schema = |name: &str| format!("/components/schemas/{name}");
+    let group_by = every!(UsageGroupBy: Client, Login, Model, Route, Tool);
+    assert_eq!(group_by, UsageGroupBy::ALL, "`ALL` lists every grouping");
+    let bucket = every!(UsageBucket: Hour, Day, Month);
+    assert_eq!(bucket, UsageBucket::ALL, "`ALL` lists every bucket");
     vec![
         (
             schema("Effort"),
-            names(&[Effort::Low, Effort::Medium, Effort::High, Effort::Max]),
+            names(&every!(Effort: Low, Medium, High, Max)),
         ),
-        (schema("CacheMode"), names(&[CacheMode::Auto])),
+        (schema("CacheMode"), names(&every!(CacheMode: Auto))),
         (
             schema("Role"),
-            names(&[Role::User, Role::Assistant, Role::System]),
+            names(&every!(Role: User, Assistant, System)),
         ),
         (schema("BlockType"), tags(&every_block())),
         (
             schema("MediaType"),
-            names(&[
-                MediaType::Png,
-                MediaType::Jpeg,
-                MediaType::Gif,
-                MediaType::Webp,
-            ]),
+            names(&every!(MediaType: Png, Jpeg, Gif, Webp)),
         ),
         (
             schema("NativeTool/properties/api"),
-            names(&[NativeApi::OpenaiResponses]),
+            names(&every!(NativeApi: OpenaiResponses)),
         ),
         (
             schema("NativeTool/properties/elsewhere"),
-            names(&[Elsewhere::Function, Elsewhere::Omit, Elsewhere::Refuse]),
+            names(&every!(Elsewhere: Function, Omit, Refuse)),
         ),
         (schema("EventType"), tags(&every_event())),
         (
             schema("StopReason"),
-            names(&[S::End, S::ToolUse, S::MaxTokens, S::Refusal]),
+            names(&every!(StopReason: End, ToolUse, MaxTokens, Refusal)),
         ),
-        (schema("ErrorClass"), names(classes)),
+        (schema("ErrorClass"), names(&every_class())),
         (
             schema("RouteState"),
-            names(&[R::Ready, R::Degraded, R::Exhausted, R::Unavailable]),
+            names(&every!(RouteState: Ready, Degraded, Exhausted, Unavailable)),
         ),
         (
             schema("OauthPaste"),
-            names(&[OauthPaste::CodeState, OauthPaste::RedirectUrl]),
+            names(&every!(OauthPaste: CodeState, RedirectUrl)),
         ),
         (
             schema("AuditAction"),
-            names(&[
-                AuditAction::Reload,
-                AuditAction::SpendReset,
-                AuditAction::ClientRotate,
-                AuditAction::ConfigRoutes,
-                AuditAction::ConfigSpendCaps,
-                AuditAction::LoginKey,
-                AuditAction::LoginOauthStart,
-                AuditAction::LoginOauthCode,
-            ]),
+            names(&every!(AuditAction:
+                Reload,
+                SpendReset,
+                ClientRotate,
+                ConfigRoutes,
+                ConfigSpendCaps,
+                LoginKey,
+                LoginOauthStart,
+                LoginOauthCode,
+            )),
         ),
         (
             schema("AuditResult"),
-            names(&[AuditResult::Ok, AuditResult::Refused]),
+            names(&every!(AuditResult: Ok, Refused)),
         ),
-        (schema("UsageGroupBy"), names(&UsageGroupBy::ALL)),
-        (schema("UsageBucket"), names(&UsageBucket::ALL)),
+        (schema("UsageGroupBy"), names(&group_by)),
+        (schema("UsageBucket"), names(&bucket)),
         (
             schema("Health/properties/status"),
-            names(&[HealthStatus::Ok]),
+            names(&every!(HealthStatus: Ok)),
         ),
     ]
 }
 
+/// Every [`ErrorClass`].
+fn every_class() -> [ErrorClass; 8] {
+    every!(ErrorClass:
+        QuotaExhausted,
+        Auth,
+        Unavailable,
+        Overloaded,
+        BadRequest,
+        ContextTooLong,
+        Cancelled,
+        NoRoute,
+    )
+}
+
 #[test]
 fn openapi_enums_match_the_types() {
-    use qb_proto::ErrorClass as C;
     let path = format!(
         "{}/../../docs/openapi-gateway.json",
         env!("CARGO_MANIFEST_DIR")
     );
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let classes = [
-        C::QuotaExhausted,
-        C::Auth,
-        C::Unavailable,
-        C::Overloaded,
-        C::BadRequest,
-        C::ContextTooLong,
-        C::Cancelled,
-        C::NoRoute,
-    ];
-    for c in classes {
+    for c in every_class() {
         assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
     }
-    let typed = typed_enums(&classes);
+    let typed = typed_enums();
     let mut found = Vec::new();
     enums("", &doc, &mut found);
     for (at, values) in &found {

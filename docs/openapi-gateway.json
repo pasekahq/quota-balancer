@@ -2061,16 +2061,15 @@
           "sha256": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$",
-            "description": "Hex SHA-256 of the config file written and now serving."
+            "description": "Hex SHA-256 of the config file written and now serving, or of the file left as it was."
           },
           "backup": {
             "type": "string",
-            "description": "Path of the copy of the file it replaced."
+            "description": "Path of the copy of the file it replaced; absent when the edit changed no byte and nothing was written."
           }
         },
         "required": [
-          "sha256",
-          "backup"
+          "sha256"
         ]
       }
     }

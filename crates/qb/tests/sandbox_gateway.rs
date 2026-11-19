@@ -249,7 +249,7 @@ fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
         let _ = edited.send(());
     }
     let (backup, key_backup) = gateway.join().unwrap();
-    let backup = PathBuf::from(backup);
+    let backup = PathBuf::from(backup.unwrap());
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), text);
     let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "the backup written in the sandbox");

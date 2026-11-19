@@ -1112,12 +1112,21 @@ fn walk_chain(at: &str, v: &Value<'_>) -> Result<Vec<Step>, WalkError> {
     Ok(steps)
 }
 
-/// A caller name fits the `on_behalf_of` of the picks its turns make and is not of the form
-/// `uid:<digits>`, the caller name of the gateway's own uid.
+/// A caller name fits the `on_behalf_of` of the picks its turns make, is one path segment of
+/// `/v1/model/clients/{name}/rotate` as it stands, and is not of the form `uid:<digits>`, the
+/// caller name of the gateway's own uid.
 fn caller_name(field: &str, name: &str) -> Result<(), Fault> {
     if name.len() > ON_BEHALF_OF_MAX {
         let reason = format!("is longer than {ON_BEHALF_OF_MAX} bytes");
         return Err((field.into(), reason));
+    }
+    let path_safe = |b: u8| b.is_ascii_alphanumeric() || b".-_:".contains(&b);
+    if !name.bytes().all(path_safe) {
+        let reason = "may hold only ASCII letters, digits, `.`, `-`, `_` and `:`".into();
+        return Err((field.into(), reason));
+    }
+    if name == "." || name == ".." {
+        return Err((field.into(), "is a dot segment of a URL path".into()));
     }
     let uid_form = name.strip_prefix("uid:");
     if uid_form.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
@@ -2126,6 +2135,7 @@ difficulty = 1
         let long = "c".repeat(129);
         assert!(check("", &named(&"c".repeat(128))).is_ok());
         assert!(check("", &named("uid:")).is_ok());
+        assert!(check("", &named("Client_a.1-b:c")).is_ok());
         let cases = [
             (
                 format!("{listen}clients = []\n{messages}"),
@@ -2146,6 +2156,26 @@ difficulty = 1
             (
                 "[[clients]]\nname = \"uid:1001\"\nuid = 1001\n".into(),
                 "clients[0].name: `uid:<n>` is the caller name of a unix socket peer",
+            ),
+            (
+                named("client a"),
+                "fronts.clients[0].name: may hold only ASCII letters, digits, `.`, `-`, `_` and `:`",
+            ),
+            (
+                named("client/a"),
+                "fronts.clients[0].name: may hold only ASCII letters, digits, `.`, `-`, `_` and `:`",
+            ),
+            (
+                named(".."),
+                "fronts.clients[0].name: is a dot segment of a URL path",
+            ),
+            (
+                "[[clients]]\nname = \"caf\u{e9}\"\nuid = 1001\n".into(),
+                "clients[0].name: may hold only ASCII letters, digits, `.`, `-`, `_` and `:`",
+            ),
+            (
+                "[[clients]]\nname = \"a?b\"\nuid = 1001\n".into(),
+                "clients[0].name: may hold only ASCII letters, digits, `.`, `-`, `_` and `:`",
             ),
         ];
         for (text, want) in cases {

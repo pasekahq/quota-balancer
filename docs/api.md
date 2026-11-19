@@ -498,7 +498,7 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
 | `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a config edit's of the file on disk before and after it; equal when it was refused, unless the edit replaced the file but could not install it |
-| `backup` | a config edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none |
+| `backup` | a config edit that wrote the file, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none |
 | `token_sha256_prefix` | a rotation that went through: the first 12 hex characters of the new token's SHA-256 |
 | `key_sha256_prefix` | a key replacement that went through: the first 12 hex characters of the new key's SHA-256 |
 
@@ -708,13 +708,16 @@ new caps at once. The answer is
 {"sha256": "5f0e…", "backup": "/etc/qb/gateway.toml.bak-1800000360"}
 ```
 
-with the hash of the file now on disk. A file that cannot be read or written is 500
-`unavailable`. On every refusal the file, its backups and the running config stay as they were,
-with one exception: a write that fails after the rename replaced the file is 500 `unavailable`
-with the message `<file> was replaced but not installed: <error>; the old file is kept as
-<backup>`. The running config stays, the file on disk is the candidate and the backup is kept,
-so a reload installs the candidate and the backup restores the old file. The gateway removes the
-new backup only when a failed write left the file unchanged, and no other backup.
+with the hash of the file now on disk. A candidate equal to the file byte for byte is not
+written: the answer is 200 with the file's hash and no `backup`, no backup is made and the
+running config is not reloaded; the audit records it as `ok` without a `backup`. A file that
+cannot be read or written is 500 `unavailable`. On every refusal the file, its backups and the
+running config stay as they were, with one exception: a write that fails after the rename
+replaced the file is 500 `unavailable` with the message `<file> was replaced but not installed:
+<error>; the old file is kept as <backup>`. The running config stays, the file on disk is the
+candidate and the backup is kept, so a reload installs the candidate and the backup restores the
+old file. The gateway removes the new backup only when a failed write left the file unchanged,
+and no other backup.
 
 ### Usage ledger
 

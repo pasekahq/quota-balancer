@@ -717,8 +717,9 @@ fn respond<T: Serialize>(stream: &mut Conn, result: Result<T, super::Refusal>) {
     }
 }
 
-/// Who may read or replace the config's routes.
-const CONFIG_OWNER: &str = "only the gateway's own uid may read or replace the config's routes";
+/// Who may read or edit the config's routes and spend caps.
+const CONFIG_OWNER: &str =
+    "only the gateway's own uid may read or edit the config's routes and spend caps";
 
 /// Answers `req` to `/v1/model/config/routes` from the peer of `uid`.
 fn config_routes(

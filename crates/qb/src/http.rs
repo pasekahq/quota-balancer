@@ -305,6 +305,49 @@ pub fn write_stream_end<W: Write>(w: &mut W) -> io::Result<()> {
     w.flush()
 }
 
+/// The values of query string `query` in the order of `keys`, each key at most once; a pair
+/// without `=` has an empty value.
+///
+/// # Errors
+/// A message naming the parameter that is not one of `keys` or is given twice.
+pub fn query_params<'a, const N: usize>(
+    query: Option<&'a str>,
+    keys: [&str; N],
+) -> Result<[Option<&'a str>; N], String> {
+    let mut values = [None; N];
+    for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(i) = keys.iter().position(|k| *k == key) else {
+            let mut takes = String::new();
+            for (n, k) in keys.iter().enumerate() {
+                let separator = match n {
+                    0 => "",
+                    n if n + 1 == N => " and ",
+                    _ => ", ",
+                };
+                takes.extend([separator, "`", k, "`"]);
+            }
+            return Err(format!(
+                "unknown parameter `{key}`: the query takes {takes}"
+            ));
+        };
+        if values[i].replace(value).is_some() {
+            return Err(format!("`{key}` is given twice"));
+        }
+    }
+    Ok(values)
+}
+
+/// `value` of query parameter `key` as a whole number.
+///
+/// # Errors
+/// A message naming `key` when `value` is not a whole number.
+pub fn whole_number(key: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("`{key}` must be a whole number"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -567,6 +567,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&backup).unwrap(), b"old");
         assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -583,6 +584,7 @@ mod tests {
         let backup = super::backup(&file, b"old", 7).unwrap();
         replace(&file, b"old", b"new", &backup, ok).unwrap();
         assert!(backup.exists());
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
     #[test]
