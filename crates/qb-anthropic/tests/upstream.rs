@@ -334,6 +334,11 @@ fn oauth_mode_prefixes_client_tool_names_and_maps_them_back() {
     });
     assert!(wire_tool_names(&req, AuthMode::Oauth).is_empty());
 
+    // A name the prefix would take past the vendor's 64 characters stays bare.
+    let mut long = turn();
+    long.tools[0].name = "t".repeat(60);
+    assert!(wire_tool_names(&long, AuthMode::Oauth).is_empty());
+
     let sse = fixture("upstream_tool_use.sse");
     let sse = String::from_utf8(sse)
         .expect("utf-8")

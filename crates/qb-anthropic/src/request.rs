@@ -106,9 +106,12 @@ pub struct Target<'a> {
     pub adaptive_thinking: bool,
 }
 
+/// Longest tool name the vendor takes.
+const MAX_TOOL_NAME: usize = 64;
+
 /// Wire names of the client tools of `req` under `auth`, client name to wire name: under
 /// [`AuthMode::Oauth`] each name without [`identity::OAUTH_TOOL_PREFIX`] gets it, unless the
-/// prefixed name is a client tool too; empty under [`AuthMode::ApiKey`]. The inverse map goes
+/// prefixed name is a client tool too or longer than the vendor's 64 characters; empty under [`AuthMode::ApiKey`]. The inverse map goes
 /// to [`crate::stream::Reader::with_tool_names`] so the client sees its own names.
 pub fn wire_tool_names(req: &TurnRequest, auth: AuthMode) -> HashMap<String, String> {
     if auth != AuthMode::Oauth {
@@ -119,7 +122,9 @@ pub fn wire_tool_names(req: &TurnRequest, auth: AuthMode) -> HashMap<String, Str
         .iter()
         .filter(|t| !t.name.starts_with(p))
         .map(|t| (t.name.clone(), format!("{p}{}", t.name)))
-        .filter(|(_, wire)| !req.tools.iter().any(|t| &t.name == wire))
+        .filter(|(_, wire)| {
+            wire.len() <= MAX_TOOL_NAME && !req.tools.iter().any(|t| &t.name == wire)
+        })
         .collect()
 }
 
