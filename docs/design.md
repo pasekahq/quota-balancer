@@ -71,8 +71,9 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   when one fails, and reports the outcome and the windows it saw. It refreshes OAuth tokens on
   demand and replaces the credential file atomically (0600, rename in the same directory).
   It rotates the token of a named loopback client with a `token_file` the same way, and replaces
-  the `[[routes]]` and the logins' `spend_cap`s of its config file and the key of an `api_key`
-  login atomically with a 0600 backup, on its own uid's request.
+  the `[[routes]]` and the logins' `spend_cap`s of its config file, the key of an `api_key`
+  login and the tokens of an OAuth login it signs in again with PKCE atomically with a 0600
+  backup, on its own uid's request.
   Before serving it makes itself non-dumpable and restricts itself with landlock to its config's
   and credential directories and the directories of its spend, audit, usage, client token and
   grace files (read-write), the resolver files, TCP connections to port 443 and a
@@ -203,7 +204,7 @@ refreshes the login for later picks.
 | dependencies | ≤ 12 direct, ≲ 50 total |
 | CPU | 0 wake-ups/s idle (daemon, agent and gateway); pick ≤ 50 µs server-side, p99 ≤ 1 ms over UDS from connect to response; gateway p99 ≤ 5 ms from a request to its upstream request |
 | disk | ≤ ~150 B per pick, or 0 with `journal = off`; the gateway writes only refreshed credential files |
-| network | 0 idle; agent ≤ 1 small HTTPS GET per login per TTL, only on demand; gateway one HTTPS request per attempt and one per token refresh |
+| network | 0 idle; agent ≤ 1 small HTTPS GET per login per TTL, only on demand; gateway one HTTPS request per attempt, one per token refresh and one per sign-in code its own uid sends |
 
 CI enforces the binary budget, the daemon's RSS, latency, wake-up and `journal = off` budgets and
 the gateway's RSS, latency and wake-up budgets in the `budgets` job. `ci/budgets.sh` checks the

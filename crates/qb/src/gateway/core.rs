@@ -7,17 +7,18 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_proto::{
     Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut,
-    ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LoginKey, LoginKeyAnswer, LoginSpend,
-    LoginStatus, Outcome, PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo,
-    RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest,
-    Usage, UsageLine, WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
+    ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LoginKey, LoginKeyAnswer,
+    LoginOauthCode, LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste,
+    Outcome, PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState,
+    RouteStatus, RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest, Usage, UsageLine,
+    WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -26,6 +27,7 @@ use super::Refusal;
 use super::config::{Api, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::config_edit::Unwritten;
 use super::creds::{CredentialStore, Kind, Refresher, Written, write_atomic};
+use super::signin::SignIn;
 use super::spend::{self, Ledger};
 use super::tokens::{self, ClientTokens};
 use super::upstream::{
@@ -36,6 +38,9 @@ use crate::config::{BearerHash, Error};
 use crate::sandbox::{file_dir, gateway_files};
 use crate::server::unix_now;
 use crate::{client, log, sha256};
+
+/// Seconds a started sign-in takes its code.
+pub const SIGN_IN_EXPIRY_S: u64 = 600;
 
 /// How long `cancel` waits for the cancelled turn to end.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
@@ -69,6 +74,12 @@ struct Running {
     turns: Mutex<Vec<Entry>>,
     admitted: AtomicU64,
     ended: Condvar,
+}
+
+/// A sign-in of `POST /v1/model/logins/{name}/oauth/start` waiting for its code.
+struct Pending {
+    signin: SignIn,
+    expires_at: u64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -126,7 +137,7 @@ pub struct Gateway {
     startup: Arc<GatewayConfig>,
     /// Held for a whole reload, so the last file read is the one that serves.
     reloading: Mutex<()>,
-    /// Shared by every snapshot, so a file's refresh lock outlives a reload.
+    /// Shared by every snapshot, so a file's write lock outlives a reload.
     store: CredentialStore,
     upstreams: Upstreams,
     qbd_bearer: Option<Zeroizing<String>>,
@@ -140,6 +151,10 @@ pub struct Gateway {
     tokens: Mutex<Arc<ClientTokens>>,
     /// The ledger of the startup `[usage]`.
     usage: Option<usage::Ledger>,
+    /// At most one per login; its verifier and state never leave this memory.
+    sign_ins: Mutex<Vec<Pending>>,
+    /// Seconds a started sign-in takes its code.
+    sign_in_expiry: u64,
 }
 
 fn bad_request(message: impl Into<String>) -> GatewayError {
@@ -176,10 +191,11 @@ fn login_scoped(kind: FailureKind) -> bool {
     )
 }
 
-/// The message of a key body that does not decode; serde's own may quote the body.
-fn body_error(e: &serde_json::Error) -> String {
+/// The message of a body of one string `field` that does not decode; serde's own may quote the
+/// body.
+fn body_error(e: &serde_json::Error, field: &str) -> String {
     if e.is_data() {
-        "the body must be one object with the string `key` only".to_owned()
+        format!("the body must be one object with the string `{field}` only")
     } else {
         format!(
             "the body is not valid JSON (line {}, column {})",
@@ -395,6 +411,8 @@ impl Gateway {
             opened,
             usage,
             tokens: Mutex::new(Arc::new(tokens)),
+            sign_ins: Mutex::new(Vec::new()),
+            sign_in_expiry: SIGN_IN_EXPIRY_S,
         })
     }
 
@@ -403,6 +421,14 @@ impl Gateway {
     #[must_use]
     pub fn sandboxed(mut self, opened: Vec<PathBuf>) -> Self {
         self.opened = opened;
+        self
+    }
+
+    /// The gateway with sign-ins that take their code for `seconds` instead of
+    /// [`SIGN_IN_EXPIRY_S`].
+    #[must_use]
+    pub fn sign_in_expiry(mut self, seconds: u64) -> Self {
+        self.sign_in_expiry = seconds;
         self
     }
 
@@ -724,10 +750,9 @@ impl Gateway {
         }
     }
 
-    /// Records a key replacement of login `name` by `actor` refused for `reason` before
-    /// [`Self::replace_login_key`].
-    pub(crate) fn refuse_login_key(&self, actor: &str, name: &str, reason: &str) {
-        let entry = audit::entry(actor, AuditAction::LoginKey, Some(name.to_owned()));
+    /// Records the `action` on login `name` by `actor` refused for `reason` before its handler.
+    pub(crate) fn refuse_login(&self, actor: &str, action: AuditAction, name: &str, reason: &str) {
+        let entry = audit::entry(actor, action, Some(name.to_owned()));
         self.record(&audit::refused(entry, reason));
     }
 
@@ -750,17 +775,11 @@ impl Gateway {
         }
         let invalid = |message: String| Refusal::new(400, ErrorClass::BadRequest, message);
         let decoded: LoginKey =
-            serde_json::from_slice(body).map_err(|e| invalid(body_error(&e)))?;
+            serde_json::from_slice(body).map_err(|e| invalid(body_error(&e, "key")))?;
         let valid = decoded.validate();
         let key = Zeroizing::new(decoded.key);
         valid.map_err(|e| invalid(e.to_owned()))?;
         let file = login.credentials.as_path();
-        let failed = |message: String| Refusal::new(500, ErrorClass::Unavailable, message);
-        let old = match std::fs::read(file) {
-            Ok(bytes) => Some(Zeroizing::new(bytes)),
-            Err(e) if e.kind() == ErrorKind::NotFound => None,
-            Err(e) => return Err(failed(format!("cannot read {}: {e}", file.display()))),
-        };
         let bytes = Written {
             kind: Kind::ApiKey,
             access_token: None,
@@ -770,42 +789,174 @@ impl Gateway {
             key: Some(&key),
         }
         .encode(file)
-        .map_err(|e| failed(e.message))?;
-        let backup = old
-            .as_ref()
-            .map(|old| config_edit::backup(file, old, unix_now()))
-            .transpose()
-            .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
-        let written = match (&old, &backup) {
-            (Some(old), Some(backup)) => {
-                config_edit::replace(file, old, &bytes, backup, write_atomic)
-            }
-            _ => write_atomic(file, &bytes).map_err(|error| Unwritten {
-                replaced: std::fs::symlink_metadata(file).is_ok(),
-                error,
-            }),
-        };
-        let backup = backup.map(|b| b.display().to_string());
-        if let Err(u) = written {
-            let file = file.display();
-            if !u.replaced {
-                let message = format!("cannot write {file}: {}; the old file stays", u.error);
-                return Err(failed(message));
-            }
-            entry.backup.clone_from(&backup);
-            let kept = backup.map_or_else(
-                || "there was no old file".to_owned(),
-                |b| format!("the old file is kept as {b}"),
-            );
-            return Err(failed(format!(
-                "{file} was replaced but the write failed: {}; {kept}",
-                u.error
-            )));
-        }
+        .map_err(|e| Refusal::new(500, ErrorClass::Unavailable, e.message))?;
+        let backup = replace_credential(file, &bytes, entry)?;
         Ok(LoginKeyAnswer {
             login: name.to_owned(),
             backup,
             key_sha256_prefix: tokens::prefix(&BearerHash(sha256::digest(key.as_bytes()))),
+        })
+    }
+
+    /// Starts a PKCE sign-in of the OAuth login `name` for `actor`, replacing a pending one of the
+    /// login: the authorize URL, what to paste back and when the sign-in expires. Logs one line
+    /// and records one audit entry either way, never the URL.
+    ///
+    /// # Errors
+    /// 404 an unknown login, 409 an `api_key` login, 500 the random source failed.
+    pub fn start_sign_in(&self, actor: &str, name: &str) -> Result<LoginOauthStarted, Refusal> {
+        let entry = audit::entry(actor, AuditAction::LoginOauthStart, Some(name.to_owned()));
+        let started = self.oauth_login(name).and_then(|login| {
+            SignIn::start(login, true).map_err(|e| Refusal::new(500, ErrorClass::Unavailable, e))
+        });
+        let signin = match started {
+            Ok(signin) => signin,
+            Err(refusal) => {
+                log::warn(&format!(
+                    "gateway: sign-in of login `{name}` refused: {}",
+                    refusal.message
+                ));
+                self.record(&audit::refused(entry, refusal.message.as_str()));
+                return Err(refusal);
+            }
+        };
+        let now = unix_now();
+        let expires_at = now.saturating_add(self.sign_in_expiry);
+        let answer = LoginOauthStarted {
+            login: name.to_owned(),
+            url: signin.url(),
+            paste: if signin.login().kind == CredentialKind::ChatgptOauth {
+                OauthPaste::RedirectUrl
+            } else {
+                OauthPaste::CodeState
+            },
+            expires_at,
+        };
+        let mut pending = lock(&self.sign_ins);
+        pending.retain(|p| p.expires_at > now && p.signin.login().name != name);
+        pending.push(Pending { signin, expires_at });
+        drop(pending);
+        log::info(&format!(
+            "gateway: sign-in of login `{name}` started, it takes a code until {expires_at}"
+        ));
+        self.record(&entry);
+        Ok(answer)
+    }
+
+    /// Exchanges the code of the [`qb_proto::LoginOauthCode`] `body` for the pending sign-in of
+    /// login `name` by `actor` and writes the new credential: the old file kept as a 0600 backup,
+    /// the new one written atomically, read by the login's next attempt. A paste that holds no
+    /// code or another state leaves the sign-in pending; any exchange consumes it. The file write
+    /// is serialised with reloads, config edits, rotations and the login's refreshes. Logs one
+    /// line and records one audit entry either way, never a value.
+    ///
+    /// # Errors
+    /// 404 an unknown login, 409 an `api_key` login, no live sign-in or a login whose entry
+    /// changed since the start, 400 a body that does not decode or a paste without a code or
+    /// with another state, 502 a refused or failed exchange, 500 a file that cannot be read or
+    /// written, as for [`Self::replace_login_key`].
+    pub fn finish_sign_in(
+        &self,
+        actor: &str,
+        name: &str,
+        body: &[u8],
+    ) -> Result<LoginOauthSigned, Refusal> {
+        let mut entry = audit::entry(actor, AuditAction::LoginOauthCode, Some(name.to_owned()));
+        match self.sign_in(name, body, &mut entry) {
+            Ok(answer) => {
+                let backup = answer.backup.as_deref().unwrap_or("none");
+                log::info(&format!(
+                    "gateway: signed in login `{name}`, backup {backup}"
+                ));
+                entry.backup.clone_from(&answer.backup);
+                self.record(&entry);
+                Ok(answer)
+            }
+            Err(refusal) => {
+                log::warn(&format!(
+                    "gateway: sign-in code of login `{name}` refused: {}",
+                    refusal.message
+                ));
+                self.record(&audit::refused(entry, refusal.message.as_str()));
+                Err(refusal)
+            }
+        }
+    }
+
+    /// The `oauth_anthropic` or `chatgpt_oauth` entry `name` of the running config.
+    fn oauth_login(&self, name: &str) -> Result<GatewayLogin, Refusal> {
+        let config = self.config();
+        let Some(login) = config.login(name) else {
+            let message = format!("no login `{name}`");
+            return Err(Refusal::new(404, ErrorClass::BadRequest, message));
+        };
+        if login.kind == CredentialKind::ApiKey {
+            let message = format!("login `{name}` is `api_key`, not an OAuth login");
+            return Err(Refusal::new(409, ErrorClass::BadRequest, message));
+        }
+        Ok(login.clone())
+    }
+
+    /// The steps of [`Self::finish_sign_in`]; a failure that replaced the file sets the backup
+    /// of `entry`.
+    fn sign_in(
+        &self,
+        name: &str,
+        body: &[u8],
+        entry: &mut AuditEntry,
+    ) -> Result<LoginOauthSigned, Refusal> {
+        self.oauth_login(name)?;
+        let invalid = |message: String| Refusal::new(400, ErrorClass::BadRequest, message);
+        let pasted = serde_json::from_slice::<LoginOauthCode>(body)
+            .map(|b| Zeroizing::new(b.pasted))
+            .map_err(|e| invalid(body_error(&e, "pasted")))?;
+        let now = unix_now();
+        let mut pending = lock(&self.sign_ins);
+        let Some(at) = pending.iter().position(|p| p.signin.login().name == name) else {
+            let message = format!(
+                "no sign-in of login `{name}` is pending; start one with POST {}/{name}/oauth/start",
+                paths::MODEL_LOGINS
+            );
+            return Err(Refusal::new(409, ErrorClass::BadRequest, message));
+        };
+        if pending[at].expires_at <= now {
+            let expired = pending.swap_remove(at).expires_at;
+            let message =
+                format!("the sign-in of login `{name}` expired at {expired}; start a new one");
+            return Err(Refusal::new(409, ErrorClass::BadRequest, message));
+        }
+        let code = pending[at].signin.code(&pasted).map_err(invalid)?;
+        let signin = pending.swap_remove(at).signin;
+        drop(pending);
+        // The exchange runs outside the reload lock, so a SIGHUP reload never waits on a vendor.
+        let bytes = signin.credential(&code).map_err(|e| {
+            let class = if e.refused {
+                ErrorClass::Auth
+            } else {
+                ErrorClass::Unavailable
+            };
+            Refusal::new(502, class, e.message)
+        })?;
+        let _one = lock(&self.reloading);
+        let started = signin.login();
+        let current = self.config();
+        let same = current
+            .login(name)
+            .is_some_and(|l| l.kind == started.kind && l.credentials == started.credentials);
+        if !same {
+            let message = format!(
+                "login `{name}` changed its kind or credentials while it signed in; start a new \
+                 sign-in"
+            );
+            return Err(Refusal::new(409, ErrorClass::BadRequest, message));
+        }
+        let file = started.credentials.as_path();
+        let refreshing = self.store.write_lock(file);
+        let _writing = lock(&refreshing);
+        let backup = replace_credential(file, &bytes, entry)?;
+        Ok(LoginOauthSigned {
+            login: name.to_owned(),
+            backup,
         })
     }
 
@@ -1603,6 +1754,56 @@ impl Gateway {
 /// The state of the logins of `config` of `vendor`, or of all of them, in `state`: `ready` when
 /// one is usable, else `exhausted` with the nearest reset when one waits, else `unavailable`. A
 /// login with a full window waits for its reset, as qbd does not pick it before.
+/// Replaces the credential file `file` with `bytes`, its old content, when there was a file,
+/// kept as a 0600 backup: the backup's path. A failure that replaced the file sets the backup of
+/// `entry`.
+///
+/// # Errors
+/// 500: the file cannot be read, the backup or the file cannot be written; the old file stays in
+/// force, unless the write failed after replacing it, which keeps the backup.
+fn replace_credential(
+    file: &Path,
+    bytes: &[u8],
+    entry: &mut AuditEntry,
+) -> Result<Option<String>, Refusal> {
+    let failed = |message: String| Refusal::new(500, ErrorClass::Unavailable, message);
+    let old = match std::fs::read(file) {
+        Ok(bytes) => Some(Zeroizing::new(bytes)),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(failed(format!("cannot read {}: {e}", file.display()))),
+    };
+    let backup = old
+        .as_ref()
+        .map(|old| config_edit::backup(file, old, unix_now()))
+        .transpose()
+        .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
+    let written = match (&old, &backup) {
+        (Some(old), Some(backup)) => config_edit::replace(file, old, bytes, backup, write_atomic),
+        _ => write_atomic(file, bytes).map_err(|error| Unwritten {
+            replaced: std::fs::symlink_metadata(file).is_ok(),
+            error,
+        }),
+    };
+    let backup = backup.map(|b| b.display().to_string());
+    if let Err(u) = written {
+        let file = file.display();
+        if !u.replaced {
+            let message = format!("cannot write {file}: {}; the old file stays", u.error);
+            return Err(failed(message));
+        }
+        entry.backup.clone_from(&backup);
+        let kept = backup.map_or_else(
+            || "there was no old file".to_owned(),
+            |b| format!("the old file is kept as {b}"),
+        );
+        return Err(failed(format!(
+            "{file} was replaced but the write failed: {}; {kept}",
+            u.error
+        )));
+    }
+    Ok(backup)
+}
+
 fn standing(
     config: &GatewayConfig,
     state: &State,

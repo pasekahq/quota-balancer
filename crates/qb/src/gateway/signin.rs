@@ -1,9 +1,10 @@
 //! `qb login`: signs an `oauth_anthropic` or `chatgpt_oauth` login in from scratch with PKCE
 //! (RFC 7636, S256) on a host without a browser. The operator opens the authorize URL on any
 //! device and pastes back `code#state` (Anthropic) or the redirect URL (OpenAI); the code is
-//! exchanged at the token endpoint and the login's credential file written. No output and no
-//! error carries the code, the verifier, a token or the account id, and every buffer that held
-//! one is zeroized.
+//! exchanged at the token endpoint and the login's credential file written. The gateway's
+//! `/v1/model/logins/{name}/oauth/*` endpoints run the same steps and write the file themselves.
+//! No output and no error carries the code, the verifier, a token or the account id, and every
+//! buffer that held one or the state is zeroized.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -24,7 +25,14 @@ pub struct SignIn {
     login: GatewayLogin,
     verifier: Zeroizing<String>,
     challenge: String,
-    state: String,
+    state: Zeroizing<String>,
+}
+
+/// Why [`SignIn::credential`] failed; the message names no value.
+pub(super) struct Unsigned {
+    /// The token endpoint answered and refused the code.
+    pub(super) refused: bool,
+    pub(super) message: String,
 }
 
 /// A credential written by [`SignIn::finish`].
@@ -68,13 +76,18 @@ impl SignIn {
         creds::vacant(&login.credentials, force)?;
         let verifier = base64url::random()?;
         let challenge = base64url::encode(&sha256::digest(verifier.as_bytes()));
-        let state = base64url::random()?.to_string();
+        let state = base64url::random()?;
         Ok(Self {
             login,
             verifier,
             challenge,
             state,
         })
+    }
+
+    /// The login signing in.
+    pub(super) fn login(&self) -> &GatewayLogin {
+        &self.login
     }
 
     /// What the operator does with the URL and pastes back.
@@ -130,46 +143,11 @@ impl SignIn {
     /// mode 0600.
     ///
     /// # Errors
-    /// The state differs or is missing, the paste holds no code, the vendor refused the code or
-    /// could not be asked, the answer lacks a token or the account, or the write failed.
+    /// As [`Self::code`] and [`Self::credential`], or the write failed.
     pub fn finish(self, pasted: &str) -> Result<Signed, String> {
-        let code = self.pasted_code(pasted.trim())?;
-        let tokens = OauthRefresher::new()
-            .exchange_code(&self.login, &code, &self.state, &self.verifier)
-            .map_err(|e| match e.status {
-                Some(_) => format!("the token endpoint refused the code: {}", e.message),
-                None => format!("the token exchange failed: {}", e.message),
-            })?;
+        let code = self.code(pasted)?;
+        let body = self.credential(&code).map_err(|e| e.message)?;
         let file = self.login.credentials.as_path();
-        let visible =
-            |field: &str, value: &str| creds::visible(file, field, value).map_err(|e| e.message);
-        visible("access_token", &tokens.access_token)?;
-        let refresh_token = tokens
-            .refresh_token
-            .as_ref()
-            .ok_or("the token answer has no `refresh_token`")?;
-        visible("refresh_token", refresh_token)?;
-        let account_id = if self.login.kind == CredentialKind::ChatgptOauth {
-            let id = tokens
-                .id_token
-                .as_deref()
-                .and_then(|t| claimed_account(t))
-                .ok_or("the token answer has no `id_token` with a `chatgpt_account_id` claim")?;
-            visible("chatgpt_account_id", &id)?;
-            Some(id)
-        } else {
-            None
-        };
-        let body = Written {
-            kind: self.login.kind.into(),
-            access_token: Some(&tokens.access_token),
-            refresh_token: Some(refresh_token),
-            account_id: account_id.as_deref().map(String::as_str),
-            expires_at: Some(tokens.expires_at),
-            key: None,
-        }
-        .encode(file)
-        .map_err(|e| e.message)?;
         creds::write_atomic(file, &body)
             .map_err(|e| format!("{}: cannot write: {e}", file.display()))?;
         Ok(Signed {
@@ -179,9 +157,71 @@ impl SignIn {
         })
     }
 
-    /// The code of `pasted`: `code#state` for Anthropic, the redirect URL's `code` and `state`
-    /// for OpenAI; refused unless the state is the one sent.
-    fn pasted_code(&self, pasted: &str) -> Result<Zeroizing<String>, String> {
+    /// Exchanges `code` at the login's `token_url`, else the vendor's endpoints: the credential
+    /// file's bytes, zeroized on drop.
+    ///
+    /// # Errors
+    /// The vendor refused the code or could not be asked, or the answer lacks a token or the
+    /// account.
+    pub(super) fn credential(&self, code: &str) -> Result<Zeroizing<Vec<u8>>, Unsigned> {
+        let failed = |message: String| Unsigned {
+            refused: false,
+            message,
+        };
+        let tokens = OauthRefresher::new()
+            .exchange_code(&self.login, code, &self.state, &self.verifier)
+            .map_err(|e| match e.status {
+                Some(_) => Unsigned {
+                    refused: true,
+                    message: format!("the token endpoint refused the code: {}", e.message),
+                },
+                None => failed(format!("the token exchange failed: {}", e.message)),
+            })?;
+        let file = self.login.credentials.as_path();
+        let visible = |field: &str, value: &str| {
+            creds::visible(file, field, value).map_err(|e| failed(e.message))
+        };
+        visible("access_token", &tokens.access_token)?;
+        let refresh_token = tokens
+            .refresh_token
+            .as_ref()
+            .ok_or_else(|| failed("the token answer has no `refresh_token`".into()))?;
+        visible("refresh_token", refresh_token)?;
+        let account_id = if self.login.kind == CredentialKind::ChatgptOauth {
+            let id = tokens
+                .id_token
+                .as_deref()
+                .and_then(|t| claimed_account(t))
+                .ok_or_else(|| {
+                    failed(
+                        "the token answer has no `id_token` with a `chatgpt_account_id` claim"
+                            .into(),
+                    )
+                })?;
+            visible("chatgpt_account_id", &id)?;
+            Some(id)
+        } else {
+            None
+        };
+        Written {
+            kind: self.login.kind.into(),
+            access_token: Some(&tokens.access_token),
+            refresh_token: Some(refresh_token),
+            account_id: account_id.as_deref().map(String::as_str),
+            expires_at: Some(tokens.expires_at),
+            key: None,
+        }
+        .encode(file)
+        .map_err(|e| failed(e.message))
+    }
+
+    /// The code of `pasted`, surrounding whitespace ignored: `code#state` for Anthropic, the
+    /// redirect URL's `code` and `state` for OpenAI.
+    ///
+    /// # Errors
+    /// The state differs or is missing, or the paste holds no code.
+    pub(super) fn code(&self, pasted: &str) -> Result<Zeroizing<String>, String> {
+        let pasted = pasted.trim();
         let (code, state, error) = if self.login.kind == CredentialKind::ChatgptOauth {
             let query = pasted
                 .split_once('?')
@@ -213,9 +253,7 @@ impl SignIn {
             )
         };
         if state.as_deref().map(String::as_str) != Some(self.state.as_str()) {
-            return Err(
-                "the pasted state is not the one this sign-in sent; run `qb login` again".into(),
-            );
+            return Err("the pasted state is not the one this sign-in sent".into());
         }
         if let Some(error) = error {
             return Err(if plain_code(&error) {

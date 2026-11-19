@@ -230,6 +230,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `GET /v1/model/config/routes` | — | 200 `ConfigRoutes` with an `ETag`, 403 a caller other than the gateway's own uid, 500 the config file cannot be read or does not validate |
 | `PUT /v1/model/config/routes` | `ConfigRoutesPut` with `If-Match` | 200 `ConfigRoutesWritten`, 400 a body or candidate file that does not validate, 403 a caller other than the gateway's own uid, 412 `If-Match` is not the file's hash, 428 no `If-Match`, 500 a file could not be read or written |
 | `POST /v1/model/logins/{name}/key` | `LoginKey` | 200 `LoginKeyAnswer`, 400 a body or key that does not validate, 403 a caller other than the gateway's own uid, 404 no such login, 409 a login that is not `api_key`, 413 a body over 8 KiB, 500 a file could not be read or written |
+| `POST /v1/model/logins/{name}/oauth/start` | — | 200 `LoginOauthStarted`, 400 a request with a body, 403 a caller other than the gateway's own uid, 404 no such login, 409 an `api_key` login, 500 the random source failed |
+| `POST /v1/model/logins/{name}/oauth/code` | `LoginOauthCode` | 200 `LoginOauthSigned`, 400 a body that does not validate or a paste without a code or with another state, 403 a caller other than the gateway's own uid, 404 no such login, 409 an `api_key` login, no live sign-in or a login changed since the start, 413 a body over 8 KiB, 502 the token endpoint refused the code or could not be asked, 500 a file could not be read or written |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -238,8 +240,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 Framing is `qbd`'s: HTTP/1.1, one request per connection, head ≤ 8 KiB, `Content-Length`
 required, chunked request bodies refused. The body of `POST /v1/model/turn` and of a `POST` to
 an HTTP front (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) may be up to the config's
-`max_request_bytes` (default 8 MiB), that of `POST /v1/model/logins/{name}/key` up to 8 KiB,
-every other body up to 64 KiB; a request whose head and body have not arrived within 10 s is dropped
+`max_request_bytes` (default 8 MiB), that of a `POST` to `/v1/model/logins/{name}/key` or
+`/v1/model/logins/{name}/oauth/code` up to 8 KiB, every other body up to 64 KiB; a request whose head and body have not arrived within 10 s is dropped
 without an answer. `/v1/model/*` requests reject unknown fields. Every non-200 answer of the
 gateway has the body `Error` below, whose `class` is authoritative and whose status is
 informative, except the answers of an HTTP front to a caller it serves, which use the error
@@ -491,12 +493,12 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 |---|---|
 | `at` | Unix time of the action |
 | `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
-| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse), `config_spend_caps` (one with `spend_caps` only) or `login_key` (a `POST /v1/model/logins/{name}/key`) |
-| `object` | the config file of a reload or a config edit, the login of a spend reset or a key replacement, the client of a rotation; absent when a refused request named none |
+| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse), `config_spend_caps` (one with `spend_caps` only), `login_key` (a `POST /v1/model/logins/{name}/key`), `login_oauth_start` (a `POST /v1/model/logins/{name}/oauth/start`) or `login_oauth_code` (a `POST /v1/model/logins/{name}/oauth/code`) |
+| `object` | the config file of a reload or a config edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation; absent when a refused request named none |
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
 | `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a config edit's of the file on disk before and after it; equal when it was refused, unless the edit replaced the file but could not install it |
-| `backup` | a config edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none |
+| `backup` | a config edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none |
 | `token_sha256_prefix` | a rotation that went through: the first 12 hex characters of the new token's SHA-256 |
 | `key_sha256_prefix` | a key replacement that went through: the first 12 hex characters of the new key's SHA-256 |
 
@@ -504,8 +506,9 @@ Every reload, by `POST /v1/model/reload` or SIGHUP, and every `POST /v1/model/sp
 `POST /v1/model/clients/{name}/rotate` and `PUT /v1/model/config/routes` that reaches its handler
 is recorded, refusals included: another uid's 403, a missing or stale `If-Match`, a body that does
 not parse, a config that does not validate, an unknown client. Every request to
-`/v1/model/logins/{name}/key` of a caller of the gateway is recorded, also one whose body was
-too large or did not arrive and one with another method. A peer that is not a caller of the gateway gets its 401
+`/v1/model/logins/{name}/key`, `/v1/model/logins/{name}/oauth/start` and
+`/v1/model/logins/{name}/oauth/code` of a caller of the gateway is recorded, also one whose body
+was too large or did not arrive and one with another method. A peer that is not a caller of the gateway gets its 401
 before any handler and leaves no line. No field holds a token, key or credential content. A
 line that cannot be appended is logged at error priority with the path; the action's answer
 stays as it was. The gateway neither rotates nor trims the file.
@@ -581,6 +584,60 @@ and the old file stays in force. A write that fails before the rename is 500 `un
 the rename replaced the file is 500 `unavailable` with `<file> was replaced but the write failed:
 <error>; the old file is kept as <backup>`, the backup kept and the new key in force. The gateway
 removes no other backup.
+
+### `POST /v1/model/logins/{name}/oauth/start` and `.../oauth/code`
+
+Sign the `oauth_anthropic` or `chatgpt_oauth` entry `name` of the running config in again with
+PKCE ([config.md](config.md#signing-in-through-the-gateway)), the steps of `qb login` in two
+requests. Only the gateway's own uid may: any other caller gets 403 `auth`; the loopback listener
+answers 404.
+
+`POST .../oauth/start` takes no body. The gateway draws a verifier and a state from the kernel's
+random source and answers the vendor's authorize URL with the verifier's S256 challenge and the
+state, what to paste back and when the sign-in expires, 600 s later:
+
+```json
+{"login": "login-1", "url": "https://vendor-a.example/oauth/authorize?...&code_challenge=...&code_challenge_method=S256&state=...",
+ "paste": "code_state", "expires_at": 1800000600}
+```
+
+`paste` is `code_state` for an `oauth_anthropic` login, the `code#state` the vendor's page shows
+after the sign-in, and `redirect_url` for a `chatgpt_oauth` login, the full address of the
+localhost page the browser then fails to load. The verifier and the state stay in the gateway's
+memory, zeroized when the sign-in ends; the state leaves the gateway only inside the URL. A login
+has at most one pending sign-in: a new start replaces it. An unknown login is 404 `bad_request`,
+an `api_key` login 409 `bad_request`, a request with a body 400 `bad_request`.
+
+`POST .../oauth/code` takes what the operator pasted, at most 8 KiB, unknown fields refused;
+surrounding whitespace is ignored:
+
+```json
+{"pasted": "synthetic-code-0001#c3ludGhldGljLXN0YXRlLTAwMDEtcGFkZGluZy1wYWRkaW5n"}
+```
+
+Without a pending sign-in of the login, or after its `expires_at`, the answer is 409
+`bad_request`. A paste whose state is not the one sent, or that holds no code, is 400
+`bad_request` and the sign-in stays pending. Otherwise the gateway takes the sign-in and
+exchanges the code at the login's `token_url`, else the vendor's token endpoints, as `qb login`
+does; the sign-in is gone whatever the exchange's outcome. A token endpoint that refuses the code
+is 502 `auth`, one that cannot be asked or whose answer lacks a token or the account 502
+`unavailable`; the message names the endpoint, the status and the OAuth error code, never a value.
+A login whose `kind` or `credentials` a reload changed since the start is 409 `bad_request`.
+
+The gateway then holds its reload lock and the login's refresh lock and writes the new tokens as
+`POST /v1/model/logins/{name}/key` writes a key: the old file, when there is one, copied to
+`<file>.bak-<unix s>` with mode 0600, the new file in the format of
+[config.md](config.md#gateway-config) written atomically with mode 0600, the same 500 answers when a file
+cannot be read or written. The exchange itself runs outside the reload lock. The login's next
+attempt sends the new token; turns need no reload or restart:
+
+```json
+{"login": "login-1", "backup": "/etc/qb/credentials/login-1.json.bak-1800000300"}
+```
+
+`backup` is `null` when the login had no credential file. The request body, the code, the
+verifier, the state and the tokens are zeroized after use; no answer, log line, audit line or
+usage line holds the code, the verifier, the state, a token or the account id.
 
 ### `GET` and `PUT /v1/model/config/routes`
 

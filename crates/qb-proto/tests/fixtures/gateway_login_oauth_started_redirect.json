@@ -1,0 +1,1 @@
+{"login": "login-2", "url": "https://vendor-b.example/oauth/authorize?response_type=code&client_id=client-b&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid&code_challenge=c3ludGhldGljLWNoYWxsZW5nZS0wMDAyLXBhZGRpbmctcGFk&code_challenge_method=S256&state=c3ludGhldGljLXN0YXRlLTAwMDItcGFkZGluZy1wYWRkaW5n", "paste": "redirect_url", "expires_at": 1800000600}

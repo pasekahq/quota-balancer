@@ -270,8 +270,9 @@ A credential file is the gateway's own copy, never a vendor CLI's file (two refr
 for one rotating refresh token); `qb login` makes one from a new sign-in of an OAuth login
 ([Signing in](#signing-in)), `qb login import` from an existing credential
 ([Importing credentials](#importing-credentials)), and the running gateway replaces an `api_key`
-login's key on request ([Replacing a key](#replacing-a-key)). It is JSON, a regular file owned by the
-gateway's user with mode 0600; anything else is refused:
+login's key ([Replacing a key](#replacing-a-key)) or signs an OAuth login in again
+([Signing in through the gateway](#signing-in-through-the-gateway)) on request. It is JSON, a
+regular file owned by the gateway's user with mode 0600; anything else is refused:
 
 ```json
 {"type": "oauth_anthropic", "access_token": "...", "refresh_token": "...", "expires_at": 1800000000}
@@ -756,7 +757,34 @@ The gateway cannot read a key from a path: its sandbox opens no directory after 
 replace a key from a file, run `qb login import --force` on that file as the gateway's user
 ([Importing credentials](#importing-credentials)); the login's next attempt reads the new file,
 and `qb --socket <gateway socket> reload` is needed only when the config changed as well. An
-OAuth login is signed in again with `qb login --force` ([Signing in](#signing-in)).
+OAuth login is signed in again through the gateway
+([Signing in through the gateway](#signing-in-through-the-gateway)) or with `qb login --force`
+([Signing in](#signing-in)).
+
+### Signing in through the gateway
+
+The gateway's own uid signs an `oauth_anthropic` or `chatgpt_oauth` login of the running config
+in again without a shell on the gateway's host, in two requests over the gateway's socket
+([api.md](api.md#post-v1modelloginsnameoauthstart-and-oauthcode)):
+
+1. `POST /v1/model/logins/<name>/oauth/start` answers the authorize URL, what to paste back
+   (`code_state` or `redirect_url`, as in step 3 of [Signing in](#signing-in)) and
+   `expires_at`, 600 s later. The verifier and the state stay in the gateway's memory; a new
+   start replaces the login's pending sign-in.
+2. Open the URL in a browser on any device and sign in with the account of the login.
+3. `POST /v1/model/logins/<name>/oauth/code` with `{"pasted": "..."}` sends what the page
+   showed or the address the browser failed to load. A wrong state or a paste without a code is
+   refused and the sign-in stays pending; otherwise the code is exchanged at the login's
+   `token_url`, else the vendor's token endpoint, and the sign-in is used up whatever the
+   vendor answers.
+
+The gateway copies the old credential file to `<file>.bak-<unix s>` (mode 0600, never over a
+file) and writes the new tokens in the format above atomically with mode 0600, as `qb login`
+writes them; the login's next attempt sends the new token, with no reload or restart. The
+exchange connects to TCP port 443 only, like the gateway's refreshes, so a loopback `token_url`
+must name port 443 where the sandbox is enforced. No answer, log line, audit line or usage line
+holds the code, the verifier, the state, a token or the account id; the state leaves the gateway
+only inside the authorize URL. The gateway never removes a backup.
 
 ### Reload
 
