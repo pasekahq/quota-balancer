@@ -6,7 +6,8 @@
 use qb_proto::{
     AuditAction, AuditAnswer, AuditResult, Block, CancelAnswer, CancelRequest, Elsewhere,
     ErrorClass, GatewayError, Message, Outcome, ReloadAnswer, Role, RouteState, RoutesAnswer,
-    SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageLine, UsdSource,
+    SpendAnswer, SpendReset, StopReason, StreamEvent, TurnRequest, UsageAnswer, UsageBucket,
+    UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -220,6 +221,45 @@ fn usage_lines() {
     assert_eq!(lines[1].usage.cache_read, 8000);
     assert_eq!(lines[1].tools, ["read_file", "search"]);
     assert_eq!(lines[0].usd, None);
+}
+
+#[test]
+fn usage_query_and_answer() {
+    let query: UsageQuery = roundtrip("gateway_usage_query.json");
+    assert_eq!(
+        (query.from, query.to, query.group_by, query.bucket),
+        (
+            1_800_000_000,
+            Some(1_800_172_800),
+            Some(UsageGroupBy::Login),
+            Some(UsageBucket::Day)
+        )
+    );
+    let unknown = serde_json::from_str::<UsageQuery>(r#"{"from":1,"limit":2}"#);
+    assert!(unknown.is_err(), "{unknown:?}");
+    let answer: UsageAnswer = roundtrip("gateway_usage_answer.json");
+    let rows: Vec<_> = answer
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r.start,
+                r.group.as_deref(),
+                r.attempts,
+                r.failed,
+                r.unpriced,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (1_799_971_200, Some("login-1"), 12, 1, 2),
+            (1_799_971_200, Some("login-2"), 3, 3, 3),
+            (1_800_057_600, Some("login-1"), 4, 0, 0),
+        ]
+    );
+    assert_eq!(answer.skipped, 1);
 }
 
 /// A turn request around one block, for the block fixtures.

@@ -761,7 +761,7 @@ pub struct AuditEntry {
 pub struct AuditAnswer {
     /// The first `limit` entries at or after `since`, oldest first.
     pub entries: Vec<AuditEntry>,
-    /// Lines of the file that do not parse as an entry; they are left out.
+    /// Lines of the file that do not parse as an entry or are too long; they are left out.
     pub skipped: u64,
 }
 
@@ -819,6 +819,143 @@ pub struct UsageLine {
     /// Sorted unique names of the attempt's tool calls, each at most [`MAX_NAME`] bytes, at most
     /// [`MAX_USAGE_TOOLS`].
     pub tools: Vec<String>,
+}
+
+/// What the rows of a usage aggregate are grouped by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageGroupBy {
+    /// The turn's caller.
+    Client,
+    /// The login the attempt ran on.
+    Login,
+    /// The model the attempt ran.
+    Model,
+    /// The turn's route alias.
+    Route,
+    /// Each tool name of the attempt; an attempt counts once under each and not at all without
+    /// tools, so the rows' sums overlap.
+    Tool,
+}
+
+impl UsageGroupBy {
+    /// Every grouping, in wire order.
+    pub const ALL: [Self; 5] = [
+        Self::Client,
+        Self::Login,
+        Self::Model,
+        Self::Route,
+        Self::Tool,
+    ];
+
+    /// The wire name, e.g. `login`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Login => "login",
+            Self::Model => "model",
+            Self::Route => "route",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+/// The UTC period a usage aggregate's rows are bucketed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageBucket {
+    /// A UTC hour.
+    Hour,
+    /// A UTC day.
+    Day,
+    /// A UTC calendar month.
+    Month,
+}
+
+impl UsageBucket {
+    /// Every bucket, in wire order.
+    pub const ALL: [Self; 3] = [Self::Hour, Self::Day, Self::Month];
+
+    /// The wire name, e.g. `day`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Month => "month",
+        }
+    }
+}
+
+/// The query parameters of `GET /v1/model/usage`, carried in its query string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageQuery {
+    /// Unix time; lines with an earlier `at` are left out.
+    pub from: u64,
+    /// Unix time after `from`, at most [`MAX_USAGE_WINDOW_S`] later; lines at or after it are
+    /// left out. Absent means the time of the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<u64>,
+    /// What the rows are grouped by; absent means one group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<UsageGroupBy>,
+    /// The UTC period of the rows; absent means the whole window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<UsageBucket>,
+}
+
+/// Longest window of a usage query: 400 days.
+pub const MAX_USAGE_WINDOW_S: u64 = 400 * 86_400;
+
+/// Most rows of a usage answer; a query that would make more is refused.
+pub const MAX_USAGE_ROWS: usize = 10_000;
+
+/// The sums of the usage lines of one bucket and group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageRow {
+    /// Start of the row's UTC bucket, which may lie before `from`; `from` without a bucket.
+    pub start: u64,
+    /// The row's client, login, model, route or tool; absent without `group_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Attempts counted.
+    pub attempts: u64,
+    /// Attempts whose `outcome` is not `ok`.
+    pub failed: u64,
+    /// Input tokens not read from cache.
+    pub input: u64,
+    /// Output tokens.
+    pub output: u64,
+    /// Input tokens read from the prompt cache.
+    pub cache_read: u64,
+    /// Input tokens written to the prompt cache.
+    pub cache_write: u64,
+    /// USD of the attempts that have one.
+    pub usd: f64,
+    /// Attempts without `usd`.
+    pub unpriced: u64,
+    /// Sum of the attempts' `duration_ms`.
+    pub duration_ms: u64,
+}
+
+/// `GET /v1/model/usage` response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageAnswer {
+    /// Start of the window.
+    pub from: u64,
+    /// End of the window, exclusive.
+    pub to: u64,
+    /// What the rows are grouped by; absent for one group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<UsageGroupBy>,
+    /// The UTC period of the rows; absent for the whole window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<UsageBucket>,
+    /// One row per bucket and group with an attempt, ordered by `start`, then `group`.
+    pub rows: Vec<UsageRow>,
+    /// Lines of the files read that do not parse as a usage line or are too long; they are
+    /// left out.
+    pub skipped: u64,
 }
 
 #[cfg(test)]

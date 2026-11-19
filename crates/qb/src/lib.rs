@@ -19,6 +19,7 @@ pub mod hangup;
 pub mod hooks;
 pub mod http;
 pub mod journal;
+mod jsonl;
 pub mod listen;
 pub mod log;
 pub mod sandbox;

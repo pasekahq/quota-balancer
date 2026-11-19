@@ -1,0 +1,6 @@
+{
+  "from": 1800000000,
+  "to": 1800172800,
+  "group_by": "login",
+  "bucket": "day"
+}

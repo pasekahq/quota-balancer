@@ -213,7 +213,7 @@
     "/v1/model/audit": {
       "get": {
         "operationId": "audit",
-        "summary": "The lines of the gateway's `audit_file`, oldest first: the first `limit` entries with `at` at or after `since`; lines that do not parse are counted in `skipped`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 404 `bad_request` without `audit_file`, 400 `bad_request` for another query parameter, one given twice or a value out of range; a missing file answers no entries.",
+        "summary": "The lines of the gateway's `audit_file`, oldest first: the first `limit` entries with `at` at or after `since`; lines that do not parse or are longer than 64 KiB are counted in `skipped`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 404 `bad_request` without `audit_file`, 400 `bad_request` for another query parameter, one given twice or a value out of range; a missing file answers no entries.",
         "parameters": [
           {
             "name": "since",
@@ -247,6 +247,76 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AuditAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/usage": {
+      "get": {
+        "operationId": "usage",
+        "summary": "Sums of the gateway's usage ledger over the window from `from` up to `to`, one row per bucket and group, ordered by `start`, then `group`; reads `usage.file` and the rotated files stamped at or after `from`, a missing file counting as empty, and counts in `skipped` the lines that do not parse or are longer than 64 KiB. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 404 `bad_request` without `[usage]`; 400 `bad_request` naming the parameter for an unknown parameter, one given twice, a missing `from` or an invalid value, and 400 `bad_request` when the answer would have more than 10000 rows.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "description": "Unix time; lines with an earlier `at` are left out.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "description": "Unix time after `from` and at most 400 days later; lines with `at` at or after it are left out. Default the time of the request.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "required": false,
+            "description": "What the rows are grouped by; absent, every line is one group.",
+            "schema": {
+              "$ref": "#/components/schemas/UsageGroupBy"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": false,
+            "description": "The UTC period of the rows; absent, the whole window is one bucket.",
+            "schema": {
+              "$ref": "#/components/schemas/UsageBucket"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The sums.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageAnswer"
                 }
               }
             }
@@ -1254,11 +1324,155 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0,
-            "description": "Lines of the file that do not parse as an entry; they are left out."
+            "description": "Lines of the file that do not parse as an entry or are longer than 64 KiB; they are left out."
           }
         },
         "required": [
           "entries",
+          "skipped"
+        ]
+      },
+      "UsageGroupBy": {
+        "type": "string",
+        "description": "What usage rows are grouped by: the turn's `client`, the attempt's `login` or `model`, the turn's `route`, or each `tool` name of the attempt, under which an attempt counts once per name and not at all without tools, so the rows' sums overlap.",
+        "enum": [
+          "client",
+          "login",
+          "model",
+          "route",
+          "tool"
+        ]
+      },
+      "UsageBucket": {
+        "type": "string",
+        "description": "The UTC period of usage rows: an `hour`, a `day` or a calendar `month`.",
+        "enum": [
+          "hour",
+          "day",
+          "month"
+        ]
+      },
+      "UsageRow": {
+        "type": "object",
+        "description": "The sums of the usage lines of one bucket and group; sums saturate at the largest value of their type.",
+        "properties": {
+          "start": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Start of the row's UTC bucket, which can lie before `from`; `from` without `bucket`."
+          },
+          "group": {
+            "type": "string",
+            "description": "The row's client, login, model, route or tool name; absent without `group_by`."
+          },
+          "attempts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines counted."
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines whose `outcome` is not `ok`."
+          },
+          "input": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Input tokens not read from cache."
+          },
+          "output": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Output tokens."
+          },
+          "cache_read": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Input tokens read from the prompt cache."
+          },
+          "cache_write": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Input tokens written to the prompt cache."
+          },
+          "usd": {
+            "type": "number",
+            "description": "Sum of the lines' `usd`, priced lines only."
+          },
+          "unpriced": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines without `usd`."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Sum of the lines' `duration_ms`."
+          }
+        },
+        "required": [
+          "start",
+          "attempts",
+          "failed",
+          "input",
+          "output",
+          "cache_read",
+          "cache_write",
+          "usd",
+          "unpriced",
+          "duration_ms"
+        ]
+      },
+      "UsageAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/usage`.",
+        "properties": {
+          "from": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Start of the window."
+          },
+          "to": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "End of the window, exclusive."
+          },
+          "group_by": {
+            "$ref": "#/components/schemas/UsageGroupBy"
+          },
+          "bucket": {
+            "$ref": "#/components/schemas/UsageBucket"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageRow"
+            },
+            "maxItems": 10000,
+            "description": "One row per bucket and group that holds a line, ordered by `start`, then `group`."
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines of the files read that do not parse as a usage line or are longer than 64 KiB; they are left out."
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "rows",
           "skipped"
         ]
       },
