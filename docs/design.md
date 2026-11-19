@@ -70,8 +70,10 @@ How each vendor's stream and usage-endpoint data becomes window reports is in
   vendor with that login's token or API key, rotates to another login before the first event
   when one fails, and reports the outcome and the windows it saw. It refreshes OAuth tokens on
   demand and replaces the credential file atomically (0600, rename in the same directory).
-  Before serving it makes itself non-dumpable and restricts itself with landlock to its
-  credential directories (read-write), the resolver files, TCP connections to port 443 and a
+  It rotates the token of a named loopback client with a `token_file` the same way, on its own
+  uid's request. Before serving it makes itself non-dumpable and restricts itself with landlock
+  to its credential directories and the directories of its spend, audit, usage, client token
+  and grace files (read-write), its config's directory (read-only), the resolver files, TCP connections to port 443 and a
   bind on the optional loopback port; gaps on older kernels are logged as for the agent, and a
   fully applied sandbox gets one info line at startup (`sandbox: non-dumpable; landlock V4: …`).
   Decisions and limits: [ADR 0001](adr/0001-model-gateway.md).

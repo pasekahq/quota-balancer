@@ -20,6 +20,8 @@
 //! - [`spend`]: the monthly spend count of capped logins;
 //! - [`audit`]: the admin audit file, appended to and read back;
 //! - [`usage`]: the usage ledger, one line per adapter attempt, rotated and pruned;
+//! - [`tokens`]: the tokens of the named loopback clients with a `token_file`, their rotation and
+//!   grace;
 //! - [`front`]: the listeners and the C4 front;
 //! - [`answer`]: how the HTTP fronts answer a turn, SSE or one body;
 //! - [`messages`]: the Messages front;
@@ -41,6 +43,7 @@ pub mod openai;
 pub mod openai_upstream;
 pub mod signin;
 pub mod spend;
+pub mod tokens;
 pub mod upstream;
 pub mod usage;
 pub mod vendor;

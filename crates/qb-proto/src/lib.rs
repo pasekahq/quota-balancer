@@ -18,11 +18,11 @@ pub mod gateway;
 
 pub use gateway::{
     Attempt, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CacheMode, CancelAnswer,
-    CancelRequest, Effort, Elsewhere, ErrorClass, GatewayError, LoginSpend, MediaType, Message,
-    NativeApi, NativeTool, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus,
-    RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool, ToolCall,
-    TurnRequest, TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine,
-    UsageQuery, UsageRow, UsdSource,
+    CancelRequest, ClientRotateAnswer, Effort, Elsewhere, ErrorClass, GatewayError, LoginSpend,
+    MediaType, Message, NativeApi, NativeTool, Object, ReloadAnswer, Role, RouteInfo, RouteState,
+    RouteStatus, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool,
+    ToolCall, TurnRequest, TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy,
+    UsageLine, UsageQuery, UsageRow, UsdSource,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.
@@ -60,6 +60,9 @@ pub mod paths {
     pub const MODEL_AUDIT: &str = "/v1/model/audit";
     /// Gateway, `GET`: sums of the gateway's usage ledger; only the gateway's own uid.
     pub const MODEL_USAGE: &str = "/v1/model/usage";
+    /// Gateway, `POST` to `{MODEL_CLIENTS}/{name}/rotate`: write a fresh token to a named
+    /// loopback client's `token_file`; only the gateway's own uid.
+    pub const MODEL_CLIENTS: &str = "/v1/model/clients";
     /// Gateway, `POST`: an Anthropic Messages request, answered in the Messages format.
     pub const MESSAGES: &str = "/v1/messages";
     /// Gateway, `POST`: an OpenAI Chat Completions request, answered in that format.

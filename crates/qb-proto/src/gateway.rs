@@ -705,6 +705,17 @@ pub struct SpendReset {
     pub login: String,
 }
 
+/// `POST /v1/model/clients/{name}/rotate` response. It never holds the token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRotateAnswer {
+    /// Name of the `[[fronts.clients]]` entry whose token was rotated.
+    pub client: String,
+    /// The first 12 hex characters of the new token's SHA-256.
+    pub token_sha256_prefix: String,
+    /// Unix time until which the previous token stays accepted.
+    pub grace_until: u64,
+}
+
 /// An admin action of the gateway, as its audit line names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -713,6 +724,9 @@ pub enum AuditAction {
     Reload,
     /// `POST /v1/model/spend/reset`: a login's spend count set to zero.
     SpendReset,
+    /// `POST /v1/model/clients/{name}/rotate`: a fresh token written to a named loopback
+    /// client's `token_file`.
+    ClientRotate,
 }
 
 /// Whether an admin action went through.
@@ -735,8 +749,8 @@ pub struct AuditEntry {
     pub actor: String,
     /// What was done.
     pub action: AuditAction,
-    /// The login of a spend reset, the config file of a reload; absent when a refused request
-    /// named none.
+    /// The login of a spend reset, the config file of a reload, the client of a rotation; absent
+    /// when a refused request named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// Whether it went through.
@@ -754,6 +768,9 @@ pub struct AuditEntry {
     /// Path of the copy an action kept of what it replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
+    /// A rotation that went through: the first 12 hex characters of the new token's SHA-256.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_sha256_prefix: Option<String>,
 }
 
 /// `GET /v1/model/audit` response.

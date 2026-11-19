@@ -8,7 +8,7 @@ max_turns = 4
 max_attempts = 4
 # Counts the monthly spend of the logins with a spend_cap; only the gateway writes it.
 spend_file = "/var/lib/qb-gateway/spend.json"
-# Each admin action (reload, spend reset) is appended here as one JSON line.
+# Each admin action (reload, spend reset, client token rotation) is appended here as one JSON line.
 audit_file = "/var/lib/qb-gateway/audit.jsonl"
 
 [[logins]]
@@ -115,6 +115,9 @@ models = { "model-large-2025-01-01" = "chat", "model-small-2025-01-01" = "compac
 # token (docs/config.md shows how to make one).
 listen = "127.0.0.1:8080"
 token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# A rotated client token's predecessor stays accepted this long; its hash waits in grace_file.
+rotate_grace_s = 3600
+grace_file = "/var/lib/qb-gateway/grace.json"
 # Seconds of silence in a started stream before an SSE keep-alive, at most 30.
 ping_interval_s = 10
 
@@ -124,6 +127,12 @@ ping_interval_s = 10
 name = "client-a"
 token_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 routes = ["compact"]
+
+# A named client whose token the gateway reads from a file and rewrites on
+# POST /v1/model/clients/client-b/rotate; hand the client its token from that file.
+[[fronts.clients]]
+name = "client-b"
+token_file = "/var/lib/qb-gateway/tokens/client-b.token"
 
 # POST /v1/messages for Anthropic SDK clients: the qbd vendor of the Anthropic logins above.
 [fronts.messages]

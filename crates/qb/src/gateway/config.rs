@@ -44,6 +44,10 @@ pub const MIN_USAGE_ROTATE_BYTES: u64 = 1 << 10;
 pub const MAX_USAGE_ROTATE_BYTES: u64 = 1 << 30;
 /// Largest `usage.keep_days`.
 pub const MAX_USAGE_KEEP_DAYS: u32 = 3660;
+/// Default of `fronts.rotate_grace_s`.
+pub const ROTATE_GRACE_S: u32 = 3600;
+/// Largest `fronts.rotate_grace_s`.
+pub const MAX_ROTATE_GRACE_S: u32 = 604_800;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
 /// `[[routes]]`, `[openai_models]`, `[prices]`, `[usage]` and `[fronts]` tables.
@@ -136,6 +140,11 @@ pub struct Fronts {
     /// Named client tokens of the loopback listener; only with `listen`, which needs this or
     /// `token_sha256`.
     pub clients: Vec<FrontClient>,
+    /// Seconds a rotated client's previous token stays accepted, 0 to [`MAX_ROTATE_GRACE_S`].
+    pub rotate_grace_s: u32,
+    /// Absolute path of the file of the previous tokens' hashes; set when a client has a
+    /// `token_file`.
+    pub grace_file: Option<PathBuf>,
     /// Seconds of silence in a started stream before a keep-alive, 1 to [`MAX_PING_INTERVAL_S`].
     pub ping_interval_s: u32,
     /// `/v1/messages`; without it that endpoint answers 404.
@@ -149,10 +158,20 @@ pub struct Fronts {
 pub struct FrontClient {
     /// Caller name of its turns.
     pub name: String,
-    /// SHA-256 of its token.
-    pub token_sha256: BearerHash,
+    /// Where the hash of its token comes from.
+    pub token: ClientToken,
     /// Route aliases it may run on; `None` for every route.
     pub routes: Option<Vec<String>>,
+}
+
+/// The source of a named client's token hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientToken {
+    /// `token_sha256`: the hash itself.
+    Sha256(BearerHash),
+    /// `token_file`: the absolute path of the file that holds the token, which the gateway
+    /// hashes at start and reload and rewrites on a rotation.
+    File(PathBuf),
 }
 
 /// The `/v1/messages` front's settings.
@@ -664,6 +683,8 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
         listen: None,
         token_sha256: None,
         clients: Vec::new(),
+        rotate_grace_s: ROTATE_GRACE_S,
+        grace_file: None,
         ping_interval_s: PING_INTERVAL_S,
         messages: None,
         openai: None,
@@ -674,6 +695,8 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
         "listen",
         "token_sha256",
         "clients",
+        "rotate_grace_s",
+        "grace_file",
         "ping_interval_s",
         "messages",
         "openai",
@@ -708,6 +731,13 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
                 }
                 clients_at = Some(v.span().start);
             }
+            "rotate_grace_s" => {
+                f.rotate_grace_s = integer(at, v)?;
+                if f.rotate_grace_s > MAX_ROTATE_GRACE_S {
+                    return Err(bad(&format!("must be 0 to {MAX_ROTATE_GRACE_S}")));
+                }
+            }
+            "grace_file" => f.grace_file = Some(string(at, v)?.into()),
             "ping_interval_s" => {
                 f.ping_interval_s = integer(at, v)?;
                 if !(1..=MAX_PING_INTERVAL_S).contains(&f.ping_interval_s) {
@@ -724,21 +754,7 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
                 })?;
                 f.messages = Some(m);
             }
-            "openai" => {
-                let mut o = OpenaiFront {
-                    vendor: String::new(),
-                    max_tokens: 0,
-                };
-                let keys = ["vendor", "max_tokens"];
-                fields(at, table(at, v)?, &keys, &keys, |key, at, v| {
-                    match key {
-                        "vendor" => o.vendor = string(at, v)?,
-                        _ => o.max_tokens = integer(at, v)?,
-                    }
-                    Ok(())
-                })?;
-                f.openai = Some(o);
-            }
+            "openai" => f.openai = Some(walk_openai_front(at, table(at, v)?)?),
             _ => {
                 for (model, alias) in table(at, v)? {
                     let model = model.get_ref().as_ref();
@@ -751,6 +767,22 @@ fn walk_fronts(at: &str, t: &DeTable<'_>) -> Result<Fronts, WalkError> {
     })?;
     tokens_need_listen(at, listen_at, token_at, clients_at)?;
     Ok(f)
+}
+
+fn walk_openai_front(at: &str, t: &DeTable<'_>) -> Result<OpenaiFront, WalkError> {
+    let mut o = OpenaiFront {
+        vendor: String::new(),
+        max_tokens: 0,
+    };
+    let keys = ["vendor", "max_tokens"];
+    fields(at, t, &keys, &keys, |key, at, v| {
+        match key {
+            "vendor" => o.vendor = string(at, v)?,
+            _ => o.max_tokens = integer(at, v)?,
+        }
+        Ok(())
+    })?;
+    Ok(o)
 }
 
 /// `listen` needs `token_sha256` or `clients`, and each of them needs `listen`; the arguments are
@@ -775,17 +807,13 @@ fn tokens_need_listen(
 }
 
 fn walk_front_client(at: &str, t: &DeTable<'_>) -> Result<FrontClient, WalkError> {
-    let mut c = FrontClient {
-        name: String::new(),
-        token_sha256: BearerHash([0; 32]),
-        routes: None,
-    };
-    let keys = ["name", "token_sha256", "routes"];
-    fields(at, t, &keys, &keys[..2], |key, at, v| {
+    let (mut name, mut routes) = (String::new(), None);
+    let (mut hash, mut file) = (None, None);
+    let keys = ["name", "token_sha256", "token_file", "routes"];
+    fields(at, t, &keys, &keys[..1], |key, at, v| {
         match key {
-            "name" => c.name = string(at, v)?,
+            "name" => name = string(at, v)?,
             "token_sha256" => {
-                let hash = BearerHash::from_hex(&string(at, v)?);
                 let bad = || {
                     (
                         at.to_owned(),
@@ -793,20 +821,37 @@ fn walk_front_client(at: &str, t: &DeTable<'_>) -> Result<FrontClient, WalkError
                         Some(v.span().start),
                     )
                 };
-                c.token_sha256 = hash.ok_or_else(bad)?;
+                hash = Some(BearerHash::from_hex(&string(at, v)?).ok_or_else(bad)?);
             }
+            "token_file" => file = Some((string(at, v)?, v.span().start)),
             _ => {
                 let items = v
                     .get_ref()
                     .as_array()
                     .ok_or_else(|| wrong(at, v, "an array of strings"))?;
-                let routes = items.iter().map(|item| string(at, item));
-                c.routes = Some(routes.collect::<Result<_, _>>()?);
+                let listed = items.iter().map(|item| string(at, item));
+                routes = Some(listed.collect::<Result<_, _>>()?);
             }
         }
         Ok(())
     })?;
-    Ok(c)
+    let token = match (hash, file) {
+        (Some(hash), None) => ClientToken::Sha256(hash),
+        (None, Some((file, _))) => ClientToken::File(file.into()),
+        (Some(_), Some((_, at_file))) => {
+            let reason = "`token_sha256` and `token_file` exclude each other";
+            return Err((format!("{at}.token_file"), reason.into(), Some(at_file)));
+        }
+        (None, None) => {
+            let reason = "is missing; a named client needs it or `token_file`";
+            return Err((format!("{at}.token_sha256"), reason.into(), None));
+        }
+    };
+    Ok(FrontClient {
+        name,
+        token,
+        routes,
+    })
 }
 
 fn walk_client(at: &str, t: &DeTable<'_>) -> Result<GatewayClient, WalkError> {
@@ -1067,10 +1112,16 @@ fn walk_chain(at: &str, v: &Value<'_>) -> Result<Vec<Step>, WalkError> {
     Ok(steps)
 }
 
-/// A caller name fits the `on_behalf_of` of the picks its turns make.
+/// A caller name fits the `on_behalf_of` of the picks its turns make and is not of the form
+/// `uid:<digits>`, the caller name of the gateway's own uid.
 fn caller_name(field: &str, name: &str) -> Result<(), Fault> {
     if name.len() > ON_BEHALF_OF_MAX {
         let reason = format!("is longer than {ON_BEHALF_OF_MAX} bytes");
+        return Err((field.into(), reason));
+    }
+    let uid_form = name.strip_prefix("uid:");
+    if uid_form.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+        let reason = "`uid:<n>` is the caller name of a unix socket peer".into();
         return Err((field.into(), reason));
     }
     Ok(())
@@ -1200,17 +1251,16 @@ impl GatewayConfig {
     }
 
     /// The named clients of `f`: their names apart from every other caller name, their hashes
-    /// apart from each other and the unnamed token's, their routes declared.
+    /// apart from each other and the unnamed token's, their token files absolute with a grace
+    /// file, their routes declared.
     fn validate_front_clients(&self, f: &Fronts) -> Result<(), Fault> {
         declare("fronts.clients", f.clients.iter().map(|c| c.name.as_str()))?;
+        if let Some(file) = &f.grace_file {
+            absolute("fronts.grace_file", file)?;
+        }
         for (i, c) in f.clients.iter().enumerate() {
             let at = |key: &str| format!("fronts.clients[{i}].{key}");
             caller_name(&at("name"), &c.name)?;
-            let uid_form = c.name.strip_prefix("uid:");
-            if uid_form.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
-                let reason = "`uid:<n>` is the caller name of a unix socket peer".into();
-                return Err((at("name"), reason));
-            }
             if self.clients.iter().any(|o| o.name == c.name) {
                 return Err((at("name"), format!("`{}` is a `[[clients]]` name", c.name)));
             }
@@ -1219,16 +1269,25 @@ impl GatewayConfig {
                     format!("`{TOKEN_CALLER}` is the caller name of `fronts.token_sha256`");
                 return Err((at("name"), reason));
             }
-            if let Some(j) = f.clients[..i]
-                .iter()
-                .position(|o| o.token_sha256 == c.token_sha256)
-            {
-                let reason = format!("is the hash of `fronts.clients[{j}]` too");
-                return Err((at("token_sha256"), reason));
-            }
-            if f.token_sha256 == Some(c.token_sha256) {
-                let reason = "is the hash of `fronts.token_sha256` too".into();
-                return Err((at("token_sha256"), reason));
+            match &c.token {
+                ClientToken::Sha256(hash) => {
+                    let same = |o: &FrontClient| o.token == c.token;
+                    if let Some(j) = f.clients[..i].iter().position(same) {
+                        let reason = format!("is the hash of `fronts.clients[{j}]` too");
+                        return Err((at("token_sha256"), reason));
+                    }
+                    if f.token_sha256 == Some(*hash) {
+                        let reason = "is the hash of `fronts.token_sha256` too".into();
+                        return Err((at("token_sha256"), reason));
+                    }
+                }
+                ClientToken::File(file) => {
+                    absolute(&at("token_file"), file)?;
+                    if f.grace_file.is_none() {
+                        let reason = "needs `fronts.grace_file` for the previous token's hash";
+                        return Err((at("token_file"), reason.into()));
+                    }
+                }
             }
             let Some(routes) = &c.routes else {
                 continue;
@@ -1880,21 +1939,41 @@ difficulty = 1
             [
                 FrontClient {
                     name: "client-a".into(),
-                    token_sha256: BearerHash([0xab; 32]),
+                    token: ClientToken::Sha256(BearerHash([0xab; 32])),
                     routes: Some(vec!["chat".into()]),
                 },
                 FrontClient {
                     name: "client-b".into(),
-                    token_sha256: BearerHash([0xcd; 32]),
+                    token: ClientToken::Sha256(BearerHash([0xcd; 32])),
                     routes: None,
                 },
             ]
+        );
+        assert_eq!(
+            (f.rotate_grace_s, f.grace_file),
+            (ROTATE_GRACE_S, None),
+            "the defaults"
         );
         let legacy = format!("{listen}\ntoken_sha256 = \"{}\"", "ef".repeat(32));
         let both = check("", &front(&legacy, &two)).unwrap().fronts.unwrap();
         assert_eq!(
             (both.token_sha256, both.clients.len()),
             (Some(BearerHash([0xef; 32])), 2)
+        );
+        let grace = "rotate_grace_s = 0\ngrace_file = \"/var/lib/qb-gateway/grace.json\"";
+        let filed = "[[fronts.clients]]\nname = \"client-c\"\n\
+                     token_file = \"/var/lib/qb-gateway/tokens/client-c\"\n";
+        let f = check("", &front(&format!("{listen}\n{grace}"), filed))
+            .unwrap()
+            .fronts
+            .unwrap();
+        assert_eq!(
+            f.clients[0].token,
+            ClientToken::File("/var/lib/qb-gateway/tokens/client-c".into())
+        );
+        assert_eq!(
+            (f.rotate_grace_s, f.grace_file),
+            (0, Some("/var/lib/qb-gateway/grace.json".into()))
         );
     }
 
@@ -1913,11 +1992,13 @@ difficulty = 1
         let cases = [
             (
                 front(listen, &one("role = \"r\"\n")),
-                "fronts.clients[0].role: unknown field, expected one of name, token_sha256, routes",
+                "fronts.clients[0].role: unknown field, expected one of name, token_sha256, \
+                 token_file, routes",
             ),
             (
                 front(listen, "[[fronts.clients]]\nname = \"client-a\"\n"),
-                "fronts.clients[0].token_sha256: is missing",
+                "fronts.clients[0].token_sha256: is missing; a named client needs it or \
+                 `token_file`",
             ),
             (
                 front(
@@ -1988,6 +2069,51 @@ difficulty = 1
     }
 
     #[test]
+    fn a_token_file_client_needs_an_absolute_path_a_grace_file_and_no_hash() {
+        let a = "ab".repeat(32);
+        let front = |keys: &str, client: &str| {
+            format!(
+                "[fronts]\nlisten = \"127.0.0.1:8080\"\n{keys}\n\
+                 [fronts.messages]\nvendor = \"vendor-a\"\n\
+                 [[fronts.clients]]\nname = \"client-a\"\n{client}"
+            )
+        };
+        let hash = format!("token_sha256 = \"{a}\"\n");
+        let file = |path: &str| format!("token_file = \"{path}\"\n");
+        let cases = [
+            (
+                front("", &format!("{hash}{}", file("/srv/tokens/client-a"))),
+                "fronts.clients[0].token_file: `token_sha256` and `token_file` exclude each other",
+            ),
+            (
+                front("", &file("tokens/client-a")),
+                "fronts.clients[0].token_file: must be an absolute path",
+            ),
+            (
+                front("", &file("/srv/tokens/client-a")),
+                "fronts.clients[0].token_file: needs `fronts.grace_file` for the previous token's \
+                 hash",
+            ),
+            (
+                front("grace_file = \"grace.json\"", &hash),
+                "fronts.grace_file: must be an absolute path",
+            ),
+            (
+                front("rotate_grace_s = 604801", &hash),
+                "fronts.rotate_grace_s: must be 0 to 604800",
+            ),
+            (
+                front("rotate_grace_s = -1", &hash),
+                "fronts.rotate_grace_s: is out of range",
+            ),
+        ];
+        for (text, want) in cases {
+            let err = check("", &text).unwrap_err();
+            assert!(err.contains(want), "{text}: {err}");
+        }
+    }
+
+    #[test]
     fn caller_names_fit_on_behalf_of_and_front_clients_are_named_apart_from_uids() {
         let a = "ab".repeat(32);
         let listen = "[fronts]\nlisten = \"127.0.0.1:8080\"\n";
@@ -2016,6 +2142,10 @@ difficulty = 1
             (
                 format!("[[clients]]\nname = \"{long}\"\nuid = 1001\n"),
                 "clients[0].name: is longer than 128 bytes",
+            ),
+            (
+                "[[clients]]\nname = \"uid:1001\"\nuid = 1001\n".into(),
+                "clients[0].name: `uid:<n>` is the caller name of a unix socket peer",
             ),
         ];
         for (text, want) in cases {

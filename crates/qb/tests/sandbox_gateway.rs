@@ -5,10 +5,14 @@
 
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, LandlockStatus, Ruleset, RulesetAttr};
+use qb::gateway::config::GatewayLogin;
+use qb::gateway::core::Gateway;
+use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
 use qb_proto::{AuditAction, AuditEntry, AuditResult, Outcome, StopReason, Usage, UsageLine};
 use rustix::process::{DumpableBehavior, dumpable_behavior};
 
@@ -30,13 +34,14 @@ fn kernel_abi() -> Option<ABI> {
     .unwrap()
 }
 
-/// The enforced ruleset: no gaps; its startup line names the credential, spend, audit, usage and
-/// config directories and the two resolver files, TCP connect to 443 and bind on `port`; `opened`
-/// are the credential, spend, audit and usage directories.
+/// The enforced ruleset: no gaps; its startup line names the credential, spend, audit, usage,
+/// client token, grace and config directories and the two resolver files, TCP connect to 443 and
+/// bind on `port`; `opened` are the credential, spend, audit, usage, client token and grace
+/// directories.
 fn assert_applied(applied: &qb::sandbox::Confined, port: u16, opened: &[PathBuf]) {
     assert_eq!(applied.gaps, Vec::<String>::new());
     let want = format!(
-        "non-dumpable; landlock V4: files beneath 7 paths only, TCP connect 443, bind {port} only"
+        "non-dumpable; landlock V4: files beneath 9 paths only, TCP connect 443, bind {port} only"
     );
     assert_eq!(applied.summary, want);
     assert_eq!(applied.opened, opened);
@@ -54,6 +59,19 @@ fn signal_reload(at: u64) -> AuditEntry {
         config_sha256_before: None,
         config_sha256_after: None,
         backup: None,
+        token_sha256_prefix: None,
+    }
+}
+
+/// A gateway that never refreshes, for a rotation under the sandbox.
+struct NoRefresh;
+
+impl Refresher for NoRefresh {
+    fn refresh(&self, _: &GatewayLogin, _: &str) -> Result<Refreshed, RefreshError> {
+        Err(RefreshError {
+            rejected: false,
+            message: "no refresh in this test".into(),
+        })
     }
 }
 
@@ -80,7 +98,7 @@ fn finished(at: u64) -> UsageLine {
 
 #[test]
 #[allow(clippy::too_many_lines)] // the dumpable flag is process-wide, so one test covers it all
-fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_reach_qbd_only() {
+fn gateway_may_write_its_own_files_read_its_config_and_reach_qbd_only() {
     let dir = Path::new("/tmp").join(format!("qb-gw-sandbox-{}", std::process::id()));
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
@@ -95,6 +113,13 @@ fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_r
     let usage = dir.join("usage");
     std::fs::create_dir_all(&usage).unwrap();
     let usage_file = usage.join("usage.jsonl");
+    let tokens = dir.join("tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    let token_file = tokens.join("client-f.token");
+    std::fs::write(&token_file, "qb-client-f-token").unwrap();
+    let grace = dir.join("grace");
+    std::fs::create_dir_all(&grace).unwrap();
+    let grace_file = grace.join("grace.json");
     let expired = usage.join(format!(
         "usage.jsonl.{}",
         qb::server::unix_now() - 2 * 86_400
@@ -115,7 +140,8 @@ fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_r
         "socket = \"{}\"\nqbd_socket = \"{}\"\nspend_file = \"{}\"\naudit_file = \"{}\"\n\
              [[logins]]\nname = \"login-1\"\nkind = \"api_key\"\napi = \"anthropic\"\ncredentials = \"{}\"\n\
              [[routes]]\nalias = \"chat\"\nrole = \"gateway\"\ndifficulty = 1\n\
-             [fronts]\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\n\
+             [fronts]\nlisten = \"127.0.0.1:{port}\"\ntoken_sha256 = \"{}\"\ngrace_file = \"{}\"\n\
+             [[fronts.clients]]\nname = \"client-f\"\ntoken_file = \"{}\"\n\
              [fronts.messages]\nvendor = \"vendor-a\"\n\
              [usage]\nfile = \"{}\"\nrotate_bytes = 1024\nkeep_days = 1\n",
         dir.join("gw.sock").display(),
@@ -124,6 +150,8 @@ fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_r
         audit_file.display(),
         credential.display(),
         "0".repeat(64),
+        grace_file.display(),
+        token_file.display(),
         usage_file.display()
     );
     std::fs::write(&file, &text).unwrap();
@@ -133,6 +161,7 @@ fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_r
         assert!(abi >= Some(ABI::V4), "landlock ABI {abi:?} < V4");
     }
     let (written, unreadable) = (credential.clone(), outside.clone());
+    let rotated = config.clone();
     let counted = spend_file.clone();
     let audited = audit_file.clone();
     let (hardened, edit) = std::sync::mpsc::channel();
@@ -157,6 +186,9 @@ fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_r
         for _ in 0..10 {
             ledger.append(&finished(now), now);
         }
+        let gateway = Gateway::new(rotated, Vec::new(), Box::new(NoRefresh), None).unwrap();
+        let answer = gateway.rotate_client("uid:1", "client-f").unwrap();
+        assert_eq!(answer.client, "client-f");
         assert!(UnixStream::connect(&qbd).is_ok(), "qbd stays reachable");
         let (accepted, _) = tcp.accept().unwrap();
         assert_eq!(
@@ -166,7 +198,7 @@ fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_r
         );
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
-            assert_applied(&applied, port, &[creds, state, audit, usage]);
+            assert_applied(&applied, port, &[creds, state, audit, usage, tokens, grace]);
             let denied = std::fs::read(&unreadable).unwrap_err();
             assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
             let denied = std::fs::write(unreadable.with_extension("new"), "x").unwrap_err();
@@ -202,6 +234,11 @@ fn gateway_may_write_its_credentials_spend_audit_and_usage_read_its_config_and_r
         r#"{"type":"api_key","key":"k2"}"#
     );
     assert!(spend_file.exists(), "written in the sandbox");
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    assert_ne!(token, "qb-client-f-token", "rotated in the sandbox");
+    let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(grace_file.exists(), "the grace file written in the sandbox");
     let appended = std::fs::read_to_string(&audit_file).unwrap();
     assert!(appended.contains(r#""action":"reload""#), "{appended}");
     let rotated = qb::gateway::usage::rotated(&usage_file).unwrap();

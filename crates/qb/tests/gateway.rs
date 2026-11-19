@@ -36,10 +36,10 @@ use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
-    AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ErrorClass,
-    GatewayError, LoginSpend, LoginStatus, Outcome, ReloadAnswer, RouteState, RouteStatus,
-    RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall,
-    TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
+    AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ClientRotateAnswer,
+    ErrorClass, GatewayError, LoginSpend, LoginStatus, Outcome, ReloadAnswer, RouteState,
+    RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking,
+    ToolCall, TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -7608,4 +7608,377 @@ fn a_messages_client_sees_its_tool_ids_kept_across_a_fallback_to_openai() {
     );
     assert_absent(&sent[0].body, &ANTHROPIC_THINKING);
     assert_eq!(c.anthropic.received().len(), 1);
+}
+
+/// The token the rotation tests start `client-f`'s token file with.
+const FILE_TOKEN: &str = "qb-client-f-token";
+
+/// A gateway whose loopback listener serves `client-f`, whose token is in a `token_file` of a
+/// directory of its own, and `client-a` with `token_sha256`; audit file and usage ledger set.
+struct Rotating {
+    r: Rig,
+    addr: SocketAddr,
+    token_file: PathBuf,
+    grace_file: PathBuf,
+    audit: PathBuf,
+    ledger: PathBuf,
+}
+
+/// The `[fronts]` keys and clients of [`Rotating`] with `rotate_grace_s = grace_s`.
+fn rotating_keys(token_file: &Path, grace_file: &Path, grace_s: u32) -> String {
+    format!(
+        "rotate_grace_s = {grace_s}\ngrace_file = \"{}\"\n\
+         [[fronts.clients]]\nname = \"client-f\"\ntoken_file = \"{}\"\n{}",
+        grace_file.display(),
+        token_file.display(),
+        front_client("client-a", CLIENT_A.1, ""),
+    )
+}
+
+/// A [`Rotating`] gateway whose token file holds `contents`.
+fn rotating_rig(grace_s: u32, contents: &str) -> Rotating {
+    let tokens = temp_dir("tokens");
+    let token_file = tokens.join("client-f.token");
+    std::fs::write(&token_file, contents).unwrap();
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let grace_file = temp_dir("grace").join("grace.json");
+    let (audit, ledger) = (audit_path(), temp_dir("ledger").join("usage.jsonl"));
+    let (listener, addr, front) = loopback_front(&rotating_keys(&token_file, &grace_file, grace_s));
+    let extra = format!(
+        "{}{}{front}",
+        audit_key(&audit),
+        usage_table(&ledger, 1 << 20)
+    );
+    let r = rig_on(4, &key_files(), &extra, own_uid(), Some(listener));
+    Rotating {
+        r,
+        addr,
+        token_file,
+        grace_file,
+        audit,
+        ledger,
+    }
+}
+
+/// The status of a Messages turn on `addr` with `token`.
+fn turn_status(addr: SocketAddr, token: &str) -> u16 {
+    loopback_post(
+        addr,
+        paths::MESSAGES,
+        token,
+        &sdk_body("model-2025-01-01", false),
+    )
+    .0
+}
+
+/// `POST /v1/model/clients/<name>/rotate` on `gw`: the status and the answer body.
+fn rotate(gw: &Path, name: &str) -> (u16, Vec<u8>) {
+    call(
+        gw,
+        "POST",
+        &format!("{}/{name}/rotate", paths::MODEL_CLIENTS),
+        "",
+    )
+}
+
+/// [`rotate`] that must answer 200: the answer and the token the file now holds.
+fn rotated(gw: &Path, token_file: &Path) -> (ClientRotateAnswer, String) {
+    let (status, body) = rotate(gw, "client-f");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let token = std::fs::read_to_string(token_file).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&body).contains(&token),
+        "the answer holds no token"
+    );
+    (serde_json::from_slice(&body).unwrap(), token)
+}
+
+/// Hex SHA-256 of `text`, by `sha256sum`.
+fn sha256_hex(text: &str) -> String {
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8(out.stdout).unwrap()[..64].to_owned()
+}
+
+#[test]
+fn a_rotation_writes_a_fresh_token_and_keeps_the_previous_one_within_the_grace() {
+    let f = rotating_rig(3600, &format!("{FILE_TOKEN}\n"));
+    assert_eq!(turn_status(f.addr, FILE_TOKEN), 200, "one newline is cut");
+    let mut answer = None;
+    let logged = stderr_until("rotated the token", || {
+        answer = Some(rotated(&f.r.gw, &f.token_file));
+    });
+    let (answer, first) = answer.unwrap();
+    let now = unix_now();
+    assert_eq!(answer.client, "client-f");
+    assert!(
+        (now..=now + 1).contains(&(answer.grace_until - 3600)),
+        "{answer:?}"
+    );
+    assert_eq!(answer.token_sha256_prefix, sha256_hex(&first)[..12]);
+    assert_eq!(first.len(), 43, "32 random bytes in base64url");
+    assert_ne!(first, FILE_TOKEN);
+    assert_eq!(mode_of(&f.token_file), 0o600);
+    assert_eq!(mode_of(&f.grace_file), 0o600);
+    assert_eq!(
+        (turn_status(f.addr, &first), turn_status(f.addr, FILE_TOKEN)),
+        (200, 200),
+        "the new token, and the old one within the grace"
+    );
+
+    let (_, second) = rotated(&f.r.gw, &f.token_file);
+    assert_eq!(
+        (
+            turn_status(f.addr, &second),
+            turn_status(f.addr, &first),
+            turn_status(f.addr, FILE_TOKEN)
+        ),
+        (200, 200, 401),
+        "a second rotation replaces the previous hash"
+    );
+    let (reloaded, body) = reload_with(&f.r.gw, |t| format!("{t}# reloaded\n"));
+    assert_eq!(reloaded, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        (turn_status(f.addr, &second), turn_status(f.addr, &first)),
+        (200, 200),
+        "a reload keeps the grace"
+    );
+    assert_eq!(
+        turn_status(f.addr, CLIENT_A.0),
+        200,
+        "a hash client serves on"
+    );
+
+    let entries = audit_answer(&f.r.gw, "").entries;
+    let rotations: Vec<_> = entries
+        .iter()
+        .filter(|e| e.action == AuditAction::ClientRotate)
+        .map(|e| (e.object.as_deref(), e.result, e.token_sha256_prefix.clone()))
+        .collect();
+    assert_eq!(
+        rotations,
+        [
+            (
+                Some("client-f"),
+                AuditResult::Ok,
+                Some(answer.token_sha256_prefix.clone())
+            ),
+            (
+                Some("client-f"),
+                AuditResult::Ok,
+                Some(sha256_hex(&second)[..12].to_owned())
+            ),
+        ]
+    );
+    let grace = std::fs::read_to_string(&f.grace_file).unwrap();
+    assert!(grace.contains(&sha256_hex(&first)), "{grace}");
+    let ledger = usage_lines(&f.ledger);
+    assert!(ledger.iter().any(|l| l.client == "client-f"), "{ledger:?}");
+    let ledger = std::fs::read_to_string(&f.ledger).unwrap();
+    let audit = std::fs::read_to_string(&f.audit).unwrap();
+    for token in [FILE_TOKEN, &first, &second] {
+        for (what, text) in [
+            ("stderr", &logged),
+            ("audit", &audit),
+            ("ledger", &ledger),
+            ("grace file", &grace),
+        ] {
+            assert!(!text.contains(token), "{what} holds a token: {text}");
+        }
+    }
+    assert!(
+        logged.contains(&format!("sha256 {}", answer.token_sha256_prefix)),
+        "{logged}"
+    );
+}
+
+#[test]
+fn without_a_grace_the_previous_token_is_refused_at_once() {
+    let f = rotating_rig(0, FILE_TOKEN);
+    let (answer, token) = rotated(&f.r.gw, &f.token_file);
+    assert!(answer.grace_until <= unix_now(), "{answer:?}");
+    assert_eq!(
+        (turn_status(f.addr, &token), turn_status(f.addr, FILE_TOKEN)),
+        (200, 401)
+    );
+}
+
+#[test]
+fn a_restart_within_the_grace_still_accepts_the_previous_token() {
+    let f = rotating_rig(3600, FILE_TOKEN);
+    let (_, token) = rotated(&f.r.gw, &f.token_file);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = std::fs::read_to_string(config_file(&f.r.gw))
+        .unwrap()
+        .replace("gw.sock", "gw2.sock")
+        .replace(&f.addr.to_string(), &addr.to_string());
+    let fake = Arc::new(Fake::default());
+    serve_gateway(
+        &config,
+        vec![(Api::Anthropic, Box::new(Shared(fake)))],
+        Box::new(Counting(Arc::default())),
+        own_uid(),
+        Some(listener),
+    );
+    assert_eq!(
+        (turn_status(addr, &token), turn_status(addr, FILE_TOKEN)),
+        (200, 200)
+    );
+}
+
+#[test]
+fn a_rotation_is_refused_for_other_uids_unknown_and_hash_clients_and_on_loopback() {
+    let f = rotating_rig(3600, FILE_TOKEN);
+    let refusal = |name: &str| {
+        let (status, body) = rotate(&f.r.gw, name);
+        let e: GatewayError = serde_json::from_slice(&body).unwrap();
+        (status, e.message.unwrap())
+    };
+    assert_eq!(
+        refusal("client-x"),
+        (
+            404,
+            "no `[[fronts.clients]]` entry is named `client-x`".into()
+        )
+    );
+    assert_eq!(
+        refusal("client-a"),
+        (
+            409,
+            "client `client-a` has a `token_sha256`, not a `token_file` the gateway can write"
+                .into()
+        )
+    );
+    let path = format!("{}/client-f/rotate", paths::MODEL_CLIENTS);
+    let (status, _) = call(&f.r.gw, "GET", &path, "");
+    assert_eq!(status, 405);
+    let auth = format!("X-Api-Key: {FILE_TOKEN}\r\n");
+    let (status, _) = error_type(tcp_send(f.addr, "POST", &path, &auth, ""));
+    assert_eq!(status, 404, "the loopback listener does not serve it");
+    assert_eq!(std::fs::read_to_string(&f.token_file).unwrap(), FILE_TOKEN);
+    let rows: Vec<_> = audit_answer(&f.r.gw, "")
+        .entries
+        .into_iter()
+        .map(|e| (e.object, e.result, e.token_sha256_prefix))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some("client-x".into()), AuditResult::Refused, None),
+            (Some("client-a".into()), AuditResult::Refused, None),
+        ]
+    );
+
+    let tokens = temp_dir("tokens");
+    let token_file = tokens.join("client-f.token");
+    std::fs::write(&token_file, FILE_TOKEN).unwrap();
+    let (_, _, front) = loopback_front(&rotating_keys(
+        &token_file,
+        &temp_dir("grace").join("grace.json"),
+        60,
+    ));
+    let audit = audit_path();
+    let extra = format!(
+        "{}\n[[clients]]\nname = \"client-u\"\nuid = {}\n{front}",
+        audit_key(&audit),
+        own_uid()
+    );
+    let r = rig_as(4, &key_files(), &extra, own_uid() + 1);
+    let (status, body) = rotate(&r.gw, "client-f");
+    let e: GatewayError = serde_json::from_slice(&body).unwrap();
+    assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap(), FILE_TOKEN);
+    let line: AuditEntry =
+        serde_json::from_str(std::fs::read_to_string(&audit).unwrap().trim_end()).unwrap();
+    assert_eq!(
+        (line.action, line.object.as_deref(), line.result),
+        (
+            AuditAction::ClientRotate,
+            Some("client-f"),
+            AuditResult::Refused
+        )
+    );
+}
+
+#[test]
+fn a_failed_token_write_keeps_the_file_and_the_accepted_tokens() {
+    let f = rotating_rig(3600, FILE_TOKEN);
+    let (_, first) = rotated(&f.r.gw, &f.token_file);
+    let grace = std::fs::read_to_string(&f.grace_file).unwrap();
+    let dir = f.token_file.parent().unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(dir.join("probe"), "").is_ok() {
+        // Running as root: directory modes do not bind, nothing to check.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let (status, body) = rotate(&f.r.gw, "client-f");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e: GatewayError = serde_json::from_slice(&body).unwrap();
+    assert_eq!((status, e.class), (500, ErrorClass::Unavailable), "{e:?}");
+    assert!(e.message.unwrap().contains("cannot write the token file"));
+    assert_eq!(std::fs::read_to_string(&f.token_file).unwrap(), first);
+    assert_eq!(std::fs::read_to_string(&f.grace_file).unwrap(), grace);
+    assert_eq!(
+        (turn_status(f.addr, &first), turn_status(f.addr, FILE_TOKEN)),
+        (200, 200)
+    );
+    let last = audit_answer(&f.r.gw, "").entries.pop().unwrap();
+    assert_eq!(
+        (last.action, last.result, last.token_sha256_prefix),
+        (AuditAction::ClientRotate, AuditResult::Refused, None)
+    );
+}
+
+#[test]
+fn an_empty_or_unreadable_token_file_fails_start_and_is_refused_on_reload() {
+    let f = rotating_rig(3600, FILE_TOKEN);
+    std::fs::write(&f.token_file, "\n").unwrap();
+    let (status, body) = call(&f.r.gw, "POST", paths::MODEL_RELOAD, "");
+    let e: GatewayError = serde_json::from_slice(&body).unwrap();
+    let message = e.message.unwrap();
+    assert_eq!(status, 400, "{message}");
+    let field = format!(
+        "fronts.clients[0].token_file: {}: is empty",
+        f.token_file.display()
+    );
+    assert!(message.contains(&field), "{message}");
+    assert_eq!(
+        turn_status(f.addr, FILE_TOKEN),
+        200,
+        "the running hash stays"
+    );
+    let last = audit_answer(&f.r.gw, "").entries.pop().unwrap();
+    assert_eq!(
+        (last.action, last.result),
+        (AuditAction::Reload, AuditResult::Refused)
+    );
+
+    let text = std::fs::read_to_string(config_file(&f.r.gw)).unwrap();
+    let config = qb::gateway::config::parse(&config_file(&f.r.gw), &text).unwrap();
+    let start = |config| {
+        let upstreams: Upstreams = Vec::new();
+        Gateway::new(config, upstreams, Box::new(Counting(Arc::default())), None)
+            .err()
+            .unwrap()
+    };
+    assert!(start(config.clone()).contains(&field), "empty");
+    std::fs::write(&f.token_file, "x".repeat(4097)).unwrap();
+    let refused = start(config.clone());
+    assert!(refused.contains("is larger than 4096 bytes"), "{refused}");
+    std::fs::remove_file(&f.token_file).unwrap();
+    let refused = start(config);
+    let missing = format!("fronts.clients[0].token_file: {}: ", f.token_file.display());
+    assert!(refused.contains(&missing), "{refused}");
 }

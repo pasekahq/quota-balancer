@@ -10,8 +10,6 @@ use std::path::PathBuf;
 
 use qb_anthropic::request::identity as anthropic;
 use qb_openai::request::identity as openai;
-use rustix::io::Errno;
-use rustix::rand::{GetRandomFlags, getrandom};
 use zeroize::Zeroizing;
 
 use super::base64url;
@@ -20,9 +18,6 @@ use super::creds::{self, Written};
 use super::import::claimed_account;
 use super::oauth::{OauthRefresher, percent_encode, plain_code};
 use crate::sha256;
-
-/// Random bytes behind the verifier and behind the state: 43 base64url characters each.
-const RANDOM_BYTES: usize = 32;
 
 /// A sign-in waiting for the pasted code.
 pub struct SignIn {
@@ -71,9 +66,9 @@ impl SignIn {
             ));
         }
         creds::vacant(&login.credentials, force)?;
-        let verifier = random()?;
+        let verifier = base64url::random()?;
         let challenge = base64url::encode(&sha256::digest(verifier.as_bytes()));
-        let state = random()?.to_string();
+        let state = base64url::random()?.to_string();
         Ok(Self {
             login,
             verifier,
@@ -235,20 +230,6 @@ impl SignIn {
         }
         Ok(code)
     }
-}
-
-/// [`RANDOM_BYTES`] from the kernel's random source, base64url-encoded.
-fn random() -> Result<Zeroizing<String>, String> {
-    let mut bytes = Zeroizing::new([0u8; RANDOM_BYTES]);
-    let mut filled = 0;
-    while filled < RANDOM_BYTES {
-        match getrandom(&mut bytes[filled..], GetRandomFlags::empty()) {
-            Ok(n) => filled += n,
-            Err(Errno::INTR) => {}
-            Err(e) => return Err(format!("getrandom: {e}")),
-        }
-    }
-    Ok(Zeroizing::new(base64url::encode(&*bytes)))
 }
 
 /// A query value decoded: `%XX` to its byte, `+` to a space; `None` for a bad escape or text

@@ -231,7 +231,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
 | `spend_file` | string | Absolute path of the file that counts the spend of the logins with a `spend_cap`; required when one has it ([Spend caps](#spend-caps)). |
-| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset) is appended to as one JSON line, created with mode 0600 in an existing directory; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
+| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation) is appended to as one JSON line, created with mode 0600 in an existing directory; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
 the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
@@ -241,7 +241,7 @@ or put the socket in a directory outside it.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `name` | string | Caller name in the log; 1 to 128 bytes. |
+| `name` | string | Caller name in the log; 1 to 128 bytes, not of the form `uid:<digits>`. |
 | `uid` | integer | Peer uid (`SO_PEERCRED`); unique. |
 
 `[[logins]]`, 1 to 32: the logins this gateway holds credentials for.
@@ -407,6 +407,8 @@ without its sub-table answers 404.
 | `models` | table of strings | Client `model` names, each mapped to a route alias, at most 256; for example `{ "claude-sonnet-4-5-20250929" = "chat", "gpt-5" = "chat" }`. A `model` equal to an alias needs no entry; a key may not be an alias, and a value must be one. Any other `model` is answered 400 `invalid_request_error`. |
 | `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves the HTTP fronts besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`, at least one `[[fronts.clients]]` entry, or both. |
 | `token_sha256` | string | With `listen`, and only with it: SHA-256 of the unnamed client token as 64 hex characters; its turns run as the caller `client-token`. Plaintext tokens are rejected. |
+| `rotate_grace_s` | integer 0..=604800 | Seconds a named client's previous token stays accepted after a rotation of its `token_file`, default 3600; 0 refuses it at once. |
+| `grace_file` | string | Absolute path of the file the gateway keeps the previous tokens' hashes in, so their grace outlasts a restart; required when a named client has `token_file`. Only hashes and times, mode 0600, in an existing directory. |
 | `ping_interval_s` | integer 1..=30 | Seconds a started stream may stay silent before the front writes an SSE keep-alive, default 10. |
 
 `[fronts.messages]`: the `POST /v1/messages` front.
@@ -431,7 +433,8 @@ token as that client. An empty `clients = []` is a config error.
 | Key | Type | Meaning |
 |---|---|---|
 | `name` | string | Required, 1 to 128 bytes and unique. Neither a `[[clients]]` name, nor `client-token`, nor of the form `uid:<digits>`. |
-| `token_sha256` | string | Required. SHA-256 of the client's token as 64 hex characters, made as below; no other named client and not `fronts.token_sha256` may have the same hash. |
+| `token_sha256` | string | SHA-256 of the client's token as 64 hex characters, made as below; no other named client and not `fronts.token_sha256` may have the same hash. Exactly one of `token_sha256` and `token_file`. |
+| `token_file` | string | Absolute path of a file that holds the client's token, at most 4096 bytes, one trailing newline cut, not empty. The gateway reads it at start and on every reload, keeps only its SHA-256 and writes a fresh token to it on a rotation ([Client token rotation](#client-token-rotation)). An unreadable or empty file fails the start and refuses a reload, naming the field; no other client may hold the same token. Needs `grace_file`. |
 | `routes` | array of strings | Route aliases the client may run on, at least one; absent means every route. A request whose `model` resolves, through `models` or as an alias, to another route is answered 403 before any pick ([api.md](api.md#model-gateway-v1model)). |
 
 ```toml
@@ -454,6 +457,29 @@ The token must not start with `sk-ant-`, `eyJ` or `cc-`: some Anthropic clients 
 that shape for a subscription OAuth token and send it with another identity. The `qb-` prefix
 above avoids that. Anyone on the host who knows the token can spend the gateway's logins, so
 keep it as private as a vendor key.
+
+### Client token rotation
+
+The gateway's own uid rotates the token of a named client with `token_file` through
+`POST /v1/model/clients/<name>/rotate` ([api.md](api.md#post-v1modelclientsnamerotate)): the
+gateway writes 32 random bytes from the kernel, base64url-encoded (43 characters), to the file
+by a rename in its directory, mode 0600, and accepts the new token from the next loopback
+connection. The token reaches the client only through the file; the answer never carries it.
+The previous token stays accepted for `rotate_grace_s`; its hash and the end of its grace go to
+`grace_file` first, so a reload or a restart within the grace still accepts it. Each client has one previous token: a second
+rotation replaces it. Entries whose grace is over are ignored and dropped at the next write.
+Neither the answer, the audit, the log nor the usage ledger holds a token; they show the first
+12 hex characters of the new token's SHA-256. The gateway never rewrites the config file.
+
+```toml
+[fronts]
+listen = "127.0.0.1:8080"
+grace_file = "/var/lib/qb-gateway/grace.json"
+
+[[fronts.clients]]
+name = "client-b"
+token_file = "/var/lib/qb-gateway/tokens/client-b.token"
+```
 
 Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).
 
@@ -712,9 +738,10 @@ new file goes through the same parsing and validation as at startup. A valid fil
 no restart-only key becomes the config of every turn admitted from then on: routes and their
 chains, logins and their credential files, `token_url`, `spend_cap`, `max_turns`,
 `max_request_bytes`, `max_attempts`, `[openai_models]`, `[prices]`, `[[clients]]`, and `[fronts]`
-but `listen`, so the fronts'
-`models`, the client tokens (`token_sha256` and `[[fronts.clients]]`) and the fronts served; a
-change to the client tokens applies to the next loopback connection. The gateway logs
+but `listen` and `grace_file`, so the fronts'
+`models`, the client tokens (`token_sha256` and `[[fronts.clients]]`), `rotate_grace_s` and the
+fronts served; a reload reads every `token_file` again, and a change to the client tokens
+applies to the next loopback connection. Previous tokens within their grace stay accepted. The gateway logs
 `gateway: reloaded <file>: <n> routes, <m> logins`.
 
 A turn already admitted finishes on the config of its admission, its retries and chain steps
@@ -722,11 +749,12 @@ included; its stream is not cut. Refresh locks of the credential files carry ove
 
 These keys need a restart: `socket`, `socket_mode`, `fronts.listen` (the listeners exist before
 the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup),
-`spend_file`, `audit_file` and `[usage]` (the sandbox opens their directories once), and a
-login whose `credentials` lies in a directory the sandbox did not open at startup (it opens the
-directories of the startup config's credential files, `spend_file`, `audit_file` and `usage.file`
-once; one missing then stays closed until a restart). A file that cannot be read, does not
-validate or changes one of them is refused: the running config stays, the gateway logs one line
+`spend_file`, `audit_file`, `[usage]` and `fronts.grace_file` (the sandbox opens their
+directories once), and a login whose `credentials` or a named client whose `token_file` lies in
+a directory the sandbox did not open at startup (it opens the directories of the startup
+config's credential files, `spend_file`, `audit_file`, `usage.file`, token files and
+`grace_file` once; one missing then stays closed until a restart). A file that cannot be read,
+does not validate, changes one of them or names a token file that cannot be read is refused: the running config stays, the gateway logs one line
 `gateway: reload refused: <file>: <field>: <reason>` with the line where the file has one, and
 `qb reload` exits 1 with the same reason. The sandbox lets the gateway read the files of its
 config file's directory, so an editor may replace the file by rename; give the config a

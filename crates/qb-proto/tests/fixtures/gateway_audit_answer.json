@@ -32,6 +32,22 @@
       "action": "spend_reset",
       "result": "refused",
       "reason": "only the gateway's own uid may read or reset the spend"
+    },
+    {
+      "at": 1800000240,
+      "actor": "uid:1000",
+      "action": "client_rotate",
+      "object": "client-a",
+      "result": "ok",
+      "token_sha256_prefix": "5d35a058cf51"
+    },
+    {
+      "at": 1800000300,
+      "actor": "uid:1000",
+      "action": "client_rotate",
+      "object": "client-b",
+      "result": "refused",
+      "reason": "client `client-b` has a `token_sha256`, not a `token_file` the gateway can write"
     }
   ],
   "skipped": 1
