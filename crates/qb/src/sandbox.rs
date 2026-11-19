@@ -1,8 +1,8 @@
 //! Self-restriction of `qb agent`, `qb gateway`, `qb login import` and `qb login` before they
 //! touch a secret: the process becomes non-dumpable, and landlock limits it to the credential
 //! directories (read-only for the agent; for the others also writing, creating and removing
-//! regular files, as a credential file is written by rename, and the same in the directory of the
-//! gateway's spend file). The agent, the gateway and `qb login` may also read the resolver files
+//! regular files, as a credential file is written by rename, and the same in the directories of
+//! the gateway's spend, audit and usage files). The agent, the gateway and `qb login` may also read the resolver files
 //! and connect over TCP to port 443; the import has no network. The gateway and `qb login` may
 //! read the files of their config's directory, the gateway for a reload, and the import those of
 //! its config's and its source's directories. The only TCP bind allowed is the gateway's on the
@@ -59,8 +59,9 @@ pub fn harden(config: &AgentConfig) -> Result<Vec<String>, String> {
 /// [`harden`] for `qb gateway`: beneath each login's credential directory also write and
 /// truncate files, create regular files and remove files, so a refreshed token can be written
 /// back by a rename inside the directory; no `REFER`, so nothing moves across directories. The
-/// same beneath the directories of `spend_file` and `audit_file`. Read files beneath the
-/// directory of `config.file`, so a reload sees the file an editor replaced.
+/// same beneath the directories of `spend_file`, `audit_file` and `usage.file`, where the ledger
+/// rotates by rename and prunes. Read files beneath the directory of `config.file`, so a reload
+/// sees the file an editor replaced.
 /// TCP bind only on the port of `fronts.listen`, whose listener must exist before. Call it
 /// before starting any thread.
 ///
@@ -73,6 +74,7 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Confined, String> {
         .map(|l| l.credentials.as_path())
         .chain(config.spend_file.as_deref())
         .chain(config.audit_file.as_deref())
+        .chain(config.usage.as_ref().map(|u| u.file.as_path()))
         .collect();
     let bind = config
         .fronts

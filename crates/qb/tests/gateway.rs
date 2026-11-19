@@ -37,9 +37,9 @@ use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
     AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ErrorClass,
-    GatewayError, LoginSpend, LoginStatus, ReloadAnswer, RouteState, RouteStatus, RoutesAnswer,
-    SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
-    WindowReport, paths,
+    GatewayError, LoginSpend, LoginStatus, Outcome, ReloadAnswer, RouteState, RouteStatus,
+    RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall,
+    TurnRequest, Usage, UsageLine, UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -1982,6 +1982,12 @@ fn a_change_that_needs_a_restart_is_refused_naming_the_field() {
         "logins[1].credentials: lies outside the credential directories the sandbox opened; \
          it takes effect only on a restart",
     );
+    let ledger = r.dir.join("usage.jsonl");
+    refused_reload(
+        &r.gw,
+        |t| format!("{t}{}", usage_table(&ledger, 1 << 20)),
+        "usage: changed; it takes effect only on a restart",
+    );
     let login_3 = format!(
         "\n[[logins]]\nname = \"login-3\"\n{ANTHROPIC_KEY}\ncredentials = \"{}/creds/login-3.json\"\n",
         r.dir.display()
@@ -2554,6 +2560,255 @@ fn a_failed_audit_append_is_logged_and_leaves_the_answer_alone() {
         "{logged}"
     );
     assert_eq!(aliases(&r.gw), ["added", "chat"]);
+}
+
+/// The `[usage]` table of a ledger at `file` rotated past `rotate_bytes` and kept 30 days.
+fn usage_table(file: &Path, rotate_bytes: u64) -> String {
+    format!(
+        "[usage]\nfile = \"{}\"\nrotate_bytes = {rotate_bytes}\nkeep_days = 30\n",
+        file.display()
+    )
+}
+
+/// The ledger file `file` and its rotated files, oldest first.
+fn ledger_files(file: &Path) -> Vec<PathBuf> {
+    let rotated = qb::gateway::usage::rotated(file).unwrap();
+    let mut files: Vec<PathBuf> = rotated.into_iter().map(|(_, f)| f).collect();
+    files.push(file.to_owned());
+    files
+}
+
+/// The lines of every ledger file of `file`, oldest first.
+fn usage_lines(file: &Path) -> Vec<UsageLine> {
+    ledger_files(file)
+        .iter()
+        .flat_map(|f| {
+            let text = std::fs::read_to_string(f).unwrap();
+            let lines: Vec<UsageLine> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            lines
+        })
+        .collect()
+}
+
+fn tool_call(id: &str, name: &str, input: Value) -> StreamEvent {
+    let Value::Object(input) = input else {
+        panic!("tool input is an object");
+    };
+    StreamEvent::ToolCall {
+        tool_call: ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input,
+        },
+    }
+}
+
+#[test]
+fn a_finished_turn_leaves_one_content_free_usage_line_priced_from_the_table() {
+    let ledger = temp_dir("usage").join("usage.jsonl");
+    let extra = format!(
+        "[[clients]]\nname = \"client-a\"\nuid = {}\n{}\
+         [prices.\"model-large\"]\ninput = 2\noutput = 10\ncache_read = 0.5\ncache_write = 4\n",
+        own_uid(),
+        usage_table(&ledger, 1 << 20)
+    );
+    let r = rig_as(4, &key_files(), &extra, own_uid() + 1);
+    let long = "t".repeat(70);
+    r.fake.script(
+        "login-1",
+        Script::Finish(
+            vec![
+                StreamEvent::Thinking {
+                    thinking: Thinking {
+                        vendor: "vendor-a".into(),
+                        opaque: "marker-thinking-c3".into(),
+                    },
+                },
+                text("marker-answer-91"),
+                tool_call("call_1", "search", json!({"q": "marker-arg-4d"})),
+                tool_call("call_2", "read_file", json!({"path": "marker-arg-77"})),
+                tool_call("call_3", "search", json!({"q": "marker-arg-e0"})),
+                tool_call("call_4", &long, json!({})),
+                StreamEvent::Usage {
+                    usage: Usage {
+                        input: 1_000_000,
+                        output: 200_000,
+                        cache_read: 2_000_000,
+                        cache_write: 500_000,
+                    },
+                },
+            ],
+            StopReason::ToolUse,
+            Vec::new(),
+        ),
+    );
+    let mut body = turn_body("turn-1");
+    body["system"] = json!("marker-system-5a");
+    body["messages"] = json!([
+        {"role": "user", "content": [{"type": "text", "text": "marker-prompt-b2"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_0", "name": "search",
+             "input": {"q": "marker-history-arg-6f"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "id": "call_0", "content": "marker-result-08"}]}
+    ]);
+    body["tools"] = json!([{"name": "search", "description": "marker-tool-doc-3e",
+                            "input_schema": {"type": "object"}}]);
+    let started = unix_now();
+    let (_, _, events) = turn(&r.gw, &body);
+    assert_eq!(kinds(&events).last().unwrap(), "stop ToolUse");
+
+    let lines = usage_lines(&ledger);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert!((started..=unix_now()).contains(&line.at), "{line:?}");
+    assert!(line.duration_ms < 20_000, "{line:?}");
+    assert_eq!(
+        (
+            line.request_id.as_str(),
+            line.client.as_str(),
+            line.route.as_str(),
+            line.step,
+            line.login.as_str(),
+            line.model.as_str(),
+        ),
+        ("turn-1", "client-a", "chat", 0, "login-1", "model-large")
+    );
+    assert_eq!(
+        (line.outcome, line.stop, line.error),
+        (Outcome::Ok, Some(StopReason::ToolUse), None)
+    );
+    assert_eq!(
+        (
+            line.usage.input,
+            line.usage.output,
+            line.usage.cache_read,
+            line.usage.cache_write
+        ),
+        (1_000_000, 200_000, 2_000_000, 500_000)
+    );
+    assert_usd(line.usd.unwrap(), 7.0);
+    assert_eq!(line.usd_source, Some(UsdSource::Prices));
+    assert_eq!(line.tools, ["read_file", "search", &long[..64]]);
+    assert_eq!(mode_of(&ledger), 0o600);
+
+    let sent = format!("{:?}", r.fake.calls());
+    for marker in [
+        "marker-prompt-b2",
+        "marker-history-arg-6f",
+        "marker-result-08",
+    ] {
+        assert!(sent.contains(marker), "the adapter got {marker}");
+    }
+    let raw = std::fs::read_to_string(&ledger).unwrap();
+    for marker in ["marker-", "test-token-"] {
+        assert!(!raw.contains(marker), "{marker} in {raw}");
+    }
+}
+
+#[test]
+fn a_chain_fallback_leaves_one_usage_line_per_step_with_the_failure_on_the_first() {
+    let ledger = temp_dir("usage").join("usage.jsonl");
+    let r = chain_rig_with(QBD_THREE_VENDORS, None, &usage_table(&ledger, 1 << 20));
+    r.fake.script("login-1", usage_limit(unix_now() + 3600));
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    let client = format!("uid:{}", own_uid());
+    let rows: Vec<_> = usage_lines(&ledger)
+        .into_iter()
+        .map(|l| {
+            assert_eq!(
+                (l.request_id.as_str(), l.client.as_str()),
+                ("turn-1", client.as_str())
+            );
+            assert_eq!(
+                (l.usd, l.usd_source, l.tools.len()),
+                (None, None, 0),
+                "unpriced"
+            );
+            (l.step, l.login, l.model, l.outcome, l.stop, l.error)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                0,
+                "login-1".into(),
+                "model-a".into(),
+                Outcome::UsageLimit,
+                None,
+                Some(ErrorClass::QuotaExhausted)
+            ),
+            (
+                1,
+                "login-2".into(),
+                "model-b".into(),
+                Outcome::Ok,
+                Some(StopReason::End),
+                None
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_ledger_rotates_before_rotate_bytes_and_prunes_expired_rotated_files() {
+    let dir = temp_dir("usage");
+    let ledger = dir.join("usage.jsonl");
+    let started = unix_now();
+    let stamp = |s: u64| dir.join(format!("usage.jsonl.{s}"));
+    let (expired, recent) = (stamp(started - 31 * 86_400), stamp(started - 86_400));
+    let other = dir.join("usage.jsonl.old");
+    for f in [&expired, &recent, &other] {
+        std::fs::write(f, "").unwrap();
+    }
+    let r = rig_as(4, &key_files(), &usage_table(&ledger, 1024), own_uid());
+    let ids: Vec<String> = (0..12).map(|i| format!("turn-{i}")).collect();
+    for id in &ids {
+        turn(&r.gw, &turn_body(id));
+    }
+
+    assert!(!expired.exists(), "older than keep_days");
+    assert!(recent.exists() && other.exists());
+    let files = ledger_files(&ledger);
+    assert_eq!(files[0], recent);
+    let rotated = &files[1..files.len() - 1];
+    assert!(rotated.len() >= 2, "{files:?}");
+    let now = unix_now();
+    for f in rotated {
+        let s = f.to_str().unwrap().rsplit('.').next().unwrap();
+        assert!((started..=now + 12).contains(&s.parse().unwrap()), "{f:?}");
+    }
+    for f in &files {
+        let len = std::fs::metadata(f).unwrap().len();
+        assert!(len <= 1024, "{f:?} has {len} bytes");
+    }
+    let written: Vec<String> = usage_lines(&ledger)
+        .into_iter()
+        .map(|l| l.request_id)
+        .collect();
+    assert_eq!(written, ids);
+}
+
+#[test]
+fn a_failed_usage_append_is_logged_and_leaves_the_turn_alone() {
+    let ledger = temp_dir("usage").join("missing").join("usage.jsonl");
+    let r = rig_as(4, &key_files(), &usage_table(&ledger, 1 << 20), own_uid());
+    let mut events = Vec::new();
+    let needle = format!("gateway: usage line not appended to {}: ", ledger.display());
+    let logged = stderr_until(&needle, || {
+        events = turn(&r.gw, &turn_body("turn-1")).2;
+    });
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+    let line = logged.lines().find(|l| l.contains(&needle)).unwrap();
+    assert!(
+        line.starts_with("error: ") || line.starts_with("<3>"),
+        "{logged}"
+    );
 }
 
 #[test]

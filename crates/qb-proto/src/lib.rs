@@ -21,7 +21,7 @@ pub use gateway::{
     CancelRequest, Effort, Elsewhere, ErrorClass, GatewayError, LoginSpend, MediaType, Message,
     NativeApi, NativeTool, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus,
     RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool, ToolCall,
-    TurnRequest, TurnRequestError, Usage,
+    TurnRequest, TurnRequestError, Usage, UsageLine, UsdSource,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.
