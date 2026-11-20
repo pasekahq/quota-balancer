@@ -14,6 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,12 +37,12 @@ use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
-    AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CancelAnswer, ClientRotateAnswer,
-    ConfigRoute, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, ConfigStep, ErrorClass,
-    GatewayError, LoginKeyAnswer, LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus,
-    OauthPaste, Outcome, ReloadAnswer, RouteState, RouteStatus, RoutesAnswer, SpendAnswer,
-    StateResponse, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer,
-    UsageLine, UsageRow, UsdSource, WindowReport, paths,
+    AdminReloadAnswer, AdminRolesWritten, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block,
+    CancelAnswer, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
+    ConfigRoutesWritten, ConfigStep, ErrorClass, GatewayError, LoginKeyAnswer, LoginOauthSigned,
+    LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste, Outcome, ReloadAnswer, RouteState,
+    RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking,
+    ToolCall, TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -412,8 +413,21 @@ fn rig_on(
     loopback: Option<TcpListener>,
 ) -> Rig {
     let dir = temp_dir("gw");
-    credentials(&dir, files);
     let qbd = start_qbd(&dir, QBD);
+    rig_at(dir, qbd, max_turns, files, extra, gateway_uid, loopback)
+}
+
+/// [`rig_on`] with the qbd on `qbd` and the gateway's files in `dir`.
+fn rig_at(
+    dir: PathBuf,
+    qbd: PathBuf,
+    max_turns: u32,
+    files: &[(&str, String, u32)],
+    extra: &str,
+    gateway_uid: u32,
+    loopback: Option<TcpListener>,
+) -> Rig {
+    credentials(&dir, files);
     let keys = |i: usize| files.get(i).map_or(ANTHROPIC_KEY, |f| keys_of(&f.1));
     let (top, tables) = split_top(extra);
     let toml = gateway_toml(&dir, &qbd, max_turns, [keys(0), keys(1)], tables);
@@ -9979,4 +9993,312 @@ fn no_secret_the_gateway_handles_reaches_its_log_ledger_audit_or_any_answer() {
     answers.push((200, start_text.replace(&started.url, "").into_bytes()));
     let hidden: Vec<&str> = secrets.iter().map(String::as_str).chain(in_url).collect();
     s.assert_hidden(&answers, &logged, &hidden);
+}
+
+/// A rig whose qbd is the binary, with its roles in `roles` and its stderr lines in `lines`.
+struct AdminRig {
+    r: Rig,
+    roles: PathBuf,
+    lines: Receiver<String>,
+    qbd: Daemon,
+}
+
+/// The roles file of [`admin_rig`]'s qbd: the role `gateway` on vendor-a.
+const ADMIN_ROLES: &str = "[[roles]]\nname = \"gateway\"\nladder = [{ difficulty = 1, candidates = \
+                           [{ vendor = \"vendor-a\", model = \"model-large\", tier = 1 }] }]\n";
+
+/// A gateway as `gateway_uid` with `extra` and the Messages front on `loopback`, on a qbd binary
+/// whose roles are in a `roles_file` and whose client `gateway`, this process's uid, has
+/// `admin_key` in its entry; login-1 is on vendor-a and login-2 on vendor-b.
+fn admin_rig(
+    admin_key: &str,
+    extra: &str,
+    gateway_uid: u32,
+    loopback: Option<TcpListener>,
+) -> AdminRig {
+    let dir = temp_dir("gwadmin");
+    let roles = dir.join("roles.toml");
+    std::fs::write(&roles, ADMIN_ROLES).unwrap();
+    let config = dir.join("qbd.toml");
+    let text = format!(
+        "roles_file = \"{roles}\"\n\
+         [journal]\nmode = \"off\"\n\
+         [limits]\nrate_per_s = 1000.0\nburst = 1000\n\
+         [[vendors]]\nname = \"vendor-a\"\n\
+         windows = [{{ name = \"five_hour\", length_s = 18000, t_burn_s = 1800 }}]\n\
+         [[vendors]]\nname = \"vendor-b\"\n\
+         windows = [{{ name = \"five_hour\", length_s = 18000, t_burn_s = 1800 }}]\n\
+         [[logins]]\nname = \"login-1\"\nvendor = \"vendor-a\"\n\
+         [[logins]]\nname = \"login-2\"\nvendor = \"vendor-b\"\n\
+         [[clients]]\nname = \"gateway\"\nuid = {uid}\nrole = \"gateway\"\n{admin_key}\n",
+        roles = roles.display(),
+        uid = own_uid(),
+    );
+    std::fs::write(&config, text).unwrap();
+    let sock = dir.join("qb.sock");
+    let exe = Path::new(env!("CARGO_BIN_EXE_qb"));
+    let mut qbd = start_daemon(exe, &config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut qbd.0);
+    let r = rig_at(dir, sock, 4, &key_files(), extra, gateway_uid, loopback);
+    AdminRig {
+        r,
+        roles,
+        lines,
+        qbd,
+    }
+}
+
+/// An `AdminRolesPut` body with the role `gateway` on `vendor` and `model`.
+fn roles_put(vendor: &str, model: &str) -> String {
+    json!({"roles": [{"name": "gateway", "ladder": [{"difficulty": 1, "candidates": [
+        {"vendor": vendor, "model": model, "tier": 1}]}]}]})
+    .to_string()
+}
+
+/// Asserts that the first admin request qbd logs is a `GET /v1/admin/roles` sent to it directly
+/// now, so no earlier request reached its admin API.
+fn assert_qbd_heard_no_admin_request(a: &AdminRig) {
+    let (status, _, body) = finish(send(&a.r.qbd, "GET", paths::ADMIN_ROLES, ""), Vec::new());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let first = line_with(&a.lines, "qbd: admin ", Duration::from_secs(10)).unwrap();
+    assert!(
+        first.ends_with("qbd: admin GET /v1/admin/roles by gateway: 200"),
+        "{first}"
+    );
+}
+
+#[test]
+fn the_gateway_s_own_uid_reads_and_replaces_qbd_s_roles_and_the_next_turn_follows_them() {
+    let audit = audit_path();
+    let a = admin_rig("admin = true", &audit_key(&audit), own_uid(), None);
+    let gw = &a.r.gw;
+    let (status, head, body) = finish(send(gw, "GET", paths::ADMIN_ROLES, ""), Vec::new());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (_, direct_head, direct) =
+        finish(send(&a.r.qbd, "GET", paths::ADMIN_ROLES, ""), Vec::new());
+    assert_eq!(body, direct, "qbd's body passes unchanged");
+    let tag = etag(&head).unwrap().to_owned();
+    assert_eq!(Some(tag.as_str()), etag(&direct_head));
+    assert_eq!(tag, format!("\"{}\"", sha256_hex(ADMIN_ROLES)));
+
+    let (status, body) = put(
+        gw,
+        paths::ADMIN_ROLES,
+        Some(&tag),
+        &roles_put("vendor-b", "model-new"),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let written: AdminRolesWritten = serde_json::from_slice(&body).unwrap();
+    let now = std::fs::read_to_string(&a.roles).unwrap();
+    assert_eq!(written.sha256, sha256_hex(&now));
+    let backup = written.backup.clone().unwrap();
+    assert_eq!(backups_of(&a.roles), [PathBuf::from(&backup)]);
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), ADMIN_ROLES);
+
+    let (_, _, events) = turn(gw, &turn_body("turn-1"));
+    assert_eq!(route_of(&events), ("vendor-b".into(), "model-new".into()));
+    assert_eq!(logins_called(&a.r), ["login-2"]);
+
+    let (status, body) = call(gw, "POST", paths::ADMIN_RELOAD, "");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let reloaded: AdminReloadAnswer = serde_json::from_slice(&body).unwrap();
+    assert_eq!((reloaded.roles, reloaded.clients), (1, 1));
+
+    let entries = audit_answer(gw, "").entries;
+    let actor = format!("uid:{}", own_uid());
+    let qbd = a.r.qbd.display().to_string();
+    assert_eq!(
+        audit_rows(&entries),
+        [
+            (
+                actor.as_str(),
+                AuditAction::AdminRoles,
+                Some(qbd.as_str()),
+                AuditResult::Ok,
+                None
+            ),
+            (
+                actor.as_str(),
+                AuditAction::AdminReload,
+                Some(qbd.as_str()),
+                AuditResult::Ok,
+                None
+            ),
+        ],
+        "the GET leaves no line"
+    );
+    let put_line = &entries[0];
+    assert_eq!(
+        (
+            put_line.config_sha256_before.as_deref(),
+            put_line.config_sha256_after.as_deref(),
+            put_line.backup.as_deref(),
+        ),
+        (
+            Some(sha256_hex(ADMIN_ROLES).as_str()),
+            Some(written.sha256.as_str()),
+            Some(backup.as_str()),
+        )
+    );
+}
+
+#[test]
+fn a_stale_or_missing_if_match_passes_qbd_s_refusal_through_and_nothing_is_written() {
+    let audit = audit_path();
+    let a = admin_rig("admin = true", &audit_key(&audit), own_uid(), None);
+    let gw = &a.r.gw;
+    let body = roles_put("vendor-b", "model-new");
+    let stale = format!("\"{}\"", "0".repeat(64));
+    let stale_says = format!(
+        "`If-Match` is not the roles file's sha256 {}",
+        sha256_hex(ADMIN_ROLES)
+    );
+    let missing_says = "`If-Match` with the roles file's sha256 is required";
+    for (if_match, want, says) in [
+        (Some(stale.as_str()), 412, stale_says.as_str()),
+        (None, 428, missing_says),
+    ] {
+        let (status, answer) = put(gw, paths::ADMIN_ROLES, if_match, &body);
+        let e: GatewayError = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(
+            (status, e.class, e.message.as_deref()),
+            (want, ErrorClass::BadRequest, Some(says))
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&a.roles).unwrap(), ADMIN_ROLES);
+    assert_eq!(backups_of(&a.roles), Vec::<PathBuf>::new());
+    let entries = audit_answer(gw, "").entries;
+    let actor = format!("uid:{}", own_uid());
+    let qbd = a.r.qbd.display().to_string();
+    let refused = |says| {
+        let object = Some(qbd.as_str());
+        (
+            actor.as_str(),
+            AuditAction::AdminRoles,
+            object,
+            AuditResult::Refused,
+            Some(says),
+        )
+    };
+    assert_eq!(
+        audit_rows(&entries),
+        [refused(stale_says.as_str()), refused(missing_says)]
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.config_sha256_after.is_none() && e.backup.is_none())
+    );
+}
+
+#[test]
+fn a_configured_client_uid_is_refused_qbd_s_admin_api_before_qbd_hears_of_it() {
+    let audit = audit_path();
+    let extra = format!(
+        "{}[[clients]]\nname = \"client-a\"\nuid = {}\n",
+        audit_key(&audit),
+        own_uid()
+    );
+    let a = admin_rig("admin = true", &extra, own_uid() + 1, None);
+    let body = roles_put("vendor-b", "model-new");
+    let owner = "only the gateway's own uid may call qbd's admin API";
+    for (method, path, body) in [
+        ("GET", paths::ADMIN_ROLES, ""),
+        ("PUT", paths::ADMIN_ROLES, body.as_str()),
+        ("POST", paths::ADMIN_RELOAD, ""),
+    ] {
+        let (status, e) = rejection(&a.r.gw, method, path, body);
+        assert_eq!(
+            (status, e.class, e.message.as_deref()),
+            (403, ErrorClass::Auth, Some(owner)),
+            "{method} {path}"
+        );
+    }
+    assert_qbd_heard_no_admin_request(&a);
+    assert_eq!(std::fs::read_to_string(&a.roles).unwrap(), ADMIN_ROLES);
+    let entries: Vec<AuditEntry> = std::fs::read_to_string(&audit)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let actor = format!("uid:{}", own_uid());
+    let qbd = a.r.qbd.display().to_string();
+    let refused = |action| {
+        let object = Some(qbd.as_str());
+        (
+            actor.as_str(),
+            action,
+            object,
+            AuditResult::Refused,
+            Some(owner),
+        )
+    };
+    assert_eq!(
+        audit_rows(&entries),
+        [
+            refused(AuditAction::AdminRoles),
+            refused(AuditAction::AdminReload)
+        ]
+    );
+}
+
+#[test]
+fn the_loopback_listener_does_not_serve_qbd_s_admin_api_to_a_client_token() {
+    let (listener, addr, front) = loopback_front("");
+    let a = admin_rig("admin = true", &front, own_uid(), Some(listener));
+    let auth = format!("X-Api-Key: {CLIENT_TOKEN}\r\n");
+    let body = roles_put("vendor-b", "model-new");
+    for (method, path, body) in [
+        ("GET", paths::ADMIN_ROLES, ""),
+        ("PUT", paths::ADMIN_ROLES, body.as_str()),
+        ("POST", paths::ADMIN_RELOAD, ""),
+    ] {
+        let (status, _, answer) = finish(tcp_send(addr, method, path, &auth, body), Vec::new());
+        assert_eq!(
+            status,
+            404,
+            "{method} {path}: {}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+    assert_qbd_heard_no_admin_request(&a);
+}
+
+#[test]
+fn a_gateway_that_qbd_does_not_make_an_admin_gets_qbd_s_403_saying_so() {
+    let a = admin_rig("", "", own_uid(), None);
+    let (status, e) = rejection(&a.r.gw, "GET", paths::ADMIN_ROLES, "");
+    let says = "qbd refused the gateway as an admin client: not an admin client; the gateway's \
+                `[[clients]]` entry in qbd's config needs `admin = true`";
+    assert_eq!(
+        (status, e.class, e.message.as_deref()),
+        (403, ErrorClass::Auth, Some(says))
+    );
+    let logged = line_with(&a.lines, "qbd: admin ", Duration::from_secs(10)).unwrap();
+    assert!(
+        logged.ends_with("qbd: admin GET /v1/admin/roles by gateway: 403"),
+        "{logged}"
+    );
+}
+
+#[test]
+fn an_unreachable_qbd_is_503_unavailable_and_a_refused_reload_line() {
+    let audit = audit_path();
+    let AdminRig { r, qbd, .. } = admin_rig("admin = true", &audit_key(&audit), own_uid(), None);
+    drop(qbd);
+    let (status, e) = rejection(&r.gw, "POST", paths::ADMIN_RELOAD, "");
+    let message = e.message.clone().unwrap();
+    assert_eq!((status, e.class), (503, ErrorClass::Unavailable), "{e:?}");
+    assert!(message.starts_with("qbd is unreachable: "), "{message}");
+    let entries = audit_answer(&r.gw, "").entries;
+    let rows = audit_rows(&entries);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].1, rows[0].3, rows[0].4),
+        (
+            AuditAction::AdminReload,
+            AuditResult::Refused,
+            Some(message.as_str())
+        )
+    );
 }

@@ -181,9 +181,10 @@ on stderr.
 
 ## Disk
 
-Only the journal, written with `O_APPEND` and no fsync (~150 bytes per pick, rotated at 1 MiB ×
+The journal, written with `O_APPEND` and no fsync (~150 bytes per pick, rotated at 1 MiB ×
 2): leases and dead-until marks, replayed on start. Quota snapshots are a cache and are not
-persisted. `journal = off` writes nothing. Line format, rotation and replay:
+persisted. The only other write is the `roles_file` with a 0600 backup on an admin's
+`PUT /v1/admin/roles` that changes it, so `journal = off` writes nothing else. Line format, rotation and replay:
 [journal.md](journal.md).
 
 ## Cold start

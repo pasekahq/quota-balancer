@@ -8,9 +8,9 @@ use qb_proto::{
     ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Effort, Elsewhere,
     ErrorClass, GatewayError, HealthStatus, LoginKey, LoginKeyAnswer, LoginOauthCode,
     LoginOauthSigned, LoginOauthStarted, MediaType, Message, NativeApi, OauthPaste, Object,
-    Outcome, ReloadAnswer, Role, RouteInfo, RouteState, RoutesAnswer, SpendAnswer, SpendReset,
-    StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer, UsageBucket,
-    UsageGroupBy, UsageLine, UsageQuery, UsdSource,
+    Outcome, ReloadAnswer, Role, RolesSource, RouteInfo, RouteState, RoutesAnswer, SpendAnswer,
+    SpendReset, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer,
+    UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -697,7 +697,13 @@ fn typed_enums() -> Vec<(String, Vec<String>)> {
                 LoginKey,
                 LoginOauthStart,
                 LoginOauthCode,
+                AdminRoles,
+                AdminReload,
             )),
+        ),
+        (
+            schema("AdminRoles/properties/source"),
+            names(&every!(RolesSource: RolesFile, Config)),
         ),
         (
             schema("AuditResult"),
@@ -751,4 +757,26 @@ fn openapi_enums_match_the_types() {
     paths.sort_unstable();
     mapped.sort_unstable();
     assert_eq!(paths, mapped, "every mapped type has its enum");
+}
+
+#[test]
+fn audit_lines_of_forwarded_admin_requests() {
+    let audit: AuditAnswer = roundtrip("gateway_audit_answer_admin.json");
+    let lines: Vec<_> = audit
+        .entries
+        .iter()
+        .map(|e| (e.action, e.result, e.backup.as_deref()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                AuditAction::AdminRoles,
+                AuditResult::Ok,
+                Some("/var/lib/qb/roles.toml.bak-1800000000")
+            ),
+            (AuditAction::AdminRoles, AuditResult::Refused, None),
+            (AuditAction::AdminReload, AuditResult::Ok, None),
+        ]
+    );
 }

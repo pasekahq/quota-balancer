@@ -1613,7 +1613,8 @@ impl Gateway {
         RoutesAnswer { routes }
     }
 
-    fn bearer(&self) -> Option<&str> {
+    /// The bearer the gateway shows `qbd`, from `qbd_bearer_file`.
+    pub(super) fn bearer(&self) -> Option<&str> {
         self.qbd_bearer.as_ref().map(|b| b.as_str())
     }
 

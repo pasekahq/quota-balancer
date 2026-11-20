@@ -340,6 +340,9 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/logins/{name}/key` | `LoginKey` | 200 `LoginKeyAnswer`, 400 a body or key that does not validate, 403 a caller other than the gateway's own uid, 404 no such login, 409 a login that is not `api_key`, 413 a body over 8 KiB, 500 a file could not be read or written |
 | `POST /v1/model/logins/{name}/oauth/start` | — | 200 `LoginOauthStarted`, 400 a request with a body, 403 a caller other than the gateway's own uid, 404 no such login, 409 an `api_key` login, 500 the random source failed |
 | `POST /v1/model/logins/{name}/oauth/code` | `LoginOauthCode` | 200 `LoginOauthSigned`, 400 a body that does not validate or a paste without a code or with another state, 403 a caller other than the gateway's own uid, 404 no such login, 409 an `api_key` login, no live sign-in or a login changed since the start, 413 a body over 8 KiB, 502 the token endpoint refused the code or could not be asked, 500 a file could not be read or written |
+| `GET /v1/admin/roles` | — | 200 `AdminRoles` with an `ETag`, as `qbd` answers it; 403 a caller other than the gateway's own uid; `qbd`'s refusal; 503 `qbd` is unreachable |
+| `PUT /v1/admin/roles` | `AdminRolesPut` with `If-Match` | 200 `AdminRolesWritten`, as `qbd` answers it; 403 a caller other than the gateway's own uid; `qbd`'s refusal; 503 `qbd` is unreachable |
+| `POST /v1/admin/reload` | — | 200 `AdminReloadAnswer`, as `qbd` answers it; 403 a caller other than the gateway's own uid; `qbd`'s refusal; 503 `qbd` is unreachable |
 | `GET /v1/health` | — | 200 `HealthResponse`, as `qbd` answers it |
 | `POST /v1/messages` | Anthropic Messages request | Messages SSE or one Messages body; errors in the Messages error format ([anthropic.md](anthropic.md#the-v1messages-front)) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions request | Chat Completions SSE or one `chat.completion` body; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
@@ -601,12 +604,12 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 |---|---|
 | `at` | Unix time of the action |
 | `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
-| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse), `config_spend_caps` (one with `spend_caps` only), `login_key` (a `POST /v1/model/logins/{name}/key`), `login_oauth_start` (a `POST /v1/model/logins/{name}/oauth/start`) or `login_oauth_code` (a `POST /v1/model/logins/{name}/oauth/code`) |
-| `object` | the config file of a reload or a config edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation; absent when a refused request named none |
+| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse), `config_spend_caps` (one with `spend_caps` only), `login_key` (a `POST /v1/model/logins/{name}/key`), `login_oauth_start` (a `POST /v1/model/logins/{name}/oauth/start`), `login_oauth_code` (a `POST /v1/model/logins/{name}/oauth/code`), `admin_roles` (a `PUT /v1/admin/roles`) or `admin_reload` (a `POST /v1/admin/reload`) |
+| `object` | the config file of a reload or a config edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation, `qbd_socket` of a request to `qbd`'s admin API; absent when a refused request named none |
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
-| `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a config edit's of the file on disk before and after it; equal when it was refused, unless the edit replaced the file but could not install it |
-| `backup` | a config edit that wrote the file, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none |
+| `config_sha256_before`, `config_sha256_after` | a reload's hex SHA-256 of the config file serving before and after it, a config edit's of the file on disk before and after it; equal when it was refused, unless the edit replaced the file but could not install it. An `admin_roles` that went through: the `If-Match` it sent and the `sha256` `qbd` answered, the hashes of `qbd`'s roles file before and after it; absent on a refused one |
+| `backup` | a config edit that wrote the file, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none; an `admin_roles` that went through: the `backup` `qbd` answered, absent when it wrote nothing |
 | `token_sha256_prefix` | a rotation that went through: the first 12 hex characters of the new token's SHA-256 |
 | `key_sha256_prefix` | a key replacement that went through: the first 12 hex characters of the new key's SHA-256 |
 
@@ -616,7 +619,9 @@ is recorded, refusals included: another uid's 403, a missing or stale `If-Match`
 not parse, a config that does not validate, an unknown client. Every request to
 `/v1/model/logins/{name}/key`, `/v1/model/logins/{name}/oauth/start` and
 `/v1/model/logins/{name}/oauth/code` of a caller of the gateway is recorded, also one whose body
-was too large or did not arrive and one with another method. A peer that is not a caller of the gateway gets its 401
+was too large or did not arrive and one with another method. Every `PUT /v1/admin/roles` and
+`POST /v1/admin/reload` of a caller of the gateway is recorded, another uid's 403, `qbd`'s
+refusals and an unreachable `qbd` included; `GET /v1/admin/roles` is not. A peer that is not a caller of the gateway gets its 401
 before any handler and leaves no line. No field holds a token, key or credential content. A
 line that cannot be appended is logged at error priority with the path; the action's answer
 stays as it was. The gateway neither rotates nor trims the file.
@@ -826,6 +831,30 @@ replaced the file is 500 `unavailable` with the message `<file> was replaced but
 candidate and the backup is kept, so a reload installs the candidate and the backup restores the
 old file. The gateway removes the new backup only when a failed write left the file unchanged,
 and no other backup.
+
+### `qbd`'s admin API: `GET`/`PUT /v1/admin/roles` and `POST /v1/admin/reload`
+
+The gateway forwards these three requests to `qbd`'s admin API ([Admin
+`/v1/admin/*`](#admin-v1admin)) on `qbd_socket`, as `qbd` defines them. Only the gateway's own
+uid may send them: any other caller gets 403 `auth` with the message `only the gateway's own uid
+may call qbd's admin API` and nothing is sent to `qbd`; the loopback listener answers 404.
+Another method is 405 `bad_request`.
+
+The gateway asks `qbd` as itself, by its uid or with the bearer of `qbd_bearer_file`, so `qbd`
+serves it only when the gateway's `[[clients]]` entry in `qbd`'s config has `admin = true`. A
+`PUT` goes with the caller's `If-Match` and body unchanged, a `POST` with its body; `GET` sends
+none. A 200 of `qbd` is answered with `qbd`'s body unchanged and, on `GET`, `qbd`'s `ETag`. Any
+other answer of `qbd` becomes an `Error` with `qbd`'s status and `qbd`'s message, of the class
+`auth` for `qbd`'s 401 and 403, `overloaded` for its 429, `unavailable` for its 500 and
+`bad_request` for every other code, such as 412 for a stale `If-Match` or 428 for none. `qbd`'s
+403 has the message ``qbd refused the gateway as an admin client: not an admin client; the
+gateway's `[[clients]]` entry in qbd's config needs `admin = true` ``, which the gateway's own 403
+never has. An answer of `qbd` without an error body is `unavailable` with its status. A `qbd`
+that cannot be reached, or stops answering for 5 s, is 503 `unavailable` with the message
+`qbd is unreachable: <error>`.
+
+With `audit_file`, each `PUT` and `POST` is recorded as `admin_roles` or `admin_reload` on
+[`GET /v1/model/audit`](#get-v1modelaudit).
 
 ### Usage ledger
 

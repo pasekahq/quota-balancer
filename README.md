@@ -49,7 +49,8 @@ keeps a tiny model of every window, and turns them into a decision:
 - **One static binary, four roles**: `qbd` (daemon), `qb agent`, `qb gateway` (optional), `qb`
   CLI.
 - **Synchronous and minimal**: no async runtime; `httparse` + `serde_json` + `rustix`.
-- **State in RAM** plus an append-only journal (or no disk writes at all).
+- **State in RAM** plus an append-only journal (or none); `qbd` writes nothing else to disk but
+  the `roles_file` an admin's `PUT /v1/admin/roles` replaces.
 - **Hardened by default**: the daemon runs with `DynamicUser`, `PrivateNetwork`, a syscall
   filter and a 16 MB memory cap; `systemd-analyze security` rates the template 0.2 ("SAFE").
 - **No telemetry.** `qb` makes no network connections except, optionally, the agent's
@@ -70,7 +71,7 @@ These are enforced in CI on every change (`ci/budgets.sh` and the acceptance lan
 | daemon peak RSS after 10 000 picks | ≤ 4 MiB |
 | pick latency over the unix socket, p99 | ≤ 1 ms |
 | idle daemon wake-ups | 0 |
-| disk writes with `journal = off` | 0 bytes |
+| disk writes with `journal = off`, no admin `PUT /v1/admin/roles` | 0 bytes |
 | `qbd.service` exposure (`systemd-analyze security`) | ≤ 1.5 |
 
 ## Build
