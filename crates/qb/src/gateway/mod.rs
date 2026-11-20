@@ -21,6 +21,7 @@
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`spend`]: the monthly spend count of capped logins;
 //! - [`audit`]: the admin audit file, appended to and read back;
+//! - [`admin`]: `qbd`'s `/v1/admin/*` forwarded for the gateway's own uid;
 //! - [`usage`]: the usage ledger, one line per adapter attempt, rotated and pruned;
 //! - [`tokens`]: the tokens of the named loopback clients with a `token_file`, their rotation and
 //!   grace;
@@ -31,6 +32,7 @@
 
 use qb_proto::ErrorClass;
 
+mod admin;
 pub mod answer;
 pub mod anthropic;
 pub mod audit;

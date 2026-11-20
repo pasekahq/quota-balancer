@@ -143,7 +143,9 @@ role = "reviewer"
 name = "agent-1"
 uid = 1002
 
+# The gateway forwards qbd's admin API (/v1/admin/*) for its own uid, so its client is an admin.
 [[clients]]
 name = "gateway"
 uid = 1003
 role = "gateway"
+admin = true

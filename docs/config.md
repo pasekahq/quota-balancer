@@ -119,7 +119,7 @@ Required.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `mode` | `"path"` or `"off"` | `off` writes nothing to disk and takes no other key. |
+| `mode` | `"path"` or `"off"` | `off` keeps no journal on disk and takes no other key. |
 | `path` | string | With `mode = "path"`: absolute path of the journal file; the previous one is `<path>.1`. Under systemd it lives in the unit's `StateDirectory`, `/var/lib/qb`. |
 | `rotate_bytes` | integer > 0 | With `mode = "path"`: rotation size, default 1048576. |
 
@@ -367,7 +367,8 @@ bytes. `routes` given as an inline array, or an item whose `[[routes.chain]]` fo
 table, cannot be edited this way.
 
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
-`qbd_bearer_file`) whose `role` is one the routes name.
+`qbd_bearer_file`) whose `role` is one the routes name, with `admin = true` when the gateway's
+own uid is to reach `qbd`'s admin API through it ([api.md](api.md#qbds-admin-api-getput-v1adminroles-and-post-v1adminreload)).
 
 `[openai_models]`, optional: settings of models of the `openai` API family, keyed by model id as
 `qbd` picks it, at most 256. An entry applies to every route and login of `api = "openai"` that

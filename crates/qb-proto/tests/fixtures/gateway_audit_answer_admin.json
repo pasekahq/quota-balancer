@@ -1,0 +1,30 @@
+{
+  "entries": [
+    {
+      "at": 1800000000,
+      "actor": "uid:1000",
+      "action": "admin_roles",
+      "object": "/run/qb/qb.sock",
+      "result": "ok",
+      "config_sha256_before": "5f1d000000000000000000000000000000000000000000000000000000000000",
+      "config_sha256_after": "7c2e000000000000000000000000000000000000000000000000000000000000",
+      "backup": "/var/lib/qb/roles.toml.bak-1800000000"
+    },
+    {
+      "at": 1800000060,
+      "actor": "uid:1000",
+      "action": "admin_roles",
+      "object": "/run/qb/qb.sock",
+      "result": "refused",
+      "reason": "`If-Match` is not the roles file's sha256 7c2e000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "at": 1800000120,
+      "actor": "uid:1000",
+      "action": "admin_reload",
+      "object": "/run/qb/qb.sock",
+      "result": "ok"
+    }
+  ],
+  "skipped": 0
+}

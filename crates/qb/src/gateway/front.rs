@@ -2,8 +2,8 @@
 //! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
 //! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
 //! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`,
-//! `/v1/model/logins/{name}/oauth/start`, `/v1/model/logins/{name}/oauth/code` and
-//! `/v1/health`, and the HTTP fronts: `/v1/messages` ([`super::messages`]),
+//! `/v1/model/logins/{name}/oauth/start`, `/v1/model/logins/{name}/oauth/code`, `/v1/health`
+//! and `qbd`'s `/v1/admin/roles` and `/v1/admin/reload` ([`super::admin`]), and the HTTP fronts: `/v1/messages` ([`super::messages`]),
 //! `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the optional loopback TCP
 //! listener serves only the HTTP fronts, to clients with a client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
@@ -35,13 +35,12 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use super::answer::Keepalive;
-use super::audit;
 use super::config::{Fronts, TOKEN_CALLER};
 use super::core::{Cancel, Gateway, edit_action};
 use super::tokens::ClientTokens;
 use super::upstream::{CancelToken, Flow};
 use super::usage::{self, AggregateError};
-use super::{messages, openai};
+use super::{admin, audit, messages, openai};
 use crate::auth::token_matches;
 use crate::hangup::Hangup;
 use crate::http::{self, Head, Method, ReadError};
@@ -570,6 +569,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
         (_, paths::MODEL_CONFIG_ROUTES) => config_routes(&mut stream, gateway, &req, uid, own_uid),
         (Method::Post, paths::MODEL_CANCEL) => cancel(&mut stream, gateway, &caller, &req.body),
         (Method::Get, paths::HEALTH) => reply(&mut stream, 200, &health(started)),
+        (_, path) if admin::serves(path) => qbd_admin(&mut stream, gateway, &req, uid, own_uid),
         (
             _,
             paths::MODEL_TURN
@@ -774,6 +774,20 @@ fn put_config_routes(
     }
     match gateway.put_config(actor, req.if_match.as_deref(), &req.body) {
         Ok(answer) => reply(stream, 200, &answer),
+        Err(r) => reject(stream, r.status, r.class, &r.message),
+    }
+}
+
+/// Answers `req` of the peer of `uid` to one of `qbd`'s admin endpoints with `qbd`'s answer, which
+/// only the gateway's own uid `own_uid` may send: its 200 body and `ETag` unchanged, or its refusal.
+fn qbd_admin(stream: &mut Conn, gateway: &Gateway, req: &http::Request, uid: u32, own_uid: u32) {
+    match admin::forward(gateway, req, &audit::uid_actor(uid), uid == own_uid) {
+        Ok(passed) => {
+            let etag = passed.etag.as_deref().map(|tag| ("ETag", tag));
+            if let Err(e) = http::write_response_with(stream, 200, etag.as_slice(), &passed.body) {
+                log::warn(&format!("gateway: write of a 200 reply failed: {e}"));
+            }
+        }
         Err(r) => reject(stream, r.status, r.class, &r.message),
     }
 }

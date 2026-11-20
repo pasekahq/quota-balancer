@@ -907,6 +907,10 @@ pub enum AuditAction {
     /// `POST /v1/model/logins/{name}/oauth/code`: the code of a sign-in exchanged and the new
     /// tokens written to the login's credential file.
     LoginOauthCode,
+    /// `PUT /v1/admin/roles` forwarded to `qbd`: its `roles_file` replaced and reloaded.
+    AdminRoles,
+    /// `POST /v1/admin/reload` forwarded to `qbd`: its config files read again.
+    AdminReload,
 }
 
 /// Whether an admin action went through.
@@ -930,7 +934,8 @@ pub struct AuditEntry {
     /// What was done.
     pub action: AuditAction,
     /// The login of a spend reset, a key replacement or a sign-in, the config file of a reload or
-    /// a config edit, the client of a rotation; absent when a refused request named none.
+    /// a config edit, the client of a rotation, `qbd`'s socket of a forwarded admin request;
+    /// absent when a refused request named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// Whether it went through.
@@ -938,15 +943,18 @@ pub struct AuditEntry {
     /// Why it was refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// A reload or a config edit: hex SHA-256 of the config file before the action.
+    /// A reload or a config edit: hex SHA-256 of the config file before the action; a forwarded
+    /// roles edit that went through: of `qbd`'s roles file before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_before: Option<String>,
     /// A reload or a config edit: hex SHA-256 of the config file after it; the same as before
-    /// when it was refused, unless a refused edit had replaced the file.
+    /// when it was refused, unless a refused edit had replaced the file. A forwarded roles edit
+    /// that went through: of `qbd`'s roles file after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_after: Option<String>,
     /// Path of the copy an action kept of what it replaced: the config file of a config edit,
-    /// the credential file of a key replacement or a sign-in.
+    /// the credential file of a key replacement or a sign-in, `qbd`'s roles file of a forwarded
+    /// roles edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
     /// A rotation that went through: the first 12 hex characters of the new token's SHA-256.
