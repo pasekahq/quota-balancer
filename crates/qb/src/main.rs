@@ -39,8 +39,8 @@ USAGE:
 
 COMMANDS:
     daemon [--config PATH]              run the policy daemon; config default: $QB_CONFIG,
-                                        else /etc/qb/qbd.toml; SIGHUP reloads its roles and
-                                        clients
+                                        else /etc/qb/qbd.toml; SIGHUP or an admin client's
+                                        POST /v1/admin/reload reloads its roles and clients
     agent --config PATH                 run the credential-owner agent: wait for the daemon's
                                         probe jobs and answer them
     gateway --config PATH               run the model gateway: serve /v1/model/* and the

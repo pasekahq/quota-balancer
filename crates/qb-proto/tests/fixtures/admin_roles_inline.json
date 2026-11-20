@@ -1,0 +1,6 @@
+{"source": "config", "file": "/etc/qb/qbd.toml",
+ "sha256": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+ "roles": [
+  {"name": "worker",
+   "ladder": [{"difficulty": 0, "candidates": [{"vendor": "vendor-a", "model": "model-small", "tier": 1}]}],
+   "reserves": []}]}

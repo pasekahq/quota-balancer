@@ -14,6 +14,8 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use toml::de::DeTable;
 
+use crate::sha256;
+
 /// Why a config was refused: the file, the field path (empty for the whole file) and the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -184,6 +186,9 @@ pub struct Client {
     pub bearer_sha256: Option<BearerHash>,
     /// Declared role the client works as; only a client listed in `[probe] agents` may omit it.
     pub role: Option<String>,
+    /// May call `/v1/admin/*`.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 /// Journal mode.
@@ -430,7 +435,36 @@ impl<'de> Deserialize<'de> for BearerHash {
 /// # Errors
 /// Either file cannot be read or they do not validate.
 pub fn load(file: &Path) -> Result<Config, Error> {
-    parse(file, &read(file)?)
+    Ok(load_sourced(file)?.config)
+}
+
+/// A validated config with the file its roles were read from and the SHA-256 of the bytes read.
+#[derive(Debug, Clone)]
+pub struct Sourced {
+    /// The config.
+    pub config: Config,
+    /// `roles_file`, or the config file itself when it holds the roles.
+    pub roles_from: PathBuf,
+    /// SHA-256 of `roles_from` as read.
+    pub roles_sha256: [u8; 32],
+}
+
+/// [`load`] that also tells where the roles came from.
+///
+/// # Errors
+/// As [`load`].
+pub fn load_sourced(file: &Path) -> Result<Sourced, Error> {
+    let text = read(file)?;
+    let (config, roles_text) = parse_sourced(file, &text)?;
+    let (roles_from, roles_text) = match (&config.roles_file, &roles_text) {
+        (Some(path), Some(roles)) => (path.clone(), roles.as_str()),
+        _ => (file.to_owned(), text.as_str()),
+    };
+    Ok(Sourced {
+        roles_sha256: sha256::digest(roles_text.as_bytes()),
+        roles_from,
+        config,
+    })
 }
 
 /// Parses config `text` and validates it together with the `roles_file` it names, which is
@@ -439,6 +473,11 @@ pub fn load(file: &Path) -> Result<Config, Error> {
 /// # Errors
 /// The text is not TOML, the roles file cannot be read, or they do not validate.
 pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
+    Ok(parse_sourced(file, text)?.0)
+}
+
+/// [`parse`] with the text of the `roles_file` read, if one is named.
+fn parse_sourced(file: &Path, text: &str) -> Result<(Config, Option<String>), Error> {
     let mut config: Config = deserialize(file, text)?;
     let doc = DeTable::parse(text).map_err(|e| toml_error(file, text, String::new(), &e))?;
     let here = Source {
@@ -453,7 +492,7 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
             return Err(here.fault(("roles".into(), reason.into())));
         }
         config.validate().map_err(|f| here.fault(f))?;
-        return Ok(config);
+        return Ok((config, None));
     };
     if inline {
         let reason = "is not allowed with `roles_file`, which holds the roles";
@@ -476,7 +515,7 @@ pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
         let in_roles = field == "roles" || field.starts_with("roles[");
         if in_roles { &there } else { &here }.fault((field, reason))
     })?;
-    Ok(config)
+    Ok((config, Some(roles_text)))
 }
 
 /// The text of the config file `file`.

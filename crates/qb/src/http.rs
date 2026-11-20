@@ -29,6 +29,18 @@ pub enum Method {
     Other,
 }
 
+impl Method {
+    /// The method's name in a log line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// A parsed request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {

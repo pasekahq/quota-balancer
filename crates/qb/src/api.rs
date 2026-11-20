@@ -23,6 +23,8 @@ use crate::log;
 pub struct Caller {
     /// Client name used in leases and the journal.
     pub client: String,
+    /// A client declared with `admin = true`.
+    pub admin: bool,
 }
 
 /// Daemon facts the API reports but does not own.
@@ -41,6 +43,8 @@ pub struct Reply {
     pub status: u16,
     /// JSON body.
     pub body: Vec<u8>,
+    /// Strong entity tag sent as `ETag`, quotes included.
+    pub etag: Option<String>,
 }
 
 /// What the transport does with a routed request.
@@ -58,12 +62,18 @@ impl From<Reply> for Answer {
     }
 }
 
-fn json<T: Serialize>(status: u16, value: &T) -> Reply {
+/// `value` as the body of a reply with `status`.
+pub fn json<T: Serialize>(status: u16, value: &T) -> Reply {
     match serde_json::to_vec(value) {
-        Ok(body) => Reply { status, body },
+        Ok(body) => Reply {
+            status,
+            body,
+            etag: None,
+        },
         Err(_) => Reply {
             status: 500,
             body: br#"{"error":"internal","message":"encode failed"}"#.to_vec(),
+            etag: None,
         },
     }
 }

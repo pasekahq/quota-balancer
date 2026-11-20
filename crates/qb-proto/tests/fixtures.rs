@@ -1,9 +1,9 @@
 //! Contract fixtures: every fixture decodes into its type and re-encodes to the same JSON.
 
 use qb_proto::{
-    AgentJob, AgentNextRequest, AgentResultRequest, Decision, ErrorBody, HealthResponse, Outcome,
-    PickRequest, PickResponse, ProbeOutcome, ReportRequest, ReportResponse, StateResponse,
-    WhyResponse,
+    AdminReloadAnswer, AdminRoles, AgentJob, AgentNextRequest, AgentResultRequest, Decision,
+    ErrorBody, HealthResponse, Outcome, PickRequest, PickResponse, ProbeOutcome, ReportRequest,
+    ReportResponse, RolesSource, StateResponse, WhyResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -81,6 +81,24 @@ fn agent_protocol() {
         (limited.outcome, limited.retry_after_s),
         (ProbeOutcome::Http429, Some(120))
     );
+}
+
+#[test]
+fn admin_roles_and_reload() {
+    let file: AdminRoles = roundtrip("admin_roles_file.json");
+    assert_eq!(file.source, RolesSource::RolesFile);
+    let names: Vec<_> = file.roles.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["worker", "reviewer"]);
+    let second = &file.roles[0].ladder[0].candidates[1];
+    assert_eq!(
+        (second.effort.as_deref(), second.cost_per_minute),
+        (Some("low"), Some(0.004))
+    );
+    assert_eq!(file.roles[0].reserves[0].fraction, 0.2);
+    let inline: AdminRoles = roundtrip("admin_roles_inline.json");
+    assert_eq!(inline.source, RolesSource::Config);
+    let reloaded: AdminReloadAnswer = roundtrip("admin_reload_answer.json");
+    assert_eq!((reloaded.roles, reloaded.clients), (2, 3));
 }
 
 #[test]

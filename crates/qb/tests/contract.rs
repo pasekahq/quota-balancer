@@ -21,13 +21,15 @@ use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb_core::{Core, Record, Spec};
 use qb_proto::{
-    AgentJob, Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LoginStatus, Outcome,
-    PickResponse, ReportRequest, ReportResponse, Source, StateResponse, WhyResponse, WindowReport,
+    AdminReloadAnswer, AdminRoles, AgentJob, Decision, ErrorBody, ErrorCode, HealthResponse,
+    HealthStatus, LadderCandidate, LadderStep, LoginStatus, Outcome, PickResponse, ReportRequest,
+    ReportResponse, RoleReserve, RolesSource, Source, StateResponse, WhyResponse, WindowReport,
     paths,
 };
 
 mod common;
 
+use common::http::{etag, finish, send, sha256_hex};
 use common::{
     Daemon, answer, events, hook_config, kill_auth, line_with, own_uid, park, pick_worker, post,
     record_event, report_login, start_daemon, state, stderr_lines, temp_dir, wait_for,
@@ -2244,5 +2246,235 @@ fn sighup_identifies_a_client_added_to_the_config() {
     assert!(
         lease_clients(&sock).contains(&(lease, "client-b".to_owned())),
         "the lease names the new client"
+    );
+}
+
+/// `GET /v1/admin/roles` on `sock` as this process's uid that must answer 200: the answer, its
+/// raw body and its `ETag`.
+fn admin_roles_ok(sock: &Path) -> (AdminRoles, String, String) {
+    let (status, head, body) = finish(send(sock, "GET", paths::ADMIN_ROLES, ""), Vec::new());
+    let text = String::from_utf8(body).unwrap();
+    assert_eq!(status, 200, "{text}");
+    let tag = etag(&head).unwrap().to_owned();
+    (serde_json::from_str(&text).unwrap(), text, tag)
+}
+
+/// `POST /v1/admin/reload` on `sock` as this process's uid, or with `bearer`.
+fn admin_reload(sock: &Path, bearer: Option<&str>) -> (u16, Vec<u8>) {
+    call(sock, "POST", paths::ADMIN_RELOAD, Some(b""), bearer).unwrap()
+}
+
+/// [`reloadable`] edit making `client-a` an admin.
+const ADMIN: &str = "admin = true";
+
+#[test]
+fn an_admin_reads_the_roles_of_the_roles_file_on_disk() {
+    let dir = temp_dir("adminroles");
+    let sock = dir.join("qb.sock");
+    let roles = dir.join("roles.toml");
+    std::fs::write(
+        &roles,
+        "[[roles]]\nname = \"worker\"\n\
+         [[roles.ladder]]\ndifficulty = 1\ncandidates = [\n\
+         { vendor = \"vendor-a\", model = \"model-small\", tier = 1 },\n\
+         { vendor = \"vendor-b\", model = \"model-large\", effort = \"high\", tier = 2, \
+         cost_per_minute = 0.004 },\n]\n\
+         [[roles.reserves]]\ndifficulty = 1\nwindow = \"five_hour\"\nfraction = 0.25\n\
+         [[roles]]\nname = \"reviewer\"\n\
+         ladder = [{ difficulty = 2, candidates = [{ vendor = \"vendor-b\", model = \"model-b\", \
+         tier = 1 }] }]\n",
+    )
+    .unwrap();
+    let mut d = start_with(&reloadable(&dir, ADMIN), &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+
+    let (got, text, tag) = admin_roles_ok(&sock);
+    let audit = line_with(&lines, "qbd: admin", Duration::from_secs(10)).unwrap();
+    assert!(
+        audit.ends_with("qbd: admin GET /v1/admin/roles by client-a: 200"),
+        "{audit}"
+    );
+    let hash = sha256_hex(&std::fs::read_to_string(&roles).unwrap());
+    assert_eq!(
+        (got.sha256.as_str(), tag),
+        (hash.as_str(), format!("\"{hash}\""))
+    );
+    assert_eq!(got.source, RolesSource::RolesFile);
+    assert_eq!(Path::new(&got.file), roles);
+    let names: Vec<_> = got.roles.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["worker", "reviewer"]);
+    let candidate = |vendor: &str, model: &str, effort: Option<&str>, tier, cost| LadderCandidate {
+        vendor: vendor.into(),
+        model: model.into(),
+        effort: effort.map(str::to_owned),
+        tier,
+        cost_per_minute: cost,
+    };
+    assert_eq!(
+        got.roles[0].ladder,
+        [LadderStep {
+            difficulty: 1,
+            candidates: vec![
+                candidate("vendor-a", "model-small", None, 1, None),
+                candidate("vendor-b", "model-large", Some("high"), 2, Some(0.004)),
+            ],
+        }]
+    );
+    assert_eq!(
+        got.roles[0].reserves,
+        [RoleReserve {
+            difficulty: 1,
+            window: "five_hour".into(),
+            fraction: 0.25,
+        }]
+    );
+    assert_eq!(got.roles[1].reserves, Vec::<RoleReserve>::new());
+    assert!(!text.contains("null"), "absent keys are omitted: {text}");
+
+    write_roles(&dir, &[("worker", "vendor-z", "model-small")]);
+    let (status, head, body) = finish(send(&sock, "GET", paths::ADMIN_ROLES, ""), Vec::new());
+    assert_eq!((status, etag(&head)), (500, None));
+    let e: ErrorBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(e.error, ErrorCode::Internal);
+    let fault = format!(
+        "{}: roles[0].ladder[0].candidates[0].vendor: undeclared vendor",
+        roles.display()
+    );
+    assert!(e.message.contains(&fault), "{}", e.message);
+}
+
+#[test]
+fn an_admin_reads_the_roles_held_inline_in_the_config() {
+    let dir = temp_dir("admininline");
+    let sock = dir.join("qb.sock");
+    let config = config_copy(
+        &dir,
+        &[(
+            "name = \"client-a\"\nuid = 1001",
+            format!("name = \"client-a\"\nuid = {}\n{ADMIN}", own_uid()),
+        )],
+    );
+    let _d = start(&config, &sock);
+    let (got, _, tag) = admin_roles_ok(&sock);
+    let hash = sha256_hex(&std::fs::read_to_string(&config).unwrap());
+    assert_eq!(
+        (got.sha256.as_str(), tag),
+        (hash.as_str(), format!("\"{hash}\""))
+    );
+    assert_eq!(
+        (got.source, Path::new(&got.file)),
+        (RolesSource::Config, config.as_path())
+    );
+    let names: Vec<_> = got.roles.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["worker", "reviewer", "gateway"]);
+    let worker = &got.roles[0];
+    let difficulties: Vec<_> = worker.ladder.iter().map(|s| s.difficulty).collect();
+    assert_eq!(difficulties, [1, 2]);
+    assert_eq!(
+        worker.ladder[0].candidates[0].effort.as_deref(),
+        Some("low")
+    );
+    assert_eq!(worker.reserves[0].window, "seven_day");
+}
+
+#[test]
+fn only_an_admin_client_reaches_the_admin_endpoints() {
+    let dir = temp_dir("adminonly");
+    let sock = dir.join("qb.sock");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let client_b = format!(
+        "[[clients]]\nname = \"client-b\"\nbearer_sha256 = \"{BEARER_SHA256}\"\nrole = \"worker\""
+    );
+    let config = reloadable(&dir, &client_b);
+    let mut d = start_with(&config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+
+    write_roles(&dir, &[("worker", "vendor-b", "model-large")]);
+    let (status, _) = call(&sock, "GET", paths::ADMIN_ROLES, None, None).unwrap();
+    let (status_b, body_b) = call(&sock, "GET", paths::ADMIN_ROLES, None, Some(BEARER)).unwrap();
+    let (reload_a, _) = admin_reload(&sock, None);
+    let (reload_b, body) = admin_reload(&sock, Some(BEARER));
+    assert_eq!((status, status_b, reload_a, reload_b), (403, 403, 403, 403));
+    assert_eq!(error_of(&body_b), ErrorCode::Forbidden);
+    assert_eq!(error_of(&body), ErrorCode::Forbidden);
+    let audit = line_with(
+        &lines,
+        "POST /v1/admin/reload by client-b",
+        Duration::from_secs(10),
+    );
+    assert!(audit.unwrap().ends_with(": 403"));
+    assert_eq!(
+        pick_role(&sock, "worker").model.as_deref(),
+        Some("model-small"),
+        "a refused caller reloads nothing"
+    );
+
+    let open = temp_socket("adminuid");
+    let _o = start(&example("minimal.toml"), &open);
+    let (status, _) = call(&open, "GET", paths::ADMIN_ROLES, None, None).unwrap();
+    let (reload, _) = admin_reload(&open, None);
+    assert_eq!((status, reload), (403, 403), "uid callers are never admins");
+}
+
+#[test]
+fn an_admin_reload_takes_a_new_ladder_and_keeps_live_leases() {
+    let dir = temp_dir("adminreload");
+    let sock = dir.join("qb.sock");
+    write_roles(
+        &dir,
+        &[
+            ("worker", "vendor-a", "model-small"),
+            ("old", "vendor-a", "model-old"),
+        ],
+    );
+    let mut d = start_with(&reloadable(&dir, ADMIN), &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let lease = pick_role(&sock, "old").lease_id.unwrap();
+
+    write_roles(&dir, &[("worker", "vendor-b", "model-large")]);
+    let (status, body) = admin_reload(&sock, None);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let counts: AdminReloadAnswer = serde_json::from_slice(&body).unwrap();
+    assert_eq!((counts.roles, counts.clients), (1, 1));
+    let line = line_with(&lines, "qbd: reload", Duration::from_secs(10)).unwrap();
+    assert!(line.ends_with("qbd.toml: 1 roles, 1 clients"), "{line}");
+    let audit = line_with(&lines, "qbd: admin", Duration::from_secs(10)).unwrap();
+    assert!(
+        audit.ends_with("qbd: admin POST /v1/admin/reload by client-a: 200"),
+        "{audit}"
+    );
+
+    let next = pick_role(&sock, "worker");
+    assert_eq!(next.model.as_deref(), Some("model-large"), "{next:?}");
+    assert!(state(&sock).leases.iter().any(|l| l.lease_id == lease));
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        &format!(r#"{{"lease_id":"{lease}","outcome":"ok","release":true}}"#),
+    );
+    assert!(r.accepted);
+}
+
+#[test]
+fn a_refused_admin_reload_answers_400_and_keeps_the_ladder() {
+    let dir = temp_dir("adminrefuse");
+    let sock = dir.join("qb.sock");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let _d = start(&reloadable(&dir, ADMIN), &sock);
+
+    write_roles(&dir, &[("worker", "vendor-z", "model-large")]);
+    let (status, body) = admin_reload(&sock, None);
+    assert_eq!(status, 400);
+    let e: ErrorBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!(e.error, ErrorCode::BadRequest);
+    let expected = format!(
+        "reload refused: {}: roles[0].ladder[0].candidates[0].vendor: undeclared vendor \
+         `vendor-z` (line 3)",
+        dir.join("roles.toml").display()
+    );
+    assert_eq!(e.message, expected);
+    assert_eq!(
+        pick_role(&sock, "worker").model.as_deref(),
+        Some("model-small")
     );
 }

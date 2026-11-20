@@ -14,6 +14,8 @@ responses may gain optional fields, which clients ignore. Types are defined in `
 | `GET /v1/health` | — | 200 `HealthResponse` |
 | `POST /v1/agent/next` | `AgentNextRequest` | 200 `AgentJob`, 400 unknown login, 403 not an agent, 429 too many waiting |
 | `POST /v1/agent/result` | `AgentResultRequest` | 200 `ReportResponse`, 403 another client's probe, 404 unknown or expired probe |
+| `GET /v1/admin/roles` | — | 200 `AdminRoles` with an `ETag`, 403 not an admin client, 500 a config file cannot be read or does not validate |
+| `POST /v1/admin/reload` | — | 200 `AdminReloadAnswer`, 400 reload refused, 403 not an admin client |
 
 Errors: `{"error": <code>, "message": "..."}` with codes `bad_request` (400), `unauthorized`
 (401), `forbidden` (403), `not_found` (404), `method_not_allowed` (405), `length_required`
@@ -207,6 +209,48 @@ deadlines of the daemon's loop, which sleeps without a timeout when nothing is p
 The response is `{"accepted": true, "login_status": ...}` as for a report. A `probe_id` that is
 unknown, already answered or timed out is 404 `not_found`; a probe handed to another client is
 403 `forbidden`; a `utilization` outside `0.0..=1.0` is 400. None of them changes anything.
+
+## Admin `/v1/admin/*`
+
+Only a caller identified as a `[[clients]]` entry with `admin = true` ([config.md](config.md))
+reaches these endpoints; any other identified caller gets 403 `forbidden` and the request
+changes nothing. With no `[[clients]]` declared every caller is `uid:<uid>` and nobody is an
+admin. `admin` is read only from the config file, so the admin API cannot grant it. Each call,
+refused or not, logs one line naming its caller and status:
+
+```
+qbd: admin POST /v1/admin/reload by client-a: 200
+```
+
+### `GET /v1/admin/roles`
+
+The roles of the config file and its `roles_file` as they are on disk, which may differ from the
+running roles until a reload. Both files go through the same parsing and validation as at
+startup. `source` is `roles_file` when the config names one, else `config`; `file` is the path of
+the file that holds the roles and `sha256` the hex SHA-256 of its bytes, also sent as the strong
+`ETag: "<sha256>"`. `roles` lists the roles in file order; `effort` and `cost_per_minute` are
+absent when the file has none. See `admin_roles_file.json`:
+
+```json
+{"source": "roles_file", "file": "/etc/qb/roles.toml", "sha256": "5f1d…",
+ "roles": [{"name": "worker",
+            "ladder": [{"difficulty": 1, "candidates": [
+                         {"vendor": "vendor-a", "model": "model-small", "tier": 1},
+                         {"vendor": "vendor-b", "model": "model-medium", "effort": "low",
+                          "tier": 2, "cost_per_minute": 0.004}]}],
+            "reserves": [{"difficulty": 1, "window": "five_hour", "fraction": 0.2}]}]}
+```
+
+A file that cannot be read or does not validate is 500 `internal` with the message
+`cannot read the roles: <file>: <field>: <reason>`, never a partial answer.
+
+### `POST /v1/admin/reload`
+
+Runs the reload SIGHUP runs ([config.md](config.md#reloading-roles-and-clients)); the body is
+ignored. A config that is taken answers `{"roles": 2, "clients": 3}`, the counts of the new
+config, and logs the same `qbd: reloaded …` line as SIGHUP. A refused one is 400 `bad_request`
+with the message `reload refused: <file>: <field>: <reason>`, naming the line where the file has
+one, and nothing changes.
 
 ## Model gateway `/v1/model/*`
 

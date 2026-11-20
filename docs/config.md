@@ -108,6 +108,7 @@ Optional. Each client needs `uid`, `bearer_sha256` or both.
 | `uid` | integer | Local peer uid (`SO_PEERCRED`); unique. |
 | `bearer_sha256` | string | SHA-256 of the bearer token as 64 hex characters; unique. Plaintext tokens are rejected. |
 | `role` | string | Declared role; a client listed in `[probe] agents` may omit it. |
+| `admin` | boolean | May call `/v1/admin/*` ([api.md](api.md#admin-v1admin)); default `false`. Only this file grants it. |
 
 Compute the hash with `printf %s "$TOKEN" | sha256sum`. How a request is matched to a client is
 described in [api.md](api.md#callers).
@@ -200,8 +201,10 @@ logger -t qb-hook -p user.warning "login $QB_LOGIN of $QB_VENDOR: $QB_EVENT"
 
 ## Reloading roles and clients
 
-SIGHUP makes the running `qbd` read its config file and its `roles_file` again, as one unit. The
-operator sends it; the shipped unit has no `ExecReload=`:
+SIGHUP, or `POST /v1/admin/reload` from an admin client
+([api.md](api.md#post-v1adminreload)), makes the running `qbd` read its config file and its
+`roles_file` again, as one unit. The operator sends the signal; the shipped unit has no
+`ExecReload=`:
 
 ```sh
 systemctl kill --kill-whom=main -s HUP qbd.service

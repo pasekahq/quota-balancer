@@ -16,6 +16,7 @@ use qb::client::call;
 use qb_proto::{LoginStatus, PickResponse, ReportResponse, StateResponse, paths};
 
 pub mod credentials;
+pub mod http;
 pub mod pkce;
 pub mod vendor;
 

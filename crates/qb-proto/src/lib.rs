@@ -46,6 +46,12 @@ pub mod paths {
     pub const AGENT_NEXT: &str = "/v1/agent/next";
     /// `POST`: an agent answers a probe job.
     pub const AGENT_RESULT: &str = "/v1/agent/result";
+    /// Prefix of the endpoints only an admin client of `qbd` may call.
+    pub const ADMIN: &str = "/v1/admin/";
+    /// `GET`: the roles and ladders of `qbd`'s config files on disk; admin only.
+    pub const ADMIN_ROLES: &str = "/v1/admin/roles";
+    /// `POST`: `qbd` reloads its roles and clients as on SIGHUP; admin only.
+    pub const ADMIN_RELOAD: &str = "/v1/admin/reload";
     /// Gateway, `POST`: run one model turn and stream its events as NDJSON.
     pub const MODEL_TURN: &str = "/v1/model/turn";
     /// Gateway, `GET`: route aliases and where a turn would run now.
@@ -506,6 +512,87 @@ pub struct HealthResponse {
     pub version: String,
     /// Seconds since the daemon started.
     pub uptime_s: u64,
+}
+
+/// Which file of `qbd` holds the roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolesSource {
+    /// The `roles_file` the config names.
+    RolesFile,
+    /// The config file itself, as `[[roles]]` tables.
+    Config,
+}
+
+/// `GET /v1/admin/roles` response: the roles of `qbd`'s files on disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdminRoles {
+    /// Which file holds the roles.
+    pub source: RolesSource,
+    /// Path of that file.
+    pub file: String,
+    /// Hex SHA-256 of that file's bytes; also the answer's `ETag`.
+    pub sha256: String,
+    /// The roles in file order.
+    pub roles: Vec<RoleConfig>,
+}
+
+/// A role as its config file declares it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleConfig {
+    /// Role name.
+    pub name: String,
+    /// Ladder steps in file order.
+    pub ladder: Vec<LadderStep>,
+    /// Reserves in file order.
+    #[serde(default)]
+    pub reserves: Vec<RoleReserve>,
+}
+
+/// One ladder step of a role.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LadderStep {
+    /// Difficulty the step serves.
+    pub difficulty: u8,
+    /// Candidates in preference order.
+    pub candidates: Vec<LadderCandidate>,
+}
+
+/// A vendor/model/effort combination of a ladder step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LadderCandidate {
+    /// Declared vendor.
+    pub vendor: String,
+    /// Model name.
+    pub model: String,
+    /// Reasoning effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Tier; lower tiers are preferred.
+    pub tier: u8,
+    /// Fraction of the vendor's shortest window one minute of work uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_minute: Option<f64>,
+}
+
+/// Fraction of a window a role keeps free at a difficulty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleReserve {
+    /// Difficulty of a ladder step of the role.
+    pub difficulty: u8,
+    /// Window name.
+    pub window: String,
+    /// Reserved fraction, `0.0..=1.0`.
+    pub fraction: f64,
+}
+
+/// `POST /v1/admin/reload` response: the counts of the config now running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminReloadAnswer {
+    /// Roles of the new config.
+    pub roles: usize,
+    /// Clients of the new config.
+    pub clients: usize,
 }
 
 /// Machine-readable error class.

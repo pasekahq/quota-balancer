@@ -1,0 +1,14 @@
+{"source": "roles_file", "file": "/etc/qb/roles.toml",
+ "sha256": "5f1d2c3b4a59687766554433221100ffeeddccbbaa99887766554433221100ff",
+ "roles": [
+  {"name": "worker",
+   "ladder": [
+    {"difficulty": 1, "candidates": [
+     {"vendor": "vendor-a", "model": "model-small", "tier": 1},
+     {"vendor": "vendor-b", "model": "model-medium", "effort": "low", "tier": 2, "cost_per_minute": 0.004}]},
+    {"difficulty": 2, "candidates": [
+     {"vendor": "vendor-b", "model": "model-large", "effort": "high", "tier": 1}]}],
+   "reserves": [{"difficulty": 1, "window": "five_hour", "fraction": 0.2}]},
+  {"name": "reviewer",
+   "ladder": [{"difficulty": 1, "candidates": [{"vendor": "vendor-a", "model": "model-small", "tier": 1}]}],
+   "reserves": []}]}

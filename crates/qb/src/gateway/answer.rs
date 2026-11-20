@@ -14,7 +14,7 @@ use rustix::net::SendFlags;
 use serde::Serialize;
 
 use super::core::{Admitted, Gateway};
-use super::front::{Caller, Conn, STREAM_WRITE_TIMEOUT, Watch, peer_text};
+use super::front::{Caller, Conn, STREAM_WRITE_TIMEOUT, Watch};
 use super::upstream::Flow;
 use crate::http;
 use crate::log;
@@ -127,7 +127,7 @@ pub(super) fn serve<E: Encoder, A: Assembler>(
         log::warn(&format!(
             "gateway: loopback refused client `{}` route `{}`: route",
             caller.name,
-            peer_text(&turn.route)
+            log::peer_text(&turn.route)
         ));
         let message = format!(
             "client `{}` may not use route `{}`",
