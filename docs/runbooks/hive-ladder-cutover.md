@@ -65,15 +65,19 @@ reading and the model ids.
    revision the binary was built from. Install a newer binary as in the Hermes cutover runbook's
    [Binary](hermes-secretary-cutover.md#binary) step; `qbd` takes it at the restart of step 2,
    the gateway at its next restart, which needs the owner's permission. A running binary with
-   these features answers 200 to both reads:
+   these features answers 200 to the first two reads and 400 to the third, a ladder read
+   without its query:
 
    ```sh
    curl -sS -o /dev/null -w '%{http_code}\n' --unix-socket <qbd-socket> http://qb/v1/roles
    curl -sS -o /dev/null -w '%{http_code}\n' --unix-socket <gateway-socket> \
      http://qb/v1/model/config/routes
+   curl -sS -o /dev/null -w '%{http_code}\n' --unix-socket <gateway-socket> \
+     http://qb/v1/model/ladder
    ```
 
-   An older `qbd` answers 404 to the first. A gateway without `client_effort` or route `logins`
+   An older `qbd` answers 404 to the first, a gateway without `GET /v1/model/ladder` 404 to the
+   third. A gateway without `client_effort` or route `logins`
    answers 200 to the second but refuses the `PUT` of step 5 with 400 naming the unknown field,
    and writes nothing.
 2. A root shell on `<host>`, a shell as `<user>`, and `jq` on `<host>`.
@@ -248,6 +252,26 @@ there already.
    line out without a cap. `<sub-login>` and `<openai-login>` need entries of their kinds
    (`oauth_anthropic`, `chatgpt_oauth`) if missing.
 
+   With `<key-cap>`, add a price for every Anthropic model of the ladder the key serves, unless
+   the file has one. The Anthropic API reports no USD cost, so the gateway counts a call on a
+   capped login only at the model's `[prices]` entry; without one the cap counts nothing
+   ([config.md](../config.md#spend-caps)). Fill in the USD per million tokens from the vendor's
+   price list:
+
+   ```toml
+   [prices."opus-5-5"]
+   input = <opus-input-usd>
+   output = <opus-output-usd>
+   cache_read = <opus-cache-read-usd>
+   cache_write = <opus-cache-write-usd>
+
+   [prices."sonnet-5-5"]
+   input = <sonnet-input-usd>
+   output = <sonnet-output-usd>
+   cache_read = <sonnet-cache-read-usd>
+   cache_write = <sonnet-cache-write-usd>
+   ```
+
    ```sh
    qb login import --config <gateway-config> --from env --source <key-env-file> \
      --var <key-var> <key-login>
@@ -270,10 +294,20 @@ Verify:
 
   `jq` prints `"source": "roles_file"` and `"file": "<roles-file>"`, `diff` nothing. The journal
   of `qbd` has `qbd: admin GET /v1/admin/roles by <gateway-client>: 200`.
-- `qb reload` prints `{"routes": <n>, "logins": <m>}` with `<m>` one more per login added, and
-  the gateway's journal has `gateway: reloaded <gateway-config>: <n> routes, <m> logins`.
+- `qb --socket <gateway-socket> reload` prints `{"routes": <n>, "logins": <m>}` with `<m>` one
+  more per login added, and the gateway's journal has
+  `gateway: reloaded <gateway-config>: <n> routes, <m> logins`.
 - With `<key-cap>`, `qb --socket <gateway-socket> spend` lists `<key-login>` with that
-  `cap_usd`.
+  `cap_usd`. After the first turn on `<key-login>`, which the routes of step 5 make possible, a
+  priced call counts: `spent_usd` is above 0, the usage rows of `<key-login>` have `usd` above 0
+  and `unpriced` 0, and the journal has no line
+  ``gateway: model `<model>` has no price and its vendor reports no cost; ...``:
+
+  ```sh
+  qb --socket <gateway-socket> spend
+  curl -sS --unix-socket <gateway-socket> "http://qb/v1/model/usage?from=$(date -d '-1 day' +%s)&group_by=login"
+  journalctl --user -u qb-gateway --since '-1 day' | grep 'has no price'
+  ```
 
 Rollback: copy both configs back, restart `qbd` (or reload it when only `admin` changed),
 reload the gateway and remove the key's credential file:
@@ -457,7 +491,7 @@ ladder() {  # ladder <query>: the loopback ladder read as <heads-client>
 
 Verify:
 
-- `qb reload` prints its counts and the journal has
+- `qb --socket <gateway-socket> reload` prints its counts and the journal has
   `gateway: reloaded <gateway-config>: <n> routes, <m> logins`.
 - `ladder route=hive-step-1` ends with `200`; a route outside the list ends with `403` and the
   journal has a warning line naming `<heads-client>`.
