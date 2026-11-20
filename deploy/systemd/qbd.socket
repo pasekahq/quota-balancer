@@ -3,7 +3,7 @@
 # Install: copy to /etc/systemd/system/, create group `qb-clients`, add client users to it.
 [Unit]
 Description=quota-balancer socket
-Documentation=https://github.com/vladmesh/quota-balancer
+Documentation=https://github.com/pasekahq/quota-balancer
 
 [Socket]
 ListenStream=/run/qb/qb.sock

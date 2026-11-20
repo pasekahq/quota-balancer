@@ -4,7 +4,7 @@
 # itself, so the unit's system call filter allows the landlock calls on top of @system-service.
 [Unit]
 Description=quota-balancer agent
-Documentation=https://github.com/vladmesh/quota-balancer
+Documentation=https://github.com/pasekahq/quota-balancer
 
 [Service]
 Type=simple
