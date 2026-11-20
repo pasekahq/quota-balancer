@@ -197,7 +197,7 @@ fn pick(core: &mut Core, journal: &mut Journal, body: &[u8], caller: &Caller, no
 /// Answers `req` for `client` at `now`, with the id of the lease a `run` grants.
 ///
 /// # Errors
-/// The request breaks an invariant of [`PickRequest::validate`].
+/// The request breaks an invariant of [`PickRequest::validate`] or lists an undeclared login.
 pub fn decide(
     core: &mut Core,
     req: PickRequest,
@@ -205,6 +205,14 @@ pub fn decide(
     now: u64,
 ) -> Result<(PickResponse, Option<u64>), PickRequestError> {
     req.validate()?;
+    if req
+        .logins
+        .iter()
+        .flatten()
+        .any(|name| !core.has_login(name))
+    {
+        return Err(PickRequestError::BadLogins);
+    }
     let target = match (req.difficulty, req.pin) {
         (Some(d), _) => Target::Difficulty(d),
         (None, Some(p)) => Target::Pin {
@@ -224,6 +232,7 @@ pub fn decide(
         expected_minutes: req.expected_minutes,
         run_id: req.run_id,
         on_behalf_of: req.on_behalf_of,
+        logins: req.logins,
     };
     Ok(match core.pick(&input, now) {
         Verdict::Run(grant, reason) => {

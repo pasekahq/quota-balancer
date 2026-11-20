@@ -126,10 +126,17 @@ pub struct PickRequest {
     /// [`ON_BEHALF_OF_MAX`] bytes, not empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
+    /// Allow-list of logins: a `run` lands only on one of them; 1 to [`PICK_LOGINS_MAX`]
+    /// distinct names, each a declared login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logins: Option<Vec<String>>,
 }
 
 /// Longest accepted [`PickRequest::on_behalf_of`], in bytes.
 pub const ON_BEHALF_OF_MAX: usize = 128;
+
+/// Most names in [`PickRequest::logins`].
+pub const PICK_LOGINS_MAX: usize = 32;
 
 /// Why a [`PickRequest`] is malformed beyond what JSON decoding catches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +149,9 @@ pub enum PickRequestError {
     EmptyRole,
     /// `on_behalf_of` is empty or longer than [`ON_BEHALF_OF_MAX`] bytes.
     BadOnBehalfOf,
+    /// `logins` is empty, longer than [`PICK_LOGINS_MAX`], repeats a name or names an
+    /// undeclared login.
+    BadLogins,
 }
 
 impl PickRequestError {
@@ -152,6 +162,7 @@ impl PickRequestError {
             Self::AmbiguousTarget => "`difficulty` and `pin` are mutually exclusive",
             Self::EmptyRole => "`role` must not be empty",
             Self::BadOnBehalfOf => "`on_behalf_of` must be 1 to 128 bytes",
+            Self::BadLogins => "`logins` must be 1 to 32 distinct declared login names",
         }
     }
 }
@@ -171,6 +182,15 @@ impl PickRequest {
             .is_some_and(|o| o.is_empty() || o.len() > ON_BEHALF_OF_MAX)
         {
             return Err(PickRequestError::BadOnBehalfOf);
+        }
+        if let Some(logins) = &self.logins {
+            let repeated = logins
+                .iter()
+                .enumerate()
+                .any(|(i, name)| logins[..i].contains(name));
+            if logins.is_empty() || logins.len() > PICK_LOGINS_MAX || repeated {
+                return Err(PickRequestError::BadLogins);
+            }
         }
         match (&self.difficulty, &self.pin) {
             (None, None) => Err(PickRequestError::NoTarget),
@@ -703,6 +723,7 @@ mod tests {
             expected_minutes: None,
             run_id: None,
             on_behalf_of: None,
+            logins: None,
         }
     }
 
@@ -759,6 +780,28 @@ mod tests {
             with(&"a".repeat(129)).validate(),
             Err(PickRequestError::BadOnBehalfOf)
         );
+    }
+
+    #[test]
+    fn validate_bounds_logins() {
+        let with = |names: Vec<String>| PickRequest {
+            logins: Some(names),
+            ..req()
+        };
+        let names = |n: usize| (0..n).map(|i| format!("login-{i}")).collect::<Vec<_>>();
+        assert_eq!(with(names(1)).validate(), Ok(()));
+        assert_eq!(with(names(32)).validate(), Ok(()));
+        for (case, logins) in [
+            ("empty", names(0)),
+            ("too many", names(33)),
+            ("repeated", vec!["login-1".into(), "login-1".into()]),
+        ] {
+            assert_eq!(
+                with(logins).validate(),
+                Err(PickRequestError::BadLogins),
+                "{case}"
+            );
+        }
     }
 
     #[test]

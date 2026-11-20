@@ -529,6 +529,34 @@ fn leases_reserve_quota_and_reports_steer_the_next_pick() {
     assert_eq!(status, 404, "a released lease is gone");
 }
 
+#[test]
+fn a_login_list_keeps_picks_on_its_logins() {
+    let sock = temp_socket("allow");
+    let _d = start(&journaled_config(sock.parent().unwrap(), 1 << 20), &sock);
+    let listed = r#"{"role":"worker","difficulty":1,"expected_minutes":30,"logins":["login-2"]}"#;
+    for _ in 0..5 {
+        let p: PickResponse = post(&sock, paths::PICK, listed);
+        assert_eq!(
+            (p.decision, p.login.as_deref()),
+            (Decision::Run, Some("login-2")),
+            "{p:?}"
+        );
+    }
+    let free = pick_worker(&sock);
+    assert_eq!(
+        free.login.as_deref(),
+        Some("login-1"),
+        "the unlisted login is preferred"
+    );
+
+    let unknown = br#"{"role":"worker","difficulty":1,"logins":["login-2","login-9"]}"#;
+    let (status, resp) = call(&sock, "POST", paths::PICK, Some(unknown), None).unwrap();
+    assert_eq!(status, 400);
+    let e: ErrorBody = serde_json::from_slice(&resp).unwrap();
+    assert_eq!(e.error, ErrorCode::BadRequest);
+    assert!(e.message.contains("`logins`"), "{}", e.message);
+}
+
 /// Token of the bearer client `client-b` in the configs below; `BEARER_SHA256` is its hash.
 const BEARER: &str = "token-b";
 const BEARER_SHA256: &str = "49e2bb7eab54cf09b409ffafd3fa8a8a955a60eb972faacaefbed3dbd3207132";

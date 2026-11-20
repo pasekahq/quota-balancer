@@ -28,6 +28,7 @@ fn roundtrip<T: Serialize + DeserializeOwned>(name: &str) -> T {
 fn pick_requests() {
     let d: PickRequest = roundtrip("pick_request_difficulty.json");
     assert_eq!(d.difficulty, Some(2));
+    assert_eq!(d.logins.as_deref().map(<[String]>::len), Some(2));
     assert!(d.validate().is_ok());
     let p: PickRequest = roundtrip("pick_request_pin.json");
     assert_eq!(p.pin.as_ref().map(|p| p.vendor.as_str()), Some("vendor-b"));

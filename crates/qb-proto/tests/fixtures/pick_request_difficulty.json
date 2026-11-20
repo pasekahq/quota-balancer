@@ -1,1 +1,1 @@
-{"role": "worker", "difficulty": 2, "expected_minutes": 30, "run_id": "run-0001", "need": ["tools"]}
+{"role": "worker", "difficulty": 2, "expected_minutes": 30, "run_id": "run-0001", "need": ["tools"], "logins": ["login-1", "login-2"]}

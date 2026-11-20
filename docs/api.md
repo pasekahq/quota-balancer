@@ -47,15 +47,23 @@ is 403 `forbidden` and changes nothing; a report by `login` is open to every cal
 ## `POST /v1/pick`
 
 ```json
-{"role": "worker", "difficulty": 2, "expected_minutes": 30, "run_id": "run-0001"}
+{"role": "worker", "difficulty": 2, "expected_minutes": 30, "run_id": "run-0001",
+ "logins": ["login-1", "login-2"]}
 {"role": "reviewer", "pin": {"vendor": "vendor-b", "model": "model-large", "effort": "high"},
  "avoid_vendor": "vendor-a"}
 ```
 
 Exactly one of `difficulty` / `pin`. Optional: `resume_of`, `avoid_vendor`, `need` (capabilities),
-`expected_minutes`, `run_id`, `on_behalf_of`. `on_behalf_of` names the end client a relaying
-caller such as `qb gateway` picks for: 1 to 128 bytes, else 400 `bad_request`. It is kept on the
-lease and in the journal; no decision, rate limit or report check reads it.
+`expected_minutes`, `run_id`, `on_behalf_of`, `logins`. `on_behalf_of` names the end client a
+relaying caller such as `qb gateway` picks for: 1 to 128 bytes, else 400 `bad_request`. It is
+kept on the lease and in the journal; no decision, rate limit or report check reads it.
+
+`logins` is an allow-list of 1 to 32 distinct declared login names, else 400 `bad_request`.
+With it a candidate runs only on the logins of its vendor that are on the list, on the requested
+step and on the neighbouring steps alike; a candidate whose vendor has none is skipped as one
+without logins. A pin with `login` is limited to that login if it is on the list, else it has
+no candidate. Reasons and `retry_after` count only the listed logins, so a list whose logins
+are all blocked answers `wait` or `dead`, never a `run` on another login.
 
 ```json
 {"decision": "run", "reason": "spend_before_reset", "lease_id": "l-17", "vendor": "vendor-a",
