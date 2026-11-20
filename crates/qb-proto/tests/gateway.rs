@@ -64,6 +64,9 @@ fn turn_requests() {
     let min: TurnRequest = roundtrip("gateway_turn_request_minimal.json");
     assert_eq!(min.validate(), Ok(()));
     assert_eq!(min.route, "compact");
+    let hour: TurnRequest = roundtrip("gateway_turn_request_cache_1h.json");
+    assert_eq!(hour.validate(), Ok(()));
+    assert_eq!(hour.cache, Some(CacheMode::Auto1h));
     let native: TurnRequest = roundtrip("gateway_turn_request_native.json");
     assert_eq!(native.validate(), Ok(()));
     assert_eq!(native.messages[1].role, Role::System);
@@ -670,7 +673,7 @@ fn typed_enums() -> Vec<(String, Vec<String>)> {
             schema("Effort"),
             names(&every!(Effort: Low, Medium, High, Max)),
         ),
-        (schema("CacheMode"), names(&every!(CacheMode: Auto))),
+        (schema("CacheMode"), names(&every!(CacheMode: Auto, Auto1h))),
         (
             schema("Role"),
             names(&every!(Role: User, Assistant, System)),

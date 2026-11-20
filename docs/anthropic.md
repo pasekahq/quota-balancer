@@ -61,7 +61,7 @@ when the last assistant message of the built request holds a `tool_use` and its 
 `thinking` or `redacted_thinking` (none of the picked vendor survived the table above, or the
 history put text before it), the request goes without `thinking`. The model then answers that turn without thinking.
 
-### Prompt cache (`cache: auto`)
+### Prompt cache (`cache: auto`, `auto_1h`)
 
 With `cache: auto` the adapter places at most three of the vendor's four breakpoints
 (`cache_control: {type: ephemeral}`):
@@ -74,6 +74,11 @@ With `cache: auto` the adapter places at most three of the vendor's four breakpo
 
 A breakpoint goes on the last block of a message that can carry one (text, image, tool use, tool
 result); thinking blocks cannot. Without `cache` the request has no breakpoints.
+
+With `cache: auto_1h` the same breakpoints carry `cache_control: {type: ephemeral, ttl: 1h}`:
+the cached prefix outlives a client's pause of more than five minutes. All breakpoints share one
+lifetime, so the vendor's rule that a longer lifetime comes before a shorter one holds. The
+`/v1/messages` front sets `auto_1h` when any breakpoint of the client asks for `ttl: 1h`.
 
 ### Header modes
 
@@ -272,7 +277,8 @@ A client closing its connection cancels the turn and shuts the upstream connecti
   digits of a deterministic non-cryptographic hash (two FNV-1a passes) of the whole id;
 - `cache` is `auto` when `cache_control` is set at the top level, on a `system` block, a tool, a
   message content block or a block inside a tool result, else absent; a `cache_control` key
-  inside a tool schema or tool input is data and does not count;
+  inside a tool schema or tool input is data and does not count; `auto_1h` when one of those
+  breakpoints has `ttl: 1h`;
 - sampling parameters, `tool_choice`, `stop_sequences` and thinking budgets are ignored; unknown
   fields are ignored;
 - a `system` message (Claude Code sends the turn's environment and reminders as one after the

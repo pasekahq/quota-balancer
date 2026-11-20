@@ -943,3 +943,23 @@ fn models_without_mid_conversation_system_messages_get_them_in_the_system_prompt
         );
     }
 }
+
+#[test]
+fn cache_auto_1h_puts_the_one_hour_ttl_on_every_breakpoint() {
+    // A client that asks for a one-hour cache must get it upstream: with the default five
+    // minutes every pause longer than that rewrites the whole prefix.
+    let mut req = turn();
+    req.cache = Some(CacheMode::Auto1h);
+    for mode in [AuthMode::ApiKey, AuthMode::Oauth] {
+        let body = serde_json::to_value(build(&req, &target(mode), &mut load).expect("builds"))
+            .expect("json");
+        let one_hour = json!({"type": "ephemeral", "ttl": "1h"});
+        let system = body["system"].as_array().expect("system blocks");
+        assert_eq!(system.last().expect("block")["cache_control"], one_hour);
+        assert_eq!(body["messages"][0]["content"][1]["cache_control"], one_hour);
+        assert_eq!(body["messages"][2]["content"][0]["cache_control"], one_hour);
+        let marks = body.to_string().matches("cache_control").count();
+        let hours = body.to_string().matches("\"ttl\":\"1h\"").count();
+        assert_eq!((marks, hours), (3, 3), "{mode:?}");
+    }
+}

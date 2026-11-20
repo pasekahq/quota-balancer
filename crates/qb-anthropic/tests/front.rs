@@ -607,3 +607,33 @@ fn tool_references_and_tool_changes_by_reference_need_no_upstream_support() {
         .expect_err("inline definition");
     assert_eq!(e.class, ErrorClass::BadRequest);
 }
+
+#[test]
+fn a_one_hour_breakpoint_asks_for_the_one_hour_cache() {
+    let body = |ttl: Option<&str>| {
+        let mut mark = json!({"type": "ephemeral"});
+        if let Some(t) = ttl {
+            mark["ttl"] = json!(t);
+        }
+        json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 16,
+            "system": [
+                {"type": "text", "text": "Be brief.", "cache_control": mark}
+            ],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        })
+        .to_string()
+    };
+    let cache = |b: String| {
+        decode_request(b.as_bytes(), "m", VENDOR, &route_of)
+            .expect("ok")
+            .turn
+            .cache
+    };
+    assert_eq!(cache(body(Some("1h"))), Some(CacheMode::Auto1h));
+    assert_eq!(cache(body(Some("5m"))), Some(CacheMode::Auto));
+    assert_eq!(cache(body(None)), Some(CacheMode::Auto));
+}

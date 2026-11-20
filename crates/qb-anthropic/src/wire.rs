@@ -79,6 +79,9 @@ pub struct CacheControl {
     /// Always `ephemeral`.
     #[serde(rename = "type")]
     pub kind: String,
+    /// Lifetime of the entry, `5m` or `1h`; the vendor's default (`5m`) when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 impl CacheControl {
@@ -86,6 +89,15 @@ impl CacheControl {
     pub fn ephemeral() -> Self {
         Self {
             kind: "ephemeral".into(),
+            ttl: None,
+        }
+    }
+
+    /// The one-hour breakpoint.
+    pub fn ephemeral_1h() -> Self {
+        Self {
+            kind: "ephemeral".into(),
+            ttl: Some("1h".into()),
         }
     }
 }

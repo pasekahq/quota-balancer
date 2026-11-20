@@ -421,7 +421,8 @@ Required: `route` (an alias of the gateway config, `^[a-z][a-z0-9_-]{0,63}$`), `
 least one, each with at least one block), `max_tokens` (≥ 1) and `request_id`
 (`^[A-Za-z0-9_-]{1,64}$`, unique among running turns). Optional: `system`, `tools`
 (`{name, description, input_schema}`, names unique, and optional `native`, below), `effort`
-(`low|medium|high|max`), `session_key` (1 to 128 bytes), `cache` (`auto`).
+(`low|medium|high|max`), `session_key` (1 to 128 bytes), `cache` (`auto`, or `auto_1h` for the vendor's one-hour
+cache lifetime where it has one, else as `auto`).
 
 The effort an attempt sends is the request's `effort`, else the picked candidate's (on a pinned
 route the pin's, on a chain route the step's). On a route with `client_effort = "ignore"`
