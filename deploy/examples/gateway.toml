@@ -95,36 +95,42 @@ vendor = "vendor-a"
 model = "model-small"
 
 # Ladder steps 1 to 5 of qbd's role "hive-heads" for the heads: each turn sends the effort of
-# the candidate qbd picks, never the client's.
+# the candidate qbd picks, never the client's, and runs only on the logins of the role's three
+# candidates that the heads may use, so the second Anthropic subscription (login-2) stays out.
 [[routes]]
 alias = "hive-step-1"
 role = "hive-heads"
 difficulty = 1
 client_effort = "ignore"
+logins = ["login-1", "login-3", "key-4"]
 
 [[routes]]
 alias = "hive-step-2"
 role = "hive-heads"
 difficulty = 2
 client_effort = "ignore"
+logins = ["login-1", "login-3", "key-4"]
 
 [[routes]]
 alias = "hive-step-3"
 role = "hive-heads"
 difficulty = 3
 client_effort = "ignore"
+logins = ["login-1", "login-3", "key-4"]
 
 [[routes]]
 alias = "hive-step-4"
 role = "hive-heads"
 difficulty = 4
 client_effort = "ignore"
+logins = ["login-1", "login-3", "key-4"]
 
 [[routes]]
 alias = "hive-step-5"
 role = "hive-heads"
 difficulty = 5
 client_effort = "ignore"
+logins = ["login-1", "login-3", "key-4"]
 
 # A model of the openai API family that refuses the reasoning parameter: its Responses requests
 # carry no reasoning, effort or include, on every route and login that runs it.

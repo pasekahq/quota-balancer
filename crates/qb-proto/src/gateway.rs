@@ -900,6 +900,9 @@ pub struct ConfigRoute {
     /// (the pick's only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_effort: Option<String>,
+    /// Logins every pick of a turn is limited to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logins: Option<Vec<String>>,
 }
 
 /// `GET /v1/model/config/routes` response: the `[[routes]]` items and the `api_key` logins'

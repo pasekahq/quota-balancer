@@ -484,7 +484,8 @@ or `role` and a `pin` of `vendor`, `model` and `effort`, on a chain route the cu
 pin), `run_id` = `session_key` or else
 `request_id`, `on_behalf_of` = the turn's caller name (`uid:<n>`, a `[[clients]]` name,
 `client-token` or a `[[fronts.clients]]` name), `resume_of` = `session_key` when given,
-`expected_minutes` of the route, and
+`expected_minutes` of the route, `logins` = the route's `logins` when it has them, so no attempt
+runs on another login, and
 `avoid_vendor` after a vendor failure on a ladder or pin route. A `wait` caused by `resume_of` is asked again once
 without it. `qbd` accepts `resume_of` but does not use it yet, so `session_key` only names the
 run: turns of one session are not kept on one login for the prompt cache. The picked login's credential entry gives the credential kind, which selects the
@@ -574,7 +575,8 @@ least 1), and its `resets_at`, if any, is no earlier than the end of that wait.
 ```
 
 Aliases sorted, each with the state of the logins it can run on in `qbd`'s `GET /v1/state`: the
-gateway's logins of the pinned vendor, or every login of the gateway for a ladder route. A login
+gateway's logins of the pinned vendor, or every login of the gateway for a ladder route, within
+the route's `logins` when it has them ([config.md](config.md#gateway-config)). A login
 waits when its status is `exhausted` or `rate_limited`, until its `dead_until`, or when its
 status is `ok`, `unknown` or `auth_stale` but a window of it is at `used` ≥ 1.0 with a
 `resets_at`, until the latest such reset, since `qbd` does not pick it before (a capped login's
@@ -613,10 +615,12 @@ a role or a route's step `qbd` does not run is 404; the states come from `qbd`'s
 `steps` are sorted by `difficulty`, each with `routes`, the sorted ladder route aliases of the
 caller that name it, and its `candidates` in ladder order. A candidate's `api` is the API family
 (`anthropic`, `openai`, `chat_completions`) of the gateway's first login, in config order, that
-`qbd` puts on its vendor, absent when the gateway holds none; `effort` is absent when the ladder
-has none. `state` and `resets_at` follow the rule of `GET /v1/model/routes` over the gateway's
-logins of the candidate's vendor: `ready`, `exhausted` with the earliest end of the waits, or
-`unavailable`.
+`qbd` puts on its vendor among the logins below, absent when there is none; `effort` is absent
+when the ladder has none. `state` and `resets_at` follow the rule of `GET /v1/model/routes` over
+the gateway's logins of the candidate's vendor within the `logins` of the queried route, or for
+`role=` within the union of the `logins` of the step's `routes`, a route without `logins` adding
+every login: `ready`, `exhausted` with the earliest end of the waits, or `unavailable`, which a
+vendor without such a login is.
 
 On the unix socket every caller reads every route. On the loopback listener only a named
 `[[fronts.clients]]` token may, within its `routes`: a route outside them, or a role none of them
@@ -840,7 +844,8 @@ the strong `ETag: "<sha256>"`:
 {"sha256": "a1b2…",
  "routes": [{"alias": "chat", "role": "gateway", "difficulty": 1, "expected_minutes": 10,
              "client_effort": "ignore"},
-            {"alias": "pinned", "role": "gateway", "vendor": "vendor-b", "model": "model-b"},
+            {"alias": "pinned", "role": "gateway", "vendor": "vendor-b", "model": "model-b",
+             "logins": ["login-3"]},
             {"alias": "chain", "role": "gateway",
              "chain": [{"vendor": "vendor-a", "model": "model-a"},
                        {"vendor": "vendor-c", "model": "model-c", "effort": "low"}]}],

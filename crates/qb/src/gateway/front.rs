@@ -868,7 +868,7 @@ fn ladder(stream: &mut Conn, gateway: &Gateway, caller: &Caller, req: &http::Req
         Ok(q) => q,
         Err(message) => return reject(stream, 400, ErrorClass::BadRequest, &message),
     };
-    match gateway.ladder(&caller.name, caller.routes.as_deref(), &query) {
+    match gateway.ladder(caller, &query) {
         Ok(answer) => reply(stream, 200, &answer),
         Err(refusal) => {
             if refusal.status == 403 {

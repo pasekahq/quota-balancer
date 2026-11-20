@@ -12,7 +12,8 @@
       "alias": "added",
       "role": "gateway",
       "difficulty": 2,
-      "client_effort": "use"
+      "client_effort": "use",
+      "logins": ["login-2"]
     }
   ]
 }

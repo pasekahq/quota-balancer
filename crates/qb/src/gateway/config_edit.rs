@@ -41,6 +41,7 @@ pub fn routes_of(routes: &[Route]) -> Vec<ConfigRoute> {
             }),
             expected_minutes: r.expected_minutes.map(i64::from),
             client_effort: r.client_effort.map(|c| c.as_str().to_owned()),
+            logins: r.logins.clone(),
         })
         .collect()
 }
@@ -88,6 +89,10 @@ pub fn render(routes: &[ConfigRoute]) -> String {
         }
         if let Some(c) = &r.client_effort {
             key(&mut out, "client_effort", c);
+        }
+        if let Some(logins) = &r.logins {
+            let names: Vec<String> = logins.iter().map(|l| basic(l)).collect();
+            let _ = writeln!(out, "logins = [{}]", names.join(", "));
         }
     }
     out
@@ -299,6 +304,7 @@ mod tests {
             chain: None,
             expected_minutes: None,
             client_effort: None,
+            logins: None,
         }
     }
 

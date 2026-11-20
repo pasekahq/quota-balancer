@@ -365,15 +365,16 @@ fn config_routes() {
                 r.vendor.is_some(),
                 r.chain.as_ref().map(Vec::len),
                 r.client_effort.as_deref(),
+                r.logins.as_ref().map(Vec::len),
             )
         })
         .collect();
     assert_eq!(
         shapes,
         [
-            (Some(1), false, None, Some("ignore")),
-            (None, true, None, None),
-            (None, false, Some(2), None)
+            (Some(1), false, None, Some("ignore"), None),
+            (None, true, None, None, Some(2)),
+            (None, false, Some(2), None, None)
         ]
     );
     let caps: Vec<_> = read.spend_caps.into_iter().collect();
@@ -383,6 +384,7 @@ fn config_routes() {
     let chain = routes[0].chain.clone().unwrap();
     assert_eq!(chain[1].effort.as_deref(), Some("low"));
     assert_eq!(routes[1].client_effort.as_deref(), Some("use"));
+    assert_eq!(routes[1].logins, Some(vec!["login-2".into()]));
     assert_eq!(put.spend_caps, None);
     let put: ConfigRoutesPut = roundtrip("gateway_config_spend_caps_put.json");
     assert_eq!(put.routes, None);
@@ -732,6 +734,11 @@ fn typed_enums() -> Vec<(String, Vec<String>)> {
         (
             schema("Health/properties/status"),
             names(&every!(HealthStatus: Ok)),
+        ),
+        // A string of `ConfigRoute`, whose values the gateway's config parser judges.
+        (
+            schema("ConfigRoute/properties/client_effort"),
+            vec!["use".into(), "ignore".into()],
         ),
     ]
 }

@@ -30,6 +30,7 @@ use super::config::{
     Api, ClientEffort, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route,
 };
 use super::creds::{CredentialStore, Kind, Refresher, Written};
+use super::front::Caller;
 use super::signin::SignIn;
 use super::spend::{self, Ledger};
 use super::tokens::{self, ClientTokens};
@@ -1608,7 +1609,8 @@ impl Gateway {
 
     /// Each route alias, sorted, with the state of the logins it can run on in qbd's
     /// `GET /v1/state`: this gateway's logins of the pinned vendor, of each step's vendor of a
-    /// chain route, or every login of this gateway for a ladder route.
+    /// chain route, or every login of this gateway for a ladder route, each within the route's
+    /// `logins` when it has them.
     pub fn routes(&self) -> RoutesAnswer {
         let config = self.config();
         let state = self.state();
@@ -1628,11 +1630,11 @@ impl Gateway {
                 };
                 if r.chain.is_empty() {
                     (status.state, status.resets_at) =
-                        standing(&config, state, r.vendor.as_deref());
+                        standing(&config, state, r.vendor.as_deref(), r.logins.as_deref());
                     return status;
                 }
                 for step in &r.chain {
-                    match standing(&config, state, Some(&step.vendor)) {
+                    match standing(&config, state, Some(&step.vendor), r.logins.as_deref()) {
                         (RouteState::Ready, _) => {
                             status.state = RouteState::Ready;
                             status.vendor = Some(step.vendor.clone());
@@ -1674,34 +1676,33 @@ impl Gateway {
         read.inspect_err(|e| log::warn(&format!("gateway: {e}")))
     }
 
-    /// The ladder `query` names for `caller`, which may use the route aliases `allowed` or, with
-    /// `None`, every route: the steps of `qbd`'s running role that its ladder routes name, each
-    /// candidate with the state of this gateway's logins of its vendor in `qbd`'s `GET /v1/state`.
-    /// Takes no lease.
+    /// The ladder `query` names for `caller`: the steps of `qbd`'s running role that its ladder
+    /// routes name, each candidate with the state of this gateway's logins of its vendor in
+    /// `qbd`'s `GET /v1/state`, within the logins of the queried route or, for a role, the union
+    /// of the logins of the step's routes, a route without `logins` adding every login. Takes no
+    /// lease.
     ///
     /// # Errors
-    /// 403 a route outside `allowed` or a role none of `allowed` names, before `qbd` is asked;
-    /// 400 a pin or chain route; 404 an unknown route, a role no ladder route names, a role `qbd`
-    /// does not run or a route's step it lacks; 503 `qbd` cannot be read.
-    pub fn ladder(
+    /// 403 a route `caller` may not run or a role none of its routes names, before `qbd` is
+    /// asked; 400 a pin or chain route; 404 an unknown route, a role no ladder route names, a
+    /// role `qbd` does not run or a route's step it lacks; 503 `qbd` cannot be read.
+    pub(super) fn ladder(
         &self,
-        caller: &str,
-        allowed: Option<&[String]>,
+        caller: &Caller,
         query: &LadderQuery,
     ) -> Result<LadderAnswer, Refusal> {
         let config = self.config();
-        let may = |alias: &str| allowed.is_none_or(|a| a.iter().any(|r| r == alias));
         let forbid = |what: String| {
             Refusal::new(
                 403,
                 ErrorClass::Auth,
-                format!("client `{caller}` may not use {what}"),
+                format!("client `{}` may not use {what}", caller.name),
             )
         };
         let missing = |message: String| Refusal::new(404, ErrorClass::BadRequest, message);
         let (role, only) = match query {
             LadderQuery::Route(alias) => {
-                if !may(alias) {
+                if !caller.may_run(alias) {
                     return Err(forbid(format!("route `{alias}`")));
                 }
                 let route = config
@@ -1711,7 +1712,7 @@ impl Gateway {
                     let message = format!("route `{alias}` pins its models and has no ladder step");
                     return Err(Refusal::new(400, ErrorClass::BadRequest, message));
                 };
-                (route.role.as_str(), Some(difficulty))
+                (route.role.as_str(), Some((difficulty, route)))
             }
             LadderQuery::Role(role) => {
                 let mut named = config
@@ -1722,7 +1723,7 @@ impl Gateway {
                 if named.peek().is_none() {
                     return Err(missing(format!("no ladder route names role `{role}`")));
                 }
-                if !named.any(|r| may(&r.alias)) {
+                if !named.any(|r| caller.may_run(&r.alias)) {
                     return Err(forbid(format!("a route of role `{role}`")));
                 }
                 (role.as_str(), None)
@@ -1737,25 +1738,29 @@ impl Gateway {
         let mut steps: Vec<LadderStepState> = spec
             .ladder
             .into_iter()
-            .filter(|s| only.is_none_or(|d| d == s.difficulty))
+            .filter(|s| only.is_none_or(|(d, _)| d == s.difficulty))
             .filter_map(|s| {
-                let routes: Vec<String> = config
+                let named: Vec<&Route> = config
                     .routes
                     .iter()
                     .filter(|r| r.role == role && r.difficulty == Some(s.difficulty))
-                    .filter(|r| may(&r.alias))
-                    .map(|r| r.alias.clone())
+                    .filter(|r| caller.may_run(&r.alias))
                     .collect();
-                if routes.is_empty() {
+                if named.is_empty() {
                     return None;
                 }
+                let listed = match only {
+                    Some((_, route)) => route.logins.clone(),
+                    None => union(&named),
+                };
                 let candidates = s
                     .candidates
                     .into_iter()
                     .map(|c| {
-                        let (state, resets_at) = standing(&config, &logins, Some(&c.vendor));
+                        let (state, resets_at) =
+                            standing(&config, &logins, Some(&c.vendor), listed.as_deref());
                         LadderCandidateState {
-                            api: family(&config, &logins, &c.vendor),
+                            api: family(&config, &logins, &c.vendor, listed.as_deref()),
                             vendor: c.vendor,
                             model: c.model,
                             effort: c.effort,
@@ -1767,13 +1772,13 @@ impl Gateway {
                     .collect();
                 Some(LadderStepState {
                     difficulty: s.difficulty,
-                    routes,
+                    routes: named.iter().map(|r| r.alias.clone()).collect(),
                     candidates,
                 })
             })
             .collect();
         steps.sort_by_key(|s| s.difficulty);
-        if let (Some(difficulty), true) = (only, steps.is_empty()) {
+        if let (Some((difficulty, _)), true) = (only, steps.is_empty()) {
             let message = format!("qbd's role `{role}` has no step of difficulty {difficulty}");
             return Err(missing(message));
         }
@@ -1803,7 +1808,7 @@ impl Gateway {
             expected_minutes: route.expected_minutes,
             run_id: Some(session.unwrap_or(&req.request_id).clone()),
             on_behalf_of: Some(turn.client.clone()),
-            logins: None,
+            logins: route.logins.clone(),
         };
         let p = self.pick_once(&pick)?;
         if p.decision != Decision::Wait || pick.resume_of.is_none() {
@@ -1938,18 +1943,33 @@ fn replace_credential(
     Ok(backup)
 }
 
-/// The state of the logins of `config` of `vendor`, or of all of them, in `state`: `ready` when
-/// one is usable, else `exhausted` with the nearest reset when one waits, else `unavailable`. A
-/// login with a full window waits for its reset, as qbd does not pick it before.
+/// The union of the `logins` of `routes`; `None`, every login, when one of them has none.
+fn union(routes: &[&Route]) -> Option<Vec<String>> {
+    let mut names = BTreeSet::new();
+    for r in routes {
+        names.extend(r.logins.as_ref()?.iter().cloned());
+    }
+    Some(names.into_iter().collect())
+}
+
+/// Whether `login` is one of `config`'s logins and of `listed`, if given.
+fn ours(config: &GatewayConfig, listed: Option<&[String]>, login: &str) -> bool {
+    config.login(login).is_some() && listed.is_none_or(|names| names.iter().any(|n| n == login))
+}
+
+/// The state of the logins of `config` of `vendor`, or of all of them, within `listed`, if
+/// given, in `state`: `ready` when one is usable, else `exhausted` with the nearest reset when
+/// one waits, else `unavailable`. A login with a full window waits for its reset, as qbd does not
+/// pick it before.
 fn standing(
     config: &GatewayConfig,
     state: &State,
     vendor: Option<&str>,
+    listed: Option<&[String]>,
 ) -> (RouteState, Option<u64>) {
     let mut standing = (RouteState::Unavailable, None);
     for l in &state.logins {
-        let ours = config.login(&l.login).is_some() && vendor.is_none_or(|v| v == l.vendor);
-        if !ours {
+        if !ours(config, listed, &l.login) || vendor.is_some_and(|v| v != l.vendor) {
             continue;
         }
         let full = l
@@ -1974,13 +1994,20 @@ fn standing(
     standing
 }
 
-/// The API family of the first login of `config` that `state` puts on `vendor`.
-fn family(config: &GatewayConfig, state: &State, vendor: &str) -> Option<ApiFamily> {
+/// The API family of the first login of `config` within `listed`, if given, that `state` puts on
+/// `vendor`.
+fn family(
+    config: &GatewayConfig,
+    state: &State,
+    vendor: &str,
+    listed: Option<&[String]>,
+) -> Option<ApiFamily> {
     let login = config.logins.iter().find(|g| {
-        state
-            .logins
-            .iter()
-            .any(|l| l.login == g.name && l.vendor == vendor)
+        ours(config, listed, &g.name)
+            && state
+                .logins
+                .iter()
+                .any(|l| l.login == g.name && l.vendor == vendor)
     })?;
     Some(match login.api {
         Api::Anthropic => ApiFamily::Anthropic,
