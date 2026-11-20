@@ -64,8 +64,12 @@ pub enum Effort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
-    /// The gateway places cache breakpoints for the picked vendor.
+    /// The gateway places cache breakpoints for the picked vendor, with its default lifetime.
     Auto,
+    /// As `auto`, with the vendor's one-hour lifetime where it has one (Anthropic's
+    /// `ttl: 1h`); a vendor without one treats it as `auto`.
+    #[serde(rename = "auto_1h")]
+    Auto1h,
 }
 
 /// Author of a message; tool results travel in `user` messages.

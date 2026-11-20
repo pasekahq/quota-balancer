@@ -259,8 +259,12 @@ pub fn build(
         cache_control: None,
         metadata: None,
     };
-    if req.cache == Some(CacheMode::Auto) {
-        place_cache_breakpoints(&mut body);
+    match req.cache {
+        Some(CacheMode::Auto) => place_cache_breakpoints(&mut body, &CacheControl::ephemeral()),
+        Some(CacheMode::Auto1h) => {
+            place_cache_breakpoints(&mut body, &CacheControl::ephemeral_1h());
+        }
+        None => {}
     }
     Ok(body)
 }
@@ -477,34 +481,36 @@ pub fn thinking_to_opaque(block: &ContentBlock) -> String {
 ///    the client rewrites the newest message.
 ///
 /// A breakpoint goes on the last block of a message that can carry one; thinking blocks cannot.
-pub fn place_cache_breakpoints(body: &mut CreateMessage) {
+/// Every breakpoint gets `mark`, so all of them share one lifetime and the vendor's rule that a
+/// longer lifetime comes before a shorter one always holds.
+pub fn place_cache_breakpoints(body: &mut CreateMessage, mark: &CacheControl) {
     let mut marked_prefix = false;
     if let Some(System::Blocks(blocks)) = &mut body.system {
         if let Some(last) = blocks.last_mut() {
-            last.cache_control = Some(CacheControl::ephemeral());
+            last.cache_control = Some(mark.clone());
             marked_prefix = true;
         }
     }
     if !marked_prefix {
         if let Some(last) = body.tools.last_mut() {
-            last.cache_control = Some(CacheControl::ephemeral());
+            last.cache_control = Some(mark.clone());
         }
     }
     let n = body.messages.len();
     if n == 0 {
         return;
     }
-    mark_message(&mut body.messages[n - 1]);
+    mark_message(&mut body.messages[n - 1], mark);
     if let Some(prev) = body.messages[..n - 1]
         .iter_mut()
         .rev()
         .find(|m| m.role == "user")
     {
-        mark_message(prev);
+        mark_message(prev, mark);
     }
 }
 
-fn mark_message(m: &mut MessageParam) {
+fn mark_message(m: &mut MessageParam, mark: &CacheControl) {
     if let Content::Text(text) = &mut m.content {
         m.content = Content::Blocks(vec![ContentBlock::Text {
             text: std::mem::take(text),
@@ -534,7 +540,7 @@ fn mark_message(m: &mut MessageParam) {
         else {
             continue;
         };
-        *slot = Some(CacheControl::ephemeral());
+        *slot = Some(mark.clone());
         return;
     }
 }

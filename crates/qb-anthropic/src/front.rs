@@ -63,7 +63,8 @@ fn bad(message: impl Into<String>) -> GatewayError {
 /// Mid-conversation `system` messages stay in place as canonical system messages; tool changes
 /// by reference in them are dropped and `tool_reference` blocks become text, since every tool
 /// goes upstream loaded.
-/// `cache` is `auto` when the request sets `cache_control` on a block, a tool or the request. Sampling parameters,
+/// `cache` is `auto` when the request sets `cache_control` on a block, a tool or the request, and
+/// `auto_1h` when one of those breakpoints asks for `ttl: 1h`. Sampling parameters,
 /// `tool_choice`, `stop_sequences` and thinking budgets are ignored.
 ///
 /// # Errors
@@ -78,7 +79,7 @@ pub fn decode_request(
 ) -> Result<FrontRequest, GatewayError> {
     let raw: Value =
         serde_json::from_slice(body).map_err(|e| bad(format!("body is not JSON: {e}")))?;
-    let cache = has_cache_control(&raw).then_some(CacheMode::Auto);
+    let cache = cache_mode(&raw);
     let req: CreateMessage = serde_json::from_value(raw)
         .map_err(|e| bad(format!("body is not a Messages request: {e}")))?;
     let route = route_of(&req.model).ok_or_else(|| {
@@ -211,24 +212,39 @@ fn canonical_messages(
     Ok(messages)
 }
 
-/// Whether the request sets `cache_control` where the vendor reads it: at the top level, on a
-/// `system` block, a tool, a message content block or a block inside a tool result. Keys of the
-/// same name inside schemas or tool inputs are data, not breakpoints.
-fn has_cache_control(v: &Value) -> bool {
-    fn set(v: &Value) -> bool {
-        v.get("cache_control").is_some_and(|c| !c.is_null())
-    }
+/// The cache policy of the request's `cache_control` breakpoints, read where the vendor reads
+/// them: at the top level, on a `system` block, a tool, a message content block or a block inside
+/// a tool result. Keys of the same name inside schemas or tool inputs are data, not breakpoints.
+/// `auto_1h` when any breakpoint asks for `ttl: 1h`, `auto` for other breakpoints, none without.
+fn cache_mode(v: &Value) -> Option<CacheMode> {
     fn blocks(v: Option<&Value>) -> &[Value] {
         v.and_then(Value::as_array).map_or(&[], Vec::as_slice)
     }
-    set(v)
-        || blocks(v.get("system")).iter().any(set)
-        || blocks(v.get("tools")).iter().any(set)
-        || blocks(v.get("messages")).iter().any(|m| {
-            blocks(m.get("content"))
-                .iter()
-                .any(|b| set(b) || blocks(b.get("content")).iter().any(set))
-        })
+    let mut marks = Vec::new();
+    let mut mark = |v: &Value| {
+        if let Some(c) = v.get("cache_control").filter(|c| !c.is_null()) {
+            marks.push(c.clone());
+        }
+    };
+    mark(v);
+    blocks(v.get("system")).iter().for_each(&mut mark);
+    blocks(v.get("tools")).iter().for_each(&mut mark);
+    for m in blocks(v.get("messages")) {
+        for b in blocks(m.get("content")) {
+            mark(b);
+            blocks(b.get("content")).iter().for_each(&mut mark);
+        }
+    }
+    if marks.is_empty() {
+        None
+    } else if marks
+        .iter()
+        .any(|c| c.get("ttl").and_then(Value::as_str) == Some("1h"))
+    {
+        Some(CacheMode::Auto1h)
+    } else {
+        Some(CacheMode::Auto)
+    }
 }
 
 /// `metadata.user_id` as a session key: itself when it fits, else `qb-sk:` and 32 hex digits

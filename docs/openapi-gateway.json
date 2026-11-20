@@ -846,9 +846,10 @@
       },
       "CacheMode": {
         "type": "string",
-        "description": "Prompt cache policy; `auto` lets qb place cache breakpoints for the picked vendor.",
+        "description": "Prompt cache policy; `auto` lets qb place cache breakpoints for the picked vendor, `auto_1h` the same with the vendor's one-hour lifetime where it has one (else as `auto`).",
         "enum": [
-          "auto"
+          "auto",
+          "auto_1h"
         ]
       },
       "Role": {
