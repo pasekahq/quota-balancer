@@ -78,6 +78,56 @@
         }
       }
     },
+    "/v1/model/ladder": {
+      "get": {
+        "operationId": "ladder",
+        "summary": "The ladder steps the caller's ladder routes run on, with each candidate's vendor, API family, model, effort, tier and the state of the gateway's logins of its vendor; no pick and no lease. Exactly one of `route` and `role`: a ladder route's step of its difficulty, or every step of a role that a ladder route the caller may use names. The roles are those qbd runs (`GET /v1/roles` of qbd), the states come from qbd's `GET /v1/state`. 400 `bad_request` for neither, both or another parameter and for a pin or chain route; 404 `bad_request` for an unknown route, a role no ladder route names, a role qbd does not run or a route's step it lacks; 503 `unavailable` when qbd cannot be read. On the unix socket every caller reads every route. On the loopback listener only a named `[[fronts.clients]]` token, within its `routes`: 403 `auth` for a route outside them or a role none of them names, before qbd is asked, and for the unnamed client token; 401 `auth` without a client token. Every error is an `Error` on both listeners.",
+        "parameters": [
+          {
+            "name": "route",
+            "in": "query",
+            "required": false,
+            "description": "Alias of a ladder route; exclusive with `role`.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "required": false,
+            "description": "A qbd role that ladder routes name; exclusive with `route`.",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The steps.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LadderAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/model/cancel": {
       "post": {
         "operationId": "cancel",
@@ -1502,6 +1552,114 @@
         },
         "required": [
           "routes"
+        ]
+      },
+      "ApiFamily": {
+        "type": "string",
+        "description": "The vendor API family a login speaks.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "chat_completions"
+        ]
+      },
+      "LadderCandidateState": {
+        "type": "object",
+        "description": "A candidate of a ladder step and the state of the gateway's logins of its vendor.",
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "qbd vendor.",
+            "minLength": 1
+          },
+          "api": {
+            "$ref": "#/components/schemas/ApiFamily",
+            "description": "API family of the gateway's first login, in config order, that qbd puts on the vendor; absent when the gateway holds none."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model.",
+            "minLength": 1
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort; absent when the ladder has none."
+          },
+          "tier": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Tier; lower tiers are preferred."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RouteState",
+            "description": "`ready`, `exhausted` or `unavailable` by the rule of `GET /v1/model/routes` over the gateway's logins of the vendor."
+          },
+          "resets_at": {
+            "type": "integer",
+            "description": "Earliest end of the waits of those logins (`exhausted`): a `dead_until`, or the reset of a full window.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "vendor",
+          "model",
+          "tier",
+          "state"
+        ]
+      },
+      "LadderStepState": {
+        "type": "object",
+        "description": "A ladder step of qbd's running role.",
+        "properties": {
+          "difficulty": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Difficulty the step serves."
+          },
+          "routes": {
+            "type": "array",
+            "description": "Ladder route aliases the caller may use that name the step, sorted.",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+            }
+          },
+          "candidates": {
+            "type": "array",
+            "description": "Candidates in ladder order.",
+            "items": {
+              "$ref": "#/components/schemas/LadderCandidateState"
+            }
+          }
+        },
+        "required": [
+          "difficulty",
+          "routes",
+          "candidates"
+        ]
+      },
+      "LadderAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/ladder`.",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The qbd role.",
+            "minLength": 1
+          },
+          "steps": {
+            "type": "array",
+            "description": "Steps by difficulty.",
+            "items": {
+              "$ref": "#/components/schemas/LadderStepState"
+            }
+          }
+        },
+        "required": [
+          "role",
+          "steps"
         ]
       },
       "CancelRequest": {

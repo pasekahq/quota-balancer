@@ -1,12 +1,12 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
-//! `/v1/model/routes`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
+//! `/v1/model/routes`, `/v1/model/ladder`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
 //! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
 //! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`,
 //! `/v1/model/logins/{name}/oauth/start`, `/v1/model/logins/{name}/oauth/code`, `/v1/health`
 //! and `qbd`'s `/v1/admin/roles` and `/v1/admin/reload` ([`super::admin`]), and the HTTP fronts:
 //! `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
 //! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to clients
-//! with a client token.
+//! with a client token, and `/v1/model/ladder` to a named one.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
 //! peer takes one of these slots only once its head showed a client token, and before that one
 //! of [`LOOPBACK_UNCHECKED`] slots of its own, for at most [`LOOPBACK_HEAD_DEADLINE`]. On the C4
@@ -37,7 +37,7 @@ use zeroize::Zeroizing;
 
 use super::answer::Keepalive;
 use super::config::{Fronts, TOKEN_CALLER};
-use super::core::{Cancel, Gateway, edit_action};
+use super::core::{Cancel, Gateway, LadderQuery, edit_action};
 use super::tokens::ClientTokens;
 use super::upstream::{CancelToken, Flow};
 use super::usage::{self, AggregateError};
@@ -553,6 +553,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             Dialect::of(path).reject(&mut stream, 405, &e);
         }
         (Method::Get, paths::MODEL_ROUTES) => reply(&mut stream, 200, &gateway.routes()),
+        (Method::Get, paths::MODEL_LADDER) => ladder(&mut stream, gateway, &caller, &req),
         (Method::Post, paths::MODEL_RELOAD) => {
             reload(&mut stream, gateway, &audit::uid_actor(uid), uid == own_uid);
         }
@@ -575,6 +576,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             _,
             paths::MODEL_TURN
             | paths::MODEL_ROUTES
+            | paths::MODEL_LADDER
             | paths::MODEL_CANCEL
             | paths::MODEL_RELOAD
             | paths::MODEL_SPEND
@@ -860,6 +862,42 @@ fn spend_reset(stream: &mut Conn, gateway: &Gateway, body: &[u8], actor: &str, o
     }
 }
 
+/// Answers `GET /v1/model/ladder` of `caller` with the query string of `req`.
+fn ladder(stream: &mut Conn, gateway: &Gateway, caller: &Caller, req: &http::Request) {
+    let query = match LadderQuery::parse(req.query.as_deref()) {
+        Ok(q) => q,
+        Err(message) => return reject(stream, 400, ErrorClass::BadRequest, &message),
+    };
+    match gateway.ladder(&caller.name, caller.routes.as_deref(), &query) {
+        Ok(answer) => reply(stream, 200, &answer),
+        Err(refusal) => {
+            if refusal.status == 403 {
+                log::warn(&format!(
+                    "gateway: refused client `{}` the ladder: {}",
+                    caller.name,
+                    log::peer_text(&refusal.message)
+                ));
+            }
+            reject(stream, refusal.status, refusal.class, &refusal.message);
+        }
+    }
+}
+
+/// Answers a loopback request to `/v1/model/ladder`: only `GET` of a named client.
+fn loopback_ladder(stream: &mut Conn, gateway: &Gateway, caller: &Caller, req: &http::Request) {
+    // The config refuses `TOKEN_CALLER` as the name of a named client.
+    if caller.name == TOKEN_CALLER {
+        let message = "the unnamed client token may not read the ladder; a `[[fronts.clients]]` \
+                       token may";
+        log::warn("gateway: loopback refused the unnamed client token the ladder");
+        return reject(stream, 403, ErrorClass::Auth, message);
+    }
+    if req.method != Method::Get {
+        return reject(stream, 405, ErrorClass::BadRequest, "method not allowed");
+    }
+    ladder(stream, gateway, caller, req);
+}
+
 /// Answers `GET /v1/model/audit` with the query string `query`, which only the gateway's `own`
 /// uid may send.
 fn read_audit(stream: &mut Conn, gateway: &Gateway, query: Option<&str>, own: bool) {
@@ -999,9 +1037,10 @@ fn refuse_head(refusal: &Cell<Option<Refusal>>, why: Refusal, head: &Head<'_>) {
     ));
 }
 
-/// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] with a client
-/// token of `[fronts]` in `x-api-key` or `Authorization: Bearer`, checked before the body is read;
-/// the turn runs as that token's caller. Every answer is in the OpenAI format for the OpenAI
+/// Serves one connection of the loopback listener: `POST` to one of [`HTTP_FRONTS`] or a request
+/// to `/v1/model/ladder` without a body, with a client token of `[fronts]` in `x-api-key` or
+/// `Authorization: Bearer`, checked before the body is read; the turn runs as that token's caller.
+/// Every answer is a [`GatewayError`] for the ladder, in the OpenAI format for the OpenAI
 /// endpoints, else in the Messages format.
 ///
 /// The connection holds `unchecked` until its head is read, which must happen within
@@ -1021,7 +1060,7 @@ fn serve_loopback(
     let fronts = config.fronts.as_ref();
     let tokens = gateway.client_tokens();
     let now = unix_now();
-    let max_turn = config.max_request_bytes as usize;
+    let limit = Cell::new(config.max_request_bytes as usize);
     let refusal = Cell::new(None);
     let dialect = Cell::new(Dialect::Messages);
     let started = Instant::now();
@@ -1031,8 +1070,9 @@ fn serve_loopback(
     let matched = Cell::new(None);
     let check = |head: &Head<'_>| {
         drop(unchecked.take());
-        if let Dialect::Openai = Dialect::of(head.path) {
-            dialect.set(Dialect::Openai);
+        let ladder = head.path == paths::MODEL_LADDER;
+        if ladder || matches!(Dialect::of(head.path), Dialect::Openai) {
+            dialect.set(Dialect::of(head.path));
         }
         let mut presented = [head.api_key, head.bearer].into_iter().flatten();
         let caller = fronts.and_then(|f| presented.find_map(|t| token_caller(f, &tokens, t, now)));
@@ -1040,7 +1080,7 @@ fn serve_loopback(
             refuse_head(&refusal, Refusal::Token, head);
             return None;
         };
-        if head.method != Method::Post || !HTTP_FRONTS.contains(&head.path) {
+        if !ladder && (head.method != Method::Post || !HTTP_FRONTS.contains(&head.path)) {
             refuse_head(&refusal, Refusal::Path, head);
             return None;
         }
@@ -1051,7 +1091,10 @@ fn serve_loopback(
         slot.set(Some(held));
         matched.set(Some(caller));
         until.set(started + READ_DEADLINE);
-        Some(max_turn)
+        if ladder {
+            limit.set(0);
+        }
+        Some(limit.get())
     };
     let read = read_until(&stream, &until, &check);
     drop(unchecked.take());
@@ -1061,14 +1104,23 @@ fn serve_loopback(
             let caller = matched
                 .take()
                 .expect("`check` admits a head with its caller");
+            if req.path == paths::MODEL_LADDER {
+                return loopback_ladder(&mut stream, gateway, &caller, &req);
+            }
             return front_turn(stream, gateway, watch, &caller, req);
         }
         (Err(ReadError::Refused { .. }), Some(refusal)) => refusal,
-        (Err(e), _) => return unreadable(&mut stream, &e, max_turn, dialect.get()),
+        (Err(e), _) => return unreadable(&mut stream, &e, limit.get(), dialect.get()),
     };
-    let served = "this listener serves only `POST /v1/messages`, `POST /v1/chat/completions` \
-                  and `POST /v1/responses`";
+    let served = "this listener serves only `POST /v1/messages`, `POST /v1/chat/completions`, \
+                  `POST /v1/responses` and `GET /v1/model/ladder`";
     match (refused, dialect.get()) {
+        (Refusal::Token, Dialect::C4) => reject(
+            &mut stream,
+            401,
+            ErrorClass::Auth,
+            "not a client token of this gateway",
+        ),
         (Refusal::Token, Dialect::Openai) => openai::refuse(
             &mut stream,
             401,

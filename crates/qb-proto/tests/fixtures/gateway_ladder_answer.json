@@ -1,0 +1,8 @@
+{"role": "worker",
+ "steps": [
+  {"difficulty": 1, "routes": ["worker-1"], "candidates": [
+   {"vendor": "vendor-a", "api": "anthropic", "model": "model-small", "tier": 1, "state": "ready"},
+   {"vendor": "vendor-b", "api": "chat_completions", "model": "model-medium", "effort": "low", "tier": 2,
+    "state": "exhausted", "resets_at": 1800018000}]},
+  {"difficulty": 2, "routes": ["worker-2", "worker-2-alt"], "candidates": [
+   {"vendor": "vendor-c", "model": "model-large", "effort": "high", "tier": 1, "state": "unavailable"}]}]}

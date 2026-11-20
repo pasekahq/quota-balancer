@@ -88,9 +88,10 @@ Secrets:
 
 ### `qbd` stays as it is
 
-`qbd` keeps its contract, sandbox and budgets: no secrets, no network, no new endpoint. The
+`qbd` keeps its contract, sandbox and budgets: no secrets, no network. The
 gateway is an ordinary client of `qbd`'s socket with a `[[clients]]` entry (by uid, or by
-bearer on a forwarded socket) and uses `POST /v1/pick`, `POST /v1/report` and `GET /v1/state`.
+bearer on a forwarded socket) and uses `POST /v1/pick`, `POST /v1/report`, `GET /v1/state` and
+`GET /v1/roles`.
 The logins it holds are `qbd` `[[logins]]` under the same names, so the windows it observes reach
 `qbd` the way stream reports from any client do. When `qbd` is unreachable the turn fails with
 a retryable error: the gateway has no policy of its own and never calls a vendor without a
@@ -107,6 +108,8 @@ A route alias is a name in the gateway config mapped to one `qbd` pick target:
 
 The alias table lives in the gateway config; ladders and reserves stay in `qbd`'s config.
 `GET /v1/model/routes` lists the aliases with the state of their logins from `GET /v1/state`.
+`GET /v1/model/ladder` shows the steps of `qbd`'s running role a caller's ladder routes run on,
+with the same state per candidate vendor, without a pick.
 
 Each attempt of a turn is one `POST /v1/pick` with the route's target, `run_id` set to the
 request's `session_key` or else its `request_id`, `resume_of` set to the `session_key` when the

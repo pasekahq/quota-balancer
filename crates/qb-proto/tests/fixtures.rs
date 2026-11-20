@@ -3,7 +3,8 @@
 use qb_proto::{
     AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, AgentJob, AgentNextRequest,
     AgentResultRequest, Decision, ErrorBody, HealthResponse, Outcome, PickRequest, PickResponse,
-    ProbeOutcome, ReportRequest, ReportResponse, RolesSource, StateResponse, WhyResponse,
+    ProbeOutcome, ReportRequest, ReportResponse, RolesResponse, RolesSource, StateResponse,
+    WhyResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -99,6 +100,13 @@ fn admin_roles_and_reload() {
     assert_eq!(inline.source, RolesSource::Config);
     let reloaded: AdminReloadAnswer = roundtrip("admin_reload_answer.json");
     assert_eq!((reloaded.roles, reloaded.clients), (2, 3));
+}
+
+#[test]
+fn running_roles_take_the_admin_roles_shape() {
+    let running: RolesResponse = roundtrip("roles_response.json");
+    let file: AdminRoles = roundtrip("admin_roles_file.json");
+    assert_eq!(running.roles[0], file.roles[0]);
 }
 
 #[test]

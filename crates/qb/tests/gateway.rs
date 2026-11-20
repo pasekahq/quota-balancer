@@ -10016,9 +10016,21 @@ fn admin_rig(
     gateway_uid: u32,
     loopback: Option<TcpListener>,
 ) -> AdminRig {
+    let roles = (ADMIN_ROLES, admin_key);
+    admin_rig_with(&key_files(), roles, extra, gateway_uid, loopback)
+}
+
+/// [`admin_rig`] with the credential files `files` and the qbd roles file and admin key `qbd`.
+fn admin_rig_with(
+    files: &[(&str, String, u32)],
+    (roles_text, admin_key): (&str, &str),
+    extra: &str,
+    gateway_uid: u32,
+    loopback: Option<TcpListener>,
+) -> AdminRig {
     let dir = temp_dir("gwadmin");
     let roles = dir.join("roles.toml");
-    std::fs::write(&roles, ADMIN_ROLES).unwrap();
+    std::fs::write(&roles, roles_text).unwrap();
     let config = dir.join("qbd.toml");
     let text = format!(
         "roles_file = \"{roles}\"\n\
@@ -10039,7 +10051,7 @@ fn admin_rig(
     let exe = Path::new(env!("CARGO_BIN_EXE_qb"));
     let mut qbd = start_daemon(exe, &config, &sock, Stdio::piped());
     let lines = stderr_lines(&mut qbd.0);
-    let r = rig_at(dir, sock, 4, &key_files(), extra, gateway_uid, loopback);
+    let r = rig_at(dir, sock, 4, files, extra, gateway_uid, loopback);
     AdminRig {
         r,
         roles,
@@ -10301,4 +10313,155 @@ fn an_unreachable_qbd_is_503_unavailable_and_a_refused_reload_line() {
             Some(message.as_str())
         )
     );
+}
+
+/// The qbd roles file of the ladder tests: role `gateway` with its steps out of order, vendor-a
+/// candidates without effort, vendor-b ones with.
+const LADDER_ROLES: &str = r#"[[roles]]
+name = "gateway"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [
+  { vendor = "vendor-a", model = "model-small", tier = 1 },
+  { vendor = "vendor-b", model = "model-b", effort = "low", tier = 2 },
+]
+
+[[roles.ladder]]
+difficulty = 3
+candidates = [{ vendor = "vendor-a", model = "model-large", tier = 1 }]
+
+[[roles.ladder]]
+difficulty = 2
+candidates = [{ vendor = "vendor-b", model = "model-medium", effort = "high", tier = 1 }]
+"#;
+
+/// Ladder routes of the role `gateway` besides `chat` at difficulty 1.
+const LADDER_ROUTES: &str = "[[routes]]\nalias = \"chat-b\"\nrole = \"gateway\"\ndifficulty = 1\n\
+                             [[routes]]\nalias = \"deep\"\nrole = \"gateway\"\ndifficulty = 2\n\
+                             [[routes]]\nalias = \"hard\"\nrole = \"gateway\"\ndifficulty = 3\n";
+
+/// `GET /v1/model/ladder?{query}` on the loopback listener `addr` with `token`: status and body.
+fn loopback_ladder(addr: SocketAddr, query: &str, token: &str) -> (u16, Value) {
+    let auth = format!("X-Api-Key: {token}\r\n");
+    let path = format!("{}?{query}", paths::MODEL_LADDER);
+    let (status, _, body) = finish(tcp_send(addr, "GET", &path, &auth, ""), Vec::new());
+    let body = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&body)));
+    (status, body)
+}
+
+/// A gateway with [`LADDER_ROUTES`] on a qbd binary of [`LADDER_ROLES`]: login-1 an Anthropic
+/// key on vendor-a, login-2 a ChatGPT login on vendor-b that qbd holds exhausted until the
+/// returned time, and on the returned loopback address `client-a` limited to the route `deep`.
+fn ladder_rig() -> (AdminRig, SocketAddr, u64) {
+    let client = front_client("client-a", CLIENT_A.1, "routes = [\"deep\"]\n");
+    let (listener, addr, front) = loopback_front(&client);
+    let files = [
+        ("login-1", api_key("test-token-1"), 0o600),
+        ("login-2", chatgpt("test-token-2", "test-account-2"), 0o600),
+    ];
+    let extra = format!("{LADDER_ROUTES}{front}");
+    let roles = (LADDER_ROLES, "");
+    let a = admin_rig_with(&files, roles, &extra, own_uid(), Some(listener));
+    let resets = unix_now() + 3600;
+    exhaust(&a.r.qbd, "login-2", resets);
+    (a, addr, resets)
+}
+
+/// Step `difficulty` of the answers of [`ladder_rig`], whose vendor-b waits until `resets`.
+fn ladder_step(difficulty: u8, resets: u64) -> Value {
+    let a = |model: &str| {
+        json!({"vendor": "vendor-a", "api": "anthropic", "model": model, "tier": 1,
+               "state": "ready"})
+    };
+    let b = |model: &str, effort: &str, tier: u8| {
+        json!({"vendor": "vendor-b", "api": "openai", "model": model, "effort": effort,
+               "tier": tier, "state": "exhausted", "resets_at": resets})
+    };
+    let (routes, candidates) = match difficulty {
+        1 => (
+            json!(["chat", "chat-b"]),
+            json!([a("model-small"), b("model-b", "low", 2)]),
+        ),
+        2 => (json!(["deep"]), json!([b("model-medium", "high", 1)])),
+        _ => (json!(["hard"]), json!([a("model-large")])),
+    };
+    json!({"difficulty": difficulty, "routes": routes, "candidates": candidates})
+}
+
+#[test]
+fn the_ladder_shows_its_steps_candidates_and_login_states_without_a_lease() {
+    let (a, _, resets) = ladder_rig();
+    let ladder = |query: &str| {
+        let path = format!("{}?{query}", paths::MODEL_LADDER);
+        let (status, body) = call(&a.r.gw, "GET", &path, "");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, 200, "{query}: {body}");
+        body
+    };
+    let steps: Vec<Value> = (1..=3).map(|d| ladder_step(d, resets)).collect();
+    assert_eq!(
+        ladder("role=gateway"),
+        json!({"role": "gateway", "steps": steps})
+    );
+    assert_eq!(
+        ladder("route=chat-b"),
+        json!({"role": "gateway", "steps": [ladder_step(1, resets)]})
+    );
+
+    let one = "exactly one of `route` and `role`";
+    for (query, status, says) in [
+        ("route=spare", 400, "route `spare` pins its models"),
+        ("route=nowhere", 404, "no route `nowhere`"),
+        ("role=nobody", 404, "no ladder route names role `nobody`"),
+        ("route=chat&role=gateway", 400, one),
+        ("", 400, one),
+        ("model=chat", 400, "unknown parameter `model`"),
+    ] {
+        let path = format!("{}?{query}", paths::MODEL_LADDER);
+        let (got, e) = rejection(&a.r.gw, "GET", &path, "");
+        let message = e.message.unwrap();
+        let class = (got, e.class);
+        assert_eq!(
+            class,
+            (status, ErrorClass::BadRequest),
+            "{query}: {message}"
+        );
+        assert!(message.contains(says), "{query}: {message}");
+    }
+    assert_eq!(state(&a.r.qbd).leases, [], "no read took a lease");
+    assert_eq!(a.r.fake.calls().len(), 0);
+}
+
+#[test]
+fn a_named_loopback_client_reads_only_the_ladder_of_its_routes() {
+    let (a, addr, resets) = ladder_rig();
+    let only_deep = json!({"role": "gateway", "steps": [ladder_step(2, resets)]});
+    for query in ["route=deep", "role=gateway"] {
+        let answer = loopback_ladder(addr, query, CLIENT_A.0);
+        assert_eq!(answer, (200, only_deep.clone()), "{query}");
+    }
+    let unnamed = "the unnamed client token may not read the ladder";
+    for (query, token, says) in [
+        (
+            "route=chat",
+            CLIENT_A.0,
+            "client `client-a` may not use route `chat`",
+        ),
+        ("route=deep", CLIENT_TOKEN, unnamed),
+    ] {
+        let (status, body) = loopback_ladder(addr, query, token);
+        let e: GatewayError = serde_json::from_value(body).unwrap();
+        assert_eq!((status, e.class), (403, ErrorClass::Auth), "{e:?}");
+        assert!(e.message.unwrap().contains(says), "{query}");
+    }
+    let (status, body) = loopback_ladder(addr, "route=deep", "not-a-token");
+    let e: GatewayError = serde_json::from_value(body).unwrap();
+    assert_eq!((status, e.class), (401, ErrorClass::Auth));
+    let auth = format!("X-Api-Key: {}\r\n", CLIENT_A.0);
+    let routes = tcp_send(addr, "GET", paths::MODEL_ROUTES, &auth, "");
+    let status = finish(routes, Vec::new()).0;
+    assert_eq!(status, 404, "the listener serves no other path");
+    assert_eq!(state(&a.r.qbd).leases, [], "no read took a lease");
 }

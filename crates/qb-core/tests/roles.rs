@@ -99,3 +99,24 @@ fn refused_roles_change_nothing() {
     assert_eq!(ran(&pick(&mut c, "worker", 1, None)).1, "y");
     assert_eq!(ran(&pick(&mut c, "old", 1, None)).1, "x");
 }
+
+#[test]
+fn the_running_roles_read_back_as_last_given() {
+    let mut c = running();
+    let names: Vec<&str> = c.roles().iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["old", "worker"]);
+    let worker = role(
+        "worker",
+        vec![step(1, vec![cand("vendor-b", "b", 1)])],
+        vec![],
+    );
+    c.set_roles(vec![worker.clone()]).expect("valid roles");
+    assert_eq!(c.roles(), std::slice::from_ref(&worker));
+    let stray = role(
+        "worker",
+        vec![step(1, vec![cand("vendor-z", "b", 1)])],
+        vec![],
+    );
+    assert!(c.set_roles(vec![stray]).is_err());
+    assert_eq!(c.roles(), [worker], "a refused replacement keeps the roles");
+}

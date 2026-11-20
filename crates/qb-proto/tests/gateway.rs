@@ -4,13 +4,13 @@
 #![allow(clippy::unwrap_used)]
 
 use qb_proto::{
-    AuditAction, AuditAnswer, AuditResult, Block, CacheMode, CancelAnswer, CancelRequest,
-    ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Effort, Elsewhere,
-    ErrorClass, GatewayError, HealthStatus, LoginKey, LoginKeyAnswer, LoginOauthCode,
-    LoginOauthSigned, LoginOauthStarted, MediaType, Message, NativeApi, OauthPaste, Object,
-    Outcome, ReloadAnswer, Role, RolesSource, RouteInfo, RouteState, RoutesAnswer, SpendAnswer,
-    SpendReset, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer,
-    UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
+    ApiFamily, AuditAction, AuditAnswer, AuditResult, Block, CacheMode, CancelAnswer,
+    CancelRequest, ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Effort,
+    Elsewhere, ErrorClass, GatewayError, HealthStatus, LadderAnswer, LoginKey, LoginKeyAnswer,
+    LoginOauthCode, LoginOauthSigned, LoginOauthStarted, MediaType, Message, NativeApi, OauthPaste,
+    Object, Outcome, ReloadAnswer, Role, RolesSource, RouteInfo, RouteState, RoutesAnswer,
+    SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
+    UsageAnswer, UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -140,6 +140,17 @@ fn errors_routes_cancel() {
     assert_eq!(body.class, ErrorClass::BadRequest);
     let routes: RoutesAnswer = roundtrip("gateway_routes_answer.json");
     assert_eq!(routes.routes[1].state, RouteState::Exhausted);
+    let ladder: LadderAnswer = roundtrip("gateway_ladder_answer.json");
+    let first = &ladder.steps[0].candidates;
+    assert_eq!(
+        (first[1].api, first[1].state, first[1].resets_at),
+        (
+            Some(ApiFamily::ChatCompletions),
+            RouteState::Exhausted,
+            Some(1_800_018_000)
+        )
+    );
+    assert_eq!(ladder.steps[1].candidates[0].api, None);
     let cancel: CancelRequest = roundtrip("gateway_cancel_request.json");
     assert_eq!(cancel.request_id, "turn-0001");
     let answer: CancelAnswer = roundtrip("gateway_cancel_answer.json");
@@ -681,6 +692,10 @@ fn typed_enums() -> Vec<(String, Vec<String>)> {
         (
             schema("RouteState"),
             names(&every!(RouteState: Ready, Degraded, Exhausted, Unavailable)),
+        ),
+        (
+            schema("ApiFamily"),
+            names(&every!(ApiFamily: Anthropic, Openai, ChatCompletions)),
         ),
         (
             schema("OauthPaste"),

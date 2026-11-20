@@ -13,14 +13,16 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_proto::{
-    Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut,
-    ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LoginKey, LoginKeyAnswer,
-    LoginOauthCode, LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste,
-    Outcome, PickRequest, PickResponse, ReloadAnswer, ReportRequest, RouteInfo, RouteState,
-    RouteStatus, RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest, Usage, UsageLine,
+    ApiFamily, Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, ConfigRoutes,
+    ConfigRoutesPut, ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LadderAnswer,
+    LadderCandidateState, LadderStepState, LoginKey, LoginKeyAnswer, LoginOauthCode,
+    LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste, Outcome, PickRequest,
+    PickResponse, ReloadAnswer, ReportRequest, RolesResponse, RouteInfo, RouteState, RouteStatus,
+    RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest, Usage, UsageLine,
     WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
 };
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
 use super::Refusal;
@@ -37,7 +39,7 @@ use crate::config::{BearerHash, Error};
 use crate::rewrite::{self, Unwritten, write_atomic};
 use crate::sandbox::{file_dir, gateway_files};
 use crate::server::unix_now;
-use crate::{client, log, sha256};
+use crate::{client, http, log, sha256};
 
 /// Seconds a started sign-in takes its code.
 pub const SIGN_IN_EXPIRY_S: u64 = 600;
@@ -348,7 +350,31 @@ enum Next {
     Done(String),
 }
 
-/// The parts of qbd's `GET /v1/state` the routes answer reads; other fields are skipped.
+/// What `GET /v1/model/ladder` reads: the step of a ladder route, or the steps of a role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LadderQuery {
+    /// `route=<alias>`.
+    Route(String),
+    /// `role=<role>`.
+    Role(String),
+}
+
+impl LadderQuery {
+    /// The query string `query` of a `GET /v1/model/ladder`.
+    ///
+    /// # Errors
+    /// A message for an unknown or repeated parameter, or not exactly one of `route` and `role`.
+    pub fn parse(query: Option<&str>) -> Result<Self, String> {
+        match http::query_params(query, ["route", "role"])? {
+            [Some(route), None] => Ok(Self::Route(route.to_owned())),
+            [None, Some(role)] => Ok(Self::Role(role.to_owned())),
+            _ => Err("give exactly one of `route` and `role`".to_owned()),
+        }
+    }
+}
+
+/// The parts of qbd's `GET /v1/state` the routes and ladder answers read; other fields are
+/// skipped.
 #[derive(Deserialize)]
 struct State {
     logins: Vec<StateLogin>,
@@ -1619,23 +1645,128 @@ impl Gateway {
     }
 
     fn state(&self) -> Option<State> {
-        match client::call(
-            &self.startup.qbd_socket,
-            "GET",
-            paths::STATE,
-            None,
-            self.bearer(),
-        ) {
-            Ok((200, body)) => serde_json::from_slice(&body).ok(),
-            Ok((status, _)) => {
-                log::warn(&format!("gateway: qbd state answered HTTP {status}"));
-                None
+        self.read_qbd(paths::STATE).ok()
+    }
+
+    /// `qbd`'s answer to `GET path`; a failure is logged and its message returned.
+    fn read_qbd<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let socket = &self.startup.qbd_socket;
+        let read = match client::call(socket, "GET", path, None, self.bearer()) {
+            Ok((200, body)) => serde_json::from_slice(&body)
+                .map_err(|e| format!("qbd answered {path} with an invalid body: {e}")),
+            Ok((status, _)) => Err(format!("qbd answered {path} with HTTP {status}")),
+            Err(e) => Err(format!("qbd is unreachable for {path}: {e}")),
+        };
+        read.inspect_err(|e| log::warn(&format!("gateway: {e}")))
+    }
+
+    /// The ladder `query` names for `caller`, which may use the route aliases `allowed` or, with
+    /// `None`, every route: the steps of `qbd`'s running role that its ladder routes name, each
+    /// candidate with the state of this gateway's logins of its vendor in `qbd`'s `GET /v1/state`.
+    /// Takes no lease.
+    ///
+    /// # Errors
+    /// 403 a route outside `allowed` or a role none of `allowed` names, before `qbd` is asked;
+    /// 400 a pin or chain route; 404 an unknown route, a role no ladder route names, a role `qbd`
+    /// does not run or a route's step it lacks; 503 `qbd` cannot be read.
+    pub fn ladder(
+        &self,
+        caller: &str,
+        allowed: Option<&[String]>,
+        query: &LadderQuery,
+    ) -> Result<LadderAnswer, Refusal> {
+        let config = self.config();
+        let may = |alias: &str| allowed.is_none_or(|a| a.iter().any(|r| r == alias));
+        let forbid = |what: String| {
+            Refusal::new(
+                403,
+                ErrorClass::Auth,
+                format!("client `{caller}` may not use {what}"),
+            )
+        };
+        let missing = |message: String| Refusal::new(404, ErrorClass::BadRequest, message);
+        let (role, only) = match query {
+            LadderQuery::Route(alias) => {
+                if !may(alias) {
+                    return Err(forbid(format!("route `{alias}`")));
+                }
+                let route = config
+                    .route(alias)
+                    .ok_or_else(|| missing(format!("no route `{alias}`")))?;
+                let Some(difficulty) = route.difficulty else {
+                    let message = format!("route `{alias}` pins its models and has no ladder step");
+                    return Err(Refusal::new(400, ErrorClass::BadRequest, message));
+                };
+                (route.role.as_str(), Some(difficulty))
             }
-            Err(e) => {
-                log::warn(&format!("gateway: qbd state: {e}"));
-                None
+            LadderQuery::Role(role) => {
+                let mut named = config
+                    .routes
+                    .iter()
+                    .filter(|r| r.role == *role && r.difficulty.is_some())
+                    .peekable();
+                if named.peek().is_none() {
+                    return Err(missing(format!("no ladder route names role `{role}`")));
+                }
+                if !named.any(|r| may(&r.alias)) {
+                    return Err(forbid(format!("a route of role `{role}`")));
+                }
+                (role.as_str(), None)
             }
+        };
+        let unreadable = |message: String| Refusal::new(503, ErrorClass::Unavailable, message);
+        let running: RolesResponse = self.read_qbd(paths::ROLES).map_err(unreadable)?;
+        let logins: State = self.read_qbd(paths::STATE).map_err(unreadable)?;
+        let Some(spec) = running.roles.into_iter().find(|r| r.name == role) else {
+            return Err(missing(format!("qbd runs no role `{role}`")));
+        };
+        let mut steps: Vec<LadderStepState> = spec
+            .ladder
+            .into_iter()
+            .filter(|s| only.is_none_or(|d| d == s.difficulty))
+            .filter_map(|s| {
+                let routes: Vec<String> = config
+                    .routes
+                    .iter()
+                    .filter(|r| r.role == role && r.difficulty == Some(s.difficulty))
+                    .filter(|r| may(&r.alias))
+                    .map(|r| r.alias.clone())
+                    .collect();
+                if routes.is_empty() {
+                    return None;
+                }
+                let candidates = s
+                    .candidates
+                    .into_iter()
+                    .map(|c| {
+                        let (state, resets_at) = standing(&config, &logins, Some(&c.vendor));
+                        LadderCandidateState {
+                            api: family(&config, &logins, &c.vendor),
+                            vendor: c.vendor,
+                            model: c.model,
+                            effort: c.effort,
+                            tier: c.tier,
+                            state,
+                            resets_at,
+                        }
+                    })
+                    .collect();
+                Some(LadderStepState {
+                    difficulty: s.difficulty,
+                    routes,
+                    candidates,
+                })
+            })
+            .collect();
+        steps.sort_by_key(|s| s.difficulty);
+        if let (Some(difficulty), true) = (only, steps.is_empty()) {
+            let message = format!("qbd's role `{role}` has no step of difficulty {difficulty}");
+            return Err(missing(message));
         }
+        Ok(LadderAnswer {
+            role: role.to_owned(),
+            steps,
+        })
     }
 
     /// A pick for `turn`'s route on behalf of its caller; a `wait` caused by `resume_of` is
@@ -1826,6 +1957,21 @@ fn standing(
         }
     }
     standing
+}
+
+/// The API family of the first login of `config` that `state` puts on `vendor`.
+fn family(config: &GatewayConfig, state: &State, vendor: &str) -> Option<ApiFamily> {
+    let login = config.logins.iter().find(|g| {
+        state
+            .logins
+            .iter()
+            .any(|l| l.login == g.name && l.vendor == vendor)
+    })?;
+    Some(match login.api {
+        Api::Anthropic => ApiFamily::Anthropic,
+        Api::Openai => ApiFamily::Openai,
+        Api::ChatCompletions => ApiFamily::ChatCompletions,
+    })
 }
 
 /// `config` with its routes sorted by alias, for `routes`.

@@ -12,6 +12,7 @@ responses may gain optional fields, which clients ignore. Types are defined in `
 | `GET /v1/state` | — | 200 `StateResponse` |
 | `GET /v1/why/{lease_id}` | — | 200 `WhyResponse`, 404 unknown or ended lease |
 | `GET /v1/health` | — | 200 `HealthResponse` |
+| `GET /v1/roles` | — | 200 `RolesResponse` |
 | `POST /v1/agent/next` | `AgentNextRequest` | 200 `AgentJob`, 400 unknown login, 403 not an agent, 429 too many waiting |
 | `POST /v1/agent/result` | `AgentResultRequest` | 200 `ReportResponse`, 403 another client's probe, 404 unknown or expired probe |
 | `GET /v1/admin/roles` | — | 200 `AdminRoles` with an `ETag`, 403 not an admin client, 500 a config file cannot be read or does not validate |
@@ -157,6 +158,20 @@ lease; the request takes a token like any other.
 ## `GET /v1/health`
 
 `{"status": "ok", "api_version": "v1", "version": "0.0.1", "uptime_s": 12}`
+
+## `GET /v1/roles`
+
+The roles `qbd` runs, as it took them at its start or its last reload (SIGHUP or
+`POST /v1/admin/reload`), in the shape of `roles` of `GET /v1/admin/roles`, without its file and
+hash: a roles file changed on disk shows only after a reload accepted it. Every identified caller
+may read it. See `roles_response.json`:
+
+```json
+{"roles": [{"name": "worker",
+            "ladder": [{"difficulty": 1, "candidates": [
+                         {"vendor": "vendor-a", "model": "model-small", "tier": 1}]}],
+            "reserves": []}]}
+```
 
 ## Agents and probes
 
@@ -328,6 +343,7 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 |---|---|---|
 | `POST /v1/model/turn` | `TurnRequest` | 200 chunked NDJSON of `StreamEvent`; a rejection is an `Error` with 400, 401, 411, 413 or 429 |
 | `GET /v1/model/routes` | — | 200 `RoutesAnswer` |
+| `GET /v1/model/ladder?route=<alias>` or `?role=<role>` | — | 200 `LadderAnswer`, 400 a bad query or a pin or chain route, 401 no client token (loopback), 403 a route or role outside a named client's `routes` or the unnamed client token (loopback), 404 an unknown route or role, a role `qbd` does not run or a step it lacks, 503 `qbd` is unreachable |
 | `POST /v1/model/cancel` | `CancelRequest` | 200 `CancelAnswer`, 403 another caller's turn, 404 no such running turn |
 | `POST /v1/model/reload` | — | 200 `ReloadAnswer`, 400 refused, 403 a caller other than the gateway's own uid |
 | `GET /v1/model/spend` | — | 200 `SpendAnswer`, 403 a caller other than the gateway's own uid |
@@ -362,8 +378,8 @@ format of that front's API.
 `[[clients]]` entry of the gateway config; any other peer gets 401 `auth` before its request
 is read. The socket file is
 0600, or 0660 with `socket_mode = 0o660`. The optional loopback listener (`fronts.listen`)
-serves only the HTTP fronts, to requests with a client token of `[fronts]`
-([config.md](config.md#gateway-config), [openai.md](openai.md#serving-the-fronts)): the unnamed
+serves only the HTTP fronts and `GET /v1/model/ladder`, to requests with a client token of
+`[fronts]` ([config.md](config.md#gateway-config), [openai.md](openai.md#serving-the-fronts)): the unnamed
 `fronts.token_sha256`, whose turns run as the caller `client-token`, or a named
 `[[fronts.clients]]` entry, whose turns run as its `name`; a named client's token is the one
 its `token_sha256` hashes or the one in its `token_file`, and after a rotation also the previous
@@ -371,7 +387,9 @@ one within its grace. A named client with `routes` that asks
 for a model resolving (through `fronts.models` or as an alias) to a route outside that list gets
 403 in its front's error format before any pick: Messages `permission_error`, OpenAI
 `permission_error` with code `route_not_allowed`, the message
-``client `<name>` may not use route `<alias>` ``.
+``client `<name>` may not use route `<alias>` ``. The ladder read is for named clients only
+([`GET /v1/model/ladder`](#get-v1modelladder)); every other path of the listener is 404 in the
+Messages or OpenAI error format.
 
 **Connections.** The gateway serves at most `max_turns` + 2 connections at once; one more gets
 429 `overloaded` with `retry_after: 1` before its request is read. A loopback peer counts against
@@ -553,6 +571,46 @@ unreachable). `vendor` and `model` are a pinned route's. A chain route applies t
 the logins of each step's vendor: it is `ready` with the `vendor` and `model` of its first
 step that is `ready`; else `exhausted` with the earliest `resets_at` over its `exhausted`
 steps when one is, else `unavailable`, without `vendor` and `model`. It takes no lease.
+
+### `GET /v1/model/ladder`
+
+The ladder steps a caller's ladder routes run on, read from `qbd` without a pick or a lease, for
+a client that wants to know which model and effort a step runs before it starts work. The query
+names exactly one of:
+
+- `route=<alias>`: a ladder route (one with `difficulty`); the answer holds its role's step of
+  that difficulty. A pin or chain route is 400 `bad_request`, an alias no route has 404.
+- `role=<role>`: every step of that `qbd` role that at least one ladder route the caller may use
+  names; a role no ladder route names is 404.
+
+Neither, both, or another parameter is 400. The roles are those `qbd` runs (`GET /v1/roles`), so
+a role or a route's step `qbd` does not run is 404; the states come from `qbd`'s
+`GET /v1/state`. Either read failing is 503 `unavailable`. See `gateway_ladder_answer.json`:
+
+```json
+{"role": "worker",
+ "steps": [
+  {"difficulty": 1, "routes": ["worker-1"], "candidates": [
+   {"vendor": "vendor-a", "api": "anthropic", "model": "model-small", "tier": 1, "state": "ready"},
+   {"vendor": "vendor-b", "api": "chat_completions", "model": "model-medium", "effort": "low",
+    "tier": 2, "state": "exhausted", "resets_at": 1800018000}]}]}
+```
+
+`steps` are sorted by `difficulty`, each with `routes`, the sorted ladder route aliases of the
+caller that name it, and its `candidates` in ladder order. A candidate's `api` is the API family
+(`anthropic`, `openai`, `chat_completions`) of the gateway's first login, in config order, that
+`qbd` puts on its vendor, absent when the gateway holds none; `effort` is absent when the ladder
+has none. `state` and `resets_at` follow the rule of `GET /v1/model/routes` over the gateway's
+logins of the candidate's vendor: `ready`, `exhausted` with the earliest end of the waits, or
+`unavailable`.
+
+On the unix socket every caller reads every route. On the loopback listener only a named
+`[[fronts.clients]]` token may, within its `routes`: a route outside them, or a role none of them
+names, is 403 `auth` with the message ``client `<name>` may not use route `<alias>` `` or
+``client `<name>` may not use a route of role `<role>` ``, before `qbd` is asked; the unnamed
+`fronts.token_sha256` is 403 `auth`, a request without a client token 401 `auth`. Every error of
+this endpoint is an `Error` on both listeners, and every 403 logs one warning line naming the
+client.
 
 ### `POST /v1/model/cancel`
 

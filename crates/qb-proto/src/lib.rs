@@ -17,14 +17,15 @@ use serde::{Deserialize, Serialize};
 pub mod gateway;
 
 pub use gateway::{
-    Attempt, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CacheMode, CancelAnswer,
-    CancelRequest, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
-    ConfigRoutesWritten, ConfigStep, Effort, Elsewhere, ErrorClass, GatewayError, LoginKey,
-    LoginKeyAnswer, LoginOauthCode, LoginOauthSigned, LoginOauthStarted, LoginSpend, MediaType,
-    Message, NativeApi, NativeTool, OauthPaste, Object, ReloadAnswer, Role, RouteInfo, RouteState,
-    RouteStatus, RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool,
-    ToolCall, TurnRequest, TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy,
-    UsageLine, UsageQuery, UsageRow, UsdSource,
+    ApiFamily, Attempt, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CacheMode,
+    CancelAnswer, CancelRequest, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
+    ConfigRoutesWritten, ConfigStep, Effort, Elsewhere, ErrorClass, GatewayError, LadderAnswer,
+    LadderCandidateState, LadderStepState, LoginKey, LoginKeyAnswer, LoginOauthCode,
+    LoginOauthSigned, LoginOauthStarted, LoginSpend, MediaType, Message, NativeApi, NativeTool,
+    OauthPaste, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus, RoutesAnswer,
+    SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool, ToolCall, TurnRequest,
+    TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine, UsageQuery,
+    UsageRow, UsdSource,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.
@@ -40,6 +41,8 @@ pub mod paths {
     pub const STATE: &str = "/v1/state";
     /// `GET`: liveness and version.
     pub const HEALTH: &str = "/v1/health";
+    /// `GET`: the roles and ladders `qbd` runs.
+    pub const ROLES: &str = "/v1/roles";
     /// `GET`, followed by a lease id: why a live lease was granted.
     pub const WHY: &str = "/v1/why/";
     /// `POST`: an agent waits for a probe job.
@@ -57,6 +60,9 @@ pub mod paths {
     pub const MODEL_TURN: &str = "/v1/model/turn";
     /// Gateway, `GET`: route aliases and where a turn would run now.
     pub const MODEL_ROUTES: &str = "/v1/model/routes";
+    /// Gateway, `GET` with `route` or `role`: the ladder steps the caller's routes run on, with
+    /// the state of each candidate.
+    pub const MODEL_LADDER: &str = "/v1/model/ladder";
     /// Gateway, `POST`: stop a running turn of the caller.
     pub const MODEL_CANCEL: &str = "/v1/model/cancel";
     /// Gateway, `POST`: read the gateway's config file again; only the gateway's own uid.
@@ -534,6 +540,13 @@ pub struct AdminRoles {
     pub file: String,
     /// Hex SHA-256 of that file's bytes; also the answer's `ETag`.
     pub sha256: String,
+    /// The roles in file order.
+    pub roles: Vec<RoleConfig>,
+}
+
+/// `GET /v1/roles` response: the roles `qbd` runs since its start or last reload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolesResponse {
     /// The roles in file order.
     pub roles: Vec<RoleConfig>,
 }

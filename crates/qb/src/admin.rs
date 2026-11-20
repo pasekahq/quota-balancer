@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 
 use qb_core::Core;
 use qb_proto::{
-    AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, ErrorCode, LadderCandidate,
-    LadderStep, RoleConfig, RoleReserve, RolesSource, paths,
+    AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, ErrorCode, RoleConfig,
+    RolesSource, paths,
 };
 
-use crate::api::{Caller, Reply, error, json};
+use crate::api::{self, Caller, Reply, error, json};
 use crate::auth::Gate;
-use crate::config::{self, Role};
+use crate::config;
 use crate::http::{Method, Request};
 use crate::rewrite::{self, basic, float};
 use crate::server::{Reload, unix_now};
@@ -109,44 +109,17 @@ fn roles(file: &Path) -> Reply {
         },
         file: sourced.roles_from.display().to_string(),
         sha256: digest.clone(),
-        roles: sourced.config.roles.iter().map(role).collect(),
+        roles: sourced
+            .config
+            .core_spec()
+            .roles
+            .iter()
+            .map(api::role)
+            .collect(),
     };
     Reply {
         etag: Some(format!("\"{digest}\"")),
         ..json(200, &answer)
-    }
-}
-
-fn role(r: &Role) -> RoleConfig {
-    RoleConfig {
-        name: r.name.clone(),
-        ladder: r
-            .ladder
-            .iter()
-            .map(|s| LadderStep {
-                difficulty: s.difficulty,
-                candidates: s
-                    .candidates
-                    .iter()
-                    .map(|c| LadderCandidate {
-                        vendor: c.vendor.clone(),
-                        model: c.model.clone(),
-                        effort: c.effort.clone(),
-                        tier: c.tier,
-                        cost_per_minute: c.cost_per_minute.map(config::Fraction::get),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        reserves: r
-            .reserves
-            .iter()
-            .map(|res| RoleReserve {
-                difficulty: res.difficulty,
-                window: res.window.clone(),
-                fraction: res.fraction.get(),
-            })
-            .collect(),
     }
 }
 
