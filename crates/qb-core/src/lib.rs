@@ -865,7 +865,7 @@ impl Core {
         for l in &mut logins {
             l.model_dead = vec![None; models.len()];
         }
-        let deadline_cap = 2 * (MAX_LEASES + logins.len() * (4 + models.len() + 2 * MAX_WINDOWS));
+        let deadline_cap = deadline_cap(logins.len(), models.len());
         Ok(Self {
             vendors,
             models,
@@ -884,6 +884,63 @@ impl Core {
             deadlines: BinaryHeap::new(),
             deadline_cap,
         })
+    }
+
+    /// Replaces the roles, their ladders and reserves, with `roles`; leases, marks, windows and
+    /// probes stay. A live lease keeps its model and its reservation when no role names it.
+    ///
+    /// # Errors
+    /// A role exceeds a table bound or names an undeclared vendor; nothing changes then.
+    pub fn set_roles(&mut self, roles: Vec<RoleSpec>) -> Result<(), SpecError> {
+        // A model a lease or a mark still names keeps its place, so neither loses it.
+        let mut models: Vec<String> = (0..self.models.len())
+            .filter(|&m| {
+                self.leases
+                    .iter()
+                    .flatten()
+                    .any(|l| l.model_index == Some(m))
+                    || self.logins.iter().any(|l| l.model_dead[m].is_some())
+            })
+            .map(|m| self.models[m].clone())
+            .collect();
+        let mut compiled = Vec::with_capacity(roles.len());
+        for r in roles {
+            compiled.push(role(r, &self.vendors, &mut models, self.cost_per_minute)?);
+        }
+        let moved: Vec<Option<usize>> = self
+            .models
+            .iter()
+            .map(|old| models.iter().position(|m| m == old))
+            .collect();
+        for lease in self.leases.iter_mut().flatten() {
+            lease.model_index = models.iter().position(|m| *m == lease.model);
+        }
+        for login in &mut self.logins {
+            let mut dead = vec![None; models.len()];
+            for (m, until) in login.model_dead.iter().enumerate() {
+                if let Some(to) = moved[m] {
+                    dead[to] = *until;
+                }
+            }
+            login.model_dead = dead;
+        }
+        let deadlines = std::mem::take(&mut self.deadlines).into_vec();
+        self.deadlines = deadlines
+            .into_iter()
+            .filter_map(|Reverse(d)| match d.event {
+                Event::ModelDeadEnd(li, m) => moved[m].map(|to| {
+                    Reverse(Deadline {
+                        at: d.at,
+                        event: Event::ModelDeadEnd(li, to),
+                    })
+                }),
+                _ => Some(Reverse(d)),
+            })
+            .collect();
+        self.deadline_cap = deadline_cap(self.logins.len(), models.len());
+        self.models = models;
+        self.roles = compiled;
+        Ok(())
     }
 
     /// Decides where a task should run and, for a `run`, issues its lease.
@@ -1827,6 +1884,12 @@ fn unauthorized(auth: Auth) -> Auth {
         Auth::Ok => Auth::Stale,
         Auth::Stale | Auth::Dead => Auth::Dead,
     }
+}
+
+/// Compaction threshold of the deadline heap: twice the most distinct deadlines `logins` logins
+/// and `models` models can have pending.
+fn deadline_cap(logins: usize, models: usize) -> usize {
+    2 * (MAX_LEASES + logins * (4 + models + 2 * MAX_WINDOWS))
 }
 
 /// Compiles a role, interning its candidates' models into `models`.

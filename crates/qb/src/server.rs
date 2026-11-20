@@ -1,6 +1,7 @@
-//! The daemon loop: sleep in `poll()` until a connection, a parked agent hanging up or the
-//! policy's next deadline, then reap finished hooks, hand due probe jobs to parked agents,
-//! accept, read one request, identify and rate-limit the caller, answer, close.
+//! The daemon loop: sleep in `poll()` until a connection, a parked agent hanging up, SIGHUP or
+//! the policy's next deadline, then reap finished hooks, reload the roles and clients on SIGHUP,
+//! hand due probe jobs to parked agents, accept, read one request, identify and rate-limit the
+//! caller, answer, close.
 //!
 //! Single thread, one request at a time with short timeouts; an agent's `next` request is parked
 //! in the poll set without a timeout until a probe is due. The policy core is owned by this
@@ -10,6 +11,7 @@ use std::convert::Infallible;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qb_core::{Core, ProbeOutcome};
@@ -20,6 +22,8 @@ use rustix::net::sockopt::{Timeout, set_socket_timeout};
 
 use crate::api::{self, Answer, Env, Reply};
 use crate::auth::{Denied, Gate};
+use crate::config::{self, Config};
+use crate::hangup::Hangup;
 use crate::hooks::Runner;
 use crate::http::{self, MAX_HEAD, Method, ReadError};
 use crate::journal::Journal;
@@ -65,9 +69,59 @@ pub fn poll_timeout(core: &mut Core, now: u64) -> Option<Duration> {
     }
 }
 
+/// The running config and the file SIGHUP reloads it from.
+pub struct Reload {
+    /// SIGHUP as a descriptor.
+    pub hangup: Hangup,
+    /// The config file `qbd` started from.
+    pub file: PathBuf,
+    /// The config `core` and the gate run.
+    pub running: Config,
+}
+
+impl Reload {
+    /// Reads the config file and its roles file again. A candidate that validates and changes
+    /// nothing but `[[roles]]` and `[[clients]]` becomes the running config: `core` takes its
+    /// roles, `gate` its clients. Logs one line either way.
+    fn run(&mut self, core: &mut Core, gate: &mut Gate) {
+        match self.apply(core, gate) {
+            Ok(()) => log::info(&format!(
+                "qbd: reloaded {}: {} roles, {} clients",
+                self.file.display(),
+                self.running.roles.len(),
+                self.running.clients.len()
+            )),
+            Err(e) => log::warn(&format!("qbd: reload refused: {e}")),
+        }
+    }
+
+    fn apply(&mut self, core: &mut Core, gate: &mut Gate) -> Result<(), config::Error> {
+        let candidate = config::load(&self.file)?;
+        if let Some(key) = self.running.restart_only_change(&candidate) {
+            return Err(config::Error {
+                file: self.file.clone(),
+                field: key.to_owned(),
+                reason: "changed; it takes effect only on a restart".to_owned(),
+            });
+        }
+        core.set_roles(candidate.core_spec().roles)
+            .map_err(|e| config::Error {
+                file: candidate
+                    .roles_file
+                    .clone()
+                    .unwrap_or_else(|| self.file.clone()),
+                field: "roles".to_owned(),
+                reason: e.to_string(),
+            })?;
+        *gate = Gate::new(&candidate.clients, &candidate.limits);
+        self.running = candidate;
+        Ok(())
+    }
+}
+
 /// Serves connections until the listener fails; `gate` admits callers, the clients in
 /// `agents` may wait for probe jobs, state changes go to `journal`, `auth_dead` edges to
-/// `hooks`.
+/// `hooks`, and SIGHUP on `reload` reloads the roles and clients.
 ///
 /// # Errors
 /// The listener cannot be made non-blocking or polled.
@@ -78,6 +132,7 @@ pub fn serve(
     hooks: &mut Runner,
     gate: &mut Gate,
     agents: &[String],
+    mut reload: Option<&mut Reload>,
 ) -> io::Result<Infallible> {
     listener.set_nonblocking(true)?;
     let started = Instant::now();
@@ -86,20 +141,32 @@ pub fn serve(
     let mut hung = Vec::with_capacity(MAX_PARKED);
     loop {
         hooks.reap();
+        if let Some(r) = reload.as_deref_mut() {
+            if r.hangup.take() {
+                r.run(core, gate);
+            }
+        }
         let now = unix_now();
         dispatch(core, &mut parked, now);
         // A deadline too far away for a timespec is as good as none.
         let timeout = poll_timeout(core, now).and_then(|d| Timespec::try_from(d).ok());
-        let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(1 + parked.len());
+        let mut fds: Vec<PollFd<'_>> = Vec::with_capacity(2 + parked.len());
         fds.push(PollFd::new(listener, PollFlags::IN));
         fds.extend(parked.iter().map(|p| PollFd::new(&p.stream, PollFlags::IN)));
+        if let Some(r) = reload.as_deref() {
+            fds.push(PollFd::new(&r.hangup, PollFlags::IN));
+        }
         match rustix::event::poll(&mut fds, timeout.as_ref()) {
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(e.into()),
         }
         // A parked agent sends nothing more, so any event means it hung up or broke protocol.
         hung.clear();
-        hung.extend(fds[1..].iter().map(|f| !f.revents().is_empty()));
+        hung.extend(
+            fds[1..=parked.len()]
+                .iter()
+                .map(|f| !f.revents().is_empty()),
+        );
         drop(fds);
         let mut i = 0;
         parked.retain(|_| {

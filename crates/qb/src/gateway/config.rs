@@ -15,7 +15,7 @@ use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
 use crate::config::{
-    BEARER_HASH_EXPECTED, BearerHash, Error, Fault, declare, toml_error, too_many,
+    BEARER_HASH_EXPECTED, BearerHash, Error, Fault, declare, offset, toml_error, too_many,
 };
 
 /// Most turns one gateway runs at once.
@@ -369,29 +369,6 @@ pub fn parse(file: &Path, text: &str) -> Result<GatewayConfig, Error> {
 
 /// A field error with the byte offset of the value, for the line number.
 type WalkError = (String, String, Option<usize>);
-
-/// The byte offset of the value at the field path `field` of `doc`, such as `routes[1].alias`
-/// or `fronts.models."m"`; `None` when the file does not hold it.
-fn offset(doc: &DeTable<'_>, field: &str) -> Option<usize> {
-    let (mut table, mut rest, mut at) = (Some(doc), field, None);
-    while !rest.is_empty() {
-        let (key, after) = match rest.strip_prefix('"') {
-            Some(quoted) => quoted.split_at(quoted.find('"')?),
-            None => rest.split_at(rest.find(['.', '[']).unwrap_or(rest.len())),
-        };
-        let mut value = table?.get(key)?;
-        rest = after.strip_prefix('"').unwrap_or(after);
-        while let Some(index) = rest.strip_prefix('[') {
-            let (i, after) = index.split_at(index.find(']')?);
-            value = value.get_ref().as_array()?.get(i.parse::<usize>().ok()?)?;
-            rest = &after[1..];
-        }
-        at = Some(value.span().start);
-        table = value.get_ref().as_table();
-        rest = rest.strip_prefix('.').unwrap_or(rest);
-    }
-    at
-}
 
 type Value<'i> = Spanned<DeValue<'i>>;
 

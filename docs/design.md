@@ -114,8 +114,8 @@ Varlink on the same socket and read-only shared memory for status bars are possi
 
 ## Policy core
 
-Vendors, windows, logins, ladders, reserves and clients come from the config file described in
-[config.md](config.md).
+Vendors, windows, logins, ladders, reserves and clients come from the config file and its roles
+file described in [config.md](config.md).
 
 State, all in one thread, no locks, no allocation on the hot path:
 
