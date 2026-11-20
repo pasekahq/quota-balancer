@@ -29,6 +29,7 @@ use qb_proto::{
 
 mod common;
 
+use common::http::{etag, finish, send, sha256_hex};
 use common::{
     Daemon, answer, events, hook_config, kill_auth, line_with, own_uid, park, pick_worker, post,
     record_event, report_login, start_daemon, state, stderr_lines, temp_dir, wait_for,
@@ -2248,42 +2249,14 @@ fn sighup_identifies_a_client_added_to_the_config() {
     );
 }
 
-/// `GET /v1/admin/roles` on `sock` as this process's uid: the status, the `ETag` if any and the
-/// body.
-fn admin_roles(sock: &Path) -> (u16, Option<String>, Vec<u8>) {
-    let mut s = UnixStream::connect(sock).unwrap();
-    write!(
-        s,
-        "GET {} HTTP/1.1\r\nHost: qb\r\nConnection: close\r\n\r\n",
-        paths::ADMIN_ROLES
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).unwrap();
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-    let head = String::from_utf8(raw[..split].to_vec()).unwrap();
-    let status = head[9..12].parse().unwrap();
-    let etag = head
-        .lines()
-        .find_map(|l| l.strip_prefix("ETag: "))
-        .map(str::to_owned);
-    (status, etag, raw[split + 4..].to_vec())
-}
-
-/// [`admin_roles`] that must answer 200: the answer, its raw body and its `ETag`.
+/// `GET /v1/admin/roles` on `sock` as this process's uid that must answer 200: the answer, its
+/// raw body and its `ETag`.
 fn admin_roles_ok(sock: &Path) -> (AdminRoles, String, String) {
-    let (status, etag, body) = admin_roles(sock);
+    let (status, head, body) = finish(send(sock, "GET", paths::ADMIN_ROLES, ""), Vec::new());
     let text = String::from_utf8(body).unwrap();
     assert_eq!(status, 200, "{text}");
-    (serde_json::from_str(&text).unwrap(), text, etag.unwrap())
-}
-
-/// Hex SHA-256 of `file` as `sha256sum` computes it.
-fn file_sha256(file: &Path) -> String {
-    let out = Command::new("sha256sum").arg(file).output().unwrap();
-    assert!(out.status.success());
-    let text = String::from_utf8(out.stdout).unwrap();
-    text.split_whitespace().next().unwrap().to_owned()
+    let tag = etag(&head).unwrap().to_owned();
+    (serde_json::from_str(&text).unwrap(), text, tag)
 }
 
 /// `POST /v1/admin/reload` on `sock` as this process's uid, or with `bearer`.
@@ -2315,15 +2288,15 @@ fn an_admin_reads_the_roles_of_the_roles_file_on_disk() {
     let mut d = start_with(&reloadable(&dir, ADMIN), &sock, Stdio::piped());
     let lines = stderr_lines(&mut d.0);
 
-    let (got, text, etag) = admin_roles_ok(&sock);
+    let (got, text, tag) = admin_roles_ok(&sock);
     let audit = line_with(&lines, "qbd: admin", Duration::from_secs(10)).unwrap();
     assert!(
         audit.ends_with("qbd: admin GET /v1/admin/roles by client-a: 200"),
         "{audit}"
     );
-    let hash = file_sha256(&roles);
+    let hash = sha256_hex(&std::fs::read_to_string(&roles).unwrap());
     assert_eq!(
-        (got.sha256.as_str(), etag),
+        (got.sha256.as_str(), tag),
         (hash.as_str(), format!("\"{hash}\""))
     );
     assert_eq!(got.source, RolesSource::RolesFile);
@@ -2359,8 +2332,8 @@ fn an_admin_reads_the_roles_of_the_roles_file_on_disk() {
     assert!(!text.contains("null"), "absent keys are omitted: {text}");
 
     write_roles(&dir, &[("worker", "vendor-z", "model-small")]);
-    let (status, etag, body) = admin_roles(&sock);
-    assert_eq!((status, etag), (500, None));
+    let (status, head, body) = finish(send(&sock, "GET", paths::ADMIN_ROLES, ""), Vec::new());
+    assert_eq!((status, etag(&head)), (500, None));
     let e: ErrorBody = serde_json::from_slice(&body).unwrap();
     assert_eq!(e.error, ErrorCode::Internal);
     let fault = format!(
@@ -2382,10 +2355,10 @@ fn an_admin_reads_the_roles_held_inline_in_the_config() {
         )],
     );
     let _d = start(&config, &sock);
-    let (got, _, etag) = admin_roles_ok(&sock);
-    let hash = file_sha256(&config);
+    let (got, _, tag) = admin_roles_ok(&sock);
+    let hash = sha256_hex(&std::fs::read_to_string(&config).unwrap());
     assert_eq!(
-        (got.sha256.as_str(), etag),
+        (got.sha256.as_str(), tag),
         (hash.as_str(), format!("\"{hash}\""))
     );
     assert_eq!(
@@ -2417,7 +2390,7 @@ fn only_an_admin_client_reaches_the_admin_endpoints() {
     let lines = stderr_lines(&mut d.0);
 
     write_roles(&dir, &[("worker", "vendor-b", "model-large")]);
-    let (status, _, _) = admin_roles(&sock);
+    let (status, _) = call(&sock, "GET", paths::ADMIN_ROLES, None, None).unwrap();
     let (status_b, body_b) = call(&sock, "GET", paths::ADMIN_ROLES, None, Some(BEARER)).unwrap();
     let (reload_a, _) = admin_reload(&sock, None);
     let (reload_b, body) = admin_reload(&sock, Some(BEARER));
@@ -2438,7 +2411,7 @@ fn only_an_admin_client_reaches_the_admin_endpoints() {
 
     let open = temp_socket("adminuid");
     let _o = start(&example("minimal.toml"), &open);
-    let (status, _, _) = admin_roles(&open);
+    let (status, _) = call(&open, "GET", paths::ADMIN_ROLES, None, None).unwrap();
     let (reload, _) = admin_reload(&open, None);
     assert_eq!((status, reload), (403, 403), "uid callers are never admins");
 }
