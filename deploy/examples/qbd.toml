@@ -1,4 +1,4 @@
-# Example qbd config: five vendors, six logins, three roles, four clients, one of them an agent
+# Example qbd config: six vendors, seven logins, four roles, five clients, one of them an agent
 # and one the gateway of deploy/examples/gateway.toml.
 # Format: docs/config.md. Install as /etc/qb/qbd.toml.
 
@@ -60,6 +60,11 @@ windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
 name = "vendor-e"
 windows = []
 
+# The heads' emergency API key, capped by the gateway.
+[[vendors]]
+name = "vendor-g"
+windows = [{ name = "spend", length_s = 2678400, t_burn_s = 0 }]
+
 [[logins]]
 name = "login-1"
 vendor = "vendor-a"
@@ -83,6 +88,10 @@ vendor = "vendor-c"
 [[logins]]
 name = "key-3"
 vendor = "vendor-d"
+
+[[logins]]
+name = "key-4"
+vendor = "vendor-g"
 
 [[roles]]
 name = "worker"
@@ -129,6 +138,52 @@ candidates = [
   { vendor = "vendor-e", model = "model-large", tier = 2 },
 ]
 
+# The heads' role, run through the gateway's routes hive-step-1 to hive-step-5: on each step
+# the Anthropic subscription (vendor-a) and the OpenAI subscription (vendor-b) first, the
+# emergency API key (vendor-g) last. The gateway sends each candidate's own effort.
+[[roles]]
+name = "hive-heads"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [
+  { vendor = "vendor-a", model = "model-small", effort = "medium", tier = 1 },
+  { vendor = "vendor-g", model = "model-small", effort = "medium", tier = 3 },
+  { vendor = "vendor-b", model = "model-small", effort = "medium", tier = 1 },
+]
+
+[[roles.ladder]]
+difficulty = 2
+candidates = [
+  { vendor = "vendor-a", model = "model-medium", effort = "medium", tier = 1 },
+  { vendor = "vendor-g", model = "model-medium", effort = "medium", tier = 3 },
+  { vendor = "vendor-b", model = "model-medium", effort = "medium", tier = 1 },
+]
+
+[[roles.ladder]]
+difficulty = 3
+candidates = [
+  { vendor = "vendor-a", model = "model-large", effort = "medium", tier = 1 },
+  { vendor = "vendor-g", model = "model-large", effort = "medium", tier = 3 },
+  { vendor = "vendor-b", model = "model-large", effort = "medium", tier = 1 },
+]
+
+[[roles.ladder]]
+difficulty = 4
+candidates = [
+  { vendor = "vendor-a", model = "model-large", effort = "high", tier = 1 },
+  { vendor = "vendor-g", model = "model-large", effort = "high", tier = 3 },
+  { vendor = "vendor-b", model = "model-large", effort = "high", tier = 1 },
+]
+
+[[roles.ladder]]
+difficulty = 5
+candidates = [
+  { vendor = "vendor-a", model = "model-large", effort = "max", tier = 1 },
+  { vendor = "vendor-g", model = "model-large", effort = "max", tier = 3 },
+  { vendor = "vendor-b", model = "model-large", effort = "xhigh", tier = 1 },
+]
+
 [[clients]]
 name = "client-a"
 uid = 1001
@@ -138,6 +193,12 @@ role = "worker"
 name = "client-b"
 bearer_sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
 role = "reviewer"
+
+# The heads, for the picks they make without the gateway.
+[[clients]]
+name = "client-c"
+uid = 1004
+role = "hive-heads"
 
 [[clients]]
 name = "agent-1"

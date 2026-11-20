@@ -364,22 +364,25 @@ fn config_routes() {
                 r.difficulty,
                 r.vendor.is_some(),
                 r.chain.as_ref().map(Vec::len),
+                r.client_effort.as_deref(),
             )
         })
         .collect();
     assert_eq!(
         shapes,
         [
-            (Some(1), false, None),
-            (None, true, None),
-            (None, false, Some(2))
+            (Some(1), false, None, Some("ignore")),
+            (None, true, None, None),
+            (None, false, Some(2), None)
         ]
     );
     let caps: Vec<_> = read.spend_caps.into_iter().collect();
     assert_eq!(caps, [("key-1".into(), Some(25.0)), ("key-2".into(), None)]);
     let put: ConfigRoutesPut = roundtrip("gateway_config_routes_put.json");
-    let chain = put.routes.unwrap()[0].chain.clone().unwrap();
+    let routes = put.routes.unwrap();
+    let chain = routes[0].chain.clone().unwrap();
     assert_eq!(chain[1].effort.as_deref(), Some("low"));
+    assert_eq!(routes[1].client_effort.as_deref(), Some("use"));
     assert_eq!(put.spend_caps, None);
     let put: ConfigRoutesPut = roundtrip("gateway_config_spend_caps_put.json");
     assert_eq!(put.routes, None);
