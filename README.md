@@ -1,5 +1,9 @@
 # quota-balancer (`qb`)
 
+[![CI](https://github.com/pasekahq/quota-balancer/actions/workflows/ci.yml/badge.svg)](https://github.com/pasekahq/quota-balancer/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/pasekahq/quota-balancer/badge)](https://scorecard.dev/viewer/?uri=github.com/pasekahq/quota-balancer)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE)
+
 A small pre-flight scheduler for people who run coding agents on their own subscriptions.
 
 Before your orchestrator starts an agent, it asks `qb` *where* to run it: which vendor, model and
@@ -150,4 +154,9 @@ when they do.
 
 ## License
 
-Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Copyright (C) 2026 the quota-balancer contributors.
+
+Licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (SPDX: `AGPL-3.0-only`).
+If you run a modified `qb` for users over a network, section 13 asks you to offer them its source.
+
+Contributions are accepted under the same license with a DCO sign-off; see [CONTRIBUTING.md](CONTRIBUTING.md).

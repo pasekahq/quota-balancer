@@ -2,7 +2,7 @@
 # it only serves the socket passed by qbd.socket. Target: `systemd-analyze security` <= 1.5.
 [Unit]
 Description=quota-balancer daemon
-Documentation=https://github.com/vladmesh/quota-balancer
+Documentation=https://github.com/pasekahq/quota-balancer
 Requires=qbd.socket
 After=qbd.socket
 

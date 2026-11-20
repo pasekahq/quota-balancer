@@ -94,7 +94,7 @@ registering their logins; client integrations.
 
 History scanned with gitleaks, docs reviewed for anything environment-specific, release
 workflow (static musl builds for x86_64 and aarch64, `SHA256SUMS`, build provenance), then the
-repository goes public under `Apache-2.0 OR MIT`.
+repository is public at `pasekahq/quota-balancer` under `AGPL-3.0-only`.
 
 ## Later (S3+)
 

@@ -6,8 +6,8 @@ members = ["crates/qb-core", "crates/qb-proto", "crates/qb-vendors", "crates/qb-
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
-license = "Apache-2.0 OR MIT"
-repository = "https://github.com/vladmesh/quota-balancer"
+license = "AGPL-3.0-only"
+repository = "https://github.com/pasekahq/quota-balancer"
 publish = false
 
 [workspace.dependencies]
