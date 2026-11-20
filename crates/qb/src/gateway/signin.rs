@@ -155,7 +155,7 @@ impl SignIn {
         })?;
         let body = self.credential(&code).map_err(|e| e.message)?;
         let file = self.login.credentials.as_path();
-        creds::write_atomic(file, &body)
+        crate::rewrite::write_atomic(file, &body)
             .map_err(|e| format!("{}: cannot write: {e}", file.display()))?;
         Ok(Signed {
             file: file.to_owned(),

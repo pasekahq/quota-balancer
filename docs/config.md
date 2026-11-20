@@ -61,7 +61,7 @@ The roles live in exactly one place: in this file, or in the file the top-level 
 
 | Key | Type | Meaning |
 |---|---|---|
-| `roles_file` | string | Optional absolute path of a TOML file that holds the `[[roles]]` and nothing else, e.g. `/var/lib/qb/roles.toml`. With it, `[[roles]]` in this file is an error; without it, this file declares them. A missing, unreadable or invalid roles file stops the start like this file does; there is no default empty role set. Errors in it name the roles file. |
+| `roles_file` | string | Optional absolute path of a TOML file that holds the `[[roles]]` and nothing else, e.g. `/var/lib/qb/roles.toml`. With it, `[[roles]]` in this file is an error; without it, this file declares them. A missing, unreadable or invalid roles file stops the start like this file does; there is no default empty role set. Errors in it name the roles file. An admin's `PUT /v1/admin/roles` ([api.md](api.md#put-v1adminroles)) rewrites this file without its comments, with backups beside it, so `qbd` must be able to write its directory, as it can `/var/lib/qb` under the shipped unit. |
 
 Each role:
 

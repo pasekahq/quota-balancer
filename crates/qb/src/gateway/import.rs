@@ -145,7 +145,7 @@ pub fn import(
     }
     .encode(target)
     .map_err(|e| e.message)?;
-    creds::write_atomic(target, &body)
+    crate::rewrite::write_atomic(target, &body)
         .map_err(|e| format!("{}: cannot write: {e}", target.display()))?;
     Ok(Imported {
         file: target.to_owned(),

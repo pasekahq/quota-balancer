@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::config::{ClientToken, FrontClient, Fronts, GatewayConfig};
-use super::creds::write_atomic;
 use super::{Refusal, base64url};
 use crate::auth::token_matches;
 use crate::config::{BearerHash, Error};
+use crate::rewrite::write_atomic;
 use crate::{log, sha256};
 
 /// Largest token file in bytes.

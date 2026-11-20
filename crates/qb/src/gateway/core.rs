@@ -25,8 +25,7 @@ use zeroize::Zeroizing;
 
 use super::Refusal;
 use super::config::{Api, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route};
-use super::config_edit::Unwritten;
-use super::creds::{CredentialStore, Kind, Refresher, Written, write_atomic};
+use super::creds::{CredentialStore, Kind, Refresher, Written};
 use super::signin::SignIn;
 use super::spend::{self, Ledger};
 use super::tokens::{self, ClientTokens};
@@ -35,6 +34,7 @@ use super::upstream::{
 };
 use super::{audit, config_edit, usage};
 use crate::config::{BearerHash, Error};
+use crate::rewrite::{self, Unwritten, write_atomic};
 use crate::sandbox::{file_dir, gateway_files};
 use crate::server::unix_now;
 use crate::{client, log, sha256};
@@ -641,35 +641,16 @@ impl Gateway {
                 backup: None,
             });
         }
-        let backup = config_edit::backup(file, text.as_bytes(), unix_now())
-            .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
-        let replaced = config_edit::replace(
-            file,
-            text.as_bytes(),
-            candidate.as_bytes(),
-            &backup,
-            write_atomic,
-        );
-        if let Err(u) = replaced {
-            if !u.replaced {
-                return Err(failed(format!(
-                    "cannot write {}: {}",
-                    file.display(),
-                    u.error
-                )));
-            }
-            if let Ok(now) = std::fs::read(file) {
-                entry.config_sha256_after = Some(sha256::hex(sha256::digest(&now)));
-            }
-            let file = file.display();
-            let backup = backup.display().to_string();
-            let message = format!(
-                "{file} was replaced but not installed: {}; the old file is kept as {backup}",
-                u.error
-            );
-            entry.backup = Some(backup);
-            return Err(failed(message));
-        }
+        let backup = rewrite::rewrite(file, text.as_bytes(), candidate.as_bytes(), unix_now())
+            .map_err(|f| {
+                if let rewrite::Failed::Replaced { backup, .. } = &f {
+                    if let Ok(now) = std::fs::read(file) {
+                        entry.config_sha256_after = Some(sha256::hex(sha256::digest(&now)));
+                    }
+                    entry.backup = Some(backup.display().to_string());
+                }
+                failed(f.message(file))
+            })?;
         let after = sha256::hex(config.sha256);
         self.install(config, current);
         let backup = backup.display().to_string();
@@ -1780,11 +1761,11 @@ fn replace_credential(
     };
     let backup = old
         .as_ref()
-        .map(|old| config_edit::backup(file, old, unix_now()))
+        .map(|old| rewrite::backup(file, old, unix_now()))
         .transpose()
         .map_err(|e| failed(format!("cannot write a backup of {}: {e}", file.display())))?;
     let written = match (&old, &backup) {
-        (Some(old), Some(backup)) => config_edit::replace(file, old, bytes, backup, write_atomic),
+        (Some(old), Some(backup)) => rewrite::replace(file, old, bytes, backup, write_atomic),
         _ => write_atomic(file, bytes).map_err(|error| Unwritten {
             replaced: std::fs::symlink_metadata(file).is_ok(),
             error,

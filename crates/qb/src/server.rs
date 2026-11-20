@@ -101,15 +101,24 @@ impl Reload {
         applied
     }
 
-    fn apply(&mut self, core: &mut Core, gate: &mut Gate) -> Result<(), config::Error> {
-        let candidate = config::load(&self.file)?;
-        if let Some(key) = self.running.restart_only_change(&candidate) {
-            return Err(config::Error {
+    /// Refuses `candidate` when it changes a key other than `[[roles]]` and `[[clients]]`.
+    ///
+    /// # Errors
+    /// The first such key, as a fault of the config file.
+    pub(crate) fn check(&self, candidate: &Config) -> Result<(), config::Error> {
+        match self.running.restart_only_change(candidate) {
+            Some(key) => Err(config::Error {
                 file: self.file.clone(),
                 field: key.to_owned(),
                 reason: "changed; it takes effect only on a restart".to_owned(),
-            });
+            }),
+            None => Ok(()),
         }
+    }
+
+    fn apply(&mut self, core: &mut Core, gate: &mut Gate) -> Result<(), config::Error> {
+        let candidate = config::load(&self.file)?;
+        self.check(&candidate)?;
         core.set_roles(candidate.core_spec().roles)
             .map_err(|e| config::Error {
                 file: candidate

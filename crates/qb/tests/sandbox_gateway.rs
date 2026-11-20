@@ -179,7 +179,7 @@ fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
             "a reload reads the replaced file"
         );
         assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
-        qb::gateway::creds::write_atomic(&written, br#"{"type":"api_key","key":"k2"}"#).unwrap();
+        qb::rewrite::write_atomic(&written, br#"{"type":"api_key","key":"k2"}"#).unwrap();
         let now = qb::server::unix_now();
         let mut ledger = qb::gateway::spend::Ledger::open(&counted, now).unwrap();
         ledger.add("login-1", 1.5, now).unwrap();

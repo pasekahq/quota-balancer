@@ -15,11 +15,13 @@ responses may gain optional fields, which clients ignore. Types are defined in `
 | `POST /v1/agent/next` | `AgentNextRequest` | 200 `AgentJob`, 400 unknown login, 403 not an agent, 429 too many waiting |
 | `POST /v1/agent/result` | `AgentResultRequest` | 200 `ReportResponse`, 403 another client's probe, 404 unknown or expired probe |
 | `GET /v1/admin/roles` | — | 200 `AdminRoles` with an `ETag`, 403 not an admin client, 500 a config file cannot be read or does not validate |
+| `PUT /v1/admin/roles` | `AdminRolesPut`, `If-Match` | 200 `AdminRolesWritten`, 400 body or roles refused, 403 not an admin client, 404 no `roles_file`, 412 stale `If-Match`, 428 no `If-Match`, 500 a file cannot be read or written |
 | `POST /v1/admin/reload` | — | 200 `AdminReloadAnswer`, 400 reload refused, 403 not an admin client |
 
 Errors: `{"error": <code>, "message": "..."}` with codes `bad_request` (400), `unauthorized`
 (401), `forbidden` (403), `not_found` (404), `method_not_allowed` (405), `length_required`
-(411), `payload_too_large` (413), `too_many_requests` (429), `internal` (500).
+(411), `precondition_failed` (412), `payload_too_large` (413), `precondition_required` (428),
+`too_many_requests` (429), `internal` (500).
 
 ## Callers
 
@@ -222,6 +224,15 @@ refused or not, logs one line naming its caller and status:
 qbd: admin POST /v1/admin/reload by client-a: 200
 ```
 
+The line of a `PUT /v1/admin/roles` also names the roles file's hash before and after and the
+backup, or that nothing was written (`after` equals `before` then, unless a failed write replaced
+the file):
+
+```
+qbd: admin PUT /v1/admin/roles by client-a: 200, roles sha256 5f1d… -> 7c2e…, backup /var/lib/qb/roles.toml.bak-1800000360
+qbd: admin PUT /v1/admin/roles by client-a: 412, roles sha256 5f1d… -> 5f1d…, nothing written
+```
+
 ### `GET /v1/admin/roles`
 
 The roles of the config file and its `roles_file` as they are on disk, which may differ from the
@@ -243,6 +254,59 @@ absent when the file has none. See `admin_roles_file.json`:
 
 A file that cannot be read or does not validate is 500 `internal` with the message
 `cannot read the roles: <file>: <field>: <reason>`, never a partial answer.
+
+### `PUT /v1/admin/roles`
+
+Replaces the `roles_file` ([config.md](config.md#roles)) with the roles of the body and makes
+them the running roles. The body is `AdminRolesPut`, the `roles` of `GET` in the same shape,
+unknown fields refused at every level; `If-Match` carries the hash `GET` answered, quoted as in
+the `ETag` or bare. See `admin_roles_put.json`:
+
+```json
+{"roles": [{"name": "worker",
+            "ladder": [{"difficulty": 1, "candidates": [
+                         {"vendor": "vendor-a", "model": "model-small", "tier": 1}]}],
+            "reserves": [{"difficulty": 1, "window": "five_hour", "fraction": 0.2}]}]}
+```
+
+A config without `roles_file` is 404 `not_found` and nothing is written. `qbd` reads the roles
+file again: no `If-Match` is 428 `precondition_required`, one that is not the file's current hash
+412 `precondition_failed`, so an edit by hand since the `GET` is detected. A body that does not
+decode is 400 `bad_request`.
+
+The roles are rendered as the whole file: one `[[roles]]` table per role in body order, each
+followed by its `[[roles.ladder]]` and `[[roles.reserves]]` tables, keys in the order of the
+`GET` shape, strings as escaped TOML basic strings, `fraction` and `cost_per_minute` as floats
+that parse back to the same number. Comments and the layout of the old file are not kept. An
+empty `roles` or `ladder` renders no table. The candidate goes through the parser and validation
+of startup together with the config file on disk, and must change nothing a reload refuses
+([config.md](config.md#reloading-roles-and-clients)); otherwise the answer is 400 `bad_request`
+with the message `roles refused: <file>: <field>: <reason>`, the line being the candidate's, for
+example ``roles[0].ladder[0].candidates[0].vendor: undeclared vendor `vendor-z` (line 7)``,
+``roles[1].name: duplicate name `worker` (line 11)``, ``missing field `roles` (line 1)`` for an
+empty `roles`, or ``clients[0].role: undeclared role `worker` (line 22)`` of the config file for
+a body that drops a role a client names.
+
+On success the old file is copied to `<roles_file>.bak-<unix s>`, `-<n>` appended when a backup
+of that second exists, with mode 0600; the candidate is written atomically with mode 0600
+(temporary file in the same directory, fsync, rename, fsync of the directory) and installed by
+the reload of `POST /v1/admin/reload`, logging `qbd: reloaded …`: live leases, login states,
+windows and marks stay, and the next `pick` follows the new ladders. The answer is
+`AdminRolesWritten` with the hash of the file now on disk:
+
+```json
+{"sha256": "7c2e…", "backup": "/var/lib/qb/roles.toml.bak-1800000360"}
+```
+
+A candidate equal to the file byte for byte is not written: the answer is 200 with the file's
+hash and no `backup`, no backup is made and nothing is reloaded. A file that cannot be read or
+written is 500 `internal`. On every refusal the file, its backups and the running roles stay as
+they were, with one exception: a write that fails after the rename replaced the file, or a reload
+that refuses the written file, is 500 `internal` with the message `<file> was replaced but not
+installed: <error>; the old file is kept as <backup>`. The running roles stay, the file on disk
+is the candidate and the backup is kept, so a reload installs the candidate and the backup
+restores the old file. `qbd` removes the new backup only when a failed write left the file
+unchanged, and no other backup.
 
 ### `POST /v1/admin/reload`
 

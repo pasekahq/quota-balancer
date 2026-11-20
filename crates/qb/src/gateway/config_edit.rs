@@ -4,24 +4,19 @@
 //!
 //! An item spans from its `[[routes]]` header to the end of the line of its last value, so
 //! comments and blank lines after that line stay, and comments inside an item go with it.
-//!
-//! [`backup`] and [`replace`] also keep and replace a credential file for a key replacement.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs::OpenOptions;
-use std::io::{self, ErrorKind, Write as _};
 use std::ops::Range;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use qb_proto::{ConfigRoute, ConfigStep};
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
-use zeroize::Zeroizing;
 
 use super::config::{CredentialKind, GatewayLogin, Route};
 use crate::config::{Error, toml_error};
+use crate::rewrite::{basic, float};
 
 /// `routes` key for key, as `/v1/model/config/routes` carries them.
 pub fn routes_of(routes: &[Route]) -> Vec<ConfigRoute> {
@@ -97,27 +92,6 @@ pub fn render(routes: &[ConfigRoute]) -> String {
 /// Appends the line `name = "<value>"`.
 fn key(out: &mut String, name: &str, value: &str) {
     let _ = writeln!(out, "{name} = {}", basic(value));
-}
-
-/// `s` as a TOML basic string.
-fn basic(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\u{:04X}", u32::from(c));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// `text`, the config file `file`, with its `[[routes]]` items replaced by `items` at the place
@@ -285,7 +259,7 @@ pub fn set_spend_caps(
         }
         let key = table.iter().find(|(k, _)| k.get_ref() == "spend_cap");
         match (key, cap) {
-            (Some((_, v)), Some(cap)) => edits.push((v.span(), usd(*cap))),
+            (Some((_, v)), Some(cap)) => edits.push((v.span(), float(*cap))),
             (Some((k, v)), None) => {
                 let start = text[..k.span().start].rfind('\n').map_or(0, |n| n + 1);
                 edits.push((start..line_end(text, v.span().end), String::new()));
@@ -293,7 +267,7 @@ pub fn set_spend_caps(
             (None, Some(cap)) => {
                 let at = line_end(text, last_end(login));
                 let newline = if text[..at].ends_with('\n') { "" } else { "\n" };
-                edits.push((at..at, format!("{newline}spend_cap = {}\n", usd(*cap))));
+                edits.push((at..at, format!("{newline}spend_cap = {}\n", float(*cap))));
             }
             (None, None) => {}
         }
@@ -304,82 +278,6 @@ pub fn set_spend_caps(
         out.replace_range(range, &with);
     }
     Ok(out)
-}
-
-/// `v` as a TOML float that parses back to the same `f64`.
-fn usd(v: f64) -> String {
-    format!("{v:?}")
-}
-
-/// Why [`replace`] failed: the write's error and whether the file may no longer hold its old
-/// bytes.
-#[derive(Debug)]
-pub struct Unwritten {
-    /// The write's error.
-    pub error: io::Error,
-    /// The file does not read back as its old bytes.
-    pub replaced: bool,
-}
-
-/// Writes `candidate` over `file`, whose bytes were `old`, through `write`. On a failure the
-/// backup `backup` of `old` is removed only when `file` still reads back as `old`; that read is
-/// zeroized, since `file` may be a credential file.
-///
-/// # Errors
-/// `write` failed.
-pub fn replace(
-    file: &Path,
-    old: &[u8],
-    candidate: &[u8],
-    backup: &Path,
-    write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
-) -> Result<(), Unwritten> {
-    let Err(error) = write(file, candidate) else {
-        return Ok(());
-    };
-    let replaced = std::fs::read(file).map_or(true, |now| *Zeroizing::new(now) != old);
-    if !replaced {
-        let _ = std::fs::remove_file(backup);
-    }
-    Err(Unwritten { error, replaced })
-}
-
-/// Most backups of one second; one more is refused.
-const BACKUPS_PER_SECOND: u32 = 100;
-
-/// Writes `bytes` to a new 0600 file `<file>.bak-<now>`, with `-<n>` appended when a backup of
-/// that second exists; never replaces a file.
-///
-/// # Errors
-/// The file cannot be created or written; a partly written one is removed.
-pub fn backup(file: &Path, bytes: &[u8], now: u64) -> io::Result<PathBuf> {
-    for n in 0..BACKUPS_PER_SECOND {
-        let mut name = file.as_os_str().to_owned();
-        name.push(format!(".bak-{now}"));
-        if n > 0 {
-            name.push(format!("-{n}"));
-        }
-        let path = PathBuf::from(name);
-        let mut f = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        };
-        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
-        }
-        return Ok(path);
-    }
-    Err(io::Error::new(
-        ErrorKind::AlreadyExists,
-        format!("{BACKUPS_PER_SECOND} backups of second {now} exist"),
-    ))
 }
 
 #[cfg(test)]
@@ -518,15 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn written_amounts_parse_back_to_the_same_f64() {
-        for v in [25.0, 0.1, 1.0 / 3.0, 1e21, 1e-7, 123_456.789, f64::MAX] {
-            let text = format!("x = {}\n", usd(v));
-            let read: BTreeMap<String, f64> = toml::from_str(&text).unwrap();
-            assert_eq!(read["x"].to_bits(), v.to_bits(), "{text}");
-        }
-    }
-
-    #[test]
     fn an_unknown_inline_or_other_kind_login_is_refused_by_name() {
         let refused = |caps: &[(&str, Option<f64>)]| capped(LOGINS, caps).unwrap_err();
         assert_eq!(
@@ -542,49 +431,6 @@ mod tests {
             capped(inline, &[("key-1", Some(1.0))]).unwrap_err(),
             "gw.toml: logins: login `key-1` is not a `[[logins]]` table"
         );
-    }
-
-    fn dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("qb-edit-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn a_failed_write_that_replaced_the_file_keeps_the_backup() {
-        let file = dir("replaced").join("gw.toml");
-        std::fs::write(&file, "old").unwrap();
-        let backup = backup(&file, b"old", 7).unwrap();
-        let after_rename = |f: &Path, bytes: &[u8]| {
-            std::fs::write(f, bytes).unwrap();
-            Err(io::Error::other("directory sync failed"))
-        };
-        let u = replace(&file, b"old", b"new", &backup, after_rename).unwrap_err();
-        assert_eq!(
-            (u.replaced, u.error.to_string().as_str()),
-            (true, "directory sync failed")
-        );
-        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
-        assert_eq!(std::fs::read(&file).unwrap(), b"new");
-        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn a_failed_write_that_left_the_file_alone_removes_the_backup() {
-        let file = dir("unchanged").join("gw.toml");
-        std::fs::write(&file, "old").unwrap();
-        let backup = backup(&file, b"old", 7).unwrap();
-        let before_rename = |_: &Path, _: &[u8]| Err(io::Error::other("disk full"));
-        let u = replace(&file, b"old", b"new", &backup, before_rename).unwrap_err();
-        assert!(!u.replaced);
-        assert!(!backup.exists());
-        assert_eq!(std::fs::read(&file).unwrap(), b"old");
-        let ok = |f: &Path, bytes: &[u8]| std::fs::write(f, bytes);
-        let backup = super::backup(&file, b"old", 7).unwrap();
-        replace(&file, b"old", b"new", &backup, ok).unwrap();
-        assert!(backup.exists());
-        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 
     #[test]

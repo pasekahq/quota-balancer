@@ -48,7 +48,7 @@ use zeroize::Zeroizing;
 
 mod common;
 
-use common::http::{etag, finish, send, sha256_hex};
+use common::http::{etag, finish, put, send, sha256_hex};
 use common::pkce::{param, params, s256};
 use common::vendor::{Answer, Received, Vendor, fixture_of};
 use common::{Daemon, line_with, start_daemon, stderr_lines, temp_dir, wait_for};
@@ -7949,22 +7949,6 @@ fn config_routes(gw: &Path) -> (ConfigRoutes, String) {
     (serde_json::from_slice(&body).unwrap(), etag)
 }
 
-/// `PUT /v1/model/config/routes` on `gw` with `If-Match: if_match` when given and `body`.
-fn put_routes(gw: &Path, if_match: Option<&str>, body: &str) -> (u16, Vec<u8>) {
-    let mut s = UnixStream::connect(gw).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-    let if_match = if_match.map_or(String::new(), |m| format!("If-Match: {m}\r\n"));
-    write!(
-        s,
-        "PUT {} HTTP/1.1\r\nHost: qb\r\n{if_match}Content-Length: {}\r\n\r\n{body}",
-        paths::MODEL_CONFIG_ROUTES,
-        body.len()
-    )
-    .unwrap();
-    let (status, _, body) = finish(s, Vec::new());
-    (status, body)
-}
-
 /// The body of a `PUT` of `routes`.
 fn routes_body(routes: &[ConfigRoute]) -> String {
     serde_json::to_string(&ConfigRoutesPut {
@@ -8038,7 +8022,12 @@ fn config_routes_answer_the_file_s_routes_and_hash_and_a_put_of_them_round_trips
     };
     assert_eq!(got.routes, [chat]);
 
-    let (status, body) = put_routes(&r.gw, Some(&etag), &routes_body(&got.routes));
+    let (status, body) = put(
+        &r.gw,
+        paths::MODEL_CONFIG_ROUTES,
+        Some(&etag),
+        &routes_body(&got.routes),
+    );
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let (again, _) = config_routes(&r.gw);
     assert_eq!(again.routes, got.routes);
@@ -8079,7 +8068,12 @@ fn a_put_of_a_changed_chain_and_a_new_route_serves_the_next_turn_and_keeps_other
         ..ladder_route("added")
     };
     let started = unix_now();
-    let (status, body) = put_routes(&r.gw, Some(&etag), &routes_body(&[chat, added]));
+    let (status, body) = put(
+        &r.gw,
+        paths::MODEL_CONFIG_ROUTES,
+        Some(&etag),
+        &routes_body(&[chat, added]),
+    );
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let written: ConfigRoutesWritten = serde_json::from_slice(&body).unwrap();
 
@@ -8212,7 +8206,7 @@ fn a_put_without_or_with_a_stale_if_match_or_an_invalid_candidate_leaves_everyth
 
 /// [`put_routes`] that must be refused: the status and the error.
 fn put_error(gw: &Path, if_match: Option<&str>, body: &str) -> (u16, GatewayError) {
-    let (status, body) = put_routes(gw, if_match, body);
+    let (status, body) = put(gw, paths::MODEL_CONFIG_ROUTES, if_match, body);
     let e = serde_json::from_slice(&body)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&body)));
     (status, e)
@@ -8232,7 +8226,12 @@ fn string_values_needing_toml_escapes_round_trip() {
         ..ladder_route("odd")
     };
     let routes = [ladder_route("chat"), odd];
-    let (status, body) = put_routes(&r.gw, Some(&etag), &routes_body(&routes));
+    let (status, body) = put(
+        &r.gw,
+        paths::MODEL_CONFIG_ROUTES,
+        Some(&etag),
+        &routes_body(&routes),
+    );
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let (got, _) = config_routes(&r.gw);
     assert_eq!(got.routes, routes);
@@ -8341,7 +8340,7 @@ fn spend_caps_are_set_changed_and_removed_in_place_and_the_spend_view_follows() 
     assert_eq!(got.spend_caps, caps([Some(1.0), Some(100.0), Some(100.0)]));
 
     let body = caps_body(&[("login-1", Some(2.5)), ("login-2", None)]);
-    let (status, answer) = put_routes(&r.gw, Some(&etag), &body);
+    let (status, answer) = put(&r.gw, paths::MODEL_CONFIG_ROUTES, Some(&etag), &body);
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
     let written: ConfigRoutesWritten = serde_json::from_slice(&answer).unwrap();
     let after = std::fs::read_to_string(&file).unwrap();
@@ -8363,7 +8362,12 @@ fn spend_caps_are_set_changed_and_removed_in_place_and_the_spend_view_follows() 
     let (got, etag) = config_routes(&r.gw);
     assert_eq!(got.spend_caps, caps([Some(2.5), None, Some(100.0)]));
 
-    let (status, answer) = put_routes(&r.gw, Some(&etag), &caps_body(&[("login-2", Some(0.1))]));
+    let (status, answer) = put(
+        &r.gw,
+        paths::MODEL_CONFIG_ROUTES,
+        Some(&etag),
+        &caps_body(&[("login-2", Some(0.1))]),
+    );
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
     let added = std::fs::read_to_string(&file).unwrap();
     let with_cap = format!("{}spend_cap = 0.1\n", chain_login(&r, "login-2", ""));
@@ -8409,7 +8413,12 @@ fn a_put_that_changes_no_byte_answers_the_file_s_hash_and_neither_writes_nor_rel
     let inode = std::fs::metadata(&file).unwrap().ino();
     let (got, etag) = config_routes(&r.gw);
 
-    let (status, answer) = put_routes(&r.gw, Some(&etag), &caps_body(&[("login-1", Some(3.0))]));
+    let (status, answer) = put(
+        &r.gw,
+        paths::MODEL_CONFIG_ROUTES,
+        Some(&etag),
+        &caps_body(&[("login-1", Some(3.0))]),
+    );
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
     let written: ConfigRoutesWritten = serde_json::from_slice(&answer).unwrap();
     let unchanged = ConfigRoutesWritten {
@@ -8452,7 +8461,7 @@ fn a_put_of_routes_and_caps_is_one_edit_audited_as_config_routes() {
         "spend_caps": {"login-3": 50, "login-1": null},
     })
     .to_string();
-    let (status, answer) = put_routes(&r.gw, Some(&etag), &body);
+    let (status, answer) = put(&r.gw, paths::MODEL_CONFIG_ROUTES, Some(&etag), &body);
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
     let written: ConfigRoutesWritten = serde_json::from_slice(&answer).unwrap();
     assert_eq!(aliases(&r.gw), ["added", "chat"]);

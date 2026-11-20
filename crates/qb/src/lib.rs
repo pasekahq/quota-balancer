@@ -23,6 +23,7 @@ pub mod journal;
 mod jsonl;
 pub mod listen;
 pub mod log;
+pub mod rewrite;
 pub mod sandbox;
 pub mod server;
 mod sha256;

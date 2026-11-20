@@ -48,7 +48,8 @@ pub mod paths {
     pub const AGENT_RESULT: &str = "/v1/agent/result";
     /// Prefix of the endpoints only an admin client of `qbd` may call.
     pub const ADMIN: &str = "/v1/admin/";
-    /// `GET`: the roles and ladders of `qbd`'s config files on disk; admin only.
+    /// `GET`: the roles and ladders of `qbd`'s config files on disk; `PUT`: replaces the
+    /// `roles_file` and runs it; admin only.
     pub const ADMIN_ROLES: &str = "/v1/admin/roles";
     /// `POST`: `qbd` reloads its roles and clients as on SIGHUP; admin only.
     pub const ADMIN_RELOAD: &str = "/v1/admin/reload";
@@ -537,8 +538,9 @@ pub struct AdminRoles {
     pub roles: Vec<RoleConfig>,
 }
 
-/// A role as its config file declares it.
+/// A role as its config file declares it; `PUT /v1/admin/roles` takes the same shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleConfig {
     /// Role name.
     pub name: String,
@@ -551,6 +553,7 @@ pub struct RoleConfig {
 
 /// One ladder step of a role.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LadderStep {
     /// Difficulty the step serves.
     pub difficulty: u8,
@@ -560,6 +563,7 @@ pub struct LadderStep {
 
 /// A vendor/model/effort combination of a ladder step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LadderCandidate {
     /// Declared vendor.
     pub vendor: String,
@@ -577,6 +581,7 @@ pub struct LadderCandidate {
 
 /// Fraction of a window a role keeps free at a difficulty.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleReserve {
     /// Difficulty of a ladder step of the role.
     pub difficulty: u8,
@@ -584,6 +589,25 @@ pub struct RoleReserve {
     pub window: String,
     /// Reserved fraction, `0.0..=1.0`.
     pub fraction: f64,
+}
+
+/// `PUT /v1/admin/roles` request: the roles that replace the `roles_file`, in the `GET` shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRolesPut {
+    /// The roles in file order.
+    pub roles: Vec<RoleConfig>,
+}
+
+/// `PUT /v1/admin/roles` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRolesWritten {
+    /// Hex SHA-256 of the roles file written and now running, or of the file left as it was.
+    pub sha256: String,
+    /// Path of the copy of the file it replaced; absent when the roles change no byte and
+    /// nothing was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
 }
 
 /// `POST /v1/admin/reload` response: the counts of the config now running.
@@ -613,9 +637,13 @@ pub enum ErrorCode {
     LengthRequired,
     /// Body or headers over the limit.
     PayloadTooLarge,
+    /// `If-Match` is not the current hash of the file it guards.
+    PreconditionFailed,
+    /// An edit without the `If-Match` it needs.
+    PreconditionRequired,
     /// Too many requests from this client.
     TooManyRequests,
-    /// Bug.
+    /// Bug, or a file the daemon cannot read or write.
     Internal,
 }
 
@@ -630,6 +658,8 @@ impl ErrorCode {
             Self::MethodNotAllowed => 405,
             Self::LengthRequired => 411,
             Self::PayloadTooLarge => 413,
+            Self::PreconditionFailed => 412,
+            Self::PreconditionRequired => 428,
             Self::TooManyRequests => 429,
             Self::Internal => 500,
         }

@@ -1,9 +1,9 @@
 //! Contract fixtures: every fixture decodes into its type and re-encodes to the same JSON.
 
 use qb_proto::{
-    AdminReloadAnswer, AdminRoles, AgentJob, AgentNextRequest, AgentResultRequest, Decision,
-    ErrorBody, HealthResponse, Outcome, PickRequest, PickResponse, ProbeOutcome, ReportRequest,
-    ReportResponse, RolesSource, StateResponse, WhyResponse,
+    AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, AgentJob, AgentNextRequest,
+    AgentResultRequest, Decision, ErrorBody, HealthResponse, Outcome, PickRequest, PickResponse,
+    ProbeOutcome, ReportRequest, ReportResponse, RolesSource, StateResponse, WhyResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -102,6 +102,20 @@ fn admin_roles_and_reload() {
 }
 
 #[test]
+fn admin_roles_put_takes_the_get_shape() {
+    let put: AdminRolesPut = roundtrip("admin_roles_put.json");
+    let got: AdminRoles = roundtrip("admin_roles_file.json");
+    assert_eq!(put.roles, got.roles);
+    let written: AdminRolesWritten = roundtrip("admin_roles_written.json");
+    assert_eq!(
+        written.backup.as_deref(),
+        Some("/var/lib/qb/roles.toml.bak-1800000360")
+    );
+    let unchanged: AdminRolesWritten = roundtrip("admin_roles_unchanged.json");
+    assert_eq!(unchanged.backup, None);
+}
+
+#[test]
 fn requests_reject_unknown_fields() {
     let err = serde_json::from_str::<PickRequest>(r#"{"role":"worker","difficulty":1,"x":1}"#);
     assert!(err.is_err());
@@ -112,4 +126,17 @@ fn requests_reject_unknown_fields() {
     let err =
         serde_json::from_str::<AgentResultRequest>(r#"{"probe_id":"p-1","outcome":"ok","x":1}"#);
     assert!(err.is_err());
+    let put: Value = serde_json::from_str(&fixture("admin_roles_put.json")).unwrap();
+    for at in [
+        "",
+        "/roles/0",
+        "/roles/0/ladder/0",
+        "/roles/0/ladder/0/candidates/0",
+        "/roles/0/reserves/0",
+    ] {
+        let mut v = put.clone();
+        let object = v.pointer_mut(at).unwrap().as_object_mut().unwrap();
+        object.insert("x".into(), 1.into());
+        assert!(serde_json::from_value::<AdminRolesPut>(v).is_err(), "{at}");
+    }
 }
