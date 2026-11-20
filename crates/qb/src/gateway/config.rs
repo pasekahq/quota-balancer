@@ -15,7 +15,8 @@ use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
 use crate::config::{
-    BEARER_HASH_EXPECTED, BearerHash, Error, Fault, declare, offset, toml_error, too_many,
+    BEARER_HASH_EXPECTED, BearerHash, Error, Fault, declare, line, offset, read, toml_error,
+    too_many,
 };
 
 /// Most turns one gateway runs at once.
@@ -289,6 +290,28 @@ pub struct Route {
     pub chain: Vec<Step>,
     /// Expected minutes of a turn, for the lease's cost estimate.
     pub expected_minutes: Option<u32>,
+    /// Whose effort a turn sends; `None` when the file has no key, which acts as
+    /// [`ClientEffort::Use`].
+    pub client_effort: Option<ClientEffort>,
+}
+
+/// Whose reasoning effort a route's turns send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientEffort {
+    /// The client's effort, else the pick's.
+    Use,
+    /// The pick's effort only; the client's is dropped.
+    Ignore,
+}
+
+impl ClientEffort {
+    /// The name in the config, e.g. `ignore`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Use => "use",
+            Self::Ignore => "ignore",
+        }
+    }
 }
 
 /// One pin of a chain route.
@@ -328,12 +351,7 @@ impl Route {
 /// The file cannot be read, is not valid TOML of this schema, or breaks a rule of
 /// `docs/config.md`.
 pub fn load(file: &Path) -> Result<GatewayConfig, Error> {
-    let text = std::fs::read_to_string(file).map_err(|e| Error {
-        file: file.to_owned(),
-        field: String::new(),
-        reason: format!("cannot read: {e}"),
-    })?;
-    parse(file, &text)
+    parse(file, &read(file)?)
 }
 
 /// Parses and validates `text` as the gateway config named `file` in errors.
@@ -349,10 +367,7 @@ pub fn parse(file: &Path, text: &str) -> Result<GatewayConfig, Error> {
     };
     let at_line = |(field, reason, at): WalkError| {
         let reason = match at {
-            Some(at) => {
-                let line = text.get(..at).map_or(0, |s| s.matches('\n').count()) + 1;
-                format!("{reason} (line {line})")
-            }
+            Some(at) => format!("{reason} (line {})", line(text, at)),
             None => reason,
         };
         fail((field, reason))
@@ -1019,6 +1034,7 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         effort: None,
         chain: Vec::new(),
         expected_minutes: None,
+        client_effort: None,
     };
     let mut chain_at = None;
     let known = [
@@ -1030,6 +1046,7 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         "effort",
         "chain",
         "expected_minutes",
+        "client_effort",
     ];
     fields(at, t, &known, &["alias", "role"], |key, at, v| {
         match key {
@@ -1042,6 +1059,16 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
             "chain" => {
                 r.chain = walk_chain(at, v)?;
                 chain_at = Some(v.span().start);
+            }
+            "client_effort" => {
+                r.client_effort = Some(match string(at, v)?.as_str() {
+                    "use" => ClientEffort::Use,
+                    "ignore" => ClientEffort::Ignore,
+                    _ => {
+                        let reason = "expected `use` or `ignore`".into();
+                        return Err((at.to_owned(), reason, Some(v.span().start)));
+                    }
+                });
             }
             _ => r.expected_minutes = Some(integer(at, v)?),
         }
@@ -1741,6 +1768,25 @@ difficulty = 1
         )
         .unwrap_err();
         assert!(err.contains("routes[1].role: is missing"), "{err}");
+    }
+
+    #[test]
+    fn client_effort_is_read_on_ladder_pin_and_chain_routes() {
+        let routes = "[[routes]]\nalias = \"pin\"\nrole = \"r\"\nvendor = \"v\"\nmodel = \"m\"\n\
+                      client_effort = \"ignore\"\n\
+                      [[routes]]\nalias = \"walk\"\nrole = \"r\"\nclient_effort = \"use\"\n\
+                      chain = [{ vendor = \"v\", model = \"m\" }]\n";
+        let c = check("", routes).unwrap();
+        let read: Vec<_> = c.routes.iter().map(|r| r.client_effort).collect();
+        assert_eq!(
+            read,
+            [None, Some(ClientEffort::Ignore), Some(ClientEffort::Use)]
+        );
+        let err = check("", "client_effort = \"none\"\n").unwrap_err();
+        assert_eq!(
+            err,
+            "gw.toml: routes[0].client_effort: expected `use` or `ignore` (line 13)"
+        );
     }
 
     #[test]

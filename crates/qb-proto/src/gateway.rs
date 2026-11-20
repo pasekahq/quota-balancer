@@ -896,6 +896,10 @@ pub struct ConfigRoute {
     /// Expected minutes of a turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_minutes: Option<i64>,
+    /// Whose reasoning effort a turn sends: `use` (the client's, else the pick's) or `ignore`
+    /// (the pick's only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_effort: Option<String>,
 }
 
 /// `GET /v1/model/config/routes` response: the `[[routes]]` items and the `api_key` logins'

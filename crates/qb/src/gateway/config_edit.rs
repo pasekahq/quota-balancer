@@ -40,6 +40,7 @@ pub fn routes_of(routes: &[Route]) -> Vec<ConfigRoute> {
                     .collect()
             }),
             expected_minutes: r.expected_minutes.map(i64::from),
+            client_effort: r.client_effort.map(|c| c.as_str().to_owned()),
         })
         .collect()
 }
@@ -84,6 +85,9 @@ pub fn render(routes: &[ConfigRoute]) -> String {
         }
         if let Some(m) = r.expected_minutes {
             let _ = writeln!(out, "expected_minutes = {m}");
+        }
+        if let Some(c) = &r.client_effort {
+            key(&mut out, "client_effort", c);
         }
     }
     out
@@ -294,6 +298,7 @@ mod tests {
             effort: None,
             chain: None,
             expected_minutes: None,
+            client_effort: None,
         }
     }
 

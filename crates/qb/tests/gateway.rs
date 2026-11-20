@@ -5828,6 +5828,199 @@ fn a_model_configured_without_reasoning_gets_no_reasoning_effort_or_include() {
     assert_eq!(bodies[1]["include"], json!(["reasoning.encrypted_content"]));
 }
 
+/// Role `effort` for [`openai_qbd`]`("vendor-a")`: step 1 an Anthropic candidate with effort
+/// `high`, step 2 an OpenAI one with `medium`, step 3 an Anthropic one without effort.
+const EFFORT_ROLE: &str = r#"
+[[roles]]
+name = "effort"
+
+[[roles.ladder]]
+difficulty = 1
+candidates = [{ vendor = "vendor-a", model = "model-a", effort = "high", tier = 1 }]
+
+[[roles.ladder]]
+difficulty = 2
+candidates = [{ vendor = "vendor-o", model = "model-o", effort = "medium", tier = 1 }]
+
+[[roles.ladder]]
+difficulty = 3
+candidates = [{ vendor = "vendor-a", model = "model-a", tier = 1 }]
+"#;
+
+/// The routes of [`effort_rig`] in turn order: alias, step of the role `effort`, whether it sets
+/// `client_effort = "ignore"`, and the model and effort a turn with client effort `low` sends.
+const EFFORT_ROUTES: [(&str, u8, bool, &str, Option<&str>); 5] = [
+    ("ignore-a", 1, true, "model-a", Some("high")),
+    ("ignore-o", 2, true, "model-o", Some("medium")),
+    ("ignore-none", 3, true, "model-a", None),
+    ("use-a", 1, false, "model-a", Some("low")),
+    ("use-o", 2, false, "model-o", Some("low")),
+];
+
+/// A gateway with both adapters on one scripted vendor, login-1 an Anthropic key on vendor-a
+/// and login-2 an OpenAI key on vendor-o, and the ladder routes of [`EFFORT_ROUTES`].
+fn effort_rig() -> (Rig, Vendor) {
+    let mut routes = String::new();
+    for (alias, difficulty, ignore, _, _) in EFFORT_ROUTES {
+        let _ = writeln!(
+            routes,
+            "[[routes]]\nalias = \"{alias}\"\nrole = \"effort\"\ndifficulty = {difficulty}"
+        );
+        if ignore {
+            routes.push_str("client_effort = \"ignore\"\n");
+        }
+    }
+    let qbd = format!("{}{EFFORT_ROLE}", openai_qbd("vendor-a"));
+    let upstreams: Upstreams = vec![
+        (Api::Anthropic, Box::new(Anthropic::new())),
+        (Api::Openai, Box::new(Openai::new())),
+    ];
+    let logins = |v: &Vendor| [v.login(ANTHROPIC_KEY), v.login(OPENAI_KEY)];
+    let front = format!("{routes}{}", fronts(""));
+    vendor_rig_with(&qbd, upstreams, &key_files(), logins, &front, None)
+}
+
+/// Queues the vendor's answer to a turn on a model of [`effort_rig`].
+fn answer_on(vendor: &Vendor, model: &str) {
+    vendor.answer(if model == "model-o" {
+        openai_recorded("200_api_key", Some("upstream_text.sse"))
+    } else {
+        recorded("200_allowed", Some("upstream_text.sse"))
+    });
+}
+
+/// The model and effort of each upstream request: Anthropic `output_config.effort` or OpenAI
+/// `reasoning.effort`.
+fn models_and_efforts(vendor: &Vendor) -> Vec<(String, Option<String>)> {
+    vendor
+        .received()
+        .iter()
+        .map(|r| {
+            let effort = r.body.pointer("/output_config/effort");
+            let effort = effort.or_else(|| r.body.pointer("/reasoning/effort"));
+            let model = r.body["model"].as_str().unwrap().to_owned();
+            (model, effort.and_then(Value::as_str).map(str::to_owned))
+        })
+        .collect()
+}
+
+fn effort_want() -> Vec<(String, Option<String>)> {
+    EFFORT_ROUTES
+        .iter()
+        .map(|(_, _, _, model, effort)| ((*model).to_owned(), effort.map(str::to_owned)))
+        .collect()
+}
+
+#[test]
+fn an_ignoring_route_sends_the_candidate_s_effort_for_a_turn_s_effort() {
+    let (r, vendor) = effort_rig();
+    for (n, (alias, _, _, model, _)) in EFFORT_ROUTES.into_iter().enumerate() {
+        answer_on(&vendor, model);
+        let mut body = turn_body(&format!("turn-{n}"));
+        body["route"] = json!(alias);
+        body["effort"] = json!("low");
+        let (_, _, events) = turn(&r.gw, &body);
+        assert_eq!(kinds(&events).last().unwrap(), "stop End", "{alias}");
+    }
+    assert_eq!(models_and_efforts(&vendor), effort_want());
+
+    let mut body = turn_body("turn-bad");
+    body["route"] = json!("ignore-a");
+    body["effort"] = json!("huge");
+    let (status, e) = rejection(&r.gw, "POST", paths::MODEL_TURN, &body.to_string());
+    assert_eq!((status, e.class), (400, ErrorClass::BadRequest), "{e:?}");
+    assert_eq!(vendor.received().len(), EFFORT_ROUTES.len());
+}
+
+#[test]
+fn an_ignoring_route_sends_the_candidate_s_effort_for_a_messages_output_config_effort() {
+    let (r, vendor) = effort_rig();
+    for (alias, _, _, model, _) in EFFORT_ROUTES {
+        answer_on(&vendor, model);
+        let mut body = sdk_body(alias, false);
+        body["output_config"] = json!({"effort": "low"});
+        let (status, _, answer) = sdk_call(&r.gw, &body, None);
+        assert_eq!(status, 200, "{alias}: {}", String::from_utf8_lossy(&answer));
+    }
+    assert_eq!(models_and_efforts(&vendor), effort_want());
+}
+
+#[test]
+fn a_put_of_client_effort_round_trips_and_its_reload_applies_it() {
+    let (r, vendor) = effort_rig();
+    let (got, etag) = config_routes(&r.gw);
+    let read: Vec<_> = got.routes[2..]
+        .iter()
+        .map(|c| (c.alias.as_str(), c.client_effort.as_deref()))
+        .collect();
+    let want: Vec<_> = EFFORT_ROUTES
+        .iter()
+        .map(|(alias, _, ignore, _, _)| (*alias, ignore.then_some("ignore")))
+        .collect();
+    assert_eq!(read, want);
+
+    let mut routes = got.routes;
+    assert_eq!(
+        (routes[2].alias.as_str(), routes[5].alias.as_str()),
+        ("ignore-a", "use-a")
+    );
+    routes[2].client_effort = Some("use".into());
+    routes[5].client_effort = Some("ignore".into());
+    let (status, body) = put(
+        &r.gw,
+        paths::MODEL_CONFIG_ROUTES,
+        Some(&etag),
+        &routes_body(&routes),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (after, etag) = config_routes(&r.gw);
+    assert_eq!(after.routes, routes);
+
+    for (n, alias) in ["ignore-a", "use-a"].into_iter().enumerate() {
+        answer_on(&vendor, "model-a");
+        let mut body = turn_body(&format!("turn-{n}"));
+        body["route"] = json!(alias);
+        body["effort"] = json!("low");
+        let (_, _, events) = turn(&r.gw, &body);
+        assert_eq!(kinds(&events).last().unwrap(), "stop End", "{alias}");
+    }
+    let low = ("model-a".to_owned(), Some("low".to_owned()));
+    let high = ("model-a".to_owned(), Some("high".to_owned()));
+    assert_eq!(models_and_efforts(&vendor), [low, high]);
+
+    routes[2].client_effort = Some("never".into());
+    let (status, e) = put_error(&r.gw, Some(&etag), &routes_body(&routes));
+    assert_eq!((status, e.class), (400, ErrorClass::BadRequest), "{e:?}");
+    let message = e.message.unwrap();
+    assert!(
+        message.contains("routes[2].client_effort: expected `use` or `ignore`"),
+        "{message}"
+    );
+}
+
+/// A qbd of the shipped `deploy/examples/qbd.toml` behind a gateway with its vendor-a logins as
+/// Anthropic keys and `hive-step-3` as the shipped gateway example declares it.
+#[test]
+fn hive_step_3_of_the_shipped_examples_sends_the_step_3_candidate_s_model_and_effort() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/examples/qbd.toml");
+    let qbd = std::fs::read_to_string(example).unwrap();
+    let route = "[[routes]]\nalias = \"hive-step-3\"\nrole = \"hive-heads\"\ndifficulty = 3\n\
+                 client_effort = \"ignore\"\n";
+    let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
+    let front = format!("{route}{}", fronts(""));
+    let (r, vendor) = vendor_rig_with(&qbd, upstreams, &key_files(), two_keys, &front, None);
+    // The step's OpenAI subscription candidate runs on login-3, which this gateway lacks.
+    exhaust(&r.qbd, "login-3", unix_now() + 3600);
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let mut body = turn_body("turn-1");
+    body["route"] = json!("hive-step-3");
+    body["effort"] = json!("low");
+    let (_, _, events) = turn(&r.gw, &body);
+    assert_eq!(kinds(&events).last().unwrap(), "stop End", "{events:?}");
+    let medium = ("model-large".to_owned(), Some("medium".to_owned()));
+    assert_eq!(models_and_efforts(&vendor), [medium]);
+}
+
 #[test]
 fn messages_on_a_chatgpt_login_sends_its_account_and_never_shows_reasoning_as_thinking() {
     const ACCESS: &str = "test-access-6d1f";
@@ -7983,6 +8176,7 @@ fn ladder_route(alias: &str) -> ConfigRoute {
         effort: None,
         chain: None,
         expected_minutes: None,
+        client_effort: None,
     }
 }
 

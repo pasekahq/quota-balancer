@@ -354,6 +354,7 @@ ladder step, a pin, or a chain of pins.
 | `effort` | string | Reasoning effort of a pin. |
 | `chain` | array of tables | Instead of `difficulty`, `vendor`, `model` and `effort`: 1 to 8 steps `{ vendor, model, effort }`, each a pin (`vendor` and `model` required), which a turn tries in order ([api.md](api.md#attempts-and-rotation)). |
 | `expected_minutes` | integer | Expected length of a turn, for the lease's cost. |
+| `client_effort` | string | Whose reasoning effort a turn sends: `use` (default) the client's, else the picked candidate's, the pin's or the chain step's; `ignore` only the pick's, or none when it has none, whatever effort the client sent ([api.md](api.md#post-v1modelturn)). |
 
 A chain across vendors: [Examples](#a-route-chaining-subscription-key-and-openrouter).
 
@@ -552,8 +553,9 @@ Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secre
 
 Each shape below is a part of [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml)
 and the lines of [`deploy/examples/qbd.toml`](../deploy/examples/qbd.toml) it needs; the two files
-together are one working installation. Every route of that gateway runs on the `qbd` role
-`gateway`, which `qbd.toml` declares with a ladder and grants to the gateway's uid:
+together are one working installation. Every route of that gateway but `hive-step-1` to
+`hive-step-5` runs on the `qbd` role `gateway`, which `qbd.toml` declares with a ladder and
+grants to the gateway's uid:
 
 ```toml
 # qbd.toml
@@ -724,6 +726,15 @@ login the gateway config has no credential entry for, the turn moves to the next
 ladder or pin route such a pick ends the turn.
 `[fronts.messages] vendor = "vendor-a"` gives the Anthropic logins' thinking blocks to
 `/v1/messages` clients.
+
+#### Ladder routes that send the candidate's effort
+
+`gateway.toml` declares `hive-step-1` to `hive-step-5`, each `role = "hive-heads"`,
+`difficulty` 1 to 5 and `client_effort = "ignore"`. `qbd.toml` declares the role `hive-heads`
+with steps 1 to 5, each with three candidates and an effort of its own: the Anthropic
+subscription vendor `vendor-a` and the OpenAI subscription vendor `vendor-b` at tier 1, and
+`vendor-g` at tier 3, the vendor of the capped API key `key-4`. A turn on `hive-step-3` sends
+the step-3 candidate's model and effort, whatever effort its client asked for.
 
 ### Importing credentials
 

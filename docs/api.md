@@ -415,6 +415,12 @@ least one, each with at least one block), `max_tokens` (≥ 1) and `request_id`
 (`{name, description, input_schema}`, names unique, and optional `native`, below), `effort`
 (`low|medium|high|max`), `session_key` (1 to 128 bytes), `cache` (`auto`).
 
+The effort an attempt sends is the request's `effort`, else the picked candidate's (on a pinned
+route the pin's, on a chain route the step's). On a route with `client_effort = "ignore"`
+([config.md](config.md#gateway-config)) it is the pick's only, or none when the pick has none;
+the request's `effort` is still validated. The HTTP fronts' `output_config.effort`,
+`reasoning.effort` and `reasoning_effort` are the request's `effort` here.
+
 A message has `role` (`user|assistant|system`) and `content`, a list of blocks, each one flat
 object with `type`. At least one message is `user` or `assistant`. A `system` message holds
 `text` blocks only: an instruction from that point
@@ -824,7 +830,8 @@ the strong `ETag: "<sha256>"`:
 
 ```json
 {"sha256": "a1b2…",
- "routes": [{"alias": "chat", "role": "gateway", "difficulty": 1, "expected_minutes": 10},
+ "routes": [{"alias": "chat", "role": "gateway", "difficulty": 1, "expected_minutes": 10,
+             "client_effort": "ignore"},
             {"alias": "pinned", "role": "gateway", "vendor": "vendor-b", "model": "model-b"},
             {"alias": "chain", "role": "gateway",
              "chain": [{"vendor": "vendor-a", "model": "model-a"},

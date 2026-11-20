@@ -26,7 +26,9 @@ use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
 use super::Refusal;
-use super::config::{Api, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route};
+use super::config::{
+    Api, ClientEffort, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route,
+};
 use super::creds::{CredentialStore, Kind, Refresher, Written};
 use super::signin::SignIn;
 use super::spend::{self, Ledger};
@@ -230,6 +232,16 @@ fn own_thinking<'a>(req: &'a TurnRequest, vendor: &str) -> Cow<'a, TurnRequest> 
         m.content.retain(|b| !foreign(b));
     }
     owned.messages.retain(|m| !m.content.is_empty());
+    Cow::Owned(owned)
+}
+
+/// `req` without the client's effort on a route whose turns send the pick's only.
+fn route_effort<'a>(req: &'a TurnRequest, route: &Route) -> Cow<'a, TurnRequest> {
+    if route.client_effort != Some(ClientEffort::Ignore) || req.effort.is_none() {
+        return Cow::Borrowed(req);
+    }
+    let mut owned = req.clone();
+    owned.effort = None;
     Cow::Owned(owned)
 }
 
@@ -1068,6 +1080,8 @@ impl Gateway {
         req: &TurnRequest,
         emit: &mut dyn FnMut(StreamEvent) -> Flow,
     ) {
+        let req = route_effort(req, &turn.route);
+        let req = req.as_ref();
         let emit = &mut |event: StreamEvent| {
             if matches!(event, StreamEvent::Stop { .. } | StreamEvent::Error { .. }) {
                 turn.finish();

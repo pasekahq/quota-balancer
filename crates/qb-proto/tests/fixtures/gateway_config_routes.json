@@ -5,7 +5,8 @@
       "alias": "chat",
       "role": "gateway",
       "difficulty": 1,
-      "expected_minutes": 10
+      "expected_minutes": 10,
+      "client_effort": "ignore"
     },
     {
       "alias": "pinned",

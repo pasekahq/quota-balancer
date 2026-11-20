@@ -535,7 +535,7 @@ fn parse_sourced(
 }
 
 /// The text of the config file `file`.
-fn read(file: &Path) -> Result<String, Error> {
+pub(crate) fn read(file: &Path) -> Result<String, Error> {
     std::fs::read_to_string(file).map_err(|e| Error {
         file: file.to_owned(),
         field: String::new(),
@@ -566,7 +566,7 @@ impl Source<'_> {
 }
 
 /// The 1-based line of byte offset `at` of `text`.
-fn line(text: &str, at: usize) -> usize {
+pub(crate) fn line(text: &str, at: usize) -> usize {
     text.get(..at).map_or(0, |s| s.matches('\n').count()) + 1
 }
 
@@ -575,12 +575,7 @@ fn line(text: &str, at: usize) -> usize {
 /// # Errors
 /// The file cannot be read or does not validate.
 pub fn load_agent(file: &Path) -> Result<AgentConfig, Error> {
-    let text = std::fs::read_to_string(file).map_err(|e| Error {
-        file: file.to_owned(),
-        field: String::new(),
-        reason: format!("cannot read: {e}"),
-    })?;
-    parse_agent(file, &text)
+    parse_agent(file, &read(file)?)
 }
 
 /// Parses and validates agent config `text`; `file` only names the source in errors.

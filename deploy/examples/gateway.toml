@@ -30,6 +30,15 @@ kind = "api_key"
 api = "anthropic"
 credentials = "/var/lib/qb-gateway/credentials/key-1.json"
 
+# The heads' emergency Anthropic API key, on a capped qbd vendor of its own ("vendor-g"), the
+# last tier of the role "hive-heads".
+[[logins]]
+name = "key-4"
+kind = "api_key"
+api = "anthropic"
+spend_cap = 30.0
+credentials = "/var/lib/qb-gateway/credentials/key-4.json"
+
 # A ChatGPT subscription login: access token, account id and refresh token.
 [[logins]]
 name = "login-3"
@@ -84,6 +93,38 @@ alias = "compact"
 role = "gateway"
 vendor = "vendor-a"
 model = "model-small"
+
+# Ladder steps 1 to 5 of qbd's role "hive-heads" for the heads: each turn sends the effort of
+# the candidate qbd picks, never the client's.
+[[routes]]
+alias = "hive-step-1"
+role = "hive-heads"
+difficulty = 1
+client_effort = "ignore"
+
+[[routes]]
+alias = "hive-step-2"
+role = "hive-heads"
+difficulty = 2
+client_effort = "ignore"
+
+[[routes]]
+alias = "hive-step-3"
+role = "hive-heads"
+difficulty = 3
+client_effort = "ignore"
+
+[[routes]]
+alias = "hive-step-4"
+role = "hive-heads"
+difficulty = 4
+client_effort = "ignore"
+
+[[routes]]
+alias = "hive-step-5"
+role = "hive-heads"
+difficulty = 5
+client_effort = "ignore"
 
 # A model of the openai API family that refuses the reasoning parameter: its Responses requests
 # carry no reasoning, effort or include, on every route and login that runs it.
