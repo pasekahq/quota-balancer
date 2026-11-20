@@ -1829,7 +1829,8 @@ difficulty = 1
                       [[routes]]\nalias = \"open\"\nrole = \"r\"\ndifficulty = 2\n";
         let c = check("", routes).unwrap();
         let read: Vec<_> = c.routes.iter().map(|r| r.logins.as_deref()).collect();
-        let one = Some(&["login-1".to_owned()][..]);
+        let listed = ["login-1".to_owned()];
+        let one = Some(&listed[..]);
         assert_eq!(read, [one, one, one, None]);
         for (keys, want) in [
             (
