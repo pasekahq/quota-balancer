@@ -49,3 +49,20 @@ pub fn warn(msg: &str) {
 pub fn error(msg: &str) {
     line(Level::Error, msg);
 }
+
+/// A peer's `text` fit for a log line: capped, and control characters escaped so it cannot
+/// forge a line.
+pub fn peer_text(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .take(PEER_LOG_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if text.chars().nth(PEER_LOG_CHARS).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Characters of a peer's text that reach the log.
+const PEER_LOG_CHARS: usize = 64;

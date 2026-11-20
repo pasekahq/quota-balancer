@@ -20,6 +20,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::net::RecvFlags;
 use rustix::net::sockopt::{Timeout, set_socket_timeout};
 
+use crate::admin;
 use crate::api::{self, Answer, Env, Reply};
 use crate::auth::{Denied, Gate};
 use crate::config::{self, Config};
@@ -83,8 +84,12 @@ impl Reload {
     /// Reads the config file and its roles file again. A candidate that validates and changes
     /// nothing but `[[roles]]` and `[[clients]]` becomes the running config: `core` takes its
     /// roles, `gate` its clients. Logs one line either way.
-    fn run(&mut self, core: &mut Core, gate: &mut Gate) {
-        match self.apply(core, gate) {
+    ///
+    /// # Errors
+    /// The candidate was refused; nothing changed.
+    pub(crate) fn run(&mut self, core: &mut Core, gate: &mut Gate) -> Result<(), config::Error> {
+        let applied = self.apply(core, gate);
+        match &applied {
             Ok(()) => log::info(&format!(
                 "qbd: reloaded {}: {} roles, {} clients",
                 self.file.display(),
@@ -93,6 +98,7 @@ impl Reload {
             )),
             Err(e) => log::warn(&format!("qbd: reload refused: {e}")),
         }
+        applied
     }
 
     fn apply(&mut self, core: &mut Core, gate: &mut Gate) -> Result<(), config::Error> {
@@ -121,7 +127,8 @@ impl Reload {
 
 /// Serves connections until the listener fails; `gate` admits callers, the clients in
 /// `agents` may wait for probe jobs, state changes go to `journal`, `auth_dead` edges to
-/// `hooks`, and SIGHUP on `reload` reloads the roles and clients.
+/// `hooks`, and SIGHUP on `reload` or an admin's `POST /v1/admin/reload` reloads the roles and
+/// clients.
 ///
 /// # Errors
 /// The listener cannot be made non-blocking or polled.
@@ -143,7 +150,8 @@ pub fn serve(
         hooks.reap();
         if let Some(r) = reload.as_deref_mut() {
             if r.hangup.take() {
-                r.run(core, gate);
+                // Logged by `run`; a refusal leaves the running config.
+                let _ = r.run(core, gate);
             }
         }
         let now = unix_now();
@@ -182,6 +190,7 @@ pub fn serve(
                             journal: &mut *journal,
                             hooks: &mut *hooks,
                             gate: &mut *gate,
+                            reload: reload.as_deref_mut(),
                             agents,
                             parked: &mut parked,
                             started,
@@ -231,6 +240,7 @@ struct Conn<'a> {
     journal: &'a mut Journal,
     hooks: &'a mut Runner,
     gate: &'a mut Gate,
+    reload: Option<&'a mut Reload>,
     agents: &'a [String],
     parked: &'a mut Vec<Parked>,
     started: Instant,
@@ -251,6 +261,9 @@ impl Conn<'_> {
                     uptime_s: self.started.elapsed().as_secs(),
                 };
                 match self.gate.admit(uid, req.bearer.as_deref(), Instant::now()) {
+                    Ok(caller) if req.path.starts_with(paths::ADMIN) => {
+                        admin::handle(self.core, self.gate, self.reload, &req, &caller)
+                    }
                     Ok(caller) => {
                         match api::handle(
                             self.core,
@@ -342,7 +355,9 @@ fn send(stream: &mut UnixStream, reply: &Reply) {
     if reply.status >= 400 {
         drain_pending(&*stream);
     }
-    if let Err(e) = http::write_response(stream, reply.status, &reply.body) {
+    let etag = reply.etag.as_deref().map(|tag| ("ETag", tag));
+    let headers = etag.as_slice();
+    if let Err(e) = http::write_response_with(stream, reply.status, headers, &reply.body) {
         log::warn(&format!("write of a {} reply failed: {e}", reply.status));
     }
 }

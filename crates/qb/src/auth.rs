@@ -77,28 +77,30 @@ impl Gate {
     }
 
     fn identify(&self, uid: Option<u32>, bearer: Option<&str>) -> Option<Caller> {
-        let name = if let Some(token) = bearer {
+        let client = if let Some(token) = bearer {
             // Every configured hash is compared so the time does not depend on which one matches.
             let mut found = None;
             for c in &self.clients {
                 if let Some(h) = &c.bearer_sha256 {
                     if token_matches(token, h) {
-                        found = Some(&c.name);
+                        found = Some(c);
                     }
                 }
             }
-            found?.clone()
+            found?
         } else if self.clients.is_empty() {
-            format!("uid:{}", uid?)
+            return Some(Caller {
+                client: format!("uid:{}", uid?),
+                admin: false,
+            });
         } else {
             let uid = uid?;
-            self.clients
-                .iter()
-                .find(|c| c.uid == Some(uid))?
-                .name
-                .clone()
+            self.clients.iter().find(|c| c.uid == Some(uid))?
         };
-        Some(Caller { client: name })
+        Some(Caller {
+            client: client.name.clone(),
+            admin: client.admin,
+        })
     }
 
     fn take(&mut self, key: &str, now: Instant) -> bool {
@@ -154,6 +156,7 @@ mod tests {
             uid,
             bearer_sha256: token.map(|t| BearerHash(sha256::digest(t.as_bytes()))),
             role: Some("worker".into()),
+            admin: false,
         }
     }
 
