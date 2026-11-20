@@ -1,5 +1,6 @@
-//! SIGHUP as a file descriptor for `qb gateway`'s poll loop: the signal is blocked in every
-//! thread and read from a signalfd, so waiting for it costs no thread, timer or wake-up.
+//! SIGHUP as a file descriptor for the poll loops of `qbd` and `qb gateway`: the signal is
+//! blocked in every thread and read from a signalfd, so waiting for it costs no thread, timer or
+//! wake-up.
 
 use std::io;
 use std::mem::MaybeUninit;

@@ -51,6 +51,7 @@ fn spawn_server() -> PathBuf {
             &mut Runner::default(),
             &mut gate,
             &[],
+            None,
         )
     });
     path
@@ -2081,4 +2082,167 @@ fn python_client_raises_http_errors_instead_of_falling_back() {
     assert_eq!(stranger["qb_error"]["status"], 401, "{stranger}");
     assert_eq!(stranger["qb_error"]["error"], "unauthorized");
     assert!(stranger.get("result").is_none(), "{stranger}");
+}
+
+/// `qbd.toml` in `dir` with its roles in `dir/roles.toml`: `login-1` on vendor-a with a
+/// five-hour window, `login-2` on vendor-b, `client-a` on this process's uid, no journal, and
+/// `extra` appended.
+fn reloadable(dir: &Path, extra: &str) -> PathBuf {
+    let text = format!(
+        "roles_file = \"{roles}\"\n\
+         [journal]\nmode = \"off\"\n\
+         [limits]\nrate_per_s = 1000.0\nburst = 1000\n\
+         [[vendors]]\nname = \"vendor-a\"\n\
+         windows = [{{ name = \"five_hour\", length_s = 18000, t_burn_s = 1800 }}]\n\
+         [[vendors]]\nname = \"vendor-b\"\nwindows = []\n\
+         [[logins]]\nname = \"login-1\"\nvendor = \"vendor-a\"\n\
+         [[logins]]\nname = \"login-2\"\nvendor = \"vendor-b\"\n\
+         [[clients]]\nname = \"client-a\"\nuid = {uid}\nrole = \"worker\"\n\
+         {extra}\n",
+        roles = dir.join("roles.toml").display(),
+        uid = own_uid(),
+    );
+    let file = dir.join("qbd.toml");
+    std::fs::write(&file, text).unwrap();
+    file
+}
+
+/// Writes `dir/roles.toml` with one role per `(name, vendor, model)`, each a single difficulty-1
+/// step.
+fn write_roles(dir: &Path, roles: &[(&str, &str, &str)]) {
+    let text = roles
+        .iter()
+        .fold(String::new(), |mut t, (name, vendor, model)| {
+            let _ = write!(
+                t,
+                "[[roles]]\nname = \"{name}\"\nladder = [{{ difficulty = 1, candidates = \
+             [{{ vendor = \"{vendor}\", model = \"{model}\", tier = 1 }}] }}]\n"
+            );
+            t
+        });
+    std::fs::write(dir.join("roles.toml"), text).unwrap();
+}
+
+/// Sends SIGHUP to `d` and returns the reload line it logs.
+fn hang_up(d: &Daemon, lines: &Receiver<String>) -> String {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(d.0.id()).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
+    line_with(lines, "qbd: reload", Duration::from_secs(10)).expect("a reload line")
+}
+
+fn pick_role(sock: &Path, role: &str) -> PickResponse {
+    let body = format!(r#"{{"role":"{role}","difficulty":1,"expected_minutes":30}}"#);
+    post(sock, paths::PICK, &body)
+}
+
+#[test]
+fn sighup_takes_a_new_ladder_and_keeps_live_leases() {
+    let dir = temp_dir("reload");
+    let sock = dir.join("qb.sock");
+    write_roles(
+        &dir,
+        &[
+            ("worker", "vendor-a", "model-small"),
+            ("old", "vendor-a", "model-old"),
+        ],
+    );
+    let mut d = start_with(&reloadable(&dir, ""), &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let held = pick_role(&sock, "old");
+    assert_eq!(held.model.as_deref(), Some("model-old"), "{held:?}");
+    let lease = held.lease_id.unwrap();
+    let before = state(&sock).logins;
+    assert!(before[0].windows[0].reserved > 0.0, "{before:?}");
+
+    write_roles(&dir, &[("worker", "vendor-b", "model-large")]);
+    let line = hang_up(&d, &lines);
+    assert!(line.ends_with("qbd.toml: 1 roles, 1 clients"), "{line}");
+
+    let next = pick_role(&sock, "worker");
+    assert_eq!(
+        (next.login.as_deref(), next.model.as_deref()),
+        (Some("login-2"), Some("model-large")),
+        "{next:?}"
+    );
+    let after = state(&sock);
+    assert!(
+        after.leases.iter().any(|l| l.lease_id == lease),
+        "{after:?}"
+    );
+    assert_eq!(after.logins[0], before[0], "login-1 keeps its reservation");
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        &format!(r#"{{"lease_id":"{lease}","outcome":"ok","release":true}}"#),
+    );
+    assert!(r.accepted);
+    assert!(state(&sock).leases.iter().all(|l| l.lease_id != lease));
+}
+
+#[test]
+fn a_refused_reload_keeps_the_running_ladder() {
+    let dir = temp_dir("refuse");
+    let sock = dir.join("qb.sock");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let config = reloadable(&dir, "");
+    let mut d = start_with(&config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+
+    write_roles(&dir, &[("worker", "vendor-z", "model-large")]);
+    let line = hang_up(&d, &lines);
+    let roles = dir.join("roles.toml");
+    let expected = format!(
+        "qbd: reload refused: {}: roles[0].ladder[0].candidates[0].vendor: undeclared vendor \
+         `vendor-z` (line 3)",
+        roles.display()
+    );
+    assert!(line.starts_with("<4>"), "{line}");
+    assert!(line.ends_with(&expected), "{line}");
+    assert_eq!(
+        pick_role(&sock, "worker").model.as_deref(),
+        Some("model-small")
+    );
+
+    write_roles(&dir, &[("worker", "vendor-b", "model-large")]);
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("burst = 1000", "burst = 999")).unwrap();
+    let line = hang_up(&d, &lines);
+    let expected = format!(
+        "{}: limits: changed; it takes effect only on a restart",
+        config.display()
+    );
+    assert!(line.ends_with(&expected), "{line}");
+    assert_eq!(
+        pick_role(&sock, "worker").model.as_deref(),
+        Some("model-small"),
+        "a restart-only change refuses the roles file with it"
+    );
+}
+
+#[test]
+fn sighup_identifies_a_client_added_to_the_config() {
+    let dir = temp_dir("addclient");
+    let sock = dir.join("qb.sock");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let config = reloadable(&dir, "");
+    let mut d = start_with(&config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let task = br#"{"role":"worker","difficulty":1}"#;
+    let (status, _) = call(&sock, "POST", paths::PICK, Some(task), Some(BEARER)).unwrap();
+    assert_eq!(status, 401);
+
+    let client_b = format!(
+        "[[clients]]\nname = \"client-b\"\nbearer_sha256 = \"{BEARER_SHA256}\"\nrole = \"worker\""
+    );
+    reloadable(&dir, &client_b);
+    let line = hang_up(&d, &lines);
+    assert!(line.ends_with("1 roles, 2 clients"), "{line}");
+    let (status, body) = call(&sock, "POST", paths::PICK, Some(task), Some(BEARER)).unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let pick: PickResponse = serde_json::from_slice(&body).unwrap();
+    let lease = pick.lease_id.unwrap();
+    assert!(
+        lease_clients(&sock).contains(&(lease, "client-b".to_owned())),
+        "the lease names the new client"
+    );
 }

@@ -447,12 +447,160 @@ fn errors_name_the_file() {
     .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "/etc/qb/test.toml: logins[1].vendor: undeclared vendor `v`"
+        "/etc/qb/test.toml: logins[1].vendor: undeclared vendor `v` (line 19)"
     );
     let missing = Path::new("/nonexistent/qbd.toml");
     let err = config::load(missing).unwrap_err();
     assert_eq!(err.file, missing);
     assert!(err.reason.starts_with("cannot read"), "{err}");
+}
+
+/// [`BASE`] without its `[[roles]]`.
+fn without_roles() -> &'static str {
+    BASE.split_once("[[roles]]").unwrap().0
+}
+
+/// A roles file of `text` in a directory of its own.
+fn roles_file(tag: &str, text: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("qb-config-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("roles.toml");
+    std::fs::write(&file, text).unwrap();
+    file
+}
+
+/// [`without_roles`] naming `roles` as its `roles_file`, with `extra` appended.
+fn naming(roles: &Path, extra: &str) -> String {
+    format!(
+        "roles_file = \"{}\"\n{}\n{extra}\n",
+        roles.display(),
+        without_roles()
+    )
+}
+
+const WORKER: &str = r#"
+[[roles]]
+name = "worker"
+ladder = [{ difficulty = 1, candidates = [{ vendor = "vendor-a", model = "m", tier = 1 }] }]
+"#;
+
+#[test]
+fn a_roles_file_holds_the_roles_a_config_without_one_declares_itself() {
+    let roles = roles_file("holds", WORKER);
+    let cfg = config::parse(Path::new(FILE), &naming(&roles, &client("uid = 1"))).unwrap();
+    assert_eq!(cfg.roles_file.as_deref(), Some(roles.as_path()));
+    let inline = config::parse(Path::new(FILE), BASE).unwrap();
+    assert_eq!(inline.roles_file, None);
+    assert_eq!(cfg.core_spec(), inline.core_spec());
+}
+
+#[test]
+fn roles_file_faults_name_their_file_field_and_line() {
+    let worker = roles_file("worker", WORKER);
+    let stray = roles_file(
+        "stray",
+        "[[roles]]\nname = \"worker\"\n\
+         ladder = [{ difficulty = 1, candidates = [{ vendor = \"vendor-z\", model = \"m\", tier = 1 }] }]\n",
+    );
+    let twice = roles_file("twice", &format!("{WORKER}{WORKER}"));
+    let settings = roles_file("settings", &format!("{WORKER}\n[limits]\nburst = 1\n"));
+    let missing = Path::new("/nonexistent/roles.toml");
+    let file = Path::new(FILE);
+    let cases: Vec<(&str, String, &Path, &str, &str)> = vec![
+        (
+            "roles in both files",
+            format!("roles_file = \"{}\"\n{BASE}", worker.display()),
+            file,
+            "roles",
+            "is not allowed with `roles_file`, which holds the roles (line 14)",
+        ),
+        (
+            "a client of a role the roles file lacks",
+            naming(
+                &worker,
+                "[[clients]]\nname = \"c\"\nuid = 1\nrole = \"reviewer\"",
+            ),
+            file,
+            "clients[0].role",
+            "undeclared role `reviewer` (line 18)",
+        ),
+        (
+            "a candidate of an undeclared vendor",
+            naming(&stray, ""),
+            &stray,
+            "roles[0].ladder[0].candidates[0].vendor",
+            "undeclared vendor `vendor-z` (line 3)",
+        ),
+        (
+            "a duplicate role",
+            naming(&twice, ""),
+            &twice,
+            "roles[1].name",
+            "duplicate name `worker` (line 7)",
+        ),
+        (
+            "a key other than roles",
+            naming(&settings, ""),
+            &settings,
+            "limits",
+            "unknown field `limits`",
+        ),
+        (
+            "a missing roles file",
+            naming(missing, ""),
+            missing,
+            "",
+            "cannot read",
+        ),
+        (
+            "a relative roles file",
+            naming(Path::new("roles.toml"), ""),
+            file,
+            "roles_file",
+            "must be absolute",
+        ),
+        (
+            "no roles anywhere",
+            without_roles().to_owned(),
+            file,
+            "roles",
+            "is missing",
+        ),
+    ];
+    for (what, text, in_file, field, reason) in cases {
+        let err = config::parse(file, &text).unwrap_err();
+        assert_eq!(
+            (err.file.as_path(), err.field.as_str()),
+            (in_file, field),
+            "{what}: {err}"
+        );
+        assert!(err.reason.contains(reason), "{what}: {err}");
+    }
+}
+
+#[test]
+fn only_roles_and_clients_change_without_a_restart() {
+    let running = config::parse(Path::new(FILE), BASE).unwrap();
+    let roles = format!(
+        "{BASE}\n[[roles]]\nname = \"reviewer\"\n\
+         ladder = [{{ difficulty = 2, candidates = [{{ vendor = \"vendor-a\", model = \"n\", tier = 1 }}] }}]\n{}\nuid = 7",
+        client("")
+    );
+    let roles = config::parse(Path::new(FILE), &roles).unwrap();
+    assert_eq!(running.restart_only_change(&roles), None);
+    let file = roles_file("restart", WORKER);
+    for (text, key) in [
+        (
+            with("[[logins]]\nname = \"login-2\"\nvendor = \"vendor-a\""),
+            "logins",
+        ),
+        (with("[limits]\nburst = 1"), "limits"),
+        (with("[hooks]\non_dead = [\"/usr/bin/true\"]"), "hooks"),
+        (naming(&file, ""), "roles_file"),
+    ] {
+        let candidate = config::parse(Path::new(FILE), &text).unwrap();
+        assert_eq!(running.restart_only_change(&candidate), Some(key), "{text}");
+    }
 }
 
 #[test]

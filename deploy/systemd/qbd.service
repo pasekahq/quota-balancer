@@ -9,6 +9,8 @@ After=qbd.socket
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/qb daemon --config /etc/qb/qbd.toml
+# SIGHUP reloads the roles and clients (docs/config.md); there is no ExecReload=, send it with
+# `systemctl kill --kill-whom=main -s HUP qbd.service`.
 Restart=on-failure
 RestartSec=1s
 

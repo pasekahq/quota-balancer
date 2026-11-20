@@ -304,6 +304,7 @@ fn start_qbd(dir: &Path, text: &str) -> PathBuf {
             &mut Runner::default(),
             &mut gate,
             &[],
+            None,
         )
     });
     sock

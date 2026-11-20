@@ -12,6 +12,7 @@ use qb_core::{
 };
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
+use toml::de::DeTable;
 
 /// Why a config was refused: the file, the field path (empty for the whole file) and the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +51,10 @@ pub struct Config {
     pub vendors: Vec<Vendor>,
     /// Logins, at most [`MAX_LOGINS`].
     pub logins: Vec<Login>,
-    /// Roles with their ladders and reserves.
+    /// Absolute path of the file that holds the roles instead of this one.
+    pub roles_file: Option<PathBuf>,
+    /// Roles with their ladders and reserves, from this file or from `roles_file`.
+    #[serde(default)]
     pub roles: Vec<Role>,
     /// Known clients.
     #[serde(default)]
@@ -107,6 +111,13 @@ pub struct Login {
     pub name: String,
     /// Declared vendor the login belongs to.
     pub vendor: String,
+}
+
+/// The contents of a `roles_file`: roles and nothing else.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RolesFile {
+    roles: Vec<Role>,
 }
 
 /// A role of work with its ladder and reserves.
@@ -414,31 +425,94 @@ impl<'de> Deserialize<'de> for BearerHash {
     }
 }
 
-/// Reads and validates the config file at `file`.
+/// Reads and validates the config file at `file` together with its `roles_file`.
 ///
 /// # Errors
-/// The file cannot be read or does not validate.
+/// Either file cannot be read or they do not validate.
 pub fn load(file: &Path) -> Result<Config, Error> {
-    let text = std::fs::read_to_string(file).map_err(|e| Error {
+    parse(file, &read(file)?)
+}
+
+/// Parses config `text` and validates it together with the `roles_file` it names, which is
+/// read from disk; `file` only names the source in errors.
+///
+/// # Errors
+/// The text is not TOML, the roles file cannot be read, or they do not validate.
+pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
+    let mut config: Config = deserialize(file, text)?;
+    let doc = DeTable::parse(text).map_err(|e| toml_error(file, text, String::new(), &e))?;
+    let here = Source {
+        file,
+        text,
+        doc: doc.get_ref(),
+    };
+    let inline = here.doc.contains_key("roles");
+    let Some(path) = config.roles_file.clone() else {
+        if !inline {
+            let reason = "is missing; declare `[[roles]]` here or name a `roles_file`";
+            return Err(here.fault(("roles".into(), reason.into())));
+        }
+        config.validate().map_err(|f| here.fault(f))?;
+        return Ok(config);
+    };
+    if inline {
+        let reason = "is not allowed with `roles_file`, which holds the roles";
+        return Err(here.fault(("roles".into(), reason.into())));
+    }
+    if !path.is_absolute() {
+        return Err(here.fault(("roles_file".into(), "must be absolute".into())));
+    }
+    let roles_text = read(&path)?;
+    let roles: RolesFile = deserialize(&path, &roles_text)?;
+    config.roles = roles.roles;
+    let roles_doc = DeTable::parse(&roles_text)
+        .map_err(|e| toml_error(&path, &roles_text, String::new(), &e))?;
+    let there = Source {
+        file: &path,
+        text: &roles_text,
+        doc: roles_doc.get_ref(),
+    };
+    config.validate().map_err(|(field, reason)| {
+        let in_roles = field == "roles" || field.starts_with("roles[");
+        if in_roles { &there } else { &here }.fault((field, reason))
+    })?;
+    Ok(config)
+}
+
+/// The text of the config file `file`.
+fn read(file: &Path) -> Result<String, Error> {
+    std::fs::read_to_string(file).map_err(|e| Error {
         file: file.to_owned(),
         field: String::new(),
         reason: format!("cannot read: {e}"),
-    })?;
-    parse(file, &text)
+    })
 }
 
-/// Parses and validates config `text`; `file` only names the source in errors.
-///
-/// # Errors
-/// The text is not TOML or does not validate.
-pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
-    let config: Config = deserialize(file, text)?;
-    config.validate().map_err(|(field, reason)| Error {
-        file: file.to_owned(),
-        field,
-        reason,
-    })?;
-    Ok(config)
+/// A config file being validated: its name, text and parsed tree.
+struct Source<'a> {
+    file: &'a Path,
+    text: &'a str,
+    doc: &'a DeTable<'a>,
+}
+
+impl Source<'_> {
+    /// `fault` as an error of this file, with the line of its field where the file holds it.
+    fn fault(&self, (field, reason): Fault) -> Error {
+        let reason = match offset(self.doc, &field) {
+            Some(at) => format!("{reason} (line {})", line(self.text, at)),
+            None => reason,
+        };
+        Error {
+            file: self.file.to_owned(),
+            field,
+            reason,
+        }
+    }
+}
+
+/// The 1-based line of byte offset `at` of `text`.
+fn line(text: &str, at: usize) -> usize {
+    text.get(..at).map_or(0, |s| s.matches('\n').count()) + 1
 }
 
 /// Reads and validates the agent config file at `file`.
@@ -485,13 +559,11 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(
 /// `e` as one line: the toml crate's own Display adds a multi-line source snippet.
 pub(crate) fn toml_error(file: &Path, text: &str, field: String, e: &toml::de::Error) -> Error {
     let reason = match e.span() {
-        Some(span) => {
-            let line = text
-                .get(..span.start)
-                .map_or(0, |s| s.matches('\n').count())
-                + 1;
-            format!("{} (line {line})", redact(e.message().trim_end()))
-        }
+        Some(span) => format!(
+            "{} (line {})",
+            redact(e.message().trim_end()),
+            line(text, span.start)
+        ),
         None => redact(e.message().trim_end()),
     };
     Error {
@@ -499,6 +571,29 @@ pub(crate) fn toml_error(file: &Path, text: &str, field: String, e: &toml::de::E
         field,
         reason,
     }
+}
+
+/// The byte offset of the value at the field path `field` of `doc`, such as `routes[1].alias`
+/// or `fronts.models."m"`; `None` when the file does not hold it.
+pub(crate) fn offset(doc: &DeTable<'_>, field: &str) -> Option<usize> {
+    let (mut table, mut rest, mut at) = (Some(doc), field, None);
+    while !rest.is_empty() {
+        let (key, after) = match rest.strip_prefix('"') {
+            Some(quoted) => quoted.split_at(quoted.find('"')?),
+            None => rest.split_at(rest.find(['.', '[']).unwrap_or(rest.len())),
+        };
+        let mut value = table?.get(key)?;
+        rest = after.strip_prefix('"').unwrap_or(after);
+        while let Some(index) = rest.strip_prefix('[') {
+            let (i, after) = index.split_at(index.find(']')?);
+            value = value.get_ref().as_array()?.get(i.parse::<usize>().ok()?)?;
+            rest = &after[1..];
+        }
+        at = Some(value.span().start);
+        table = value.get_ref().as_table();
+        rest = rest.strip_prefix('.').unwrap_or(rest);
+    }
+    at
 }
 
 /// `message` without the string values serde quotes in type and variant errors, so a token
@@ -619,6 +714,38 @@ impl Config {
                 backoff_max_s: self.probe.backoff_max_s,
             }),
         }
+    }
+
+    /// The first key other than `roles` and `clients` whose value `candidate` changes: a reload
+    /// takes only a candidate without one.
+    pub fn restart_only_change(&self, candidate: &Self) -> Option<&'static str> {
+        let Self {
+            vendors,
+            logins,
+            roles_file,
+            roles: _,
+            clients: _,
+            journal,
+            snapshot,
+            leases,
+            outcomes,
+            probe,
+            limits,
+            hooks,
+        } = self;
+        let changed = [
+            ("vendors", *vendors != candidate.vendors),
+            ("logins", *logins != candidate.logins),
+            ("roles_file", *roles_file != candidate.roles_file),
+            ("journal", *journal != candidate.journal),
+            ("snapshot", *snapshot != candidate.snapshot),
+            ("leases", *leases != candidate.leases),
+            ("outcomes", *outcomes != candidate.outcomes),
+            ("probe", *probe != candidate.probe),
+            ("limits", *limits != candidate.limits),
+            ("hooks", *hooks != candidate.hooks),
+        ];
+        changed.into_iter().find_map(|(key, c)| c.then_some(key))
     }
 
     fn validate(&self) -> Result<(), Fault> {

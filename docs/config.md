@@ -1,6 +1,6 @@
 # Config
 
-`qbd` reads one TOML file at start-up:
+`qbd` reads one TOML file at start-up, and the roles file it names, if any:
 
 ```sh
 qb daemon --config PATH
@@ -8,10 +8,11 @@ qb daemon --config PATH
 
 Without `--config` the path is `$QB_CONFIG`, else `/etc/qb/qbd.toml`. A missing, unreadable or
 invalid file stops the daemon before it binds its socket: exit code 2 and one line on stderr
-naming the file, the field path and the reason, for example
+naming the file, the field path, the reason and the line where the file holds the field, for
+example
 
 ```
-qb: /etc/qb/qbd.toml: roles[0].ladder[1].candidates[2].vendor: undeclared vendor `vendor-c`
+qb: /etc/qb/qbd.toml: roles[0].ladder[1].candidates[2].vendor: undeclared vendor `vendor-c` (line 42)
 ```
 
 The file holds no secrets: clients are identified by uid or by the SHA-256 of their bearer
@@ -25,7 +26,8 @@ Working examples: [`deploy/examples/`](../deploy/examples).
 - Unknown keys are rejected everywhere.
 - Names (`name` of vendors, windows, logins, roles, clients) are non-empty and unique within
   their list; windows are unique per vendor.
-- Every reference (`vendor`, `window`, `role`) names something declared in the same file.
+- Every reference (`vendor`, `window`, `role`) names something declared in the config: the file
+  and its `roles_file` together.
 - Times are seconds, sizes are bytes, fractions are `0.0..=1.0`.
 
 ## `[[vendors]]`
@@ -53,6 +55,15 @@ At most 32.
 | `vendor` | string | Declared vendor. |
 
 ## `[[roles]]`
+
+The roles live in exactly one place: in this file, or in the file the top-level key
+`roles_file` names.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `roles_file` | string | Optional absolute path of a TOML file that holds the `[[roles]]` and nothing else, e.g. `/var/lib/qb/roles.toml`. With it, `[[roles]]` in this file is an error; without it, this file declares them. A missing, unreadable or invalid roles file stops the start like this file does; there is no default empty role set. Errors in it name the roles file. |
+
+Each role:
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -186,6 +197,39 @@ and `/usr/local/libexec/qb-hook`
 #!/bin/sh
 logger -t qb-hook -p user.warning "login $QB_LOGIN of $QB_VENDOR: $QB_EVENT"
 ```
+
+## Reloading roles and clients
+
+SIGHUP makes the running `qbd` read its config file and its `roles_file` again, as one unit. The
+operator sends it; the shipped unit has no `ExecReload=`:
+
+```sh
+systemctl kill --kill-whom=main -s HUP qbd.service
+```
+
+`--kill-whom=main` keeps the signal from a hook that is running at that moment. Both files go
+through the same parsing and validation as at startup. A config that validates and differs from
+the running one only in `[[roles]]` (ladders and reserves) and `[[clients]]` becomes the
+running config: the next `pick` uses the new ladders and reserves and the next request is
+identified against the new clients. `qbd` logs
+
+```
+qbd: reloaded /etc/qb/qbd.toml: <n> roles, <m> clients
+```
+
+Every other key needs a restart: `[[vendors]]` and their windows, `[[logins]]`, `roles_file`,
+`[journal]`, `[snapshot]`, `[leases]`, `[outcomes]`, `[probe]`, `[limits]` and `[hooks]`. A file
+that cannot be read, does not validate or changes one of them is refused and nothing changes;
+`qbd` logs one line naming the first such key or the fault, with the line where the file has
+one:
+
+```
+qbd: reload refused: /etc/qb/qbd.toml: limits: changed; it takes effect only on a restart
+```
+
+A reload keeps the live state: every lease stays in `/v1/state` with its reserved cost and is
+released by a report of its `lease_id`, also when the new config drops its role; login statuses,
+windows, marks, probes and the agents waiting in `POST /v1/agent/next` stay too.
 
 ## Agent config
 

@@ -39,7 +39,8 @@ USAGE:
 
 COMMANDS:
     daemon [--config PATH]              run the policy daemon; config default: $QB_CONFIG,
-                                        else /etc/qb/qbd.toml
+                                        else /etc/qb/qbd.toml; SIGHUP reloads its roles and
+                                        clients
     agent --config PATH                 run the credential-owner agent: wait for the daemon's
                                         probe jobs and answer them
     gateway --config PATH               run the model gateway: serve /v1/model/* and the
@@ -737,6 +738,8 @@ fn gateway(file: &Path) -> Result<ExitCode, String> {
 }
 
 fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
+    // First, so a SIGHUP during startup waits for the loop instead of ending the process.
+    let hangup = Hangup::new().map_err(|e| format!("SIGHUP: {e}"))?;
     let (config, mut core) = load(file)?;
     let mut journal = match &config.journal {
         config::Journal::Off {} => Journal::off(),
@@ -757,13 +760,20 @@ fn daemon(socket: &Path, file: &Path) -> Result<ExitCode, String> {
     };
     let mut gate = Gate::new(&config.clients, &config.limits);
     let mut hooks = Runner::new(&config);
+    let agents = config.probe.agents.clone();
+    let mut reload = server::Reload {
+        hangup,
+        file: file.to_owned(),
+        running: config,
+    };
     let Err(e) = server::serve(
         &listener,
         &mut core,
         &mut journal,
         &mut hooks,
         &mut gate,
-        &config.probe.agents,
+        &agents,
+        Some(&mut reload),
     );
     Err(format!("listener failed: {e}"))
 }
