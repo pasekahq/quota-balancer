@@ -20,10 +20,10 @@ only for its own credential owner. The decision is [ADR 0001](docs/adr/0001-mode
 the gateway serves logins of the Anthropic Messages API, by OAuth token or API key, and of the
 OpenAI Responses API, by ChatGPT subscription login or API key.
 
-> **Status: pre-alpha skeleton (0.0.x).** The API contract, transport, CLI and service templates
-> are in place, and the agent probes the vendors' usage endpoints; the scheduling policy and
-> vendor adapters are being built.
-> See [docs/roadmap.md](docs/roadmap.md). Not ready for use.
+> **Status: alpha (0.0.x), no tagged release yet.** The daemon, CLI, agent probes and the model
+> gateway (Anthropic Messages, OpenAI Responses, API keys, OpenRouter, fallback chains) work and
+> run in the author's own setup; multi-host use and the first release with prebuilt binaries are
+> next. Expect breaking changes. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Why
 
