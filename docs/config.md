@@ -550,6 +550,9 @@ token_file = "/var/lib/qb-gateway/tokens/client-b.token"
 
 Switching a Hermes agent to the Messages front, and back: [runbooks/hermes-secretary-cutover.md](runbooks/hermes-secretary-cutover.md).
 
+Moving `qbd`'s roles to a `roles_file` and giving the heads the role `hive-heads` and the routes
+`hive-step-1` to `hive-step-5`: [runbooks/hive-ladder-cutover.md](runbooks/hive-ladder-cutover.md).
+
 ### Examples
 
 Each shape below is a part of [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml)
