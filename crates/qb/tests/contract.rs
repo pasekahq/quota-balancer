@@ -21,15 +21,15 @@ use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb_core::{Core, Record, Spec};
 use qb_proto::{
-    AdminReloadAnswer, AdminRoles, AgentJob, Decision, ErrorBody, ErrorCode, HealthResponse,
-    HealthStatus, LadderCandidate, LadderStep, LoginStatus, Outcome, PickResponse, ReportRequest,
-    ReportResponse, RoleReserve, RolesSource, Source, StateResponse, WhyResponse, WindowReport,
-    paths,
+    AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, AgentJob, Decision, ErrorBody,
+    ErrorCode, HealthResponse, HealthStatus, LadderCandidate, LadderStep, LoginStatus, Outcome,
+    PickResponse, ReportRequest, ReportResponse, RoleConfig, RoleReserve, RolesSource, Source,
+    StateResponse, WhyResponse, WindowReport, paths,
 };
 
 mod common;
 
-use common::http::{etag, finish, send, sha256_hex};
+use common::http::{etag, finish, put, send, sha256_hex};
 use common::{
     Daemon, answer, events, hook_config, kill_auth, line_with, own_uid, park, pick_worker, post,
     record_event, report_login, start_daemon, state, stderr_lines, temp_dir, wait_for,
@@ -2477,4 +2477,364 @@ fn a_refused_admin_reload_answers_400_and_keeps_the_ladder() {
         pick_role(&sock, "worker").model.as_deref(),
         Some("model-small")
     );
+}
+
+/// A role with one difficulty-1 step on `(vendor, model)` at tier 1.
+fn one_step(name: &str, vendor: &str, model: &str) -> RoleConfig {
+    RoleConfig {
+        name: name.into(),
+        ladder: vec![LadderStep {
+            difficulty: 1,
+            candidates: vec![LadderCandidate {
+                vendor: vendor.into(),
+                model: model.into(),
+                effort: None,
+                tier: 1,
+                cost_per_minute: None,
+            }],
+        }],
+        reserves: Vec::new(),
+    }
+}
+
+/// `PUT /v1/admin/roles` of `roles` on `sock` as this process's uid, with `If-Match: if_match`
+/// when given.
+fn put_roles(sock: &Path, if_match: Option<&str>, roles: &[RoleConfig]) -> (u16, Vec<u8>) {
+    let body = serde_json::to_string(&AdminRolesPut {
+        roles: roles.to_vec(),
+    })
+    .unwrap();
+    put(sock, paths::ADMIN_ROLES, if_match, &body)
+}
+
+/// The backups `<name>.bak-*` beside `file`.
+fn backups_of(file: &Path) -> Vec<PathBuf> {
+    let prefix = format!("{}.bak-", file.file_name().unwrap().to_string_lossy());
+    std::fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        })
+        .collect()
+}
+
+/// The error of a refused `PUT` that must answer `status` with `code`, and the audit line it logs.
+fn refused_put(
+    sock: &Path,
+    lines: &Receiver<String>,
+    if_match: Option<&str>,
+    roles: &[RoleConfig],
+    (status, code): (u16, ErrorCode),
+) -> (String, String) {
+    let (got, body) = put_roles(sock, if_match, roles);
+    let e: ErrorBody = serde_json::from_slice(&body).unwrap();
+    assert_eq!((got, e.error), (status, code), "{}", e.message);
+    let audit = line_with(lines, "qbd: admin PUT", Duration::from_secs(10)).unwrap();
+    (e.message, audit)
+}
+
+#[test]
+fn an_admin_put_rewrites_the_roles_file_and_the_next_pick_follows_it() {
+    let dir = temp_dir("adminput");
+    let sock = dir.join("qb.sock");
+    let roles = dir.join("roles.toml");
+    write_roles(
+        &dir,
+        &[
+            ("worker", "vendor-a", "model-small"),
+            ("old", "vendor-a", "model-old"),
+        ],
+    );
+    let old = std::fs::read_to_string(&roles).unwrap();
+    let mut d = start_with(&reloadable(&dir, ADMIN), &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let lease = pick_role(&sock, "old").lease_id.unwrap();
+    let held = state(&sock).logins[0].clone();
+    let (_, _, tag) = admin_roles_ok(&sock);
+
+    let odd = "model-\"large\"\\é\t";
+    let mut worker = one_step("worker", "vendor-b", odd);
+    worker.ladder[0].candidates[0].effort = Some("high".into());
+    worker.ladder[0].candidates[0].cost_per_minute = Some(1.0 / 3.0);
+    worker.ladder.push(LadderStep {
+        difficulty: 2,
+        candidates: vec![LadderCandidate {
+            vendor: "vendor-a".into(),
+            model: "model-small".into(),
+            effort: None,
+            tier: 2,
+            cost_per_minute: None,
+        }],
+    });
+    worker.reserves.push(RoleReserve {
+        difficulty: 2,
+        window: "five_hour".into(),
+        fraction: 0.1,
+    });
+    let new_roles = [worker, one_step("reviewer", "vendor-a", "model-small")];
+    let (status, body) = put_roles(&sock, Some(&tag), &new_roles);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let written: AdminRolesWritten = serde_json::from_slice(&body).unwrap();
+
+    let text = std::fs::read_to_string(&roles).unwrap();
+    assert_eq!(written.sha256, sha256_hex(&text));
+    let backup = PathBuf::from(written.backup.unwrap());
+    assert_eq!(backups_of(&roles), std::slice::from_ref(&backup));
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), old);
+    for f in [&roles, &backup] {
+        assert_eq!(std::fs::metadata(f).unwrap().mode() & 0o777, 0o600);
+    }
+    let reloaded = line_with(&lines, "qbd: reloaded", Duration::from_secs(10)).unwrap();
+    assert!(
+        reloaded.ends_with("qbd.toml: 2 roles, 1 clients"),
+        "{reloaded}"
+    );
+    let audit = line_with(&lines, "qbd: admin PUT", Duration::from_secs(10)).unwrap();
+    let expected = format!(
+        "qbd: admin PUT /v1/admin/roles by client-a: 200, roles sha256 {} -> {}, backup {}",
+        sha256_hex(&old),
+        written.sha256,
+        backup.display()
+    );
+    assert!(audit.ends_with(&expected), "{audit}");
+
+    let next = pick_role(&sock, "worker");
+    assert_eq!(
+        (next.login.as_deref(), next.model.as_deref()),
+        (Some("login-2"), Some(odd)),
+        "{next:?}"
+    );
+    let (got, _, tag) = admin_roles_ok(&sock);
+    assert_eq!(
+        (got.sha256, got.roles),
+        (written.sha256.clone(), new_roles.to_vec())
+    );
+    assert_eq!(tag, format!("\"{}\"", written.sha256));
+    let after = state(&sock);
+    assert!(
+        after.leases.iter().any(|l| l.lease_id == lease),
+        "{after:?}"
+    );
+    assert_eq!(
+        after.logins[0], held,
+        "login-1 keeps its lease's reservation"
+    );
+    let r: ReportResponse = post(
+        &sock,
+        paths::REPORT,
+        &format!(r#"{{"lease_id":"{lease}","outcome":"ok","release":true}}"#),
+    );
+    assert!(r.accepted);
+    assert!(state(&sock).leases.iter().all(|l| l.lease_id != lease));
+}
+
+#[test]
+fn a_put_without_or_with_a_stale_if_match_writes_nothing() {
+    let dir = temp_dir("adminstale");
+    let sock = dir.join("qb.sock");
+    let roles = dir.join("roles.toml");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let old = std::fs::read_to_string(&roles).unwrap();
+    let mut d = start_with(&reloadable(&dir, ADMIN), &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let hash = sha256_hex(&old);
+    let new_roles = [one_step("worker", "vendor-b", "model-large")];
+
+    let (message, audit) = refused_put(
+        &sock,
+        &lines,
+        None,
+        &new_roles,
+        (428, ErrorCode::PreconditionRequired),
+    );
+    assert_eq!(
+        message,
+        "`If-Match` with the roles file's sha256 is required"
+    );
+    let expected = format!("by client-a: 428, roles sha256 {hash} -> {hash}, nothing written");
+    assert!(audit.ends_with(&expected), "{audit}");
+    let stale = sha256_hex("an edit by hand");
+    let (message, _) = refused_put(
+        &sock,
+        &lines,
+        Some(&stale),
+        &new_roles,
+        (412, ErrorCode::PreconditionFailed),
+    );
+    assert_eq!(
+        message,
+        format!("`If-Match` is not the roles file's sha256 {hash}")
+    );
+
+    assert_eq!(std::fs::read_to_string(&roles).unwrap(), old);
+    assert_eq!(backups_of(&roles), Vec::<PathBuf>::new());
+    assert_eq!(
+        pick_role(&sock, "worker").model.as_deref(),
+        Some("model-small")
+    );
+}
+
+#[test]
+fn a_put_the_startup_parser_refuses_writes_nothing() {
+    let dir = temp_dir("adminbad");
+    let sock = dir.join("qb.sock");
+    let roles = dir.join("roles.toml");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let old = std::fs::read_to_string(&roles).unwrap();
+    let config = reloadable(&dir, ADMIN);
+    let mut d = start_with(&config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let tag = sha256_hex(&old);
+    let bad = (400, ErrorCode::BadRequest);
+
+    let (message, audit) = refused_put(
+        &sock,
+        &lines,
+        Some(&tag),
+        &[one_step("reviewer", "vendor-a", "model-small")],
+        bad,
+    );
+    let expected = format!(
+        "roles refused: {}: clients[0].role: undeclared role `worker` (line 22)",
+        config.display()
+    );
+    assert_eq!(message, expected);
+    assert!(audit.ends_with(", nothing written"), "{audit}");
+    let mut reserved = one_step("worker", "vendor-a", "model-small");
+    reserved.reserves.push(RoleReserve {
+        difficulty: 3,
+        window: "five_hour".into(),
+        fraction: 0.5,
+    });
+    let roles_fault = |field: &str, reason: &str| {
+        format!("roles refused: {}: {field}: {reason}", roles.display())
+    };
+    for (put, expected) in [
+        (
+            vec![one_step("worker", "vendor-z", "model-small")],
+            roles_fault(
+                "roles[0].ladder[0].candidates[0].vendor",
+                "undeclared vendor `vendor-z` (line 7)",
+            ),
+        ),
+        (
+            vec![
+                one_step("worker", "vendor-a", "model-small"),
+                one_step("worker", "vendor-b", "model-large"),
+            ],
+            roles_fault("roles[1].name", "duplicate name `worker` (line 11)"),
+        ),
+        (
+            vec![reserved],
+            roles_fault(
+                "roles[0].reserves[0].difficulty",
+                "no ladder step with difficulty 3 (line 11)",
+            ),
+        ),
+        (
+            Vec::new(),
+            format!(
+                "roles refused: {}: missing field `roles` (line 1)",
+                roles.display()
+            ),
+        ),
+    ] {
+        let (message, _) = refused_put(&sock, &lines, Some(&tag), &put, bad);
+        assert_eq!(message, expected);
+    }
+
+    assert_eq!(std::fs::read_to_string(&roles).unwrap(), old);
+    assert_eq!(backups_of(&roles), Vec::<PathBuf>::new());
+    assert_eq!(
+        pick_role(&sock, "worker").model.as_deref(),
+        Some("model-small")
+    );
+}
+
+#[test]
+fn a_put_without_a_roles_file_is_404_and_writes_nothing() {
+    let dir = temp_dir("adminnofile");
+    let sock = dir.join("qb.sock");
+    let config = config_copy(
+        &dir,
+        &[(
+            "name = \"client-a\"\nuid = 1001",
+            format!("name = \"client-a\"\nuid = {}\n{ADMIN}", own_uid()),
+        )],
+    );
+    let old = std::fs::read_to_string(&config).unwrap();
+    let mut d = start_with(&config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let (got, _, tag) = admin_roles_ok(&sock);
+
+    let (message, audit) = refused_put(
+        &sock,
+        &lines,
+        Some(&tag),
+        &got.roles,
+        (404, ErrorCode::NotFound),
+    );
+    assert_eq!(
+        message,
+        format!("no roles_file: the roles are in {}", config.display())
+    );
+    assert!(
+        audit.ends_with("by client-a: 404, nothing written"),
+        "{audit}"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), old);
+    assert_eq!(backups_of(&config), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn a_put_equal_to_the_file_writes_and_reloads_nothing() {
+    let dir = temp_dir("adminsame");
+    let sock = dir.join("qb.sock");
+    let roles = dir.join("roles.toml");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let config = reloadable(&dir, ADMIN);
+    let mut d = start_with(&config, &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let (got, _, tag) = admin_roles_ok(&sock);
+    let (status, body) = put_roles(&sock, Some(&tag), &got.roles);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let first: AdminRolesWritten = serde_json::from_slice(&body).unwrap();
+    let rendered = std::fs::read_to_string(&roles).unwrap();
+    let client_b = format!(
+        "{ADMIN}\n[[clients]]\nname = \"client-b\"\nbearer_sha256 = \"{BEARER_SHA256}\"\n\
+         role = \"worker\""
+    );
+    reloadable(&dir, &client_b);
+
+    let (status, body) = put_roles(&sock, Some(&first.sha256), &got.roles);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let same: AdminRolesWritten = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        same,
+        AdminRolesWritten {
+            sha256: first.sha256.clone(),
+            backup: None,
+        }
+    );
+    let audit = line_with(&lines, "qbd: admin PUT", Duration::from_secs(10)).unwrap();
+    assert!(audit.contains(": 200, roles sha256"), "{audit}");
+    let audit = line_with(&lines, "qbd: admin PUT", Duration::from_secs(10)).unwrap();
+    let expected = format!(
+        ": 200, roles sha256 {0} -> {0}, nothing written",
+        first.sha256
+    );
+    assert!(audit.ends_with(&expected), "{audit}");
+    assert_eq!(std::fs::read_to_string(&roles).unwrap(), rendered);
+    assert_eq!(
+        backups_of(&roles).len(),
+        1,
+        "only the first PUT made a backup"
+    );
+    let task = br#"{"role":"worker","difficulty":1}"#;
+    let (status, _) = call(&sock, "POST", paths::PICK, Some(task), Some(BEARER)).unwrap();
+    assert_eq!(status, 401, "no reload took the client added since");
 }

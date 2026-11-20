@@ -455,7 +455,7 @@ pub struct Sourced {
 /// As [`load`].
 pub fn load_sourced(file: &Path) -> Result<Sourced, Error> {
     let text = read(file)?;
-    let (config, roles_text) = parse_sourced(file, &text)?;
+    let (config, roles_text) = parse_sourced(file, &text, None)?;
     let (roles_from, roles_text) = match (&config.roles_file, &roles_text) {
         (Some(path), Some(roles)) => (path.clone(), roles.as_str()),
         _ => (file.to_owned(), text.as_str()),
@@ -473,11 +473,24 @@ pub fn load_sourced(file: &Path) -> Result<Sourced, Error> {
 /// # Errors
 /// The text is not TOML, the roles file cannot be read, or they do not validate.
 pub fn parse(file: &Path, text: &str) -> Result<Config, Error> {
-    Ok(parse_sourced(file, text)?.0)
+    Ok(parse_sourced(file, text, None)?.0)
 }
 
-/// [`parse`] with the text of the `roles_file` read, if one is named.
-fn parse_sourced(file: &Path, text: &str) -> Result<(Config, Option<String>), Error> {
+/// [`load`] with `roles` standing for the text of the `roles_file` the config file names; a
+/// config file without one holds its roles and `roles` is not read.
+///
+/// # Errors
+/// As [`load`], an error of `roles` naming the `roles_file`.
+pub fn load_with_roles(file: &Path, roles: &str) -> Result<Config, Error> {
+    Ok(parse_sourced(file, &read(file)?, Some(roles))?.0)
+}
+
+/// [`parse`] with the text of the `roles_file`, `roles` or else read from disk, if one is named.
+fn parse_sourced(
+    file: &Path,
+    text: &str,
+    roles: Option<&str>,
+) -> Result<(Config, Option<String>), Error> {
     let mut config: Config = deserialize(file, text)?;
     let doc = DeTable::parse(text).map_err(|e| toml_error(file, text, String::new(), &e))?;
     let here = Source {
@@ -501,7 +514,10 @@ fn parse_sourced(file: &Path, text: &str) -> Result<(Config, Option<String>), Er
     if !path.is_absolute() {
         return Err(here.fault(("roles_file".into(), "must be absolute".into())));
     }
-    let roles_text = read(&path)?;
+    let roles_text = match roles {
+        Some(text) => text.to_owned(),
+        None => read(&path)?,
+    };
     let roles: RolesFile = deserialize(&path, &roles_text)?;
     config.roles = roles.roles;
     let roles_doc = DeTable::parse(&roles_text)

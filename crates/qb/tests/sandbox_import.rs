@@ -54,7 +54,7 @@ fn import_may_read_its_config_and_source_write_the_target_directory_and_nothing_
         assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
         assert!(std::fs::read(&config).is_ok(), "the config stays readable");
         assert!(std::fs::read(&source).is_ok(), "the source stays readable");
-        qb::gateway::creds::write_atomic(&target, br#"{"type":"api_key","key":"k"}"#).unwrap();
+        qb::rewrite::write_atomic(&target, br#"{"type":"api_key","key":"k"}"#).unwrap();
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
             assert_eq!(gaps, Vec::<String>::new());

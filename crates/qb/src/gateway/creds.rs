@@ -11,11 +11,10 @@
 //! ```
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::de::DeserializeOwned;
@@ -24,6 +23,7 @@ use zeroize::Zeroizing;
 
 use super::config::{CredentialKind, GatewayLogin};
 use super::upstream::Credential;
+use crate::rewrite::write_atomic;
 
 /// An OAuth token is refreshed when it expires within this many seconds.
 pub const REFRESH_MARGIN_S: u64 = 60;
@@ -442,48 +442,10 @@ pub(super) fn vacant(target: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Replaces `file` with `bytes` so that a reader sees the old or the new file, never a part:
-/// a 0600 temporary file in the same directory, fsync, rename, fsync of the directory.
-///
-/// # Errors
-/// Any step failed; the temporary file is removed and `file` is unchanged.
-pub fn write_atomic(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let dir = file
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let name = file.file_name().map_or_else(
-        || "credentials".into(),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let tmp: PathBuf = dir.join(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, file)?;
-        File::open(dir)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 

@@ -11,7 +11,7 @@ use qb_vendors::rfc3339::days_in_month;
 use serde::{Deserialize, Serialize};
 
 use super::config::Price;
-use super::creds::write_atomic;
+use crate::rewrite::write_atomic;
 
 /// Name of the window a capped login's spend is reported as; its vendor declares it in qbd.
 pub const WINDOW: &str = "spend";

@@ -55,7 +55,7 @@ fn login_may_read_its_config_write_the_target_directory_resolve_and_nothing_else
             std::fs::read("/etc/hosts").is_ok(),
             "the resolver files stay readable"
         );
-        qb::gateway::creds::write_atomic(&target, br#"{"type":"api_key","key":"k"}"#).unwrap();
+        qb::rewrite::write_atomic(&target, br#"{"type":"api_key","key":"k"}"#).unwrap();
         if abi >= Some(ABI::V4) {
             eprintln!("landlock {abi:?}: enforcing branch");
             assert_eq!(gaps, Vec::<String>::new());

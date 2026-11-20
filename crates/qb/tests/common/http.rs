@@ -19,6 +19,21 @@ pub fn send(sock: &Path, method: &str, path: &str, body: &str) -> UnixStream {
     s
 }
 
+/// `PUT path` on `sock` with `If-Match: if_match` when given and `body`: status and body.
+pub fn put(sock: &Path, path: &str, if_match: Option<&str>, body: &str) -> (u16, Vec<u8>) {
+    let mut s = UnixStream::connect(sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let if_match = if_match.map_or(String::new(), |m| format!("If-Match: {m}\r\n"));
+    write!(
+        s,
+        "PUT {path} HTTP/1.1\r\nHost: qb\r\n{if_match}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let (status, _, body) = finish(s, Vec::new());
+    (status, body)
+}
+
 /// The chunked body `raw` without its framing.
 pub fn dechunk(mut raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
