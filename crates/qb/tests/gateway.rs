@@ -10055,16 +10055,6 @@ fn roles_put(vendor: &str, model: &str) -> String {
     .to_string()
 }
 
-/// The backups qbd made of `roles`.
-fn roles_backups(roles: &Path) -> Vec<PathBuf> {
-    let name = format!("{}.bak-", roles.file_name().unwrap().to_str().unwrap());
-    std::fs::read_dir(roles.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with(&name))
-        .collect()
-}
-
 /// Asserts that the first admin request qbd logs is a `GET /v1/admin/roles` sent to it directly
 /// now, so no earlier request reached its admin API.
 fn assert_qbd_heard_no_admin_request(a: &AdminRig) {
@@ -10075,11 +10065,6 @@ fn assert_qbd_heard_no_admin_request(a: &AdminRig) {
         first.ends_with("qbd: admin GET /v1/admin/roles by gateway: 200"),
         "{first}"
     );
-}
-
-/// What the audit of `gw` holds, each entry with its hashes and backup.
-fn audit_entries(gw: &Path) -> Vec<AuditEntry> {
-    audit_answer(gw, "").entries
 }
 
 #[test]
@@ -10107,7 +10092,7 @@ fn the_gateway_s_own_uid_reads_and_replaces_qbd_s_roles_and_the_next_turn_follow
     let now = std::fs::read_to_string(&a.roles).unwrap();
     assert_eq!(written.sha256, sha256_hex(&now));
     let backup = written.backup.clone().unwrap();
-    assert_eq!(roles_backups(&a.roles), [PathBuf::from(&backup)]);
+    assert_eq!(backups_of(&a.roles), [PathBuf::from(&backup)]);
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), ADMIN_ROLES);
 
     let (_, _, events) = turn(gw, &turn_body("turn-1"));
@@ -10119,7 +10104,7 @@ fn the_gateway_s_own_uid_reads_and_replaces_qbd_s_roles_and_the_next_turn_follow
     let reloaded: AdminReloadAnswer = serde_json::from_slice(&body).unwrap();
     assert_eq!((reloaded.roles, reloaded.clients), (1, 1));
 
-    let entries = audit_entries(gw);
+    let entries = audit_answer(gw, "").entries;
     let actor = format!("uid:{}", own_uid());
     let qbd = a.r.qbd.display().to_string();
     assert_eq!(
@@ -10181,8 +10166,8 @@ fn a_stale_or_missing_if_match_passes_qbd_s_refusal_through_and_nothing_is_writt
         );
     }
     assert_eq!(std::fs::read_to_string(&a.roles).unwrap(), ADMIN_ROLES);
-    assert_eq!(roles_backups(&a.roles), Vec::<PathBuf>::new());
-    let entries = audit_entries(gw);
+    assert_eq!(backups_of(&a.roles), Vec::<PathBuf>::new());
+    let entries = audit_answer(gw, "").entries;
     let actor = format!("uid:{}", own_uid());
     let qbd = a.r.qbd.display().to_string();
     let refused = |says| {
@@ -10305,7 +10290,7 @@ fn an_unreachable_qbd_is_503_unavailable_and_a_refused_reload_line() {
     let message = e.message.clone().unwrap();
     assert_eq!((status, e.class), (503, ErrorClass::Unavailable), "{e:?}");
     assert!(message.starts_with("qbd is unreachable: "), "{message}");
-    let entries = audit_entries(&r.gw);
+    let entries = audit_answer(&r.gw, "").entries;
     let rows = audit_rows(&entries);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(

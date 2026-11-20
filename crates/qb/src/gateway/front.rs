@@ -3,9 +3,10 @@
 //! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
 //! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`,
 //! `/v1/model/logins/{name}/oauth/start`, `/v1/model/logins/{name}/oauth/code`, `/v1/health`
-//! and `qbd`'s `/v1/admin/roles` and `/v1/admin/reload` ([`super::admin`]), and the HTTP fronts: `/v1/messages` ([`super::messages`]),
-//! `/v1/chat/completions` and `/v1/responses` ([`super::openai`]); the optional loopback TCP
-//! listener serves only the HTTP fronts, to clients with a client token.
+//! and `qbd`'s `/v1/admin/roles` and `/v1/admin/reload` ([`super::admin`]), and the HTTP fronts:
+//! `/v1/messages` ([`super::messages`]), `/v1/chat/completions` and `/v1/responses`
+//! ([`super::openai`]); the optional loopback TCP listener serves only the HTTP fronts, to clients
+//! with a client token.
 //! One thread per connection, at most `max_turns` + [`EXTRA_CONNECTIONS`] at once; a loopback
 //! peer takes one of these slots only once its head showed a client token, and before that one
 //! of [`LOOPBACK_UNCHECKED`] slots of its own, for at most [`LOOPBACK_HEAD_DEADLINE`]. On the C4
