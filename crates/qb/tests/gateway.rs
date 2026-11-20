@@ -24,12 +24,12 @@ use qb::gateway::chat_upstream::ChatCompletions;
 use qb::gateway::config::{Api, GatewayLogin};
 use qb::gateway::core::{Cancel, Gateway, Upstreams};
 use qb::gateway::creds::{RefreshError, Refreshed, Refresher};
-use qb::gateway::front;
 use qb::gateway::oauth::OauthRefresher;
 use qb::gateway::openai_upstream::Openai;
 use qb::gateway::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Sink, Upstream,
 };
+use qb::gateway::{config_edit, front};
 use qb::hooks::Runner;
 use qb::journal::Journal;
 use qb::server::unix_now;
@@ -6021,6 +6021,201 @@ fn hive_step_3_of_the_shipped_examples_sends_the_step_3_candidate_s_model_and_ef
     assert_eq!(models_and_efforts(&vendor), [medium]);
 }
 
+/// Routes of [`QBD`]'s role `gateway` limited to login-1: a ladder step, a pin and a chain.
+const LISTED_ROUTES: &str = "[[routes]]\nalias = \"hive-step-1\"\nrole = \"gateway\"\n\
+                             difficulty = 1\nlogins = [\"login-1\"]\n\
+                             [[routes]]\nalias = \"pin-1\"\nrole = \"gateway\"\n\
+                             vendor = \"vendor-a\"\nmodel = \"model-large\"\n\
+                             logins = [\"login-1\"]\n\
+                             [[routes]]\nalias = \"chain-1\"\nrole = \"gateway\"\n\
+                             logins = [\"login-1\"]\n\
+                             chain = [{ vendor = \"vendor-a\", model = \"model-large\" }]\n";
+
+/// A gateway with the Anthropic adapter on a scripted vendor, login-1 and login-2 Anthropic keys
+/// on vendor-a, and the routes [`LISTED_ROUTES`].
+fn listed_rig() -> (Rig, Vendor) {
+    let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
+    let front = format!("{LISTED_ROUTES}{}", fronts(""));
+    vendor_rig_with(QBD, upstreams, &key_files(), two_keys, &front, None)
+}
+
+/// The kinds of the events of a turn on `alias`.
+fn kinds_on(r: &Rig, alias: &str, request_id: &str) -> Vec<String> {
+    kinds(&turn(&r.gw, &turn_on(alias, request_id)).2)
+}
+
+/// The `x-api-key` of each request the vendor received.
+fn keys_sent(vendor: &Vendor) -> Vec<String> {
+    let sent = vendor.received();
+    sent.iter()
+        .map(|s| s.header("x-api-key").unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_hive_step_route_with_logins_never_reaches_a_login_outside_its_list() {
+    let (r, vendor) = listed_rig();
+    for n in 0..2 {
+        vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+        let kinds = kinds_on(&r, "hive-step-1", &format!("turn-{n}"));
+        assert_eq!(kinds.last().unwrap(), "stop End", "{kinds:?}");
+    }
+    vendor.answer(recorded("429_usage_limit", None));
+    let kinds = kinds_on(&r, "hive-step-1", "turn-limit");
+    assert_eq!(kinds.last().unwrap(), "error QuotaExhausted", "{kinds:?}");
+    for alias in ["hive-step-1", "pin-1", "chain-1"] {
+        let kinds = kinds_on(&r, alias, &format!("turn-{alias}"));
+        assert_eq!(kinds, ["error QuotaExhausted"], "{alias}");
+    }
+    assert_eq!(keys_sent(&vendor), ["test-token-1"; 3]);
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Exhausted);
+    assert_eq!(s.leases, []);
+
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let kinds = kinds_on(&r, "chat", "turn-unlisted");
+    assert_eq!(kinds.last().unwrap(), "stop End", "{kinds:?}");
+    let want = [
+        "test-token-1",
+        "test-token-1",
+        "test-token-1",
+        "test-token-2",
+    ];
+    assert_eq!(
+        keys_sent(&vendor),
+        want,
+        "a route without logins runs on login-2"
+    );
+}
+
+#[test]
+fn a_put_of_route_logins_round_trips_and_its_reload_applies_it() {
+    let (r, vendor) = listed_rig();
+    let (got, etag) = config_routes(&r.gw);
+    let read: Vec<_> = got
+        .routes
+        .iter()
+        .map(|c| (c.alias.as_str(), c.logins.clone()))
+        .collect();
+    let one = Some(vec!["login-1".to_owned()]);
+    let want = [
+        ("chat", None),
+        ("spare", None),
+        ("hive-step-1", one.clone()),
+        ("pin-1", one.clone()),
+        ("chain-1", one),
+    ];
+    assert_eq!(read, want);
+
+    exhaust(&r.qbd, "login-1", unix_now() + 3600);
+    let mut routes = got.routes;
+    routes[2].logins = Some(vec!["login-2".into()]);
+    let (status, body) = put(
+        &r.gw,
+        paths::MODEL_CONFIG_ROUTES,
+        Some(&etag),
+        &routes_body(&routes),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (after, etag) = config_routes(&r.gw);
+    assert_eq!(after.routes, routes);
+    vendor.answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let kinds = kinds_on(&r, "hive-step-1", "turn-1");
+    assert_eq!(kinds.last().unwrap(), "stop End", "{kinds:?}");
+    assert_eq!(keys_sent(&vendor), ["test-token-2"]);
+
+    routes[2].logins = Some(vec!["login-9".into()]);
+    let (status, e) = put_error(&r.gw, Some(&etag), &routes_body(&routes));
+    assert_eq!((status, e.class), (400, ErrorClass::BadRequest), "{e:?}");
+    let message = e.message.unwrap();
+    assert!(
+        message.contains("routes[2].logins: `login-9` is no `[[logins]]` name"),
+        "{message}"
+    );
+}
+
+/// The 200 answer of `GET /v1/model/ladder?{query}` of the gateway `gw`.
+fn ladder_of(gw: &Path, query: &str) -> Value {
+    let path = format!("{}?{query}", paths::MODEL_LADDER);
+    let (status, body) = call(gw, "GET", &path, "");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{query}: {body}");
+    body
+}
+
+/// `state` and `resets_at` of the candidates of vendor `vendor` in `GET /v1/model/ladder?{query}`
+/// of the gateway `gw`, step by step.
+fn ladder_states(gw: &Path, query: &str, vendor: &str) -> Vec<(Value, Value)> {
+    ladder_of(gw, query)["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["candidates"].as_array().unwrap())
+        .filter(|c| c["vendor"] == vendor)
+        .map(|c| (c["state"].clone(), c["resets_at"].clone()))
+        .collect()
+}
+
+/// A qbd of the shipped `deploy/examples/qbd.toml` behind a gateway with the `hive-heads` routes
+/// of the shipped `deploy/examples/gateway.toml`, the logins they list and login-2.
+#[test]
+fn the_shipped_hive_heads_ladder_never_shows_login_2_s_state_for_vendor_a() {
+    let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/examples");
+    let qbd_text = std::fs::read_to_string(examples.join("qbd.toml")).unwrap();
+    let shipped = qb::gateway::config::load(&examples.join("gateway.toml")).unwrap();
+    let hive: Vec<_> = shipped
+        .routes
+        .iter()
+        .filter(|r| r.role == "hive-heads")
+        .cloned()
+        .collect();
+    assert_eq!(hive.len(), 5);
+    let mut names = vec!["login-2".to_owned()];
+    for r in &hive {
+        names.extend(r.logins.clone().unwrap());
+    }
+    names.sort();
+    names.dedup();
+    let routes = config_edit::render(&config_edit::routes_of(&hive));
+    for (exhausted, want) in [("login-2", "ready"), ("login-1", "exhausted")] {
+        let dir = temp_dir("gwhive");
+        let qbd = start_qbd(&dir, &qbd_text);
+        let mut text = format!(
+            "socket = \"{}/gw.sock\"\nqbd_socket = \"{}\"\n",
+            dir.display(),
+            qbd.display()
+        );
+        for name in &names {
+            let login = shipped.login(name).unwrap();
+            let _ = writeln!(
+                text,
+                "[[logins]]\nname = \"{name}\"\nkind = \"{}\"\napi = \"{}\"\n\
+                 credentials = \"{}/creds/{name}.json\"",
+                login.kind.as_str(),
+                login.api.as_str(),
+                dir.display()
+            );
+        }
+        text.push_str(&routes);
+        let gw = serve_gateway(
+            &text,
+            Vec::new(),
+            Box::new(Counting(Arc::default())),
+            own_uid(),
+            None,
+        );
+        let resets = unix_now() + 3600;
+        exhaust(&qbd, exhausted, resets);
+        let at = if want == "ready" {
+            Value::Null
+        } else {
+            json!(resets)
+        };
+        let states = ladder_states(&gw, "role=hive-heads", "vendor-a");
+        assert_eq!(states, vec![(json!(want), at); 5], "{exhausted} exhausted");
+    }
+}
+
 #[test]
 fn messages_on_a_chatgpt_login_sends_its_account_and_never_shows_reasoning_as_thinking() {
     const ACCESS: &str = "test-access-6d1f";
@@ -8177,6 +8372,7 @@ fn ladder_route(alias: &str) -> ConfigRoute {
         chain: None,
         expected_minutes: None,
         client_effort: None,
+        logins: None,
     }
 }
 
@@ -10530,10 +10726,12 @@ difficulty = 2
 candidates = [{ vendor = "vendor-b", model = "model-medium", effort = "high", tier = 1 }]
 "#;
 
-/// Ladder routes of the role `gateway` besides `chat` at difficulty 1.
+/// Ladder routes of the role `gateway` besides `chat` at difficulty 1, and a ladder route of the
+/// role `side`.
 const LADDER_ROUTES: &str = "[[routes]]\nalias = \"chat-b\"\nrole = \"gateway\"\ndifficulty = 1\n\
                              [[routes]]\nalias = \"deep\"\nrole = \"gateway\"\ndifficulty = 2\n\
-                             [[routes]]\nalias = \"hard\"\nrole = \"gateway\"\ndifficulty = 3\n";
+                             [[routes]]\nalias = \"hard\"\nrole = \"gateway\"\ndifficulty = 3\n\
+                             [[routes]]\nalias = \"side\"\nrole = \"side\"\ndifficulty = 1\n";
 
 /// `GET /v1/model/ladder?{query}` on the loopback listener `addr` with `token`: status and body.
 fn loopback_ladder(addr: SocketAddr, query: &str, token: &str) -> (u16, Value) {
@@ -10549,13 +10747,18 @@ fn loopback_ladder(addr: SocketAddr, query: &str, token: &str) -> (u16, Value) {
 /// key on vendor-a, login-2 a ChatGPT login on vendor-b that qbd holds exhausted until the
 /// returned time, and on the returned loopback address `client-a` limited to the route `deep`.
 fn ladder_rig() -> (AdminRig, SocketAddr, u64) {
+    ladder_rig_with(LADDER_ROUTES)
+}
+
+/// [`ladder_rig`] with the routes `routes` besides `chat` and `spare`.
+fn ladder_rig_with(routes: &str) -> (AdminRig, SocketAddr, u64) {
     let client = front_client("client-a", CLIENT_A.1, "routes = [\"deep\"]\n");
     let (listener, addr, front) = loopback_front(&client);
     let files = [
         ("login-1", api_key("test-token-1"), 0o600),
         ("login-2", chatgpt("test-token-2", "test-account-2"), 0o600),
     ];
-    let extra = format!("{LADDER_ROUTES}{front}");
+    let extra = format!("{routes}{front}");
     let roles = (LADDER_ROLES, "");
     let a = admin_rig_with(&files, roles, &extra, own_uid(), Some(listener));
     let resets = unix_now() + 3600;
@@ -10587,13 +10790,7 @@ fn ladder_step(difficulty: u8, resets: u64) -> Value {
 #[test]
 fn the_ladder_shows_its_steps_candidates_and_login_states_without_a_lease() {
     let (a, _, resets) = ladder_rig();
-    let ladder = |query: &str| {
-        let path = format!("{}?{query}", paths::MODEL_LADDER);
-        let (status, body) = call(&a.r.gw, "GET", &path, "");
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(status, 200, "{query}: {body}");
-        body
-    };
+    let ladder = |query: &str| ladder_of(&a.r.gw, query);
     let steps: Vec<Value> = (1..=3).map(|d| ladder_step(d, resets)).collect();
     assert_eq!(
         ladder("role=gateway"),
@@ -10643,6 +10840,11 @@ fn a_named_loopback_client_reads_only_the_ladder_of_its_routes() {
             CLIENT_A.0,
             "client `client-a` may not use route `chat`",
         ),
+        (
+            "role=side",
+            CLIENT_A.0,
+            "client `client-a` may not use a route of role `side`",
+        ),
         ("route=deep", CLIENT_TOKEN, unnamed),
     ] {
         let (status, body) = loopback_ladder(addr, query, token);
@@ -10658,4 +10860,57 @@ fn a_named_loopback_client_reads_only_the_ladder_of_its_routes() {
     let status = finish(routes, Vec::new()).0;
     assert_eq!(status, 404, "the listener serves no other path");
     assert_eq!(state(&a.r.qbd).leases, [], "no read took a lease");
+}
+
+/// Ladder routes limited to login-1, on vendor-a, of steps 1 and 2 of the role `gateway`, and a
+/// pin of vendor-b limited to it; `deep` is the route [`ladder_rig`]'s `client-a` may use.
+const LISTED_LADDER_ROUTES: &str = "[[routes]]\nalias = \"only-a\"\nrole = \"gateway\"\n\
+                                    difficulty = 1\nlogins = [\"login-1\"]\n\
+                                    [[routes]]\nalias = \"deep\"\nrole = \"gateway\"\n\
+                                    difficulty = 2\nlogins = [\"login-1\"]\n\
+                                    [[routes]]\nalias = \"pin-b\"\nrole = \"gateway\"\n\
+                                    vendor = \"vendor-b\"\nmodel = \"model-b\"\n\
+                                    logins = [\"login-1\"]\n";
+
+#[test]
+fn routes_and_the_ladder_show_the_state_of_a_route_s_listed_logins_only() {
+    let (a, _, resets) = ladder_rig_with(LISTED_LADDER_ROUTES);
+    let gw = &a.r.gw;
+    let states: Vec<_> = routes_of(gw)
+        .into_iter()
+        .map(|r| (r.alias, r.state, r.resets_at))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("chat".to_owned(), RouteState::Ready, None),
+            ("deep".to_owned(), RouteState::Ready, None),
+            ("only-a".to_owned(), RouteState::Ready, None),
+            ("pin-b".to_owned(), RouteState::Unavailable, None),
+            ("spare".to_owned(), RouteState::Exhausted, Some(resets)),
+        ]
+    );
+
+    let ladder = |query: &str| ladder_of(gw, query);
+    let a_ready = json!({"vendor": "vendor-a", "api": "anthropic", "model": "model-small",
+                         "tier": 1, "state": "ready"});
+    let b_unlisted = |model: &str, effort: &str, tier: u8| {
+        json!({"vendor": "vendor-b", "model": model, "effort": effort, "tier": tier,
+               "state": "unavailable"})
+    };
+    let only_a = json!({"difficulty": 1, "routes": ["chat", "only-a"],
+                        "candidates": [a_ready, b_unlisted("model-b", "low", 2)]});
+    assert_eq!(
+        ladder("route=only-a"),
+        json!({"role": "gateway", "steps": [only_a]})
+    );
+    let mut step_1 = ladder_step(1, resets);
+    step_1["routes"] = json!(["chat", "only-a"]);
+    let step_2 = json!({"difficulty": 2, "routes": ["deep"],
+                        "candidates": [b_unlisted("model-medium", "high", 1)]});
+    assert_eq!(
+        ladder("role=gateway"),
+        json!({"role": "gateway", "steps": [step_1, step_2]}),
+        "step 1 adds chat's every login, step 2 has deep's"
+    );
 }

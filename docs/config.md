@@ -355,6 +355,7 @@ ladder step, a pin, or a chain of pins.
 | `chain` | array of tables | Instead of `difficulty`, `vendor`, `model` and `effort`: 1 to 8 steps `{ vendor, model, effort }`, each a pin (`vendor` and `model` required), which a turn tries in order ([api.md](api.md#attempts-and-rotation)). |
 | `expected_minutes` | integer | Expected length of a turn, for the lease's cost. |
 | `client_effort` | string | Whose reasoning effort a turn sends: `use` (default) the client's, else the picked candidate's, the pin's or the chain step's; `ignore` only the pick's, or none when it has none, whatever effort the client sent ([api.md](api.md#post-v1modelturn)). |
+| `logins` | array of strings | 1 to 32 distinct `[[logins]]` names of this file: every pick of a turn on the route, on each step of a chain, names them as `qbd`'s `logins`, so the turn runs on no other login, and `GET /v1/model/routes` and `GET /v1/model/ladder` take the route's state over them only ([api.md](api.md#get-v1modelroutes)). Without it every login is open to the route. |
 
 A chain across vendors: [Examples](#a-route-chaining-subscription-key-and-openrouter).
 
@@ -734,7 +735,9 @@ ladder or pin route such a pick ends the turn.
 with steps 1 to 5, each with three candidates and an effort of its own: the Anthropic
 subscription vendor `vendor-a` and the OpenAI subscription vendor `vendor-b` at tier 1, and
 `vendor-g` at tier 3, the vendor of the capped API key `key-4`. A turn on `hive-step-3` sends
-the step-3 candidate's model and effort, whatever effort its client asked for.
+the step-3 candidate's model and effort, whatever effort its client asked for. Each route
+lists `logins = ["login-1", "login-3", "key-4"]`, so the heads never run on, and their ladder
+never shows, the second Anthropic subscription `login-2`, which `vendor-a` serves too.
 
 ### Importing credentials
 

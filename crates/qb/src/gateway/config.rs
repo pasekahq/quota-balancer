@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use qb_core::MAX_LOGINS;
 use qb_openai::chat_upstream;
-use qb_proto::{ON_BEHALF_OF_MAX, Pin};
+use qb_proto::{ON_BEHALF_OF_MAX, PICK_LOGINS_MAX, Pin};
 use toml::Spanned;
 use toml::de::{DeTable, DeValue};
 
@@ -293,6 +293,9 @@ pub struct Route {
     /// Whose effort a turn sends; `None` when the file has no key, which acts as
     /// [`ClientEffort::Use`].
     pub client_effort: Option<ClientEffort>,
+    /// Logins of this config every pick of a turn is limited to, 1 to [`PICK_LOGINS_MAX`];
+    /// `None` for every login.
+    pub logins: Option<Vec<String>>,
 }
 
 /// Whose reasoning effort a route's turns send.
@@ -435,6 +438,14 @@ fn string(at: &str, v: &Value<'_>) -> Result<String, WalkError> {
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| wrong(at, v, "a string"))
+}
+
+fn strings(at: &str, v: &Value<'_>) -> Result<Vec<String>, WalkError> {
+    let items = v
+        .get_ref()
+        .as_array()
+        .ok_or_else(|| wrong(at, v, "an array of strings"))?;
+    items.iter().map(|item| string(at, item)).collect()
 }
 
 fn boolean(at: &str, v: &Value<'_>) -> Result<bool, WalkError> {
@@ -816,14 +827,7 @@ fn walk_front_client(at: &str, t: &DeTable<'_>) -> Result<FrontClient, WalkError
                 hash = Some(BearerHash::from_hex(&string(at, v)?).ok_or_else(bad)?);
             }
             "token_file" => file = Some((string(at, v)?, v.span().start)),
-            _ => {
-                let items = v
-                    .get_ref()
-                    .as_array()
-                    .ok_or_else(|| wrong(at, v, "an array of strings"))?;
-                let listed = items.iter().map(|item| string(at, item));
-                routes = Some(listed.collect::<Result<_, _>>()?);
-            }
+            _ => routes = Some(strings(at, v)?),
         }
         Ok(())
     })?;
@@ -1035,6 +1039,7 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         chain: Vec::new(),
         expected_minutes: None,
         client_effort: None,
+        logins: None,
     };
     let mut chain_at = None;
     let known = [
@@ -1047,6 +1052,7 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
         "chain",
         "expected_minutes",
         "client_effort",
+        "logins",
     ];
     fields(at, t, &known, &["alias", "role"], |key, at, v| {
         match key {
@@ -1070,6 +1076,7 @@ fn walk_route(at: &str, t: &DeTable<'_>) -> Result<Route, WalkError> {
                     }
                 });
             }
+            "logins" => r.logins = Some(strings(at, v)?),
             _ => r.expected_minutes = Some(integer(at, v)?),
         }
         Ok(())
@@ -1350,6 +1357,29 @@ impl GatewayConfig {
             }
             if r.difficulty.is_some() && r.effort.is_some() {
                 return Err((at, "`effort` belongs to a pin".into()));
+            }
+            if let Some(logins) = &r.logins {
+                self.validate_route_logins(&format!("{at}.logins"), logins)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A route's `logins`: 1 to [`PICK_LOGINS_MAX`] distinct names of `[[logins]]` entries.
+    fn validate_route_logins(&self, field: &str, logins: &[String]) -> Result<(), Fault> {
+        if logins.is_empty() || logins.len() > PICK_LOGINS_MAX {
+            let reason = format!(
+                "must have 1 to {PICK_LOGINS_MAX} names, found {}",
+                logins.len()
+            );
+            return Err((field.into(), reason));
+        }
+        for (i, name) in logins.iter().enumerate() {
+            if logins[..i].contains(name) {
+                return Err((field.into(), format!("duplicate name `{name}`")));
+            }
+            if self.login(name).is_none() {
+                return Err((field.into(), format!("`{name}` is no `[[logins]]` name")));
             }
         }
         Ok(())
@@ -1787,6 +1817,42 @@ difficulty = 1
             err,
             "gw.toml: routes[0].client_effort: expected `use` or `ignore` (line 13)"
         );
+    }
+
+    #[test]
+    fn route_logins_are_read_on_ladder_pin_and_chain_routes_and_must_name_distinct_logins() {
+        let routes = "logins = [\"login-1\"]\n\
+                      [[routes]]\nalias = \"pin\"\nrole = \"r\"\nvendor = \"v\"\nmodel = \"m\"\n\
+                      logins = [\"login-1\"]\n\
+                      [[routes]]\nalias = \"walk\"\nrole = \"r\"\nlogins = [\"login-1\"]\n\
+                      chain = [{ vendor = \"v\", model = \"m\" }]\n\
+                      [[routes]]\nalias = \"open\"\nrole = \"r\"\ndifficulty = 2\n";
+        let c = check("", routes).unwrap();
+        let read: Vec<_> = c.routes.iter().map(|r| r.logins.as_deref()).collect();
+        let listed = ["login-1".to_owned()];
+        let one = Some(&listed[..]);
+        assert_eq!(read, [one, one, one, None]);
+        for (keys, want) in [
+            (
+                "logins = [\"login-1\", \"login-1\"]\n",
+                "routes[0].logins: duplicate name `login-1` (line 13)",
+            ),
+            (
+                "logins = [\"login-9\"]\n",
+                "routes[0].logins: `login-9` is no `[[logins]]` name (line 13)",
+            ),
+            (
+                "logins = []\n",
+                "routes[0].logins: must have 1 to 32 names, found 0 (line 13)",
+            ),
+            (
+                "logins = \"login-1\"\n",
+                "routes[0].logins: expected an array of strings, found string (line 13)",
+            ),
+        ] {
+            let err = check("", keys).unwrap_err();
+            assert_eq!(err, format!("gw.toml: {want}"), "{keys}");
+        }
     }
 
     #[test]

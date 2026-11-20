@@ -13,7 +13,8 @@
       "role": "gateway",
       "vendor": "vendor-b",
       "model": "model-b",
-      "effort": "high"
+      "effort": "high",
+      "logins": ["login-1", "login-3"]
     },
     {
       "alias": "chain",
