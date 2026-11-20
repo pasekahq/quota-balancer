@@ -276,6 +276,8 @@ pub struct PickInput {
     pub run_id: Option<String>,
     /// End client a relaying caller picks for, kept in the lease; no decision reads it.
     pub on_behalf_of: Option<String>,
+    /// Allow-list of login names; only these logins are considered, a pin's login included.
+    pub logins: Option<Vec<String>>,
 }
 
 /// Declares [`Reason`] from one table, so `as_str`, `from_name` and `ALL` cannot disagree.
@@ -1044,6 +1046,7 @@ impl Core {
         let role = self.roles.iter().find(|r| r.name == input.role)?;
         let avoid = input.avoid_vendor.as_deref();
         let minutes = input.expected_minutes;
+        let allowed = self.allowed(input.logins.as_deref());
         match &input.target {
             Target::Difficulty(d) => {
                 let at = role.steps.iter().position(|s| s.difficulty == *d)?;
@@ -1052,7 +1055,8 @@ impl Core {
                     let Some(step) = i.and_then(|i| role.steps.get(i)) else {
                         continue;
                     };
-                    if let Some(c) = self.best_on_step(step, avoid, minutes, now, rejected) {
+                    let best = self.best_on_step(step, avoid, allowed, minutes, now, rejected);
+                    if let Some(c) = best {
                         let cand = &step.candidates[c.candidate];
                         return Some(Settled {
                             choice: c,
@@ -1089,7 +1093,10 @@ impl Core {
                 let cost = self.cost(vi, rate, minutes);
                 let mut best: Option<Choice> = None;
                 for (li, l) in self.logins.iter().enumerate() {
-                    if l.vendor != vi || login.as_ref().is_some_and(|name| *name != l.name) {
+                    if l.vendor != vi
+                        || allowed & (1 << li) == 0
+                        || login.as_ref().is_some_and(|name| *name != l.name)
+                    {
                         continue;
                     }
                     let choice = Choice {
@@ -1113,10 +1120,23 @@ impl Core {
         }
     }
 
+    /// Bit per login index of the logins `names` allows; every login without a list.
+    fn allowed(&self, names: Option<&[String]>) -> u32 {
+        let Some(names) = names else {
+            return u32::MAX;
+        };
+        self.logins
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| names.contains(&l.name))
+            .fold(0, |mask, (li, _)| mask | 1 << li)
+    }
+
     fn best_on_step(
         &self,
         step: &Step,
         avoid: Option<&str>,
+        allowed: u32,
         minutes: Option<u32>,
         now: UnixSecs,
         rejected: &mut Rejected,
@@ -1127,7 +1147,9 @@ impl Core {
                 continue;
             }
             let cost = self.cost(cand.vendor, cand.cost_per_minute, minutes);
-            for li in (0..self.logins.len()).filter(|&li| self.logins[li].vendor == cand.vendor) {
+            let on_list =
+                |&li: &usize| self.logins[li].vendor == cand.vendor && allowed & (1 << li) != 0;
+            for li in (0..self.logins.len()).filter(on_list) {
                 let choice = Choice {
                     tier: Some(cand.tier),
                     urgency: self.urgency(li, &cost, now),
@@ -1641,6 +1663,11 @@ impl Core {
             expires_at: l.expires_at,
             reason: l.reason,
         })
+    }
+
+    /// Whether `login` is a configured login.
+    pub fn has_login(&self, login: &str) -> bool {
+        self.logins.iter().any(|l| l.name == login)
     }
 
     /// The marks of the configured login `login`.

@@ -3,9 +3,10 @@
 mod common;
 
 use common::{
-    DAY, HOUR, NOW, cand, core, input, observe, pick, pin, ran, reserve, role, spec, step,
+    DAY, HOUR, NOW, cand, core, input, observe, on, outcome, pick, pin, ran, reserve, role, spec,
+    step,
 };
-use qb_core::{Reason, Target, Verdict};
+use qb_core::{OutcomeClass, PickInput, Reason, Target, Verdict};
 
 /// One vendor-a candidate at difficulty 1 that keeps 20 % of `seven_day` free.
 fn keeper() -> qb_core::Core {
@@ -466,4 +467,139 @@ fn empty_core_has_no_candidates() {
             Verdict::Dead(Reason::NoCandidates)
         );
     }
+}
+
+/// A `worker` pick of `target` limited to `logins`.
+fn listed(target: Target, logins: &[&str]) -> PickInput {
+    let mut i = input("worker", target, None);
+    i.logins = Some(logins.iter().map(|&l| l.into()).collect());
+    i
+}
+
+#[test]
+fn a_login_list_limits_the_ladder_step_to_its_logins() {
+    let mut c = core(spec(vec![role(
+        "worker",
+        vec![step(1, vec![cand("vendor-a", "m", 1)])],
+        vec![],
+    )]));
+    assert_eq!(ran(&pick(&mut c, "worker", 1, None)).0, "login-1");
+    let v = c.pick(&listed(Target::Difficulty(1), &["login-2"]), NOW);
+    assert_eq!(ran(&v).0, "login-2");
+    assert!(matches!(v, Verdict::Run(_, Reason::SpendBeforeReset)));
+    assert_eq!(
+        c.pick(&listed(Target::Difficulty(1), &["login-3"]), NOW),
+        Verdict::Dead(Reason::NoCandidates),
+        "a vendor without a listed login is passed over"
+    );
+}
+
+#[test]
+fn a_blocked_listed_login_waits_while_an_unlisted_one_is_free() {
+    let mut c = core(spec(vec![role(
+        "worker",
+        vec![step(1, vec![cand("vendor-a", "m", 1)])],
+        vec![],
+    )]));
+    outcome(&mut c, on("login-2"), OutcomeClass::Http429, None, NOW).expect("known login");
+    assert_eq!(ran(&pick(&mut c, "worker", 1, None)).0, "login-1");
+    let v = c.pick(&listed(Target::Difficulty(1), &["login-2"]), NOW);
+    assert!(
+        matches!(v, Verdict::Wait { retry_after, reason: Reason::AllExhausted, .. }
+            if retry_after == NOW + 60),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn a_neighbour_step_on_an_unlisted_login_is_skipped() {
+    let mut c = core(spec(vec![role(
+        "worker",
+        vec![
+            step(1, vec![cand("vendor-a", "small", 1)]),
+            step(2, vec![cand("vendor-b", "medium", 1)]),
+            step(3, vec![cand("vendor-a", "large", 1)]),
+        ],
+        vec![reserve(1, "seven_day", 0.5)],
+    )]));
+    observe(
+        &mut c,
+        "login-3",
+        &[("five_hour", 1.0, Some(NOW + 2 * HOUR))],
+        NOW,
+    );
+    // login-2 fails the reserve of step 1 and passes step 3, which has none.
+    observe(
+        &mut c,
+        "login-2",
+        &[("seven_day", 0.6, Some(NOW + 3 * DAY))],
+        NOW,
+    );
+    assert_eq!(ran(&pick(&mut c, "worker", 2, None)), ("login-1", "small"));
+    let v = c.pick(&listed(Target::Difficulty(2), &["login-3", "login-2"]), NOW);
+    assert_eq!(ran(&v), ("login-2", "large"));
+    assert!(matches!(v, Verdict::Run(_, Reason::NeighbourStep)));
+}
+
+#[test]
+fn a_login_list_limits_a_pin_and_meets_its_login() {
+    let mut c = core(spec(vec![role(
+        "worker",
+        vec![step(1, vec![cand("vendor-b", "m", 1)])],
+        vec![],
+    )]));
+    let cases = [
+        ("pin without login", None, vec!["login-2"], Some("login-2")),
+        (
+            "pin login on the list",
+            Some("login-2"),
+            vec!["login-1", "login-2"],
+            Some("login-2"),
+        ),
+        (
+            "pin login off the list",
+            Some("login-1"),
+            vec!["login-2"],
+            None,
+        ),
+        ("no vendor login listed", None, vec!["login-3"], None),
+    ];
+    for (name, pinned, logins, expected) in cases {
+        let v = c.pick(&listed(pin("vendor-a", "m", pinned), &logins), NOW);
+        match expected {
+            Some(login) => assert_eq!(ran(&v).0, login, "{name}"),
+            None => assert_eq!(v, Verdict::Dead(Reason::NoCandidates), "{name}"),
+        }
+    }
+}
+
+#[test]
+fn a_list_of_every_login_decides_as_no_list() {
+    let decide = |logins: Option<&[&str]>| {
+        let mut c = core(spec(vec![role(
+            "worker",
+            vec![step(1, vec![cand("vendor-a", "m", 1)])],
+            vec![],
+        )]));
+        observe(
+            &mut c,
+            "login-1",
+            &[("seven_day", 0.1, Some(NOW + 6 * DAY))],
+            NOW,
+        );
+        observe(
+            &mut c,
+            "login-2",
+            &[("seven_day", 0.7, Some(NOW + 6 * HOUR))],
+            NOW,
+        );
+        let i = match logins {
+            Some(l) => listed(Target::Difficulty(1), l),
+            None => input("worker", Target::Difficulty(1), None),
+        };
+        c.pick(&i, NOW)
+    };
+    let unlisted = decide(None);
+    assert_eq!(ran(&unlisted).0, "login-2");
+    assert_eq!(decide(Some(&["login-1", "login-2", "login-3"])), unlisted);
 }

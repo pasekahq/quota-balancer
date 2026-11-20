@@ -132,6 +132,7 @@ pub fn input(role: &str, target: Target, avoid_vendor: Option<&str>) -> PickInpu
         expected_minutes: None,
         run_id: None,
         on_behalf_of: None,
+        logins: None,
     }
 }
 

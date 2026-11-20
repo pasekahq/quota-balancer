@@ -537,6 +537,7 @@ mod tests {
                 expected_minutes: None,
                 run_id: None,
                 on_behalf_of: None,
+                logins: None,
             },
             NOW,
         );

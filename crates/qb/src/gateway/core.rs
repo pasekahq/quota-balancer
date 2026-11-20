@@ -1803,6 +1803,7 @@ impl Gateway {
             expected_minutes: route.expected_minutes,
             run_id: Some(session.unwrap_or(&req.request_id).clone()),
             on_behalf_of: Some(turn.client.clone()),
+            logins: None,
         };
         let p = self.pick_once(&pick)?;
         if p.decision != Decision::Wait || pick.resume_of.is_none() {
