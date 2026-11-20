@@ -655,6 +655,60 @@ pub struct RoutesAnswer {
     pub routes: Vec<RouteStatus>,
 }
 
+/// The vendor API family the gateway's logins of a vendor speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiFamily {
+    /// The Anthropic Messages API.
+    Anthropic,
+    /// The OpenAI APIs.
+    Openai,
+    /// The Chat Completions API of an OpenAI-compatible vendor.
+    ChatCompletions,
+}
+
+/// A candidate of a ladder step and the state of the gateway's logins of its vendor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LadderCandidateState {
+    /// Vendor.
+    pub vendor: String,
+    /// API family of the gateway's first login of the vendor; absent when it holds none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiFamily>,
+    /// Model.
+    pub model: String,
+    /// Reasoning effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Tier; lower tiers are preferred.
+    pub tier: u8,
+    /// `ready`, `exhausted` or `unavailable`, by the rule of `GET /v1/model/routes`.
+    pub state: RouteState,
+    /// Nearest reset (`exhausted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+}
+
+/// A ladder step and the route aliases of the caller that run on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LadderStepState {
+    /// Difficulty the step serves.
+    pub difficulty: u8,
+    /// Ladder route aliases the caller may use that name the step, sorted.
+    pub routes: Vec<String>,
+    /// Candidates in ladder order.
+    pub candidates: Vec<LadderCandidateState>,
+}
+
+/// `GET /v1/model/ladder` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LadderAnswer {
+    /// The `qbd` role.
+    pub role: String,
+    /// Steps by difficulty.
+    pub steps: Vec<LadderStepState>,
+}
+
 /// `POST /v1/model/cancel` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

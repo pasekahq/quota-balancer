@@ -467,7 +467,7 @@ without its sub-table answers 404.
 | Key | Type | Meaning |
 |---|---|---|
 | `models` | table of strings | Client `model` names, each mapped to a route alias, at most 256; for example `{ "claude-sonnet-4-5-20250929" = "chat", "gpt-5" = "chat" }`. A `model` equal to an alias needs no entry; a key may not be an alias, and a value must be one. Any other `model` is answered 400 `invalid_request_error`. |
-| `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves the HTTP fronts besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`, at least one `[[fronts.clients]]` entry, or both. |
+| `listen` | string | A loopback TCP address, `127.0.0.1:<port>` or `[::1]:<port>`, that serves the HTTP fronts, and `GET /v1/model/ladder` to named clients, besides the unix socket, for clients that only speak HTTP over TCP; any other address, or port 0, is a config error. Needs `token_sha256`, at least one `[[fronts.clients]]` entry, or both. |
 | `token_sha256` | string | With `listen`, and only with it: SHA-256 of the unnamed client token as 64 hex characters; its turns run as the caller `client-token`. Plaintext tokens are rejected. |
 | `rotate_grace_s` | integer 0..=604800 | Seconds a named client's previous token stays accepted after a rotation of its `token_file`, default 3600; 0 refuses it at once. |
 | `grace_file` | string | Absolute path of the file the gateway keeps the previous tokens' hashes in, so their grace outlasts a restart; required when a named client has `token_file`. Only hashes and times, mode 0600, in an existing directory. |
@@ -497,7 +497,7 @@ token as that client. An empty `clients = []` is a config error.
 | `name` | string | Required, 1 to 128 bytes of ASCII letters, digits, `.`, `-`, `_` and `:`, not `.` or `..`, and unique, so `POST /v1/model/clients/<name>/rotate` names it as it stands. Neither a `[[clients]]` name, nor `client-token`, nor of the form `uid:<digits>`. |
 | `token_sha256` | string | SHA-256 of the client's token as 64 hex characters, made as below; no other named client and not `fronts.token_sha256` may have the same hash. Exactly one of `token_sha256` and `token_file`. |
 | `token_file` | string | Absolute path of a file that holds the client's token, at most 4096 bytes, one trailing newline cut, not empty. The gateway reads it at start and on every reload, keeps only its SHA-256 and writes a fresh token to it on a rotation ([Client token rotation](#client-token-rotation)). An unreadable or empty file fails the start and refuses a reload, naming the field; no other client may hold the same token. Needs `grace_file`. |
-| `routes` | array of strings | Route aliases the client may run on, at least one; absent means every route. A request whose `model` resolves, through `models` or as an alias, to another route is answered 403 before any pick ([api.md](api.md#model-gateway-v1model)). |
+| `routes` | array of strings | Route aliases the client may run on and read the ladder of, at least one; absent means every route. A request whose `model` resolves, through `models` or as an alias, to another route is answered 403 before any pick ([api.md](api.md#model-gateway-v1model)), as is a `GET /v1/model/ladder` of another route or of a role none of these routes names ([api.md](api.md#get-v1modelladder)). |
 
 ```toml
 [[fronts.clients]]

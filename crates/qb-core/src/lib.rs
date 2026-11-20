@@ -787,6 +787,8 @@ pub struct Core {
     models: Vec<String>,
     logins: Vec<Login>,
     roles: Vec<Role>,
+    /// The roles as given to [`Core::new`] or the last [`Core::set_roles`].
+    role_specs: Vec<RoleSpec>,
     ttl_s: u64,
     lease_ttl_s: u64,
     cost_per_minute: f64,
@@ -859,8 +861,13 @@ impl Core {
         }
         let mut models: Vec<String> = Vec::new();
         let mut roles = Vec::with_capacity(spec.roles.len());
-        for r in spec.roles {
-            roles.push(role(r, &vendors, &mut models, spec.cost_per_minute)?);
+        for r in &spec.roles {
+            roles.push(role(
+                r.clone(),
+                &vendors,
+                &mut models,
+                spec.cost_per_minute,
+            )?);
         }
         for l in &mut logins {
             l.model_dead = vec![None; models.len()];
@@ -871,6 +878,7 @@ impl Core {
             models,
             logins,
             roles,
+            role_specs: spec.roles,
             ttl_s: spec.snapshot_ttl_s,
             lease_ttl_s: spec.lease_ttl_s,
             cost_per_minute: spec.cost_per_minute,
@@ -904,8 +912,13 @@ impl Core {
             .map(|m| self.models[m].clone())
             .collect();
         let mut compiled = Vec::with_capacity(roles.len());
-        for r in roles {
-            compiled.push(role(r, &self.vendors, &mut models, self.cost_per_minute)?);
+        for r in &roles {
+            compiled.push(role(
+                r.clone(),
+                &self.vendors,
+                &mut models,
+                self.cost_per_minute,
+            )?);
         }
         let moved: Vec<Option<usize>> = self
             .models
@@ -940,7 +953,13 @@ impl Core {
         self.deadline_cap = deadline_cap(self.logins.len(), models.len());
         self.models = models;
         self.roles = compiled;
+        self.role_specs = roles;
         Ok(())
+    }
+
+    /// The running roles in the order they were given.
+    pub fn roles(&self) -> &[RoleSpec] {
+        &self.role_specs
     }
 
     /// Decides where a task should run and, for a `run`, issues its lease.

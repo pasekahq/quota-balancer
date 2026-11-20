@@ -3,13 +3,14 @@
 use qb_core::{
     Auth, Core, LoginStatus as CoreStatus, LoginView, Marks, OutcomeClass, PickInput, ProbeError,
     ProbeJob, ProbeOutcome as CoreProbeOutcome, Record, ReportError, ReportInput, ReportSubject,
-    Source as CoreSource, Target, Verdict, WindowObservation,
+    RoleSpec, Source as CoreSource, Target, Verdict, WindowObservation,
 };
 use qb_proto::{
     API_VERSION, AgentJob, AgentNextRequest, AgentResultRequest, Decision, ErrorBody, ErrorCode,
-    HealthResponse, HealthStatus, LeaseState, LoginState, LoginStatus, Outcome, PickRequest,
-    PickRequestError, PickResponse, ProbeOutcome, ReportRequest, ReportResponse, Source,
-    StateResponse, WhyResponse, WindowCost, WindowReport, WindowState, paths,
+    HealthResponse, HealthStatus, LadderCandidate, LadderStep, LeaseState, LoginState, LoginStatus,
+    Outcome, PickRequest, PickRequestError, PickResponse, ProbeOutcome, ReportRequest,
+    ReportResponse, RoleConfig, RoleReserve, RolesResponse, Source, StateResponse, WhyResponse,
+    WindowCost, WindowReport, WindowState, paths,
 };
 use serde::Serialize;
 
@@ -105,6 +106,7 @@ pub fn handle(
         paths::REPORT,
         paths::STATE,
         paths::HEALTH,
+        paths::ROLES,
         paths::AGENT_NEXT,
         paths::AGENT_RESULT,
     ];
@@ -113,6 +115,13 @@ pub fn handle(
     match (req.method, req.path.as_str(), why_of) {
         (Method::Get, paths::HEALTH, _) => health(env).into(),
         (Method::Get, paths::STATE, _) => json(200, &state(core, now)).into(),
+        (Method::Get, paths::ROLES, _) => json(
+            200,
+            &RolesResponse {
+                roles: core.roles().iter().map(role).collect(),
+            },
+        )
+        .into(),
         (Method::Get, _, Some(lease)) => why(core, lease, now).into(),
         (Method::Post, paths::PICK, _) => pick(core, journal, &req.body, caller, now).into(),
         (Method::Post, paths::REPORT, _) => {
@@ -482,6 +491,40 @@ fn login_state(l: LoginView) -> LoginState {
                 observed_at: w.observed_at,
                 source: source(w.source),
                 stale: w.stale,
+            })
+            .collect(),
+    }
+}
+
+/// `r` in the wire shape of the roles of `GET /v1/roles` and `/v1/admin/roles`.
+pub(crate) fn role(r: &RoleSpec) -> RoleConfig {
+    RoleConfig {
+        name: r.name.clone(),
+        ladder: r
+            .ladder
+            .iter()
+            .map(|s| LadderStep {
+                difficulty: s.difficulty,
+                candidates: s
+                    .candidates
+                    .iter()
+                    .map(|c| LadderCandidate {
+                        vendor: c.vendor.clone(),
+                        model: c.model.clone(),
+                        effort: c.effort.clone(),
+                        tier: c.tier,
+                        cost_per_minute: c.cost_per_minute,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        reserves: r
+            .reserves
+            .iter()
+            .map(|res| RoleReserve {
+                difficulty: res.difficulty,
+                window: res.window.clone(),
+                fraction: res.fraction,
             })
             .collect(),
     }

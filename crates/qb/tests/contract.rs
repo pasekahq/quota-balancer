@@ -23,8 +23,8 @@ use qb_core::{Core, Record, Spec};
 use qb_proto::{
     AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, AgentJob, Decision, ErrorBody,
     ErrorCode, HealthResponse, HealthStatus, LadderCandidate, LadderStep, LoginStatus, Outcome,
-    PickResponse, ReportRequest, ReportResponse, RoleConfig, RoleReserve, RolesSource, Source,
-    StateResponse, WhyResponse, WindowReport, paths,
+    PickResponse, ReportRequest, ReportResponse, RoleConfig, RoleReserve, RolesResponse,
+    RolesSource, Source, StateResponse, WhyResponse, WindowReport, paths,
 };
 
 mod common;
@@ -2219,6 +2219,62 @@ fn a_refused_reload_keeps_the_running_ladder() {
         Some("model-small"),
         "a restart-only change refuses the roles file with it"
     );
+}
+
+/// `GET /v1/roles` on `sock` as this process's uid: the models of each role's steps, by role.
+fn running_models(sock: &Path) -> Vec<(String, Vec<String>)> {
+    let (status, body) = call(sock, "GET", paths::ROLES, None, None).unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let running: RolesResponse = serde_json::from_slice(&body).unwrap();
+    running
+        .roles
+        .into_iter()
+        .map(|r| {
+            let models = r.ladder.iter().flat_map(|s| &s.candidates);
+            (r.name, models.map(|c| c.model.clone()).collect())
+        })
+        .collect()
+}
+
+#[test]
+fn the_running_roles_follow_a_reload_not_the_file_on_disk() {
+    let dir = temp_dir("runroles");
+    let sock = dir.join("qb.sock");
+    write_roles(&dir, &[("worker", "vendor-a", "model-small")]);
+    let mut d = start_with(&reloadable(&dir, ""), &sock, Stdio::piped());
+    let lines = stderr_lines(&mut d.0);
+    let at_start = vec![("worker".to_owned(), vec!["model-small".to_owned()])];
+    assert_eq!(
+        running_models(&sock),
+        at_start,
+        "a non-admin client reads them"
+    );
+
+    write_roles(
+        &dir,
+        &[
+            ("worker", "vendor-b", "model-large"),
+            ("other", "vendor-a", "model-other"),
+        ],
+    );
+    assert_eq!(
+        running_models(&sock),
+        at_start,
+        "an unreloaded file is not running"
+    );
+    hang_up(&d, &lines);
+    assert_eq!(
+        running_models(&sock),
+        [
+            ("worker".to_owned(), vec!["model-large".to_owned()]),
+            ("other".to_owned(), vec!["model-other".to_owned()]),
+        ]
+    );
+
+    let (status, _) = call(&sock, "GET", paths::ROLES, None, Some(BEARER)).unwrap();
+    assert_eq!(status, 401, "an unidentified caller");
+    let (status, _) = call(&sock, "POST", paths::ROLES, Some(b""), None).unwrap();
+    assert_eq!(status, 405);
 }
 
 #[test]
