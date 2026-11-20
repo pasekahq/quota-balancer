@@ -147,9 +147,9 @@ name = "hive-heads"
 [[roles.ladder]]
 difficulty = 1
 candidates = [
-  { vendor = "vendor-a", model = "model-small", effort = "low", tier = 1 },
-  { vendor = "vendor-g", model = "model-small", effort = "low", tier = 3 },
-  { vendor = "vendor-b", model = "model-small", effort = "low", tier = 1 },
+  { vendor = "vendor-a", model = "model-small", effort = "medium", tier = 1 },
+  { vendor = "vendor-g", model = "model-small", effort = "medium", tier = 3 },
+  { vendor = "vendor-b", model = "model-small", effort = "medium", tier = 1 },
 ]
 
 [[roles.ladder]]

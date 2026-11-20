@@ -1527,12 +1527,12 @@ fn with_probes_off_a_parked_agent_gets_no_job_and_others_are_served() {
         let p = pick_worker(&sock);
         assert_eq!(p.decision, Decision::Run, "{p:?}");
         assert!(p.stale, "the pick relied on a stale login");
-        assert_eq!(state(&sock).logins.len(), 6);
+        assert_eq!(state(&sock).logins.len(), 7);
     }
     // A `next` gets a due job before the daemon accepts the next connection, so once `state`
     // has answered, a job for `late` would already be in its socket.
     let mut late = park(&sock, Some(BEARER), &logins);
-    assert_eq!(state(&sock).logins.len(), 6);
+    assert_eq!(state(&sock).logins.len(), 7);
     assert_eq!(answer(&mut late, Duration::from_millis(10)), None);
     assert_eq!(answer(&mut parked, Duration::from_millis(10)), None);
 }
@@ -1783,7 +1783,7 @@ fn parked_connections_are_bounded_per_agent_and_in_total() {
     let (status, resp) = next_now(&sock, Some(BOTS[2].0), &logins);
     assert_eq!(status, 429, "at most 4 parked in total");
     assert_eq!(error_of(&resp), ErrorCode::TooManyRequests);
-    assert_eq!(state(&sock).logins.len(), 6, "others are still served");
+    assert_eq!(state(&sock).logins.len(), 7, "others are still served");
 
     drop(waiting.pop());
     let _last = park_when_free(&sock, BOTS[2].0, &logins);
@@ -2422,7 +2422,7 @@ fn an_admin_reads_the_roles_held_inline_in_the_config() {
         (RolesSource::Config, config.as_path())
     );
     let names: Vec<_> = got.roles.iter().map(|r| r.name.as_str()).collect();
-    assert_eq!(names, ["worker", "reviewer", "gateway"]);
+    assert_eq!(names, ["worker", "reviewer", "gateway", "hive-heads"]);
     let worker = &got.roles[0];
     let difficulties: Vec<_> = worker.ladder.iter().map(|s| s.difficulty).collect();
     assert_eq!(difficulties, [1, 2]);
