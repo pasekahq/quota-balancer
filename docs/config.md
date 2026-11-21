@@ -399,7 +399,7 @@ cache_write = 3.75
 
 | Key | Type | Meaning |
 |---|---|---|
-| `input` | number | Input tokens not read from cache. |
+| `input` | number | Input tokens neither read from nor written to the prompt cache; disjoint from `cache_read` and `cache_write`. |
 | `output` | number | Output tokens. |
 | `cache_read` | number | Input tokens read from the prompt cache. |
 | `cache_write` | number | Input tokens written to the prompt cache. |

@@ -137,7 +137,7 @@ State, all in one thread, no locks, no allocation on the hot path:
 `pick` for k ≤ 8 candidates and W ≤ 4 windows:
 
 1. Candidates from the pin or the ladder, each expanded to the logins of its vendor, only
-   those on the request's `logins` when it has one; `resume_of` keeps the session's login. A
+   those on the request's `logins` when it has one; `resume_of` is accepted but not used yet, so it does not keep the session's login. A
    pin takes the logins of the pinned vendor (or the one named login) and no role reserve.
 2. Drop dead logins/models, the avoided vendor, and candidates missing a required capability;
    `auth_stale` logins stay: the token is refreshed on next use, by the vendor CLI or, for its
