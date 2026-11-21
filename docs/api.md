@@ -461,6 +461,21 @@ Before the turn starts the request is checked; a failure is answered at once: 40
 `path`, a `request_id` already running), 413 over `max_request_bytes`, 429 `overloaded` with
 `retry_after: 1` when `max_turns` turns run already.
 
+The framing refusals of every gateway endpoint are an `Error` of class `bad_request`, not
+retryable, with a `message` and without `retry_after`, `resets_at` or `tried`; on an HTTP
+front they come in that front's error format instead:
+
+| Status | When | `message` |
+|---|---|---|
+| 400 | a head that does not parse, a `Transfer-Encoding` header, or a body shorter than its `Content-Length` | `malformed HTTP request` |
+| 411 | a `POST` or `PUT` without `Content-Length` | `Content-Length required` |
+| 413 | a head over 8 KiB | `request head too large` |
+| 413 | a body over the endpoint's limit (`max_request_bytes` for a turn); before it answers, the gateway reads and drops up to 1 MiB of the unread body for at most 2 s, so a client still writing can read the answer | `request body over <limit> bytes` |
+
+So a client cannot tell a 411 or 413 from any other `bad_request` by `class`; the status (or
+the `message`) does. A connection closed before it sent a byte, or a request not complete
+within 10 s, gets no answer.
+
 An admitted turn is answered `200` with `Transfer-Encoding: chunked` and
 `Content-Type: application/x-ndjson`, one event per line. The response head goes out together
 with the first event:
@@ -477,6 +492,15 @@ with the first event:
 `route` comes with the first content event of the attempt that answers; `usage` replaces any
 earlier one; `stop.reason` is `end`, `tool_use`, `max_tokens` or `refusal`. A stream ends with
 exactly one `stop` or `error`; one that ends without either was cut by a transport failure.
+
+The four counts of `usage` are disjoint: `input` is the input tokens neither read from nor
+written to the prompt cache, so the whole input of the attempt is `input + cache_read +
+cache_write`. The Anthropic adapter passes the vendor's `input_tokens`,
+`cache_read_input_tokens` and `cache_creation_input_tokens` through, which the vendor already
+counts apart. The OpenAI Responses and Chat Completions adapters count cached tokens inside
+the vendor's input count, so `input` is that count minus `cached_tokens`, `cache_read` is
+`cached_tokens`, and `cache_write` is always 0, since those APIs do not report cache writes.
+The usage ledger and `GET /v1/model/usage` keep the same counts.
 
 #### Attempts and rotation
 
@@ -515,6 +539,14 @@ failed in a turn is never called again in that turn: when a pick still returns i
 released with `error`, and on a ladder or pin route the turn ends with the last failure's class,
 as it does when the pick after a failure answers `dead`. So a key login that answers 401 gets
 one call per turn, an OAuth login two (before and after its one refresh).
+
+**Session stickiness.** A `TurnRequest` has no `resume_of` field (it is 400 as an unknown
+field); `session_key` is the only session hint, and it guarantees nothing about where a turn
+runs. Two turns with the same `session_key` may run on different logins, vendors or models of
+their route, as two turns without one may; nothing pins a session to the `login_label` or
+`model` of an earlier `route` event. Only the route's own bounds hold: its `logins`, its pin or
+chain steps, and, within one turn, that a login that failed is not tried again. A client that
+needs one login for a session must use a route whose `logins` name only that login.
 
 A chain route walks its steps in order, starting with the first. Until an event has reached
 the client, the turn moves to the next step without an adapter call when `qbd` answers the
@@ -635,9 +667,12 @@ client.
 
 `{"request_id": "turn-0001"}` stops that running turn of this caller: the adapter's read is
 interrupted, the lease is released, the stream ends with an `error` of class `cancelled`, and
-the answer `{"cancelled": true}` comes once the turn has ended (at most 5 s). 404 when no turn
-with that id runs, 403 when another caller started it. A client that closes its stream cancels
-its turn the same way, without an event.
+the answer `{"cancelled": true}` comes once the turn has ended, or after 5 s even if the turn
+has not ended by then. 404 when no turn with that id runs (also one that has already ended),
+403 when another caller started it; both are an `Error` of class `bad_request`, not
+retryable. The `cancelled` class appears only in the `error` event of the cancelled turn's
+stream, never in an answer of this endpoint; its `http_status` 409 is not used by any
+endpoint. A client that closes its stream cancels its turn the same way, without an event.
 
 ### `POST /v1/model/reload`
 
