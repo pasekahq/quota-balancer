@@ -8122,15 +8122,17 @@ fn a_rotation_writes_a_fresh_token_and_keeps_the_previous_one_within_the_grace()
     let f = rotating_rig(3600, &format!("{FILE_TOKEN}\n"));
     assert_eq!(turn_status(f.addr, FILE_TOKEN), 200, "one newline is cut");
     let mut answer = None;
+    let (mut before, mut after) = (0, 0);
     let logged = stderr_until("rotated the token", || {
+        before = unix_now();
         answer = Some(rotated(&f.r.gw, &f.token_file));
+        after = unix_now();
     });
     let (answer, first) = answer.unwrap();
-    let now = unix_now();
     assert_eq!(answer.client, "client-f");
     assert!(
-        (now..=now + 1).contains(&(answer.grace_until - 3600)),
-        "{answer:?}"
+        (before..=after).contains(&(answer.grace_until - 3600)),
+        "the grace starts while the rotation runs: {before}..={after}, {answer:?}"
     );
     assert_eq!(answer.token_sha256_prefix, sha256_hex(&first)[..12]);
     assert_eq!(first.len(), 43, "32 random bytes in base64url");
