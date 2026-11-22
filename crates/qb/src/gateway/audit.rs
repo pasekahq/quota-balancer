@@ -94,12 +94,17 @@ fn narrowed(
 }
 
 /// Appends `entry` to `file` as one line in one `write`, creating the file with mode 0600 and
-/// narrowing an existing one to it first, as [`narrow`] does. A failure is logged at error
-/// priority with the path and never returned, so the action's answer does not depend on it.
+/// narrowing an existing one to it first, as [`narrow`] does; a file that cannot be narrowed
+/// still gets the line. A failure is logged at error priority with the path and never returned,
+/// so the action's answer does not depend on it.
 pub fn append(file: &Path, entry: &AuditEntry) {
     let written = json_line(entry).and_then(|line| {
         let mut f = open_append(file)?;
-        narrowed(file, &f.metadata()?, |p| f.set_permissions(p))?;
+        // A file that stays wide still gets the line: losing the record is worse.
+        let meta = f.metadata()?;
+        if let Err(e) = narrowed(file, &meta, |p| f.set_permissions(p)) {
+            log::error(&format!("gateway: audit_file {}: {e}", file.display()));
+        }
         write_line(&mut f, &line)
     });
     if let Err(e) = written {
