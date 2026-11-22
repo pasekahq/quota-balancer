@@ -742,16 +742,6 @@ fn installation_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> 
             faults.push(format!("route `{alias}`: role `{}` not in qbd", route.role));
             continue;
         };
-        if !qbd
-            .clients
-            .iter()
-            .any(|c| c.role.as_deref() == Some(role.name.as_str()))
-        {
-            faults.push(format!(
-                "route `{alias}`: no qbd client has role `{}`",
-                role.name
-            ));
-        }
         let mut vendors: Vec<&str> = route.chain.iter().map(|s| s.vendor.as_str()).collect();
         vendors.extend(route.vendor.as_deref());
         faults.extend(listed_faults(qbd, route, role));
@@ -778,6 +768,17 @@ fn installation_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> 
             }
             pickable.push(vendor);
         }
+    }
+    // The gateway's own qbd client needs a role one of the routes names; qbd picks the role a
+    // request names, not the caller's, so the other route roles need no client of their own.
+    if !gw.routes.is_empty()
+        && !qbd.clients.iter().any(|c| {
+            c.role
+                .as_deref()
+                .is_some_and(|role| gw.routes.iter().any(|r| r.role == role))
+        })
+    {
+        faults.push("no qbd client has a role the routes name".to_owned());
     }
     for login in &gw.logins {
         let name = &login.name;
@@ -868,7 +869,7 @@ fn a_broken_installation_rule_is_found_in_either_example() {
                 "name = \"gateway\"\nuid = 1003\nrole = \"gateway\"",
                 "name = \"gateway\"\nuid = 1003\nrole = \"worker\"",
             ),
-            "route `chat`: no qbd client has role `gateway`",
+            "no qbd client has a role the routes name",
         ),
         (
             gw(

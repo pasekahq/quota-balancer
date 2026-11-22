@@ -1,4 +1,4 @@
-# Example qbd config: six vendors, seven logins, four roles, five clients, one of them an agent
+# Example qbd config: six vendors, seven logins, four roles, four clients, one of them an agent
 # and one the gateway of deploy/examples/gateway.toml.
 # Format: docs/config.md. Install as /etc/qb/qbd.toml.
 
@@ -193,12 +193,6 @@ role = "worker"
 name = "client-b"
 bearer_sha256 = "0000000000000000000000000000000000000000000000000000000000000001"
 role = "reviewer"
-
-# The heads, for the picks they make without the gateway.
-[[clients]]
-name = "client-c"
-uid = 1004
-role = "hive-heads"
 
 [[clients]]
 name = "agent-1"
