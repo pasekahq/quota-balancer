@@ -985,6 +985,8 @@ pub enum AuditAction {
     AdminRoles,
     /// `POST /v1/admin/reload` forwarded to `qbd`: its config files read again.
     AdminReload,
+    /// `POST /v1/admin/logins/reset` forwarded to `qbd`: auth marks of logins cleared.
+    AdminLoginsReset,
 }
 
 /// Whether an admin action went through.

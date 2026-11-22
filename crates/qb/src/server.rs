@@ -271,7 +271,13 @@ impl Conn<'_> {
                 };
                 match self.gate.admit(uid, req.bearer.as_deref(), Instant::now()) {
                     Ok(caller) if req.path.starts_with(paths::ADMIN) => {
-                        admin::handle(self.core, self.gate, self.reload, &req, &caller)
+                        let state = admin::State {
+                            core: self.core,
+                            gate: self.gate,
+                            journal: self.journal,
+                            hooks: self.hooks,
+                        };
+                        admin::handle(state, self.reload, &req, &caller, env.now)
                     }
                     Ok(caller) => {
                         match api::handle(
@@ -442,6 +448,7 @@ mod tests {
             outcome: OutcomeClass::Http429,
             model: None,
             release: false,
+            credential: None,
             windows: Vec::new(),
         };
         core.report(&input, now).expect("known login");

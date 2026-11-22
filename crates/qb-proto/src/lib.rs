@@ -56,6 +56,8 @@ pub mod paths {
     pub const ADMIN_ROLES: &str = "/v1/admin/roles";
     /// `POST`: `qbd` reloads its roles and clients as on SIGHUP; admin only.
     pub const ADMIN_RELOAD: &str = "/v1/admin/reload";
+    /// `POST`: clears the `auth_stale` and `auth_dead` marks of logins; admin only.
+    pub const ADMIN_LOGINS_RESET: &str = "/v1/admin/logins/reset";
     /// Gateway, `POST`: run one model turn and stream its events as NDJSON.
     pub const MODEL_TURN: &str = "/v1/model/turn";
     /// Gateway, `GET`: route aliases and where a turn would run now.
@@ -324,6 +326,26 @@ pub struct ReportRequest {
     /// The run is over; release the lease.
     #[serde(default)]
     pub release: bool,
+    /// Fingerprint of the credential the reported request used: 8 to 64 lowercase hex digits
+    /// of a hash, never the secret. An `auth_stale` or `auth_dead` mark keeps the fingerprint
+    /// it was reported with; a report of another fingerprint clears the mark first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+/// Fewest hex digits of a [`ReportRequest::credential`] fingerprint.
+pub const CREDENTIAL_MIN: usize = 8;
+
+/// Most hex digits of a [`ReportRequest::credential`] fingerprint.
+pub const CREDENTIAL_MAX: usize = 64;
+
+/// Whether `fingerprint` is a valid [`ReportRequest::credential`]: [`CREDENTIAL_MIN`] to
+/// [`CREDENTIAL_MAX`] lowercase hex digits.
+pub fn credential_valid(fingerprint: &str) -> bool {
+    (CREDENTIAL_MIN..=CREDENTIAL_MAX).contains(&fingerprint.len())
+        && fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `POST /v1/agent/next` request.
@@ -651,6 +673,51 @@ pub struct AdminReloadAnswer {
     pub roles: usize,
     /// Clients of the new config.
     pub clients: usize,
+}
+
+/// `POST /v1/admin/logins/reset` request: the logins whose `auth_stale` or `auth_dead` mark
+/// to clear, or `all` of them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminLoginsReset {
+    /// Declared logins, by config name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logins: Vec<String>,
+    /// Every declared login instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+}
+
+impl AdminLoginsReset {
+    /// Checks that exactly one of `logins` and `all` is given.
+    ///
+    /// # Errors
+    /// Both or neither are given.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.logins.is_empty(), self.all) {
+            (false, false) | (true, true) => Ok(()),
+            (true, false) => Err("`logins` or `all` is required"),
+            (false, true) => Err("`logins` and `all` are exclusive"),
+        }
+    }
+}
+
+/// `POST /v1/admin/logins/reset` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminLoginsResetAnswer {
+    /// One entry per login asked for, in declaration order with `all`, else in request order.
+    pub logins: Vec<LoginReset>,
+}
+
+/// What a reset did to one login.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginReset {
+    /// Login name.
+    pub login: String,
+    /// The login had an `auth_stale` or `auth_dead` mark, now cleared.
+    pub cleared: bool,
+    /// Login status after the reset.
+    pub status: LoginStatus,
 }
 
 /// Machine-readable error class.

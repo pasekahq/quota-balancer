@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qb::auth::Gate;
 use qb::gateway::anthropic::Anthropic;
@@ -37,12 +37,13 @@ use qb_anthropic::request::identity;
 use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
-    AdminReloadAnswer, AdminRolesWritten, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block,
-    CancelAnswer, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
-    ConfigRoutesWritten, ConfigStep, ErrorClass, GatewayError, LoginKeyAnswer, LoginOauthSigned,
-    LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste, Outcome, ReloadAnswer, RouteState,
-    RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking,
-    ToolCall, TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
+    AdminLoginsResetAnswer, AdminReloadAnswer, AdminRolesWritten, AuditAction, AuditAnswer,
+    AuditEntry, AuditResult, Block, CancelAnswer, ClientRotateAnswer, ConfigRoute, ConfigRoutes,
+    ConfigRoutesPut, ConfigRoutesWritten, ConfigStep, ErrorClass, GatewayError, LoginKeyAnswer,
+    LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste, Outcome,
+    ReloadAnswer, RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason,
+    StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow,
+    UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -102,6 +103,9 @@ enum Script {
     Drip,
     /// Fail as a refused request with a message that quotes the secret and the account id.
     Leak,
+    /// Write the contents to the file, as a credential replaced while the request is in flight,
+    /// then fail as a rejected credential.
+    Replaced(PathBuf, String),
 }
 
 /// A scripted adapter: one queue of scripts per login, and a record of every call.
@@ -128,6 +132,7 @@ impl Fake {
 struct Shared(Arc<Fake>);
 
 impl Upstream for Shared {
+    #[allow(clippy::too_many_lines)] // one arm per script
     fn turn(
         &self,
         at: &Picked<'_>,
@@ -197,6 +202,10 @@ impl Upstream for Shared {
                         cost,
                     }),
                 }
+            }
+            Script::Replaced(file, contents) => {
+                std::fs::write(file, contents).unwrap();
+                Err(Failure::new(FailureKind::Auth, "scripted Auth"))
             }
             Script::Leak => Err(Failure::new(
                 FailureKind::BadRequest,
@@ -9109,6 +9118,178 @@ fn login_1_secrets(r: &Rig) -> Vec<String> {
 }
 
 #[test]
+fn a_key_login_killed_by_a_401_is_picked_again_once_its_key_is_replaced() {
+    let r = rig();
+    r.fake.script(
+        "login-1",
+        Script::Fail(Vec::new(), FailureKind::Auth, Vec::new()),
+    );
+    let (_, _, first) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&first), ["route login-2", "text_delta", "stop End"]);
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let (_, _, second) = turn(&r.gw, &turn_body("turn-2"));
+    assert_eq!(
+        kinds(&second)[0],
+        "route login-2",
+        "a dead login is not picked"
+    );
+
+    let (status, body) = put_key(&r.gw, "login-1", &json!({"key": NEW_KEY}).to_string());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_ne!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let (_, _, third) = turn(&r.gw, &turn_body("turn-3"));
+    assert_eq!(kinds(&third), ["route login-1", "text_delta", "stop End"]);
+    assert_eq!(
+        login_1_secrets(&r).last().map(String::as_str),
+        Some(NEW_KEY)
+    );
+}
+
+#[test]
+fn a_401_marks_the_credential_the_attempt_sent_not_one_written_meanwhile() {
+    let r = rig();
+    let file = r.dir.join("creds/login-1.json");
+    r.fake.script(
+        "login-1",
+        Script::Replaced(file.clone(), api_key("test-token-new")),
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    // A gateway that starts afresh knows only the new file, and that one never failed.
+    let text = std::fs::read_to_string(config_file(&r.gw)).unwrap();
+    std::fs::remove_file(&r.gw).unwrap();
+    let fake = Arc::new(Fake::default());
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
+        Box::new(Counting(Arc::new(AtomicUsize::new(0)))),
+        own_uid(),
+        None,
+    );
+    until_alive(&r.qbd, "login-1");
+    let (_, _, events) = turn(&gw, &turn_body("turn-2"));
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+    assert_eq!(fake.calls()[0].1, "test-token-new");
+}
+
+#[test]
+fn an_oauth_login_dead_after_its_refresh_stays_dead_across_a_reload() {
+    let oauth = format!(
+        r#"{{"type":"oauth_anthropic","access_token":"access-0","refresh_token":"refresh-0","expires_at":{}}}"#,
+        unix_now() + 3600
+    );
+    let r = rig_with(
+        4,
+        &[
+            ("login-1", oauth, 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    for _ in 0..2 {
+        r.fake.script(
+            "login-1",
+            Script::Fail(Vec::new(), FailureKind::Auth, Vec::new()),
+        );
+    }
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(r.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_RELOAD, "");
+    assert_eq!(status, 200);
+    assert_eq!(
+        status_of(&state(&r.qbd), "login-1"),
+        LoginStatus::AuthDead,
+        "the refreshed file is the credential that failed"
+    );
+}
+
+#[test]
+fn a_key_replacement_clears_a_mark_reported_without_a_fingerprint() {
+    let r = rig();
+    // As an agent's probe or a journal older than fingerprints leaves it.
+    for _ in 0..2 {
+        let report = r#"{"login":"login-1","outcome":"http_401"}"#;
+        assert_eq!(call(&r.qbd, "POST", paths::REPORT, report).0, 200);
+    }
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_RELOAD, "");
+    assert_eq!(status, 200);
+    assert_eq!(
+        status_of(&state(&r.qbd), "login-1"),
+        LoginStatus::AuthDead,
+        "an unchanged file keeps the mark"
+    );
+    let (status, body) = put_key(&r.gw, "login-1", &json!({"key": NEW_KEY}).to_string());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_ne!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+}
+
+/// Waits up to 5 s for `login` to leave `auth_dead` in the qbd on `qbd`.
+fn until_alive(qbd: &Path, login: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while status_of(&state(qbd), login) == LoginStatus::AuthDead {
+        assert!(Instant::now() < deadline, "{login} stays auth_dead");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_dead_login_whose_file_changed_is_picked_again_after_a_reload_or_a_restart() {
+    let r = rig_with(
+        4,
+        &[
+            ("login-1", api_key("test-token-1"), 0o644),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    let file = r.dir.join("creds/login-1.json");
+    let dead = || {
+        let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+        assert_eq!(kinds(&events)[0], "route login-2");
+        assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    };
+    dead();
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_RELOAD, "");
+    assert_eq!(status, 200);
+    assert_eq!(
+        status_of(&state(&r.qbd), "login-1"),
+        LoginStatus::AuthDead,
+        "the same file keeps the mark"
+    );
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_RELOAD, "");
+    assert_eq!(status, 200);
+    assert_ne!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-2"));
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+
+    // Dead again, fixed while no gateway runs, and back once a gateway starts.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    dead();
+    std::fs::write(&file, api_key("test-token-3")).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let text = std::fs::read_to_string(config_file(&r.gw)).unwrap();
+    std::fs::remove_file(&r.gw).unwrap();
+    let fake = Arc::new(Fake::default());
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
+        Box::new(Counting(Arc::new(AtomicUsize::new(0)))),
+        own_uid(),
+        None,
+    );
+    until_alive(&r.qbd, "login-1");
+    let (_, _, events) = turn(&gw, &turn_body("turn-3"));
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+    assert_eq!(fake.calls()[0].1, "test-token-3");
+}
+
+#[test]
 fn a_new_key_is_written_beside_a_backup_and_the_next_attempt_sends_it() {
     let (r, audit, ledger) = key_rig(api_key("test-key-two-5c3d"), "", own_uid());
     let file = r.dir.join("creds/login-1.json");
@@ -10667,6 +10848,46 @@ fn a_stale_or_missing_if_match_passes_qbd_s_refusal_through_and_nothing_is_writt
 }
 
 #[test]
+fn the_gateway_forwards_a_reset_of_qbd_s_logins_and_audits_it() {
+    let audit = audit_path();
+    let a = admin_rig("admin = true", &audit_key(&audit), own_uid(), None);
+    for _ in 0..2 {
+        let report = r#"{"login":"login-1","outcome":"http_401"}"#;
+        assert_eq!(call(&a.r.qbd, "POST", paths::REPORT, report).0, 200);
+    }
+    assert_eq!(
+        status_of(&state(&a.r.qbd), "login-1"),
+        LoginStatus::AuthDead
+    );
+    let (status, answer) = call(
+        &a.r.gw,
+        "POST",
+        paths::ADMIN_LOGINS_RESET,
+        r#"{"logins":["login-1"]}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let answer: AdminLoginsResetAnswer = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer.logins.len(), 1);
+    assert!(answer.logins[0].cleared);
+    assert_ne!(
+        status_of(&state(&a.r.qbd), "login-1"),
+        LoginStatus::AuthDead
+    );
+    let (status, _) = rejection(&a.r.gw, "POST", paths::ADMIN_LOGINS_RESET, "{}");
+    assert_eq!(status, 400, "neither `logins` nor `all`");
+    let entries = audit_answer(&a.r.gw, "").entries;
+    let rows: Vec<(AuditAction, AuditResult)> =
+        entries.iter().map(|e| (e.action, e.result)).collect();
+    assert_eq!(
+        rows,
+        [
+            (AuditAction::AdminLoginsReset, AuditResult::Ok),
+            (AuditAction::AdminLoginsReset, AuditResult::Refused),
+        ]
+    );
+}
+
+#[test]
 fn a_configured_client_uid_is_refused_qbd_s_admin_api_before_qbd_hears_of_it() {
     let audit = audit_path();
     let extra = format!(
@@ -10681,6 +10902,7 @@ fn a_configured_client_uid_is_refused_qbd_s_admin_api_before_qbd_hears_of_it() {
         ("GET", paths::ADMIN_ROLES, ""),
         ("PUT", paths::ADMIN_ROLES, body.as_str()),
         ("POST", paths::ADMIN_RELOAD, ""),
+        ("POST", paths::ADMIN_LOGINS_RESET, r#"{"all":true}"#),
     ] {
         let (status, e) = rejection(&a.r.gw, method, path, body);
         assert_eq!(
@@ -10712,7 +10934,8 @@ fn a_configured_client_uid_is_refused_qbd_s_admin_api_before_qbd_hears_of_it() {
         audit_rows(&entries),
         [
             refused(AuditAction::AdminRoles),
-            refused(AuditAction::AdminReload)
+            refused(AuditAction::AdminReload),
+            refused(AuditAction::AdminLoginsReset),
         ]
     );
 }

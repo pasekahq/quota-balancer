@@ -423,6 +423,10 @@ pub struct ReportInput {
     pub release: bool,
     /// Fresh windows; each overwrites the login's snapshot of that window.
     pub windows: Vec<WindowObservation>,
+    /// Fingerprint of the credential the reported request used. Another fingerprint than the
+    /// one the login's auth mark holds clears that mark before the outcome applies; a mark
+    /// without one takes this one.
+    pub credential: Option<String>,
 }
 
 /// Why [`Core::report`] refused a report.
@@ -525,6 +529,9 @@ pub struct Marks {
     pub rate_limited_until: Option<UnixSecs>,
     /// Dead-until per model name.
     pub model_dead: Vec<(String, UnixSecs)>,
+    /// Fingerprint of the credential an `auth` mark other than `ok` was reported with; `None`
+    /// with `ok` or when no report named one.
+    pub credential: Option<String>,
 }
 
 /// A live lease with everything [`Core::restore`] needs to rebuild it.
@@ -674,6 +681,8 @@ struct Login {
     /// A declared window was reported at least once.
     seen: bool,
     auth: Auth,
+    /// Fingerprint of the credential behind an `auth` other than `ok`.
+    credential: Option<String>,
     exhausted_until: Option<UnixSecs>,
     rate_limited_until: Option<UnixSecs>,
     /// Dead-until per model index.
@@ -859,6 +868,7 @@ impl Core {
                 reserved: [0.0; MAX_WINDOWS],
                 leases: 0,
                 probe: ProbeState::default(),
+                credential: None,
             });
         }
         let mut models: Vec<String> = Vec::new();
@@ -1393,6 +1403,12 @@ impl Core {
 
         let observed = self.observe(li, &input.windows, Source::Stream, now);
         let login = &mut self.logins[li];
+        let renewed = input.credential.as_ref().filter(|fp| {
+            login.auth != Auth::Ok && login.credential.as_ref().is_some_and(|c| c != *fp)
+        });
+        if renewed.is_some() {
+            login.auth = Auth::Ok;
+        }
         match input.outcome {
             OutcomeClass::Ok => {
                 if observed {
@@ -1418,6 +1434,12 @@ impl Core {
                 }
             }
             OutcomeClass::Error => {}
+        }
+        let login = &mut self.logins[li];
+        if login.auth == Auth::Ok {
+            login.credential = None;
+        } else if let Some(fp) = &input.credential {
+            login.credential = Some(fp.clone());
         }
         if let (true, Some(slot)) = (input.release, lease_slot) {
             self.release(slot);
@@ -1683,7 +1705,26 @@ impl Core {
                 .zip(&l.model_dead)
                 .filter_map(|(m, t)| Some((m.clone(), (*t)?)))
                 .collect(),
+            credential: l.credential.clone(),
         })
+    }
+
+    /// Clears the `auth_stale` or `auth_dead` mark of the configured login `login` as of `now`,
+    /// after the deadlines due then: whether it had one, and the login's status afterwards.
+    /// Its other marks stay. `None` for a login the config does not declare.
+    pub fn reset_auth(&mut self, login: &str, now: UnixSecs) -> Option<(bool, LoginStatus)> {
+        self.tick(now);
+        let li = self.logins.iter().position(|l| l.name == login)?;
+        let l = &mut self.logins[li];
+        let cleared = l.auth != Auth::Ok;
+        l.auth = Auth::Ok;
+        l.credential = None;
+        Some((cleared, self.status(li)))
+    }
+
+    /// The declared logins, in declaration order.
+    pub fn login_names(&self) -> impl Iterator<Item = &str> {
+        self.logins.iter().map(|l| l.name.as_str())
     }
 
     /// The live state as records: the lease counter, every live lease in slot order and the
@@ -1737,6 +1778,7 @@ impl Core {
                     .collect();
                 let l = &mut self.logins[li];
                 l.auth = marks.auth;
+                l.credential = marks.credential.clone().filter(|_| marks.auth != Auth::Ok);
                 l.exhausted_until = marks.exhausted_until;
                 l.rate_limited_until = marks.rate_limited_until;
                 l.model_dead.clone_from(&models);
@@ -1882,6 +1924,7 @@ impl Core {
                 let login = &mut self.logins[li];
                 if observed {
                     login.auth = Auth::Ok;
+                    login.credential = None;
                 }
                 login.probe.backoff_s = 0;
                 login.probe.backoff_until = None;

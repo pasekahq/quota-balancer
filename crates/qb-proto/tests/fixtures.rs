@@ -1,10 +1,10 @@
 //! Contract fixtures: every fixture decodes into its type and re-encodes to the same JSON.
 
 use qb_proto::{
-    AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, AgentJob, AgentNextRequest,
-    AgentResultRequest, Decision, ErrorBody, HealthResponse, Outcome, PickRequest, PickResponse,
-    ProbeOutcome, ReportRequest, ReportResponse, RolesResponse, RolesSource, StateResponse,
-    WhyResponse,
+    AdminLoginsReset, AdminLoginsResetAnswer, AdminReloadAnswer, AdminRoles, AdminRolesPut,
+    AdminRolesWritten, AgentJob, AgentNextRequest, AgentResultRequest, Decision, ErrorBody,
+    HealthResponse, Outcome, PickRequest, PickResponse, ProbeOutcome, ReportRequest,
+    ReportResponse, RolesResponse, RolesSource, StateResponse, WhyResponse, credential_valid,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -51,6 +51,10 @@ fn reports() {
     assert_eq!(stream.windows.len(), 2);
     let limit: ReportRequest = roundtrip("report_request_limit.json");
     assert_eq!(limit.outcome, Outcome::UsageLimit);
+    let refused: ReportRequest = roundtrip("report_request_401.json");
+    assert_eq!(refused.outcome, Outcome::Http401);
+    assert!(refused.credential.as_deref().is_some_and(credential_valid));
+    assert_eq!(limit.credential, None);
     let _: ReportResponse = roundtrip("report_response.json");
 }
 
@@ -148,4 +152,29 @@ fn requests_reject_unknown_fields() {
         object.insert("x".into(), 1.into());
         assert!(serde_json::from_value::<AdminRolesPut>(v).is_err(), "{at}");
     }
+}
+
+#[test]
+fn admin_logins_reset() {
+    let named: AdminLoginsReset = roundtrip("admin_logins_reset.json");
+    assert_eq!(named.logins, ["login-1", "login-2"]);
+    assert!(named.validate().is_ok());
+    let all: AdminLoginsReset = roundtrip("admin_logins_reset_all.json");
+    assert!(all.all && all.validate().is_ok());
+    assert!(AdminLoginsReset::default().validate().is_err());
+    let both = AdminLoginsReset { all: true, ..named };
+    assert!(both.validate().is_err());
+    let answer: AdminLoginsResetAnswer = roundtrip("admin_logins_reset_answer.json");
+    assert!(answer.logins[0].cleared && !answer.logins[1].cleared);
+    assert!(serde_json::from_str::<AdminLoginsReset>(r#"{"login":"login-1"}"#).is_err());
+}
+
+#[test]
+fn credential_fingerprints() {
+    assert!(credential_valid("3f2a9c41"));
+    assert!(credential_valid(&"0".repeat(64)));
+    for bad in ["3f2a9c4", "3F2A9C41", "3f2a9c4g", "", "3f2a 9c41"] {
+        assert!(!credential_valid(bad), "{bad}");
+    }
+    assert!(!credential_valid(&"0".repeat(65)));
 }

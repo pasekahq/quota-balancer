@@ -14,7 +14,7 @@ exactly one record key. Unknown keys are rejected.
 |---|---|---|
 | `lease` | a `pick` grants a run | `{"at":1800000000,"lease":{"id":257,"login":"login-1","model":"model-small","client":"uid:1001","run_id":"run-1","on_behalf_of":"client-a","cost":[0.06,0.0018],"expires_at":1800005400,"reason":"spend_before_reset"}}` |
 | `release` | a report releases a lease | `{"at":1800000600,"release":257}` |
-| `marks` | a report or a probe result changes a login's marks | `{"at":1800000600,"marks":{"login":"login-1","exhausted_until":1800018000}}` |
+| `marks` | a report, a probe result or an admin reset changes a login's marks | `{"at":1800000600,"marks":{"login":"login-1","exhausted_until":1800018000}}` |
 | `issued` | a rotation starts a new file | `{"at":1800000600,"issued":12}` |
 
 - `lease`: `id` is the number in the wire id `l-<id>`; `run_id` and `on_behalf_of` are omitted
@@ -24,8 +24,10 @@ exactly one record key. Unknown keys are rejected.
   reason is unknown; a `reason` that is not a pick reason does not decode.
 - `marks`: all marks of the login after the change. `auth` is `ok`, `stale` or `dead` and is
   omitted when `ok`; `exhausted_until` and `rate_limited_until` are omitted when unset;
-  `model_dead` maps a model to the end of its dead mark and is omitted when empty. A missing
-  mark is a cleared mark.
+  `model_dead` maps a model to the end of its dead mark and is omitted when empty;
+  `credential` is the fingerprint an `auth` other than `ok` holds ([api.md](api.md#post-v1report))
+  and is omitted without one. A missing mark is a cleared mark. A `credential` makes the line
+  unreadable to a `qbd` older than the field.
 - `issued`: how many leases were issued so far; ids issued after a restart are higher.
 
 Lease expiries and the ends of marks are not written: they follow from the recorded times.

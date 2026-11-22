@@ -331,6 +331,16 @@ pub fn serve(
     let live = Arc::new(AtomicUsize::new(0));
     let unchecked = Arc::new(AtomicUsize::new(0));
     let watch = Arc::new(Watch::new()?);
+    // On a thread of its own, so a slow qbd holds no connection back.
+    let announcing = Arc::clone(gateway);
+    let spawned = std::thread::Builder::new()
+        .name("qb-gateway-announce".into())
+        .spawn(move || announcing.announce_credentials());
+    if let Err(e) = spawned {
+        log::warn(&format!(
+            "gateway: cannot announce the credentials to qbd: {e}"
+        ));
+    }
     loop {
         let ready = watch.wait(listener, loopback, hangup);
         if ready.reload {

@@ -1,5 +1,5 @@
 //! `qbd`'s `/v1/admin/*` forwarded for the gateway's own uid: each request goes to `qbd` as the
-//! gateway, a `PUT` of the roles and a reload leave an audit line.
+//! gateway, a `PUT` of the roles, a reload and a reset of logins leave an audit line.
 
 use qb_proto::{AdminRolesWritten, AuditAction, ErrorBody, ErrorClass, ErrorCode, paths};
 
@@ -15,7 +15,10 @@ const OWNER: &str = "only the gateway's own uid may call qbd's admin API";
 
 /// Whether `path` is one of `qbd`'s admin endpoints the gateway forwards.
 pub(crate) fn serves(path: &str) -> bool {
-    matches!(path, paths::ADMIN_ROLES | paths::ADMIN_RELOAD)
+    matches!(
+        path,
+        paths::ADMIN_ROLES | paths::ADMIN_RELOAD | paths::ADMIN_LOGINS_RESET
+    )
 }
 
 /// What `qbd` answered a forwarded request with 200: its `ETag` and its body.
@@ -41,6 +44,7 @@ pub(crate) fn forward(
     let audited = match (req.method, req.path.as_str()) {
         (Method::Put, paths::ADMIN_ROLES) => Some(AuditAction::AdminRoles),
         (Method::Post, paths::ADMIN_RELOAD) => Some(AuditAction::AdminReload),
+        (Method::Post, paths::ADMIN_LOGINS_RESET) => Some(AuditAction::AdminLoginsReset),
         _ => None,
     };
     let result = exchange(gateway, req, own);
@@ -72,7 +76,9 @@ fn exchange(gateway: &Gateway, req: &Request, own: bool) -> Result<Passed, Refus
     let (body, if_match) = match (req.method, req.path.as_str()) {
         (Method::Get, paths::ADMIN_ROLES) => (None, None),
         (Method::Put, paths::ADMIN_ROLES) => (Some(&req.body[..]), req.if_match.as_deref()),
-        (Method::Post, paths::ADMIN_RELOAD) => (Some(&req.body[..]), None),
+        (Method::Post, paths::ADMIN_RELOAD | paths::ADMIN_LOGINS_RESET) => {
+            (Some(&req.body[..]), None)
+        }
         _ => {
             let message = "method not allowed".to_owned();
             return Err(Refusal::new(405, ErrorClass::BadRequest, message));

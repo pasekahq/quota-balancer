@@ -754,6 +754,44 @@
         }
       }
     },
+    "/v1/admin/logins/reset": {
+      "post": {
+        "operationId": "adminLoginsReset",
+        "summary": "qbd clears the `auth_stale` or `auth_dead` mark of the logins named, or of every login with `all`, and journals each change; other marks stay; qbd's body comes back unchanged. Audited as `admin_logins_reset`, refusals included. Forwarded to qbd's admin API on `qbd_socket` as the gateway itself (its uid or the bearer of `qbd_bearer_file`), so qbd serves it only when the gateway's `[[clients]]` entry has `admin = true`; docs/api.md, section \"Admin `/v1/admin/*`\", is qbd's contract. Only the gateway's own uid, 403 `auth` for any other caller before anything is sent to qbd; not served on the loopback listener. A non-200 answer of qbd becomes an `Error` with qbd's status and message, `auth` for qbd's 401 and 403 (whose message says the gateway's client needs `admin = true`), `overloaded` for 429, `unavailable` for 500 or an answer without an error body, `bad_request` otherwise; 503 `unavailable` when qbd cannot be reached.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminLoginsReset"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "qbd's answer, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminLoginsResetAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -1916,7 +1954,7 @@
       },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd; `admin_logins_reset` auth marks of qbd's logins cleared by a `POST /v1/admin/logins/reset` forwarded to qbd.",
         "enum": [
           "reload",
           "spend_reset",
@@ -1927,7 +1965,8 @@
           "login_oauth_start",
           "login_oauth_code",
           "admin_roles",
-          "admin_reload"
+          "admin_reload",
+          "admin_logins_reset"
         ]
       },
       "AuditResult": {
@@ -2568,6 +2607,67 @@
         "required": [
           "roles",
           "clients"
+        ]
+      },
+      "AdminLoginsReset": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "qbd's `POST /v1/admin/logins/reset` request: exactly one of `logins` and `all`.",
+        "properties": {
+          "logins": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Declared logins, by config name; an unknown one is 404 and clears nothing."
+          },
+          "all": {
+            "type": "boolean",
+            "description": "Every declared login instead."
+          }
+        }
+      },
+      "AdminLoginsResetAnswer": {
+        "type": "object",
+        "description": "qbd's `POST /v1/admin/logins/reset` answer.",
+        "properties": {
+          "logins": {
+            "type": "array",
+            "description": "One entry per login, in declaration order with `all`, else in request order.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "login": {
+                  "type": "string",
+                  "description": "Login name."
+                },
+                "cleared": {
+                  "type": "boolean",
+                  "description": "The login had an `auth_stale` or `auth_dead` mark, now cleared."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "ok",
+                    "rate_limited",
+                    "exhausted",
+                    "auth_stale",
+                    "auth_dead",
+                    "unknown"
+                  ],
+                  "description": "Login status after the reset."
+                }
+              },
+              "required": [
+                "login",
+                "cleared",
+                "status"
+              ]
+            }
+          }
+        },
+        "required": [
+          "logins"
         ]
       }
     }

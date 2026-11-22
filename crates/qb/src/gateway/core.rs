@@ -5,7 +5,7 @@
 //! left, the turn ends with `error`.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,7 +29,7 @@ use super::Refusal;
 use super::config::{
     Api, ClientEffort, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route,
 };
-use super::creds::{CredentialStore, Kind, Refresher, Written};
+use super::creds::{self, CredentialStore, Kind, Refresher, Written};
 use super::front::Caller;
 use super::signin::SignIn;
 use super::spend::{self, Ledger};
@@ -160,6 +160,8 @@ pub struct Gateway {
     sign_ins: Mutex<Vec<Pending>>,
     /// Seconds a started sign-in takes its code.
     sign_in_expiry: u64,
+    /// The credential fingerprint of each login that qbd last took from an announcement.
+    announced: Mutex<HashMap<String, String>>,
 }
 
 fn bad_request(message: impl Into<String>) -> GatewayError {
@@ -263,6 +265,8 @@ struct Relay<'e> {
     started: Instant,
     /// The client is gone: nothing more reaches it.
     gone: bool,
+    /// The fingerprint of the credential file read for the attempt.
+    fingerprint: String,
     emit: &'e mut dyn FnMut(StreamEvent) -> Flow,
 }
 
@@ -456,6 +460,7 @@ impl Gateway {
             tokens: Mutex::new(Arc::new(tokens)),
             sign_ins: Mutex::new(Vec::new()),
             sign_in_expiry: SIGN_IN_EXPIRY_S,
+            announced: Mutex::new(HashMap::new()),
         })
     }
 
@@ -513,12 +518,21 @@ impl Gateway {
     /// Reads the config file and its `token_file`s again for `actor`. A config that parses and
     /// validates as at startup, keeps every restart-only field and whose token files read
     /// becomes the snapshot of later admissions; admitted turns keep theirs. Logs one line and
-    /// records one audit entry either way, narrowing a wide `audit_file` first.
+    /// records one audit entry either way, narrowing a wide `audit_file` first. Once the lock is
+    /// released, a taken config's changed credential files are announced to qbd
+    /// ([`Self::announce_credentials`]).
     ///
     /// # Errors
     /// The file is unreadable or invalid, changes a restart-only field, or a token file cannot
     /// be read as a token; the running config stays.
     pub fn reload(&self, actor: &str) -> Result<ReloadAnswer, String> {
+        let answer = self.reload_locked(actor)?;
+        self.announce_credentials();
+        Ok(answer)
+    }
+
+    /// [`Self::reload`] under the reload lock, without the announcements that follow it.
+    fn reload_locked(&self, actor: &str) -> Result<ReloadAnswer, String> {
         let _one = lock(&self.reloading);
         if let Some(file) = &self.startup.audit_file {
             if let Err(e) = audit::narrow(file) {
@@ -763,9 +777,10 @@ impl Gateway {
         body: &[u8],
     ) -> Result<LoginKeyAnswer, Refusal> {
         // A reload must not take a config whose credential file is half replaced.
-        let _one = lock(&self.reloading);
+        let one = lock(&self.reloading);
+        let before = self.fingerprint_of(name);
         let mut entry = audit::entry(actor, AuditAction::LoginKey, Some(name.to_owned()));
-        match self.write_login_key(name, body, &mut entry) {
+        let result = match self.write_login_key(name, body, &mut entry) {
             Ok(answer) => {
                 let backup = answer.backup.as_deref().unwrap_or("none");
                 log::info(&format!(
@@ -785,7 +800,20 @@ impl Gateway {
                 self.record(&audit::refused(entry, refusal.message.as_str()));
                 Err(refusal)
             }
+        };
+        drop(one);
+        if result.is_ok() {
+            self.announce_replaced(name, before);
         }
+        result
+    }
+
+    /// The fingerprint of the credential file of login `name` of the current config.
+    fn fingerprint_of(&self, name: &str) -> Option<String> {
+        let config = self.config();
+        config
+            .login(name)
+            .map(|l| creds::fingerprint(&l.credentials))
     }
 
     /// Records the `action` on login `name` by `actor` refused for `reason` before its handler.
@@ -897,6 +925,7 @@ impl Gateway {
         body: &[u8],
     ) -> Result<LoginOauthSigned, Refusal> {
         let mut entry = audit::entry(actor, AuditAction::LoginOauthCode, Some(name.to_owned()));
+        let before = self.fingerprint_of(name);
         match self.sign_in(name, body, &mut entry) {
             Ok(answer) => {
                 let backup = answer.backup.as_deref().unwrap_or("none");
@@ -905,6 +934,7 @@ impl Gateway {
                 ));
                 entry.backup.clone_from(&answer.backup);
                 self.record(&entry);
+                self.announce_replaced(name, before);
                 Ok(answer)
             }
             Err(refusal) => {
@@ -1259,14 +1289,17 @@ impl Gateway {
         let started = Instant::now();
         loop {
             let loaded = self.store.load(entry, now, refreshed);
+            // After the load, which may have refreshed the file, and before the request, so a 401
+            // blames the credential this attempt sends and not a file replaced meanwhile.
+            let fingerprint = creds::fingerprint(&entry.credentials);
             let credential = match loaded {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn(&format!("gateway: {e}"));
                     progress.tried.push(attempt);
                     if e.unusable {
-                        self.report(&lease, Outcome::Http401, Vec::new());
-                        self.report_dead(&login);
+                        self.report_401(&lease, &login, &fingerprint, Vec::new());
+                        self.report_dead(&login, &fingerprint);
                         progress.failed.push(login);
                         return Next::Retry;
                     }
@@ -1300,6 +1333,7 @@ impl Gateway {
                 tools: BTreeSet::new(),
                 started,
                 gone: false,
+                fingerprint,
                 emit: &mut *emit,
             };
             let result = upstream.turn(
@@ -1373,7 +1407,7 @@ impl Gateway {
         } else {
             outcome
         };
-        self.report(lease, outcome, failure.windows);
+        self.report_attempt(lease, &login, outcome, failure.windows, &relay.fingerprint);
         let stopped = turn.cancel.is_cancelled();
         let end = Err(if stopped {
             ErrorClass::Cancelled
@@ -1416,7 +1450,7 @@ impl Gateway {
             }
             if login_scoped(failure.kind) {
                 if failure.kind == FailureKind::Auth {
-                    self.report_dead(&login);
+                    self.report_dead(&login, &relay.fingerprint);
                 }
                 progress.failed.push(login);
                 return Next::Retry;
@@ -1542,6 +1576,7 @@ impl Gateway {
             model: None,
             windows: vec![window],
             release: false,
+            credential: None,
         });
     }
 
@@ -1863,38 +1898,145 @@ impl Gateway {
             model: None,
             windows,
             release: true,
+            credential: None,
         });
     }
 
+    /// [`Self::report`] of an attempt on `login` that read the credential of fingerprint `fp`,
+    /// which an `http_401` carries.
+    fn report_attempt(
+        &self,
+        lease: &str,
+        login: &str,
+        outcome: Outcome,
+        windows: Vec<WindowReport>,
+        fp: &str,
+    ) {
+        match outcome {
+            Outcome::Http401 => self.report_401(lease, login, fp, windows),
+            _ => self.report(lease, outcome, windows),
+        }
+    }
+
+    /// Reports an `http_401` for `lease` on `login`, whose attempt read the credential of
+    /// fingerprint `fp`, and releases it: qbd keeps the fingerprint with the auth mark.
+    fn report_401(&self, lease: &str, login: &str, fp: &str, windows: Vec<WindowReport>) {
+        let took = self.send_report(&ReportRequest {
+            lease_id: Some(lease.to_owned()),
+            login: None,
+            outcome: Outcome::Http401,
+            model: None,
+            windows,
+            release: true,
+            credential: Some(fp.to_owned()),
+        });
+        self.took(took, login, fp);
+    }
+
+    /// Remembers that qbd holds `fp` for `login`, when it `took` a report of it: a refresh by
+    /// the gateway changes the file behind the last announcement.
+    fn took(&self, took: bool, login: &str, fp: &str) {
+        if took {
+            lock(&self.announced).insert(login.to_owned(), fp.to_owned());
+        }
+    }
+
     /// Reports one more `http_401` on `login` after its lease report, so qbd marks it
-    /// `auth_dead` and the next pick of the turn skips it: the credential failed even after a
-    /// refresh, or its file is unusable, and neither passes by itself.
-    fn report_dead(&self, login: &str) {
-        self.send_report(&ReportRequest {
+    /// `auth_dead` and the next pick of the turn skips it: the credential of fingerprint `fp`
+    /// failed even after a refresh, or its file is unusable, and neither passes by itself. A
+    /// credential written later has another fingerprint, which [`Self::announce_credential`]
+    /// brings to qbd.
+    fn report_dead(&self, login: &str, fp: &str) {
+        let took = self.send_report(&ReportRequest {
             lease_id: None,
             login: Some(login.to_owned()),
             outcome: Outcome::Http401,
             model: None,
             windows: Vec::new(),
             release: false,
+            credential: Some(fp.to_owned()),
         });
+        self.took(took, login, fp);
     }
 
-    fn send_report(&self, req: &ReportRequest) {
-        let Ok(body) = serde_json::to_vec(req) else {
+    /// Tells qbd that the credential of `login` has the fingerprint `fp`, with an `error` report
+    /// that marks nothing: an auth mark qbd keeps for another fingerprint clears, one without a
+    /// fingerprint takes it. Remembers `fp` once qbd took it.
+    fn announce(&self, login: &str, fp: &str) {
+        let took = self.send_report(&ReportRequest {
+            lease_id: None,
+            login: Some(login.to_owned()),
+            outcome: Outcome::Error,
+            model: None,
+            windows: Vec::new(),
+            release: false,
+            credential: Some(fp.to_owned()),
+        });
+        self.took(took, login, fp);
+    }
+
+    /// [`Self::announce`] of the fingerprint of `login`'s credential file as it is now, unless
+    /// qbd already took that one. When qbd took another one before, that one goes again first,
+    /// so a mark set without a fingerprint takes it and the new one clears the mark.
+    fn announce_credential(&self, login: &GatewayLogin) {
+        let fp = creds::fingerprint(&login.credentials);
+        let before = lock(&self.announced).get(&login.name).cloned();
+        if before.as_ref() == Some(&fp) {
             return;
+        }
+        if let Some(before) = before {
+            self.announce(&login.name, &before);
+        }
+        self.announce(&login.name, &fp);
+    }
+
+    /// [`Self::announce_credential`] of every login of the current config. The gateway calls it
+    /// once it serves and after each reload, so a credential file replaced while it was down, or
+    /// by `qb login` or `qb login import`, clears the auth mark of its old credential.
+    pub fn announce_credentials(&self) {
+        for login in &self.config().logins {
+            self.announce_credential(login);
+        }
+    }
+
+    /// Announces that the gateway replaced the credential file of login `name`, whose old
+    /// fingerprint was `before`: the old one first, which a mark without a fingerprint takes,
+    /// then the new one, which clears it.
+    fn announce_replaced(&self, name: &str, before: Option<String>) {
+        if let Some(before) = before {
+            self.announce(name, &before);
+        }
+        if let Some(login) = self.config().login(name) {
+            self.announce_credential(login);
+        }
+    }
+
+    /// Sends `req` to qbd: whether qbd took it; a refusal or failure is logged.
+    fn send_report(&self, req: &ReportRequest) -> bool {
+        let Ok(body) = serde_json::to_vec(req) else {
+            return false;
         };
         let of = req.lease_id.as_ref().or(req.login.as_ref());
         let of = of.map_or("", String::as_str);
         let socket = &self.startup.qbd_socket;
         match client::call(socket, "POST", paths::REPORT, Some(&body), self.bearer()) {
-            Ok((200, _)) => {}
+            Ok((200, _)) => return true,
+            // A qbd older than `credential` refuses it: the mark matters more than its
+            // fingerprint.
+            Ok((400, _)) if req.credential.is_some() && req.outcome == Outcome::Http401 => {
+                let plain = ReportRequest {
+                    credential: None,
+                    ..req.clone()
+                };
+                return self.send_report(&plain);
+            }
             Ok((status, resp)) => log::warn(&format!(
                 "gateway: qbd report of {of} answered HTTP {status}: {}",
                 String::from_utf8_lossy(&resp)
             )),
             Err(e) => log::warn(&format!("gateway: qbd report of {of}: {e}")),
         }
+        false
     }
 }
 

@@ -390,6 +390,7 @@ fn random_report(
         outcome,
         model: None,
         release: lease.is_some() && rng.chance(40),
+        credential: None,
         windows,
     };
     (report, lease)

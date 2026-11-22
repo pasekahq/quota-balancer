@@ -859,6 +859,25 @@ must name port 443 where the sandbox is enforced. No answer, log line, audit lin
 holds the code, the verifier, the state, a token or the account id; the state leaves the gateway
 only inside the authorize URL. The gateway never removes a backup.
 
+### A login `auth_dead` in `qbd`
+
+A login whose credential failed even after a refresh, or whose file is unusable, is
+`auth_dead` in `qbd` ([api.md](api.md#attempts-and-rotation)), which keeps the mark across
+restarts. A new credential brings it back: `qbd` keeps a fingerprint of the credential file with
+the mark, and the gateway tells `qbd` the fingerprint of each credential file when it starts and
+the changed ones after each reload, so a mark of another file clears.
+
+- A key replaced or a login signed in through the gateway clears the mark at once.
+- After `qb login`, `qb login import` or an edit of the file (a `chmod` too), reload the gateway
+  (`qb --socket <gateway socket> reload` or SIGHUP) or restart it.
+- Without a change of the file, an admin client of `qbd` clears the mark with
+  `qb login reset <LOGIN>` or `qb login reset --all`
+  ([api.md](api.md#post-v1adminloginsreset)); `qb --socket <gateway socket> login reset ...`
+  goes through the gateway when its `[[clients]]` entry in `qbd` has `admin = true`.
+
+The fingerprints need a `qbd` at least as new as the gateway: an older one refuses a report
+that carries one. Upgrade `qbd` first.
+
 ### Reload
 
 SIGHUP, `systemctl --user reload qb-gateway` or `qb --socket <gateway socket> reload`
