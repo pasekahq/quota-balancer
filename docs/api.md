@@ -790,7 +790,9 @@ token rotations wait. It copies the credential file, when there is one, to
 never over a file, then writes `{"type": "api_key", "key": "<key>"}` atomically with mode 0600
 (temporary file in the same directory, fsync, rename, fsync of the directory). The login's next
 attempt reads the new file; turns need no reload or restart. The request body, the key and the
-file's bytes are zeroized after use. The answer never holds the key:
+file's bytes are zeroized after use, and the key is decoded straight into a zeroizing string,
+not through a copy of the JSON parser's ([SECURITY.md](../SECURITY.md)). The answer never holds
+the key:
 
 ```json
 {"login": "key-1", "backup": "/etc/qb/credentials/key-1.json.bak-1800000480",
@@ -861,8 +863,9 @@ attempt sends the new token; turns need no reload or restart:
 {"login": "login-1", "backup": "/etc/qb/credentials/login-1.json.bak-1800000300"}
 ```
 
-`backup` is `null` when the login had no credential file. The request body, the code, the
-verifier, the state and the tokens are zeroized after use; no answer, log line, audit line or
+`backup` is `null` when the login had no credential file. The request body, the paste (decoded
+as the key of `POST .../key` is), the code, the verifier, the state and the tokens are zeroized
+after use; no answer, log line, audit line or
 usage line holds the code, the verifier, the state, a token or the account id.
 
 ### `GET` and `PUT /v1/model/config/routes`

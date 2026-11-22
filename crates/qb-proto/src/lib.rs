@@ -25,7 +25,7 @@ pub use gateway::{
     OauthPaste, Object, ReloadAnswer, Role, RouteInfo, RouteState, RouteStatus, RoutesAnswer,
     SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, Tool, ToolCall, TurnRequest,
     TurnRequestError, Usage, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine, UsageQuery,
-    UsageRow, UsdSource,
+    UsageRow, UsdSource, validate_login_key,
 };
 
 /// API version reported by `/v1/health` and used as the URL prefix.

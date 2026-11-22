@@ -9221,6 +9221,30 @@ fn a_login_without_a_credential_file_gets_one_and_no_backup() {
     assert_eq!(login_1_secrets(&r), [NEW_KEY]);
 }
 
+#[test]
+fn a_key_sent_with_json_escapes_is_written_and_sent_unescaped() {
+    let (r, _, _) = key_rig(api_key("test-key-two-5c3d"), "", own_uid());
+    let file = r.dir.join("creds/login-1.json");
+    let body = r#"{ "key" : "test-key-\u0041\"q\\\/z\ud83d\ude00" }"#;
+    let want = "test-key-A\"q\\/z";
+    let (status, answer) = put_key(&r.gw, "login-1", body);
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&answer));
+    assert!(
+        String::from_utf8_lossy(&answer).contains("non-ASCII"),
+        "the emoji is decoded before the key is checked"
+    );
+    let body = body.replace("\\ud83d\\ude00", "");
+    let (status, answer) = put_key(&r.gw, "login-1", &body);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let answer: LoginKeyAnswer = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer.key_sha256_prefix, sha256_hex(want)[..12]);
+    let written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(written, json!({"type": "api_key", "key": want}));
+    let (status, _, _) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(status, 200);
+    assert_eq!(login_1_secrets(&r), [want]);
+}
+
 /// Bad key requests: the login, the body, the status and the message of the answer.
 fn bad_key_requests() -> Vec<(&'static str, String, u16, &'static str)> {
     let key = |key: &str| json!({ "key": key }).to_string();

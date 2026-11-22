@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 use qb_proto::{
     ApiFamily, Attempt, AuditAction, AuditEntry, Block, ClientRotateAnswer, ConfigRoutes,
     ConfigRoutesPut, ConfigRoutesWritten, Decision, ErrorClass, GatewayError, LadderAnswer,
-    LadderCandidateState, LadderStepState, LoginKey, LoginKeyAnswer, LoginOauthCode,
-    LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste, Outcome, PickRequest,
-    PickResponse, ReloadAnswer, ReportRequest, RolesResponse, RouteInfo, RouteState, RouteStatus,
-    RoutesAnswer, SpendAnswer, StopReason, StreamEvent, TurnRequest, Usage, UsageLine,
-    WindowReport, gateway::MAX_NAME, gateway::MAX_USAGE_TOOLS, paths,
+    LadderCandidateState, LadderStepState, LoginKeyAnswer, LoginOauthSigned, LoginOauthStarted,
+    LoginSpend, LoginStatus, OauthPaste, Outcome, PickRequest, PickResponse, ReloadAnswer,
+    ReportRequest, RolesResponse, RouteInfo, RouteState, RouteStatus, RoutesAnswer, SpendAnswer,
+    StopReason, StreamEvent, TurnRequest, Usage, UsageLine, WindowReport, gateway::MAX_NAME,
+    gateway::MAX_USAGE_TOOLS, paths, validate_login_key,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -37,7 +37,7 @@ use super::tokens::{self, ClientTokens};
 use super::upstream::{
     CancelToken, Credential, Failure, FailureKind, Finished, Flow, Picked, Upstream,
 };
-use super::{audit, config_edit, usage};
+use super::{audit, config_edit, secret_body, usage};
 use crate::config::{BearerHash, Error};
 use crate::rewrite::{self, Unwritten, write_atomic};
 use crate::sandbox::{file_dir, gateway_files};
@@ -812,11 +812,8 @@ impl Gateway {
             return Err(Refusal::new(409, ErrorClass::BadRequest, message));
         }
         let invalid = |message: String| Refusal::new(400, ErrorClass::BadRequest, message);
-        let decoded: LoginKey =
-            serde_json::from_slice(body).map_err(|e| invalid(body_error(&e, "key")))?;
-        let valid = decoded.validate();
-        let key = Zeroizing::new(decoded.key);
-        valid.map_err(|e| invalid(e.to_owned()))?;
+        let key = secret_body::decode(body, "key").map_err(|e| invalid(body_error(&e, "key")))?;
+        validate_login_key(&key).map_err(|e| invalid(e.to_owned()))?;
         let file = login.credentials.as_path();
         let bytes = Written {
             kind: Kind::ApiKey,
@@ -945,9 +942,8 @@ impl Gateway {
     ) -> Result<LoginOauthSigned, Refusal> {
         self.oauth_login(name)?;
         let invalid = |message: String| Refusal::new(400, ErrorClass::BadRequest, message);
-        let pasted = serde_json::from_slice::<LoginOauthCode>(body)
-            .map(|b| Zeroizing::new(b.pasted))
-            .map_err(|e| invalid(body_error(&e, "pasted")))?;
+        let pasted =
+            secret_body::decode(body, "pasted").map_err(|e| invalid(body_error(&e, "pasted")))?;
         let now = unix_now();
         let mut pending = lock(&self.sign_ins);
         let Some(at) = pending.iter().position(|p| p.signin.login().name == name) else {
