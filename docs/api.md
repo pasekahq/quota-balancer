@@ -54,7 +54,9 @@ is 403 `forbidden` and changes nothing; a report by `login` is open to every cal
 ```
 
 Exactly one of `difficulty` / `pin`. Optional: `resume_of`, `avoid_vendor`, `need` (capabilities),
-`expected_minutes`, `run_id`, `on_behalf_of`, `logins`. `on_behalf_of` names the end client a
+`expected_minutes`, `run_id`, `on_behalf_of`, `logins`. `need` is accepted but not used yet: no
+candidate declares capabilities, so it filters nothing and the pick is the one without it.
+`on_behalf_of` names the end client a
 relaying caller such as `qb gateway` picks for: 1 to 128 bytes, else 400 `bad_request`. It is
 kept on the lease and in the journal; no decision, rate limit or report check reads it.
 

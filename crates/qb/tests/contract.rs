@@ -557,6 +557,21 @@ fn a_login_list_keeps_picks_on_its_logins() {
     assert!(e.message.contains("`logins`"), "{}", e.message);
 }
 
+#[test]
+fn need_is_accepted_and_does_not_change_the_pick() {
+    let sock = temp_socket("need");
+    let _d = start(&journaled_config(sock.parent().unwrap(), 1 << 20), &sock);
+    let shape = |p: PickResponse| (p.decision, p.vendor, p.model, p.effort, p.login, p.tier);
+    let needy = r#"{"role":"worker","difficulty":1,"need":["capability-x","capability-y"]}"#;
+    let with_need: PickResponse = post(&sock, paths::PICK, needy);
+    assert_eq!(with_need.decision, Decision::Run, "{with_need:?}");
+    assert_eq!(
+        shape(with_need),
+        shape(pick_worker(&sock)),
+        "no candidate declares capabilities, so `need` filters nothing"
+    );
+}
+
 /// Token of the bearer client `client-b` in the configs below; `BEARER_SHA256` is its hash.
 const BEARER: &str = "token-b";
 const BEARER_SHA256: &str = "49e2bb7eab54cf09b409ffafd3fa8a8a955a60eb972faacaefbed3dbd3207132";
