@@ -679,9 +679,24 @@ fn candidate_vendors(role: &config::Role) -> impl Iterator<Item = &str> {
         .map(|c| c.vendor.as_str())
 }
 
+/// The vendors of the candidates qbd tries for a pick at `difficulty` of `role`: those of its
+/// step and of the steps next to it in difficulty order.
+fn reachable_vendors(role: &config::Role, difficulty: u8) -> Vec<&str> {
+    let mut steps: Vec<&config::Step> = role.ladder.iter().collect();
+    steps.sort_by_key(|s| s.difficulty);
+    let Some(at) = steps.iter().position(|s| s.difficulty == difficulty) else {
+        return Vec::new();
+    };
+    steps[at.saturating_sub(1)..steps.len().min(at + 2)]
+        .iter()
+        .flat_map(|s| &s.candidates)
+        .map(|c| c.vendor.as_str())
+        .collect()
+}
+
 /// Breaks of the rule that a route's `logins` hold a login of its pinned vendor, of each chain
-/// step's vendor, or, on a ladder route, of a candidate vendor of `role`: without one every pick
-/// of the route, or of that step, is limited to logins that cannot serve it.
+/// step's vendor, or, on a ladder route, of a candidate vendor of its step of `role` or of a
+/// step next to it: without one qbd never picks the route, or that chain step.
 fn listed_faults(qbd: &config::Config, route: &Route, role: &config::Role) -> Vec<String> {
     let Some(names) = &route.logins else {
         return Vec::new();
@@ -698,11 +713,15 @@ fn listed_faults(qbd: &config::Config, route: &Route, role: &config::Role) -> Ve
         .filter(|v| !listed(v))
         .map(|v| format!("route `{alias}`: no listed login serves vendor `{v}`"))
         .collect();
-    if route.difficulty.is_some() && !candidate_vendors(role).any(listed) {
-        faults.push(format!(
-            "route `{alias}`: no listed login serves a candidate vendor of `{}`",
-            role.name
-        ));
+    if let Some(d) = route.difficulty {
+        let vendors = reachable_vendors(role, d);
+        if !vendors.is_empty() && !vendors.into_iter().any(listed) {
+            faults.push(format!(
+                "route `{alias}`: no listed login serves a candidate vendor of step {d} of `{}` \
+                 or a step next to it",
+                role.name
+            ));
+        }
     }
     faults
 }
@@ -888,13 +907,39 @@ fn a_broken_installation_rule_is_found_in_either_example() {
                 "logins = [\"login-1\", \"login-3\", \"key-4\"]",
                 "logins = [\"key-1\"]",
             ),
-            "route `hive-step-1`: no listed login serves a candidate vendor of `hive-heads`",
+            "route `hive-step-1`: no listed login serves a candidate vendor of step 1 of \
+             `hive-heads` or a step next to it",
         ),
     ];
     for ((qbd_edit, gw_edit), fault) in cases {
         let faults = example_faults(qbd_edit, gw_edit);
         assert!(faults.iter().any(|f| f == fault), "{fault}: {faults:?}");
     }
+}
+
+#[test]
+fn a_ladder_route_s_logins_must_serve_its_step_or_a_step_next_to_it() {
+    // key-1 (vendor-e) serves a candidate of step 5 of hive-heads only.
+    let faults = example_faults(
+        (
+            "{ vendor = \"vendor-g\", model = \"model-large\", effort = \"max\", tier = 3 }",
+            "{ vendor = \"vendor-e\", model = \"model-large\", effort = \"max\", tier = 3 }",
+        ),
+        (
+            "logins = [\"login-1\", \"login-3\", \"key-4\"]",
+            "logins = [\"key-1\"]",
+        ),
+    );
+    let ladder: Vec<&str> = faults
+        .iter()
+        .filter(|f| f.contains("a step next to it"))
+        .filter_map(|f| f.strip_prefix("route `")?.split('`').next())
+        .collect();
+    assert_eq!(
+        ladder,
+        ["hive-step-1", "hive-step-2", "hive-step-3"],
+        "{faults:?}"
+    );
 }
 
 const AGENT: &str = r#"
