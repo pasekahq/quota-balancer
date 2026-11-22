@@ -2426,6 +2426,27 @@ fn reloads_and_spend_resets_leave_audit_lines_that_read_back_oldest_first() {
 }
 
 #[test]
+fn an_audit_file_wider_than_0600_is_narrowed_at_startup_and_on_reload() {
+    let audit = audit_path();
+    std::fs::create_dir_all(audit.parent().unwrap()).unwrap();
+    let kept = r#"{"at":1800000000,"actor":"uid:1000","action":"spend_reset","object":"login-1","result":"ok"}"#;
+    std::fs::write(&audit, format!("{kept}\n")).unwrap();
+    let widen = |mode: u32| {
+        std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    widen(0o644);
+    let r = rig_as(4, &key_files(), &audit_key(&audit), own_uid());
+    assert_eq!(mode_of(&audit), 0o600, "narrowed at startup");
+    assert_eq!(audit_answer(&r.gw, "").entries.len(), 1, "the lines stay");
+
+    widen(0o660);
+    let (status, body) = call(&r.gw, "POST", paths::MODEL_RELOAD, "");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mode_of(&audit), 0o600, "narrowed on reload");
+    assert_eq!(audit_answer(&r.gw, "").entries.len(), 2);
+}
+
+#[test]
 fn another_uid_is_refused_the_admin_endpoints_and_its_refusals_are_recorded() {
     let audit = audit_path();
     let files = [("login-1", api_key("test-token-1"), 0o600)];

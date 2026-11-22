@@ -1,9 +1,10 @@
 //! The admin audit: each admin action of the gateway appended to its `audit_file` as one JSON
 //! line, and those lines read back for `GET /v1/model/audit`.
 
-use std::fs::File;
+use std::fs::{File, Metadata, Permissions};
 use std::io::{self, ErrorKind, Write};
 use std::ops::ControlFlow;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use qb_proto::{AuditAction, AuditAnswer, AuditEntry, AuditResult};
@@ -52,11 +53,60 @@ pub(crate) fn refused(mut entry: AuditEntry, reason: impl Into<String>) -> Audit
     entry
 }
 
-/// Appends `entry` to `file` as one line in one `write`, creating the file with mode 0600. A
-/// failure is logged at error priority with the path and never returned, so the action's answer
-/// does not depend on it.
+/// Narrows an existing regular `file` whose mode lets its group or others in to 0600 and logs a
+/// warning when it did; a missing file or one of another kind is left alone. Called at startup
+/// and on each reload: `append` creates the file 0600, but an older file keeps its mode.
+///
+/// # Errors
+/// The file's mode cannot be read or changed; the message names the file.
+pub fn narrow(file: &Path) -> Result<(), String> {
+    let meta = match std::fs::metadata(file) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        meta => meta,
+    };
+    meta.and_then(|m| narrowed(file, &m, |p| std::fs::set_permissions(file, p)))
+        .map_err(|e| format!("audit_file {}: {e}", file.display()))
+}
+
+/// Applies 0600 through `set` when `meta`, the metadata of the regular file `file`, gives the
+/// group or others any bit, and logs it.
+fn narrowed(
+    file: &Path,
+    meta: &Metadata,
+    set: impl FnOnce(Permissions) -> io::Result<()>,
+) -> io::Result<()> {
+    let mode = meta.mode() & 0o7777;
+    let wide = mode & 0o077 != 0;
+    if !(meta.is_file() && wide) {
+        return Ok(());
+    }
+    set(Permissions::from_mode(0o600)).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("mode {mode:04o} is wider than 0600 and cannot be narrowed: {e}"),
+        )
+    })?;
+    log::warn(&format!(
+        "gateway: audit_file {} had mode {mode:04o}; narrowed to 0600",
+        file.display()
+    ));
+    Ok(())
+}
+
+/// Appends `entry` to `file` as one line in one `write`, creating the file with mode 0600 and
+/// narrowing an existing one to it first, as [`narrow`] does; a file that cannot be narrowed
+/// still gets the line. A failure is logged at error priority with the path and never returned,
+/// so the action's answer does not depend on it.
 pub fn append(file: &Path, entry: &AuditEntry) {
-    let written = json_line(entry).and_then(|line| write_line(&mut open_append(file)?, &line));
+    let written = json_line(entry).and_then(|line| {
+        let mut f = open_append(file)?;
+        // A file that stays wide still gets the line: losing the record is worse.
+        let meta = f.metadata()?;
+        if let Err(e) = narrowed(file, &meta, |p| f.set_permissions(p)) {
+            log::error(&format!("gateway: audit_file {}: {e}", file.display()));
+        }
+        write_line(&mut f, &line)
+    });
     if let Err(e) = written {
         log::error(&format!(
             "gateway: audit line not appended to {}: {e}",
@@ -137,6 +187,34 @@ pub(crate) fn read(file: &Path, query: &Query) -> io::Result<AuditAnswer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_append_narrows_a_wide_file_and_narrow_leaves_other_kinds_alone() {
+        let dir = std::env::temp_dir().join(format!("qb-audit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().mode() & 0o7777;
+        let file = dir.join("audit.jsonl");
+        std::fs::write(&file, "").unwrap();
+        std::fs::set_permissions(&file, Permissions::from_mode(0o644)).unwrap();
+        append(&file, &entry("uid:1000", AuditAction::Reload, None));
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 1);
+
+        std::fs::set_permissions(&file, Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(narrow(&file), Ok(()));
+        assert_eq!(mode(&file), 0o400, "a narrower mode stays");
+        assert_eq!(narrow(&dir.join("missing.jsonl")), Ok(()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::set_permissions(&sub, Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(narrow(&sub), Ok(()));
+        assert_eq!(
+            mode(&sub),
+            0o755,
+            "a directory is not the audit's to narrow"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_query_takes_since_and_a_bounded_limit() {

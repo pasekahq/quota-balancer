@@ -414,7 +414,8 @@ impl Gateway {
     ///
     /// # Errors
     /// The config's `spend_file` exists but cannot be read as one, a `token_file` cannot be read
-    /// as a token, or the `grace_file` exists but cannot be read as one.
+    /// as a token, the `grace_file` exists but cannot be read as one, or the `audit_file` exists
+    /// with a mode wider than 0600 that cannot be narrowed.
     pub fn new(
         config: GatewayConfig,
         upstreams: Upstreams,
@@ -425,6 +426,9 @@ impl Gateway {
             Some(f) => Some(Mutex::new(Ledger::open(f, unix_now())?)),
             None => None,
         };
+        if let Some(file) = &config.audit_file {
+            audit::narrow(file)?;
+        }
         let usage = config.usage.clone().map(usage::Ledger::new);
         let tokens = ClientTokens::load(&config, unix_now())?;
         let startup = Arc::new(sorted(config));
@@ -509,13 +513,18 @@ impl Gateway {
     /// Reads the config file and its `token_file`s again for `actor`. A config that parses and
     /// validates as at startup, keeps every restart-only field and whose token files read
     /// becomes the snapshot of later admissions; admitted turns keep theirs. Logs one line and
-    /// records one audit entry either way.
+    /// records one audit entry either way, narrowing a wide `audit_file` first.
     ///
     /// # Errors
     /// The file is unreadable or invalid, changes a restart-only field, or a token file cannot
     /// be read as a token; the running config stays.
     pub fn reload(&self, actor: &str) -> Result<ReloadAnswer, String> {
         let _one = lock(&self.reloading);
+        if let Some(file) = &self.startup.audit_file {
+            if let Err(e) = audit::narrow(file) {
+                log::error(&format!("gateway: {e}"));
+            }
+        }
         let before = self.config().sha256;
         let (config, current) = match self.admissible(super::config::load(&self.startup.file)) {
             Ok(loaded) => loaded,
