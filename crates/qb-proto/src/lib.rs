@@ -113,7 +113,8 @@ pub struct PickRequest {
     /// Vendor to avoid (independent review).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avoid_vendor: Option<String>,
-    /// Required capabilities; a candidate must have all of them.
+    /// Required capabilities. Accepted but not used yet: no candidate declares capabilities, so
+    /// it filters nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub need: Vec<String>,
     /// Expected duration of the task, used for the cost estimate.

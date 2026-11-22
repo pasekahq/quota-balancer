@@ -139,7 +139,8 @@ State, all in one thread, no locks, no allocation on the hot path:
 1. Candidates from the pin or the ladder, each expanded to the logins of its vendor, only
    those on the request's `logins` when it has one; `resume_of` is accepted but not used yet, so it does not keep the session's login. A
    pin takes the logins of the pinned vendor (or the one named login) and no role reserve.
-2. Drop dead logins/models, the avoided vendor, and candidates missing a required capability;
+2. Drop dead logins/models and the avoided vendor; `need` is accepted but not used yet, as no
+   candidate declares capabilities;
    `auth_stale` logins stay: the token is refreshed on next use, by the vendor CLI or, for its
    own logins, by `qb gateway`.
 3. Admissible if for every window of the login's vendor `left = 1 − used − reserved − cost`
