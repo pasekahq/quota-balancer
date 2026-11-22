@@ -79,8 +79,9 @@ Release builds are CPU-heavy (fat LTO). Run one cargo build at a time on shared 
 6. **The daemon never holds vendor credentials** and never opens outbound sockets. Only four
    components touch credential files, all as the credential owner, non-dumpable, under
    landlock and with `zeroize` after use: `qb agent` reads them read-only for the duration of
-   one request; `qb gateway` reads them for each upstream request and writes them only to
-   store refreshed OAuth tokens and, on its own uid's request, beside a 0600 backup of the old
+   one request; `qb gateway` reads them for each upstream request and to hash them into the
+   fingerprint it reports to `qbd` (never the secret), and writes them only to store refreshed
+   OAuth tokens and, on its own uid's request, beside a 0600 backup of the old
    file, the new key of an `api_key` login from the body of `POST /v1/model/logins/{name}/key`
    or the tokens of an OAuth login's sign-in, whose code `POST .../oauth/code` brings for the
    verifier and state that `POST .../oauth/start` drew and kept in its memory;

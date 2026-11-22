@@ -265,6 +265,8 @@ struct Relay<'e> {
     started: Instant,
     /// The client is gone: nothing more reaches it.
     gone: bool,
+    /// The fingerprint of the credential file read for the attempt.
+    fingerprint: String,
     emit: &'e mut dyn FnMut(StreamEvent) -> Flow,
 }
 
@@ -1278,6 +1280,9 @@ impl Gateway {
         let mut refreshed = false;
         let started = Instant::now();
         loop {
+            // Read before the credential, so a file replaced while the attempt runs is not blamed
+            // for its 401.
+            let fingerprint = creds::fingerprint(&entry.credentials);
             let loaded = self.store.load(entry, now, refreshed);
             let credential = match loaded {
                 Ok(c) => c,
@@ -1285,8 +1290,8 @@ impl Gateway {
                     log::warn(&format!("gateway: {e}"));
                     progress.tried.push(attempt);
                     if e.unusable {
-                        self.report_401(&lease, &entry.credentials, Vec::new());
-                        self.report_dead(&turn.config, &login);
+                        self.report_401(&lease, &fingerprint, Vec::new());
+                        self.report_dead(&login, &fingerprint);
                         progress.failed.push(login);
                         return Next::Retry;
                     }
@@ -1320,6 +1325,7 @@ impl Gateway {
                 tools: BTreeSet::new(),
                 started,
                 gone: false,
+                fingerprint,
                 emit: &mut *emit,
             };
             let result = upstream.turn(
@@ -1393,7 +1399,7 @@ impl Gateway {
         } else {
             outcome
         };
-        self.report_attempt(&turn.config, lease, &login, outcome, failure.windows);
+        self.report_attempt(lease, outcome, failure.windows, &relay.fingerprint);
         let stopped = turn.cancel.is_cancelled();
         let end = Err(if stopped {
             ErrorClass::Cancelled
@@ -1436,7 +1442,7 @@ impl Gateway {
             }
             if login_scoped(failure.kind) {
                 if failure.kind == FailureKind::Auth {
-                    self.report_dead(&turn.config, &login);
+                    self.report_dead(&login, &relay.fingerprint);
                 }
                 progress.failed.push(login);
                 return Next::Retry;
@@ -1888,9 +1894,18 @@ impl Gateway {
         });
     }
 
-    /// Reports an `http_401` for `lease` of the login whose credential file is `file` and
-    /// releases it: qbd keeps the file's fingerprint with the auth mark.
-    fn report_401(&self, lease: &str, file: &Path, windows: Vec<WindowReport>) {
+    /// [`Self::report`] of an attempt that read the credential of fingerprint `fp`, which an
+    /// `http_401` carries.
+    fn report_attempt(&self, lease: &str, outcome: Outcome, windows: Vec<WindowReport>, fp: &str) {
+        match outcome {
+            Outcome::Http401 => self.report_401(lease, fp, windows),
+            _ => self.report(lease, outcome, windows),
+        }
+    }
+
+    /// Reports an `http_401` for `lease`, whose attempt read the credential of fingerprint `fp`,
+    /// and releases it: qbd keeps the fingerprint with the auth mark.
+    fn report_401(&self, lease: &str, fp: &str, windows: Vec<WindowReport>) {
         self.send_report(&ReportRequest {
             lease_id: Some(lease.to_owned()),
             login: None,
@@ -1898,31 +1913,16 @@ impl Gateway {
             model: None,
             windows,
             release: true,
-            credential: Some(creds::fingerprint(file)),
+            credential: Some(fp.to_owned()),
         });
     }
 
-    /// [`Self::report`] of an attempt on `login` of `config`, with its credential's fingerprint
-    /// when the outcome is `http_401`.
-    fn report_attempt(
-        &self,
-        config: &GatewayConfig,
-        lease: &str,
-        login: &str,
-        outcome: Outcome,
-        windows: Vec<WindowReport>,
-    ) {
-        match (outcome, config.login(login)) {
-            (Outcome::Http401, Some(entry)) => self.report_401(lease, &entry.credentials, windows),
-            _ => self.report(lease, outcome, windows),
-        }
-    }
-
-    /// Reports one more `http_401` on `login` of `config` after its lease report, so qbd marks
-    /// it `auth_dead` and the next pick of the turn skips it: its credential failed even after a
-    /// refresh, or its file is unusable, and neither passes by itself. A credential written later
-    /// has another fingerprint, which [`Self::announce_credential`] brings to qbd.
-    fn report_dead(&self, config: &GatewayConfig, login: &str) {
+    /// Reports one more `http_401` on `login` after its lease report, so qbd marks it
+    /// `auth_dead` and the next pick of the turn skips it: the credential of fingerprint `fp`
+    /// failed even after a refresh, or its file is unusable, and neither passes by itself. A
+    /// credential written later has another fingerprint, which [`Self::announce_credential`]
+    /// brings to qbd.
+    fn report_dead(&self, login: &str, fp: &str) {
         self.send_report(&ReportRequest {
             lease_id: None,
             login: Some(login.to_owned()),
@@ -1930,9 +1930,7 @@ impl Gateway {
             model: None,
             windows: Vec::new(),
             release: false,
-            credential: config
-                .login(login)
-                .map(|entry| creds::fingerprint(&entry.credentials)),
+            credential: Some(fp.to_owned()),
         });
     }
 
@@ -1955,12 +1953,18 @@ impl Gateway {
     }
 
     /// [`Self::announce`] of the fingerprint of `login`'s credential file as it is now, unless
-    /// qbd already took that one.
+    /// qbd already took that one. When qbd took another one before, that one goes again first,
+    /// so a mark set without a fingerprint takes it and the new one clears the mark.
     fn announce_credential(&self, login: &GatewayLogin) {
         let fp = creds::fingerprint(&login.credentials);
-        if lock(&self.announced).get(&login.name) != Some(&fp) {
-            self.announce(&login.name, fp);
+        let before = lock(&self.announced).get(&login.name).cloned();
+        if before.as_ref() == Some(&fp) {
+            return;
         }
+        if let Some(before) = before {
+            self.announce(&login.name, before);
+        }
+        self.announce(&login.name, fp);
     }
 
     /// [`Self::announce_credential`] of every login of the current config. The gateway calls it
@@ -1994,6 +1998,15 @@ impl Gateway {
         let socket = &self.startup.qbd_socket;
         match client::call(socket, "POST", paths::REPORT, Some(&body), self.bearer()) {
             Ok((200, _)) => return true,
+            // A qbd older than `credential` refuses it: the mark matters more than its
+            // fingerprint.
+            Ok((400, _)) if req.credential.is_some() && req.outcome == Outcome::Http401 => {
+                let plain = ReportRequest {
+                    credential: None,
+                    ..req.clone()
+                };
+                return self.send_report(&plain);
+            }
             Ok((status, resp)) => log::warn(&format!(
                 "gateway: qbd report of {of} answered HTTP {status}: {}",
                 String::from_utf8_lossy(&resp)

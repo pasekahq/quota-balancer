@@ -837,8 +837,9 @@ fn login_reset_clears_auth_marks_for_an_admin_only_and_survives_a_restart() {
 
     let bearer = dir.join("bearer");
     std::fs::write(&bearer, BEARER).unwrap();
-    let (code, _) = login_reset(&sock, Some(&bearer), &["login-3"]);
+    let (code, out) = login_reset(&sock, Some(&bearer), &["login-3"]);
     assert_eq!(code, 1, "client-b is no admin");
+    assert_eq!(error_of(out.as_bytes()), ErrorCode::Forbidden, "{out}");
     assert_eq!(status_in(&state(&sock), "login-3"), LoginStatus::AuthDead);
     let (code, _) = login_reset(&sock, None, &["login-9"]);
     assert_eq!(code, 1, "an unknown login");

@@ -578,19 +578,23 @@ as it does when the pick after a failure answers `dead`. So a key login that ans
 one call per turn, an OAuth login two (before and after its one refresh).
 
 Both 401 reports carry `credential`, the first 16 hex digits of the SHA-256 of the login's
-credential file's bytes, mode and modification time ([`POST /v1/report`](#post-v1report)). The
-gateway also sends that fingerprint to `qbd` in an `error` report: of every login of its config
-once it serves (on a thread of its own, so it holds no connection back), after each reload of
-each login whose fingerprint differs from the last one `qbd` took, and after a
+credential file's bytes, mode and modification time, read just before the attempt read the
+credential, so a file replaced while the request runs is not blamed for its 401
+([`POST /v1/report`](#post-v1report)). The gateway also sends fingerprints to `qbd` in `error`
+reports: of every login of its config once it serves (on a thread of its own, so it holds no
+connection back); after each reload, of each login whose fingerprint differs from the last one
+`qbd` took, that last one first and then the new one; and after a
 [key replacement](#post-v1modelloginsnamekey) or a
-[sign-in](#post-v1modelloginsnameoauthstart-and-oauthcode) wrote a login's file, first the old
-file's and then the new file's, so a mark set without a fingerprint clears as well. So a login
+[sign-in](#post-v1modelloginsnameoauthstart-and-oauthcode) wrote a login's file, the old file's
+and then the new file's. A mark set without a fingerprint takes the first of the two and the
+second clears it. So a login
 marked `auth_dead` comes back once its credential file changes: a new key, a new sign-in,
 `qb login`, `qb login import`, or an edited or `chmod`ed file followed by a reload or a restart
 of the gateway. Any write of the file changes the fingerprint, a token refresh included.
 `qb login reset` ([`POST /v1/admin/logins/reset`](#post-v1adminloginsreset)) clears the mark
-without a change. A `qbd` older than `credential` answers these reports 400, so upgrade `qbd`
-before the gateway.
+without a change. A `qbd` older than `credential` answers these reports 400: the gateway then
+sends its 401 reports again without it, so the mark still lands, but no fingerprint clears it.
+Upgrade `qbd` before the gateway.
 
 **Session stickiness.** A `TurnRequest` has no `resume_of` field (it is 400 as an unknown
 field); `session_key` is the only session hint, and it guarantees nothing about where a turn

@@ -103,6 +103,9 @@ enum Script {
     Drip,
     /// Fail as a refused request with a message that quotes the secret and the account id.
     Leak,
+    /// Write the contents to the file, as a credential replaced while the request is in flight,
+    /// then fail as a rejected credential.
+    Replaced(PathBuf, String),
 }
 
 /// A scripted adapter: one queue of scripts per login, and a record of every call.
@@ -129,6 +132,7 @@ impl Fake {
 struct Shared(Arc<Fake>);
 
 impl Upstream for Shared {
+    #[allow(clippy::too_many_lines)] // one arm per script
     fn turn(
         &self,
         at: &Picked<'_>,
@@ -198,6 +202,10 @@ impl Upstream for Shared {
                         cost,
                     }),
                 }
+            }
+            Script::Replaced(file, contents) => {
+                std::fs::write(file, contents).unwrap();
+                Err(Failure::new(FailureKind::Auth, "scripted Auth"))
             }
             Script::Leak => Err(Failure::new(
                 FailureKind::BadRequest,
@@ -9135,6 +9143,34 @@ fn a_key_login_killed_by_a_401_is_picked_again_once_its_key_is_replaced() {
         login_1_secrets(&r).last().map(String::as_str),
         Some(NEW_KEY)
     );
+}
+
+#[test]
+fn a_401_marks_the_credential_the_attempt_sent_not_one_written_meanwhile() {
+    let r = rig();
+    let file = r.dir.join("creds/login-1.json");
+    r.fake.script(
+        "login-1",
+        Script::Replaced(file.clone(), api_key("test-token-new")),
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    // A gateway that starts afresh knows only the new file, and that one never failed.
+    let text = std::fs::read_to_string(config_file(&r.gw)).unwrap();
+    std::fs::remove_file(&r.gw).unwrap();
+    let fake = Arc::new(Fake::default());
+    let gw = serve_gateway(
+        &text,
+        vec![(Api::Anthropic, Box::new(Shared(Arc::clone(&fake))))],
+        Box::new(Counting(Arc::new(AtomicUsize::new(0)))),
+        own_uid(),
+        None,
+    );
+    until_alive(&r.qbd, "login-1");
+    let (_, _, events) = turn(&gw, &turn_body("turn-2"));
+    assert_eq!(kinds(&events), ["route login-1", "text_delta", "stop End"]);
+    assert_eq!(fake.calls()[0].1, "test-token-new");
 }
 
 #[test]
