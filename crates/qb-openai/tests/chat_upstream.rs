@@ -230,6 +230,10 @@ fn tool_ids_over_40_bytes_go_out_shortened_and_still_paired() {
         assert!(long.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
     }
     assert_ne!(calls[2], calls[3], "two long ids never merge");
+    assert_eq!(
+        calls[2], "qbh_3ec158b254665c91196a4a89031ce6d7",
+        "the hash of a history in flight never changes"
+    );
     let (again, _) = sent_ids(&rounds(&ids));
     assert_eq!(again, calls, "the map is deterministic across turns");
 }

@@ -158,7 +158,7 @@ pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> 
 }
 
 /// The longest tool call id the OpenAI Chat Completions API takes (a longer one is a 400,
-/// "string too long"); compatible vendors take at least as much.
+/// "string too long"). The id rules of other compatible vendors are not recorded.
 pub const MAX_TOOL_ID: usize = 40;
 
 /// Prefix of a tool id over [`MAX_TOOL_ID`] bytes, shortened by [`tool_id`].

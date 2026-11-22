@@ -186,7 +186,7 @@ the OpenAI API takes (`chat_upstream::MAX_TOOL_ID`; a longer one is a 400, "stri
 A longer id (a client's, or another vendor's that a chain turn brings back) goes out as `qbh_`
 and the 32 lowercase hex digits of its 128-bit FNV-1a hash, the same in the call and its tool
 message, so the pair still matches on every turn. The vendor answers with ids of its own, so the
-client never sees the shortened form.
+client never sees the shortened form. The id rules of other compatible vendors are not recorded.
 
 | Header | Value |
 |---|---|
