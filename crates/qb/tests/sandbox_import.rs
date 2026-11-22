@@ -3,6 +3,9 @@
 
 #![allow(clippy::unwrap_used)]
 
+#[path = "common/cleanup.rs"]
+mod cleanup;
+
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -31,6 +34,7 @@ fn kernel_abi() -> Option<ABI> {
 #[test]
 fn import_may_read_its_config_and_source_write_the_target_directory_and_nothing_else() {
     let dir = Path::new("/tmp").join(format!("qb-import-sandbox-{}", std::process::id()));
+    cleanup::remove_at_test_end(&dir);
     let (etc, src, creds) = (dir.join("etc"), dir.join("src"), dir.join("creds"));
     for d in [&etc, &src, &creds] {
         std::fs::create_dir_all(d).unwrap();

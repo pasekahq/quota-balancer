@@ -488,14 +488,7 @@ mod tests {
     const MARK: &str = "test-token-7f3a";
 
     fn dir(tag: &str) -> PathBuf {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "qb-creds-{}-{tag}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::testdir::new(&format!("creds-{tag}"))
     }
 
     fn file(tag: &str, body: &str, mode: u32) -> PathBuf {

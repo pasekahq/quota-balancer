@@ -522,8 +522,7 @@ mod tests {
     }
 
     fn temp_file(name: &str, contents: Option<&str>) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("qb-agent-unit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::new("agent-unit");
         let file = dir.join(name);
         if let Some(c) = contents {
             std::fs::write(&file, c).unwrap();

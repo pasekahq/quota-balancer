@@ -435,8 +435,7 @@ mod tests {
 
     #[test]
     fn a_failed_reopen_writes_nothing_until_the_live_state_can_start_a_file() {
-        let dir = std::env::temp_dir().join(format!("qb-journal-reopen-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::testdir::new("journal-reopen");
         let path = dir.join("journal");
         let core = rate_limited_core();
         let mut journal = Journal::open(&path, 1, 0).expect("open");
@@ -468,8 +467,7 @@ mod tests {
     #[test]
     fn a_failed_write_restarts_the_file_with_the_live_state() {
         const TORN: &[u8] = b"{\"at\":";
-        let dir = std::env::temp_dir().join(format!("qb-journal-write-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::testdir::new("journal-write");
         let path = dir.join("journal");
         let core = rate_limited_core();
         let mut journal = Journal::open(&path, 1 << 20, 0).expect("open");

@@ -2,6 +2,9 @@
 
 #![allow(clippy::unwrap_used)]
 
+#[path = "common/cleanup.rs"]
+mod cleanup;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -464,6 +467,7 @@ fn without_roles() -> &'static str {
 fn roles_file(tag: &str, text: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qb-config-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    cleanup::remove_at_test_end(&dir);
     let file = dir.join("roles.toml");
     std::fs::write(&file, text).unwrap();
     file

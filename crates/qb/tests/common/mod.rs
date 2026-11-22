@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use qb::client::call;
 use qb_proto::{LoginStatus, PickResponse, ReportResponse, StateResponse, paths};
 
+pub mod cleanup;
 pub mod credentials;
 pub mod http;
 pub mod pkce;
@@ -26,7 +27,8 @@ const NAME_ROOM: usize = 40;
 /// `sun_path` holds 108 bytes including the terminating NUL.
 const SUN_PATH: usize = 108;
 
-/// A fresh directory for one test under a base short enough for unix socket paths.
+/// A fresh directory for one test under a base short enough for unix socket paths, removed when
+/// the test ends ([`cleanup`]).
 pub fn temp_dir(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let tmp = std::env::temp_dir();
@@ -41,6 +43,7 @@ pub fn temp_dir(tag: &str) -> PathBuf {
         N.fetch_add(1, Ordering::SeqCst)
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    cleanup::remove_at_test_end(&dir);
     dir
 }
 

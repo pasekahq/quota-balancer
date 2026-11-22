@@ -28,6 +28,8 @@ pub mod sandbox;
 pub mod server;
 mod sha256;
 pub mod stream;
+#[cfg(test)]
+mod testdir;
 
 /// Socket path used when neither `--socket` nor `QB_SOCKET` is given.
 pub const DEFAULT_SOCKET: &str = "/run/qb/qb.sock";
