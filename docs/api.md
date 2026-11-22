@@ -578,8 +578,9 @@ as it does when the pick after a failure answers `dead`. So a key login that ans
 one call per turn, an OAuth login two (before and after its one refresh).
 
 Both 401 reports carry `credential`, the first 16 hex digits of the SHA-256 of the login's
-credential file's bytes, mode and modification time, read just before the attempt read the
-credential, so a file replaced while the request runs is not blamed for its 401
+credential file's bytes, mode and modification time, read once the attempt loaded (and maybe
+refreshed) the credential and before its request, so a file replaced while the request runs is
+not blamed for its 401
 ([`POST /v1/report`](#post-v1report)). The gateway also sends fingerprints to `qbd` in `error`
 reports: of every login of its config once it serves (on a thread of its own, so it holds no
 connection back); after each reload, of each login whose fingerprint differs from the last one

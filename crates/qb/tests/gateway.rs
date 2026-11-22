@@ -9174,6 +9174,38 @@ fn a_401_marks_the_credential_the_attempt_sent_not_one_written_meanwhile() {
 }
 
 #[test]
+fn an_oauth_login_dead_after_its_refresh_stays_dead_across_a_reload() {
+    let oauth = format!(
+        r#"{{"type":"oauth_anthropic","access_token":"access-0","refresh_token":"refresh-0","expires_at":{}}}"#,
+        unix_now() + 3600
+    );
+    let r = rig_with(
+        4,
+        &[
+            ("login-1", oauth, 0o600),
+            ("login-2", api_key("test-token-2"), 0o600),
+        ],
+    );
+    for _ in 0..2 {
+        r.fake.script(
+            "login-1",
+            Script::Fail(Vec::new(), FailureKind::Auth, Vec::new()),
+        );
+    }
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events)[0], "route login-2");
+    assert_eq!(r.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(status_of(&state(&r.qbd), "login-1"), LoginStatus::AuthDead);
+    let (status, _) = call(&r.gw, "POST", paths::MODEL_RELOAD, "");
+    assert_eq!(status, 200);
+    assert_eq!(
+        status_of(&state(&r.qbd), "login-1"),
+        LoginStatus::AuthDead,
+        "the refreshed file is the credential that failed"
+    );
+}
+
+#[test]
 fn a_key_replacement_clears_a_mark_reported_without_a_fingerprint() {
     let r = rig();
     // As an agent's probe or a journal older than fingerprints leaves it.
