@@ -2922,3 +2922,43 @@ fn a_put_equal_to_the_file_writes_and_reloads_nothing() {
     let (status, _) = call(&sock, "POST", paths::PICK, Some(task), Some(BEARER)).unwrap();
     assert_eq!(status, 401, "no reload took the client added since");
 }
+
+/// `qb --version` and `qb version` print the version and the git revision the binary was built
+/// from, so that two builds of one version can be told apart.
+#[test]
+fn version_names_the_build_revision() {
+    let exe = env!("CARGO_BIN_EXE_qb");
+    let head = Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "rev-parse",
+            "--short=12",
+            "HEAD",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8(o.stdout).unwrap().trim().to_owned());
+    for args in [&["--version"][..], &["-V"], &["version"]] {
+        let out = Command::new(exe).args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}");
+        let line = String::from_utf8(out.stdout).unwrap();
+        let rest = line
+            .strip_prefix(&format!("qb {} (", env!("CARGO_PKG_VERSION")))
+            .unwrap_or_else(|| panic!("{args:?}: {line:?}"));
+        let rev = rest
+            .strip_suffix(")\n")
+            .unwrap_or_else(|| panic!("{line:?}"));
+        match (
+            std::env::var("QB_BUILD_REVISION")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            &head,
+        ) {
+            (Some(env), _) => assert_eq!(rev, env.trim()),
+            (None, Some(head)) => assert_eq!(rev, head),
+            (None, None) => assert_eq!(rev, "unknown"),
+        }
+    }
+}

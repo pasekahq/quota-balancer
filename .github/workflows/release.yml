@@ -1,0 +1,196 @@
+name: Release
+
+# A tag v<workspace version> builds, checks, attests and publishes a release (docs/release.md).
+# workflow_dispatch and pull requests that touch the release path run everything but the
+# publication: a dry run. The attestation runs on tags and dispatches only, since a pull request
+# from a fork gets no id-token.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - ci/release.sh
+      - ci/budgets.sh
+      - crates/qb/build.rs
+      - CHANGELOG.md
+      - Cargo.toml
+      - Cargo.lock
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          # Native arm64 runner (free for public repositories): the binary is built and its
+          # --version run on its own architecture, with the same host gcc for ring's C as x86_64.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Tag matches the workspace version
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: ci/release.sh check-tag "$TAG"
+      - name: Build, check static linking and --version
+        run: |
+          rustc -V
+          ci/release.sh build "${{ matrix.target }}"
+      - name: Binary size and static linking (ci/budgets.sh)
+        run: ci/budgets.sh "target/${{ matrix.target }}/release/qb"
+      - name: Package
+        run: ci/release.sh package "${{ matrix.target }}" dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # A second build from a checkout at another path; checksums compares the binaries.
+  reproduce:
+    name: reproduce ${{ matrix.target }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: rebuild
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build again
+        working-directory: rebuild
+        run: |
+          ci/release.sh build "${{ matrix.target }}"
+          mkdir -p ../repro
+          sha256sum <"target/${{ matrix.target }}/release/qb" | cut -d' ' -f1 \
+            >"../repro/${{ matrix.target }}.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: repro-${{ matrix.target }}
+          path: repro/
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    needs: [build, reproduce]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: repro-*
+          path: repro
+          merge-multiple: true
+      - name: Both builds of each target are the same bytes
+        run: |
+          status=0
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            first=$(sha256sum <"dist/qb-$target" | cut -d' ' -f1)
+            second=$(cat "repro/$target.sha256")
+            echo "$target: $first / $second"
+            if [ "$first" != "$second" ]; then
+              echo "::error::qb-$target is not reproducible"; status=1
+            fi
+          done
+          exit "$status"
+      - name: Every asset is there and every binary static
+        run: |
+          version=$(ci/release.sh version)
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            test -f "dist/qb-$version-$target.tar.gz"
+            ci/release.sh check-static "dist/qb-$target"
+          done
+      - name: SHA256SUMS
+        run: ci/release.sh sums dist
+      - name: Release notes from CHANGELOG.md
+        run: |
+          ci/release.sh notes "$(ci/release.sh version)" >notes.md
+          cat notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            dist/
+            notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    needs: checksums
+    if: github.event_name != 'pull_request'
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+
+  publish:
+    needs: attest
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "qb ${TAG#v}" --notes-file notes.md dist/*

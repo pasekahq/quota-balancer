@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/qb-core", "crates/qb-proto", "crates/qb-vendors", "crates/qb-anthropic", "crates/qb-openai", "crates/qb"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "AGPL-3.0-only"
