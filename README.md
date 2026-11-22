@@ -20,10 +20,10 @@ only for its own credential owner. The decision is [ADR 0001](docs/adr/0001-mode
 the gateway serves logins of the Anthropic Messages API, by OAuth token or API key, and of the
 OpenAI Responses API, by ChatGPT subscription login or API key.
 
-> **Status: alpha (0.0.x), no tagged release yet.** The daemon, CLI, agent probes and the model
-> gateway (Anthropic Messages, OpenAI Responses, API keys, OpenRouter, fallback chains) work and
-> run in the author's own setup; multi-host use and the first release with prebuilt binaries are
-> next. Expect breaking changes. See [docs/roadmap.md](docs/roadmap.md).
+> **Status: alpha (0.1.x).** The daemon, CLI, agent probes and the model gateway (Anthropic
+> Messages, OpenAI Responses, API keys, OpenRouter, fallback chains) work and run in the author's
+> own setup; multi-host use is next. Expect breaking changes between minor versions. See
+> [CHANGELOG.md](CHANGELOG.md) and [docs/roadmap.md](docs/roadmap.md).
 
 ## Why
 
@@ -77,6 +77,21 @@ These are enforced in CI on every change (`ci/budgets.sh` and the acceptance lan
 | idle daemon wake-ups | 0 |
 | disk writes with `journal = off`, no admin `PUT /v1/admin/roles` | 0 bytes |
 | `qbd.service` exposure (`systemd-analyze security`) | ≤ 1.5 |
+
+## Download
+
+[Releases](https://github.com/pasekahq/quota-balancer/releases) carry static binaries for
+x86_64 and arm64 Linux, bare (`qb-x86_64-unknown-linux-musl`, `qb-aarch64-unknown-linux-musl`)
+and as tarballs with the license, a `SHA256SUMS` file and build provenance attestations:
+
+```sh
+gh release download v0.1.0 -R pasekahq/quota-balancer
+sha256sum -c SHA256SUMS
+gh attestation verify qb-x86_64-unknown-linux-musl -R pasekahq/quota-balancer
+```
+
+`qb --version` prints the version and the git revision of the build. Asset names, the checks of
+the release workflow and the maintainer steps are in [docs/release.md](docs/release.md).
 
 ## Build
 

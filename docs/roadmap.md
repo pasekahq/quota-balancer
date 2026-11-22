@@ -90,11 +90,12 @@ The live check of the subscription logins runs per [runbooks/openai-live-smoke.m
 Remote clients through an ssh-forwarded unix socket with bearer tokens; agents on other hosts
 registering their logins; client integrations.
 
-## 0.1 — public release
+## 0.1 — public release (done)
 
 History scanned with gitleaks, docs reviewed for anything environment-specific, release
-workflow (static musl builds for x86_64 and aarch64, `SHA256SUMS`, build provenance), then the
-repository is public at `pasekahq/quota-balancer` under `AGPL-3.0-only`.
+workflow (static musl builds for x86_64 and aarch64, `SHA256SUMS`, build provenance; see
+[release.md](release.md)), then the repository is public at `pasekahq/quota-balancer` under
+`AGPL-3.0-only`.
 
 ## Later (S3+)
 
