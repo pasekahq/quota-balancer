@@ -278,7 +278,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
 | `spend_file` | string | Absolute path of the file that counts the spend of the logins with a `spend_cap`; required when one has it ([Spend caps](#spend-caps)). |
-| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation, config edit) is appended to as one JSON line, created with mode 0600 in an existing directory; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
+| `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation, config edit) is appended to as one JSON line, created with mode 0600 in an existing directory; an existing file whose mode lets its group or others in is narrowed to 0600 at startup (the gateway does not start when it cannot), on each reload and before each append; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
 
 `[[clients]]`, optional: callers besides the gateway's own uid. Such a caller must also reach
 the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
