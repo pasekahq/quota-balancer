@@ -7,10 +7,10 @@ use qb_proto::{
     ApiFamily, AuditAction, AuditAnswer, AuditResult, Block, CacheMode, CancelAnswer,
     CancelRequest, ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Effort,
     Elsewhere, ErrorClass, GatewayError, HealthStatus, LadderAnswer, LoginKey, LoginKeyAnswer,
-    LoginOauthCode, LoginOauthSigned, LoginOauthStarted, MediaType, Message, NativeApi, OauthPaste,
-    Object, Outcome, ReloadAnswer, Role, RolesSource, RouteInfo, RouteState, RoutesAnswer,
-    SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
-    UsageAnswer, UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
+    LoginOauthCode, LoginOauthSigned, LoginOauthStarted, LoginStatus, MediaType, Message,
+    NativeApi, OauthPaste, Object, Outcome, ReloadAnswer, Role, RolesSource, RouteInfo, RouteState,
+    RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, ToolCall,
+    TurnRequest, Usage, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -722,11 +722,23 @@ fn typed_enums() -> Vec<(String, Vec<String>)> {
                 LoginOauthCode,
                 AdminRoles,
                 AdminReload,
+                AdminLoginsReset,
             )),
         ),
         (
             schema("AdminRoles/properties/source"),
             names(&every!(RolesSource: RolesFile, Config)),
+        ),
+        (
+            schema("AdminLoginsResetAnswer/properties/logins/items/properties/status"),
+            names(&every!(LoginStatus:
+                Ok,
+                RateLimited,
+                Exhausted,
+                AuthStale,
+                AuthDead,
+                Unknown,
+            )),
         ),
         (
             schema("AuditResult"),

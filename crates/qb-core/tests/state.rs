@@ -23,6 +23,7 @@ fn report(core: &mut Core, subject: ReportSubject, used: f64) -> Result<LoginSta
         outcome: OutcomeClass::Ok,
         model: None,
         release: false,
+        credential: None,
         windows: vec![WindowObservation {
             name: "five_hour".into(),
             used,

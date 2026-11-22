@@ -165,6 +165,36 @@ impl Written<'_> {
     }
 }
 
+/// Hex digits of a credential fingerprint.
+const FINGERPRINT_HEX: usize = 16;
+
+/// The fingerprint of the credential in `file` that qbd keeps with a login's auth mark: the
+/// first 16 hex digits of the SHA-256 of the file's bytes, mode and modification time, each
+/// absent when it cannot be read. Any write of the file (a refresh included), a `chmod` or a
+/// `touch` changes it; it reveals nothing of the secret.
+pub fn fingerprint(file: &Path) -> String {
+    let meta = std::fs::metadata(file).ok();
+    // Room for the metadata too, so no growth leaves a copy of the secret behind.
+    let size = meta.as_ref().map_or(0, std::fs::Metadata::len);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        usize::try_from(size).unwrap_or(0).saturating_add(32),
+    ));
+    // At most the size seen, so a file that grows meanwhile cannot make the buffer move.
+    if let Ok(f) = File::open(file) {
+        if f.take(size).read_to_end(&mut bytes).is_err() {
+            bytes.clear();
+        }
+    }
+    if let Some(meta) = meta {
+        bytes.extend_from_slice(&meta.mode().to_le_bytes());
+        bytes.extend_from_slice(&meta.mtime().to_le_bytes());
+        bytes.extend_from_slice(&meta.mtime_nsec().to_le_bytes());
+    }
+    let mut hex = crate::sha256::hex(crate::sha256::digest(&bytes));
+    hex.truncate(FINGERPRINT_HEX);
+    hex
+}
+
 /// Loads credentials and refreshes expired OAuth tokens, one refresh per credential file at a
 /// time.
 pub struct CredentialStore {

@@ -66,6 +66,8 @@ struct MarksLine {
     rate_limited_until: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     model_dead: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference
@@ -112,6 +114,7 @@ pub fn encode(record: &Record, at: u64) -> Result<Vec<u8>, serde_json::Error> {
                 exhausted_until: marks.exhausted_until,
                 rate_limited_until: marks.rate_limited_until,
                 model_dead: marks.model_dead.iter().cloned().collect(),
+                credential: marks.credential.clone(),
             });
         }
     }
@@ -157,6 +160,7 @@ pub fn decode(line: &[u8]) -> Result<(Record, u64), String> {
                 exhausted_until: m.exhausted_until,
                 rate_limited_until: m.rate_limited_until,
                 model_dead: m.model_dead.into_iter().collect(),
+                credential: m.credential,
             },
         },
         _ => {
@@ -413,6 +417,7 @@ mod tests {
             outcome: OutcomeClass::Http429,
             model: None,
             release: false,
+            credential: None,
             windows: Vec::new(),
         };
         core.report(&input, NOW).expect("known login");

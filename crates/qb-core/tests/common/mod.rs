@@ -110,6 +110,7 @@ pub fn observe(core: &mut Core, login: &str, windows: &[(&str, f64, Option<u64>)
         outcome: OutcomeClass::Ok,
         model: None,
         release: false,
+        credential: None,
         windows: windows
             .iter()
             .map(|&(name, used, resets_at)| WindowObservation {
@@ -173,6 +174,7 @@ pub fn outcome(
         outcome,
         model: model.map(Into::into),
         release: false,
+        credential: None,
         windows: Vec::new(),
     };
     core.report(&input, at)
@@ -185,6 +187,7 @@ pub fn release(core: &mut Core, id: u64, at: u64) {
         outcome: OutcomeClass::Ok,
         model: None,
         release: true,
+        credential: None,
         windows: Vec::new(),
     };
     core.report(&input, at).expect("live lease");

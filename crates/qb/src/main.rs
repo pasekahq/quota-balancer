@@ -26,7 +26,7 @@ use qb::{
     stream,
 };
 use qb_core::Core;
-use qb_proto::{Outcome, PickRequest, Pin, ReportRequest, SpendReset, paths};
+use qb_proto::{AdminLoginsReset, Outcome, PickRequest, Pin, ReportRequest, SpendReset, paths};
 use qb_vendors::claude::Event;
 use zeroize::Zeroizing;
 
@@ -62,6 +62,9 @@ COMMANDS:
                                         entries, --entry id or label), `claude-code`, `codex`,
                                         `env` (with --var NAME); the file must not exist
                                         unless --force; exit 1 if refused
+    login reset (<LOGIN>... | --all)   POST /v1/admin/logins/reset (an admin client of qbd):
+                                        clear the auth_stale or auth_dead mark of each LOGIN,
+                                        or of every login, journaled; other marks stay
     login --config PATH [--force] <LOGIN>
                                         sign the `oauth_anthropic` or `chatgpt_oauth` LOGIN of
                                         the gateway config PATH in with OAuth PKCE: print an
@@ -121,6 +124,7 @@ enum Call {
     Reload,
     Spend,
     SpendReset(String),
+    LoginsReset(AdminLoginsReset),
     Why(String),
     Pick(PickRequest),
     Report(ReportRequest),
@@ -200,6 +204,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
     let (mut format, mut source_file, mut provider, mut entry, mut var) =
         (None, None, None, None, None);
     let mut force = false;
+    let mut all = false;
     let mut name: Option<String> = if as_qbd {
         Some("daemon".to_owned())
     } else {
@@ -225,6 +230,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
         model: None,
         windows: Vec::new(),
         release: false,
+        credential: None,
     };
     let mut outcome_set = false;
 
@@ -245,7 +251,13 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
                 operand = Some(v);
             }
             Value(v) if sub == Some("spend") && spend_args.len() < 2 => spend_args.push(v),
-            Value(v) if sub == Some("login") && login_args.len() < 2 => login_args.push(v),
+            Value(v)
+                if sub == Some("login")
+                    && (login_args.len() < 2
+                        || login_args.first().is_some_and(|a| a == "reset")) =>
+            {
+                login_args.push(v);
+            }
             Long("config")
                 if matches!(
                     sub,
@@ -267,6 +279,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             Long("entry") if sub == Some("login") => entry = Some(string(p.value()?)?),
             Long("var") if sub == Some("login") => var = Some(string(p.value()?)?),
             Long("force") if sub == Some("login") => force = true,
+            Long("all") if sub == Some("login") => all = true,
             Long("from-stream-json") if sub == Some("report") => {
                 from_stream = Some(PathBuf::from(p.value()?));
             }
@@ -316,6 +329,19 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             [verb, login] if verb == "reset" => Cmd::Call(Call::SpendReset(string(login.clone())?)),
             _ => return Err("expected `spend` or `spend reset <LOGIN>`".into()),
         },
+        Some("login") if login_args.first().is_some_and(|a| a == "reset") && config.is_none() => {
+            let logins = login_args[1..]
+                .iter()
+                .cloned()
+                .map(string)
+                .collect::<Result<Vec<_>, _>>()?;
+            let reset = AdminLoginsReset { logins, all };
+            reset
+                .validate()
+                .map_err(|_| "expected `login reset <LOGIN>...` or `login reset --all`")?;
+            Cmd::Call(Call::LoginsReset(reset))
+        }
+        _ if all => return Err("--all goes with `login reset`".into()),
         Some("login") if login_args.len() == 1 && login_args[0] != "import" => {
             if format.is_some()
                 || source_file.is_some()
@@ -478,6 +504,9 @@ fn run(args: Args) -> Result<ExitCode, String> {
                 Call::SpendReset(login) => {
                     let body = encode(&SpendReset { login })?;
                     send("POST", paths::MODEL_SPEND_RESET, Some(&body))
+                }
+                Call::LoginsReset(reset) => {
+                    send("POST", paths::ADMIN_LOGINS_RESET, Some(&encode(&reset)?))
                 }
                 Call::Why(lease) => send("GET", &format!("{}{lease}", paths::WHY), None),
                 Call::Pick(req) => send("POST", paths::PICK, Some(&encode(&req)?)),

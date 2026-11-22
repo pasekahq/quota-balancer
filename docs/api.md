@@ -121,15 +121,26 @@ Each entry of `windows` overwrites that window of the login's snapshot (`source 
 |---|---|
 | `ok` | With at least one declared window, `unknown`, `auth_stale` and `auth_dead` become `ok`. |
 | `usage_limit`, `rejected` | `exhausted` until the earliest reset of a window at ≥ 0.99 used, else the reset of the vendor's longest window, else one longest-window length from now. |
-| `http_401` | `auth_stale`; a 401 on an `auth_stale` login makes it `auth_dead`, which only an `ok` with a declared window clears, such as a report of a session run after re-login. An `auth_stale` login stays pickable. |
+| `http_401` | `auth_stale`; a 401 on an `auth_stale` login makes it `auth_dead`, which only an `ok` with a declared window, a report of another `credential` (below) or [`POST /v1/admin/logins/reset`](#post-v1adminloginsreset) clears. An `auth_stale` login stays pickable. |
 | `http_429` | `rate_limited` for `outcomes.rate_limit_backoff_s`. |
 | `model_unavailable` | The model is dead on the login for `outcomes.model_unavailable_s`; other models and logins are unaffected. |
 | `error` | Nothing. |
 
 Marks end by time only: an `ok` report does not lift `exhausted` or `rate_limited`. Nothing is
-applied when the report answers an error: 400 for a `utilization` outside `0.0..=1.0` or a
-`model_unavailable` login report without `model`, 404 for an unknown lease or login or a
-`model_unavailable` model no ladder declares.
+applied when the report answers an error: 400 for a `utilization` outside `0.0..=1.0`, a
+`model_unavailable` login report without `model` or a `credential` that is not 8 to 64
+lowercase hex digits, 404 for an unknown lease or login or a `model_unavailable` model no ladder
+declares.
+
+`credential`, optional, is a fingerprint of the credential the reported request used: a hash,
+never the secret ([the gateway](#attempts-and-rotation) sends 16 hex digits of a SHA-256 of the
+credential file). An `auth_stale` or `auth_dead` mark keeps the fingerprint of the report that
+set it; a mark set without one takes the next fingerprint reported. `GET /v1/state` does not show
+it. A report of another fingerprint clears the mark before its outcome applies: the credential
+changed, so the old one's failure says nothing about it. An `error` report with a new
+`credential` therefore clears the mark and does nothing else, and an `http_401` with a new
+`credential` makes the login `auth_stale`, not `auth_dead`. A report without `credential` leaves
+the mark as it is.
 
 Response: `{"accepted": true, "login_status": "exhausted"}` with `login_status` one of `ok`,
 `rate_limited`, `exhausted`, `auth_stale`, `auth_dead`, `unknown`; with several marks the first
@@ -332,6 +343,30 @@ installed: <error>; the old file is kept as <backup>`. The running roles stay, t
 is the candidate and the backup is kept, so a reload installs the candidate and the backup
 restores the old file. `qbd` removes the new backup only when a failed write left the file
 unchanged, and no other backup.
+
+### `POST /v1/admin/logins/reset`
+
+```json
+{"logins": ["login-1", "login-2"]}
+{"all": true}
+```
+
+Clears the `auth_stale` or `auth_dead` mark of each login named in `logins`, or of every declared
+login with `all`; exactly one of the two is given, else 400 `bad_request`. A login the config
+does not declare is 404 `not_found` and nothing is cleared. Other marks stay: an `exhausted` login
+stays `exhausted`. Each login whose mark is cleared is journaled as after a report, so a restart
+keeps it cleared, and leaving `auth_dead` runs the `on_recover` hook. It works with or without a
+`roles_file`. The answer lists every login asked for, in request order or, with `all`, in
+declaration order:
+
+```json
+{"logins": [{"login": "login-1", "cleared": true, "status": "unknown"},
+            {"login": "login-2", "cleared": false, "status": "ok"}]}
+```
+
+`status` is the login's status afterwards, as in `GET /v1/state`. The log line names the logins
+whose mark was cleared, `auth marks cleared: login-1`, or says `no auth mark cleared`. The CLI is
+`qb login reset <LOGIN>...` or `qb login reset --all`.
 
 ### `POST /v1/admin/reload`
 
@@ -542,6 +577,21 @@ released with `error`, and on a ladder or pin route the turn ends with the last 
 as it does when the pick after a failure answers `dead`. So a key login that answers 401 gets
 one call per turn, an OAuth login two (before and after its one refresh).
 
+Both 401 reports carry `credential`, the first 16 hex digits of the SHA-256 of the login's
+credential file's bytes, mode and modification time ([`POST /v1/report`](#post-v1report)). The
+gateway also sends that fingerprint to `qbd` in an `error` report: of every login of its config
+once it serves (on a thread of its own, so it holds no connection back), after each reload of
+each login whose fingerprint differs from the last one `qbd` took, and after a
+[key replacement](#post-v1modelloginsnamekey) or a
+[sign-in](#post-v1modelloginsnameoauthstart-and-oauthcode) wrote a login's file, first the old
+file's and then the new file's, so a mark set without a fingerprint clears as well. So a login
+marked `auth_dead` comes back once its credential file changes: a new key, a new sign-in,
+`qb login`, `qb login import`, or an edited or `chmod`ed file followed by a reload or a restart
+of the gateway. Any write of the file changes the fingerprint, a token refresh included.
+`qb login reset` ([`POST /v1/admin/logins/reset`](#post-v1adminloginsreset)) clears the mark
+without a change. A `qbd` older than `credential` answers these reports 400, so upgrade `qbd`
+before the gateway.
+
 **Session stickiness.** A `TurnRequest` has no `resume_of` field (it is 400 as an unknown
 field); `session_key` is the only session hint, and it guarantees nothing about where a turn
 runs. Two turns with the same `session_key` may run on different logins, vendors or models of
@@ -719,7 +769,7 @@ appends one JSON line per admin action to that file, creating it with mode 0600,
 |---|---|
 | `at` | Unix time of the action |
 | `actor` | `uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload |
-| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse), `config_spend_caps` (one with `spend_caps` only), `login_key` (a `POST /v1/model/logins/{name}/key`), `login_oauth_start` (a `POST /v1/model/logins/{name}/oauth/start`), `login_oauth_code` (a `POST /v1/model/logins/{name}/oauth/code`), `admin_roles` (a `PUT /v1/admin/roles`) or `admin_reload` (a `POST /v1/admin/reload`) |
+| `action` | `reload`, `spend_reset`, `client_rotate`, `config_routes` (a `PUT /v1/model/config/routes` with `routes`, or whose body does not parse), `config_spend_caps` (one with `spend_caps` only), `login_key` (a `POST /v1/model/logins/{name}/key`), `login_oauth_start` (a `POST /v1/model/logins/{name}/oauth/start`), `login_oauth_code` (a `POST /v1/model/logins/{name}/oauth/code`), `admin_roles` (a `PUT /v1/admin/roles`), `admin_reload` (a `POST /v1/admin/reload`) or `admin_logins_reset` (a `POST /v1/admin/logins/reset`) |
 | `object` | the config file of a reload or a config edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation, `qbd_socket` of a request to `qbd`'s admin API; absent when a refused request named none |
 | `result` | `ok` when the action answered 200, else `refused` |
 | `reason` | with `refused`: the refusal's message, such as the reload's `<file>: <field>: <reason>` |
@@ -952,9 +1002,9 @@ candidate and the backup is kept, so a reload installs the candidate and the bac
 old file. The gateway removes the new backup only when a failed write left the file unchanged,
 and no other backup.
 
-### `qbd`'s admin API: `GET`/`PUT /v1/admin/roles` and `POST /v1/admin/reload`
+### `qbd`'s admin API: `GET`/`PUT /v1/admin/roles`, `POST /v1/admin/reload` and `POST /v1/admin/logins/reset`
 
-The gateway forwards these three requests to `qbd`'s admin API ([Admin
+The gateway forwards these four requests to `qbd`'s admin API ([Admin
 `/v1/admin/*`](#admin-v1admin)) on `qbd_socket`, as `qbd` defines them. Only the gateway's own
 uid may send them: any other caller gets 403 `auth` with the message `only the gateway's own uid
 may call qbd's admin API` and nothing is sent to `qbd`; the loopback listener answers 404.
@@ -973,7 +1023,8 @@ never has. An answer of `qbd` without an error body is `unavailable` with its st
 that cannot be reached, or stops answering for 5 s, is 503 `unavailable` with the message
 `qbd is unreachable: <error>`.
 
-With `audit_file`, each `PUT` and `POST` is recorded as `admin_roles` or `admin_reload` on
+With `audit_file`, each `PUT` and `POST` is recorded as `admin_roles`, `admin_reload` or
+`admin_logins_reset` on
 [`GET /v1/model/audit`](#get-v1modelaudit).
 
 ### Usage ledger

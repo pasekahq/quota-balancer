@@ -158,14 +158,16 @@ State, all in one thread, no locks, no allocation on the hot path:
 6. Create the lease (a full table answers `wait`), append one journal line, answer.
 
 `report` is O(1): limit/rejected → exhausted until reset; 401 → `auth_stale`, repeated →
-`auth_dead`, both cleared by an `ok` with an observed window; 429 → short back-off; model unavailable → per-(login, model) dead mark; stream
+`auth_dead`, both cleared by an `ok` with an observed window, by a report of another credential
+fingerprint than the one the mark holds (the gateway reports its credential files' fingerprints)
+or by an admin's `POST /v1/admin/logins/reset`; 429 → short back-off; model unavailable → per-(login, model) dead mark; stream
 windows overwrite the snapshot and reset its TTL. The exact rules are in [api.md](api.md).
 
 ## Hooks
 
 `[hooks]` in the config ([config.md](config.md#hooks)) names commands `qbd` runs on a login's
 `auth_dead` edges: `on_dead` when a report or probe result makes the login `auth_dead`,
-`on_recover` when one clears it. The edge is decided where a request changes the login's marks,
+`on_recover` when a report, a probe result or an admin reset clears it. The edge is decided where a request changes the login's marks,
 so a repeated dead state, journal replay at start and marks that end by time run nothing.
 
 A hook is exec'd without a shell, with stdin and stdout on `/dev/null` and stderr inherited, so

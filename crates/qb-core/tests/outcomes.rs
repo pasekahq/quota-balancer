@@ -238,6 +238,7 @@ fn report_classes_set_the_login_status_and_its_end() {
                 outcome: *class,
                 model: Some("a".into()),
                 release: false,
+                credential: None,
                 windows: windows
                     .iter()
                     .map(|&(name, used, resets_at)| WindowObservation {

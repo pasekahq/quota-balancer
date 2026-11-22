@@ -1,35 +1,49 @@
 //! `qbd`'s `/v1/admin/*`: only a client declared with `admin = true` reaches it. The roles of the
-//! config files on disk, their `roles_file` replaced, and the reload SIGHUP also runs. Every call
-//! logs one line naming its caller.
+//! config files on disk, their `roles_file` replaced, the reload SIGHUP also runs, and the auth
+//! marks of logins cleared. Every call logs one line naming its caller.
 
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use qb_core::Core;
 use qb_proto::{
-    AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, ErrorCode, RoleConfig,
-    RolesSource, paths,
+    AdminLoginsReset, AdminLoginsResetAnswer, AdminReloadAnswer, AdminRoles, AdminRolesPut,
+    AdminRolesWritten, ErrorCode, LoginReset, RoleConfig, RolesSource, paths,
 };
 
 use crate::api::{self, Caller, Reply, error, json};
 use crate::auth::Gate;
 use crate::config;
+use crate::hooks::Runner;
 use crate::http::{Method, Request};
+use crate::journal::Journal;
 use crate::rewrite::{self, basic, float};
 use crate::server::{Reload, unix_now};
 use crate::{log, sha256};
 
-/// Answers `req` to a path under [`paths::ADMIN`] from `caller`; without `reload`, there are no
-/// files to read and every admin path is 404.
+/// The daemon state an admin request may change.
+pub struct State<'a> {
+    /// The policy core.
+    pub core: &'a mut Core,
+    /// The clients and their tokens.
+    pub gate: &'a mut Gate,
+    /// Where changed marks go.
+    pub journal: &'a mut Journal,
+    /// The hooks of `auth_dead` edges.
+    pub hooks: &'a mut Runner,
+}
+
+/// Answers `req` to a path under [`paths::ADMIN`] from `caller` at `now`; without `reload`,
+/// there are no files to read and every admin path but [`paths::ADMIN_LOGINS_RESET`] is 404.
 pub fn handle(
-    core: &mut Core,
-    gate: &mut Gate,
+    state: State<'_>,
     reload: Option<&mut Reload>,
     req: &Request,
     caller: &Caller,
+    now: u64,
 ) -> Reply {
     let mut trail = None;
-    let reply = route(core, gate, reload, req, caller, &mut trail);
+    let reply = route(state, reload, req, caller, now, &mut trail);
     let mut line = format!(
         "qbd: admin {} {} by {}: {}",
         req.method.as_str(),
@@ -48,29 +62,39 @@ pub fn handle(
     reply
 }
 
-/// [`handle`] without its log line; a `PUT` of the roles fills `trail`.
+/// [`handle`] without its log line; a `PUT` of the roles and a reset of logins fill `trail`.
 fn route(
-    core: &mut Core,
-    gate: &mut Gate,
+    state: State<'_>,
     reload: Option<&mut Reload>,
     req: &Request,
     caller: &Caller,
-    trail: &mut Option<Trail>,
+    now: u64,
+    trail: &mut Option<String>,
 ) -> Reply {
     if !caller.admin {
         return error(ErrorCode::Forbidden, "not an admin client");
     }
+    match (req.method, req.path.as_str()) {
+        (Method::Post, paths::ADMIN_LOGINS_RESET) => return reset_logins(state, req, now, trail),
+        (_, paths::ADMIN_LOGINS_RESET) => {
+            return error(ErrorCode::MethodNotAllowed, "method not allowed");
+        }
+        _ => {}
+    }
+    let State { core, gate, .. } = state;
     let Some(reload) = reload else {
         return error(ErrorCode::NotFound, "no config file");
     };
     match (req.method, req.path.as_str()) {
         (Method::Get, paths::ADMIN_ROLES) => roles(&reload.file),
         (Method::Put, paths::ADMIN_ROLES) => {
-            let t = trail.insert(Trail::default());
-            match put_roles(core, gate, reload, req, t) {
+            let mut t = Trail::default();
+            let reply = match put_roles(core, gate, reload, req, &mut t) {
                 Ok(written) => json(200, &written),
                 Err(refused) => refused,
-            }
+            };
+            *trail = Some(t.to_string());
+            reply
         }
         (Method::Post, paths::ADMIN_RELOAD) => match reload.run(core, gate) {
             Ok(()) => json(
@@ -87,6 +111,62 @@ fn route(
         }
         _ => error(ErrorCode::NotFound, "no such endpoint"),
     }
+}
+
+/// Clears the auth marks of the logins of the [`AdminLoginsReset`] body of `req` at `now`, each
+/// changed login journaled as after a report; `trail` names the logins cleared.
+fn reset_logins(state: State<'_>, req: &Request, now: u64, trail: &mut Option<String>) -> Reply {
+    let body: AdminLoginsReset = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => return error(ErrorCode::BadRequest, format!("invalid reset: {e}")),
+    };
+    if let Err(e) = body.validate() {
+        return error(ErrorCode::BadRequest, format!("invalid reset: {e}"));
+    }
+    let State {
+        core,
+        journal,
+        hooks,
+        ..
+    } = state;
+    let logins: Vec<String> = if body.all {
+        core.login_names().map(str::to_owned).collect()
+    } else {
+        body.logins
+    };
+    if let Some(unknown) = logins.iter().find(|l| !core.has_login(l)) {
+        return error(
+            ErrorCode::NotFound,
+            format!("no login `{}`", log::peer_text(unknown)),
+        );
+    }
+    // Marks that end by time end first, so the journal records only what the reset changed.
+    core.tick(now);
+    let mut answer = AdminLoginsResetAnswer { logins: Vec::new() };
+    for login in logins {
+        let before = core.marks(&login);
+        let Some((cleared, status)) = core.reset_auth(&login, now) else {
+            continue;
+        };
+        api::record_marks(journal, hooks, core, login.clone(), before.as_ref(), now);
+        answer.logins.push(LoginReset {
+            login,
+            cleared,
+            status: api::login_status(status),
+        });
+    }
+    let cleared: Vec<&str> = answer
+        .logins
+        .iter()
+        .filter(|l| l.cleared)
+        .map(|l| l.login.as_str())
+        .collect();
+    *trail = Some(if cleared.is_empty() {
+        "no auth mark cleared".to_owned()
+    } else {
+        format!("auth marks cleared: {}", cleared.join(" "))
+    });
+    json(200, &answer)
 }
 
 /// The roles of the config file `file` and its `roles_file` as they are on disk, with the hash of

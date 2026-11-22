@@ -159,7 +159,7 @@ fn record(journal: &mut Journal, core: &Core, record: &Record, now: u64) {
 
 /// Journals the marks of `login` when they differ from `before`, its marks before the change,
 /// and fires the hook of an edge into or out of `auth_dead`.
-fn record_marks(
+pub(crate) fn record_marks(
     journal: &mut Journal,
     hooks: &mut Runner,
     core: &Core,
@@ -296,6 +296,16 @@ fn report(
         Ok(r) => r,
         Err(e) => return error(ErrorCode::BadRequest, format!("invalid report: {e}")),
     };
+    if req
+        .credential
+        .as_deref()
+        .is_some_and(|c| !qb_proto::credential_valid(c))
+    {
+        return error(
+            ErrorCode::BadRequest,
+            "invalid report: `credential` must be 8 to 64 lowercase hex digits",
+        );
+    }
     let subject = match (req.lease_id, req.login) {
         (Some(lease), _) => match parse_lease_id(&lease) {
             Some(id) => ReportSubject::Lease(id),
@@ -309,6 +319,7 @@ fn report(
         outcome: outcome(req.outcome),
         model: req.model,
         release: req.release,
+        credential: req.credential,
         windows: observations(req.windows),
     };
     core.tick(now);
@@ -601,7 +612,7 @@ fn outcome(o: Outcome) -> OutcomeClass {
     }
 }
 
-fn login_status(s: CoreStatus) -> LoginStatus {
+pub(crate) fn login_status(s: CoreStatus) -> LoginStatus {
     match s {
         CoreStatus::Ok => LoginStatus::Ok,
         CoreStatus::RateLimited => LoginStatus::RateLimited,

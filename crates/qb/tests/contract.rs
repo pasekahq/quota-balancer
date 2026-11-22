@@ -21,10 +21,11 @@ use qb::hooks::Runner;
 use qb::journal::{self, Journal};
 use qb_core::{Core, Record, Spec};
 use qb_proto::{
-    AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten, AgentJob, Decision, ErrorBody,
-    ErrorCode, HealthResponse, HealthStatus, LadderCandidate, LadderStep, LoginStatus, Outcome,
-    PickResponse, ReportRequest, ReportResponse, RoleConfig, RoleReserve, RolesResponse,
-    RolesSource, Source, StateResponse, WhyResponse, WindowReport, paths,
+    AdminLoginsResetAnswer, AdminReloadAnswer, AdminRoles, AdminRolesPut, AdminRolesWritten,
+    AgentJob, Decision, ErrorBody, ErrorCode, HealthResponse, HealthStatus, LadderCandidate,
+    LadderStep, LoginStatus, Outcome, PickResponse, ReportRequest, ReportResponse, RoleConfig,
+    RoleReserve, RolesResponse, RolesSource, Source, StateResponse, WhyResponse, WindowReport,
+    paths,
 };
 
 mod common;
@@ -292,6 +293,7 @@ fn report_windows(sock: &Path, login: &str, windows: &[(&str, f64, u64)]) {
             })
             .collect(),
         release: false,
+        credential: None,
     };
     let body = serde_json::to_vec(&req).unwrap();
     let (status, resp) = call(sock, "POST", paths::REPORT, Some(&body), None).unwrap();
@@ -728,6 +730,169 @@ fn leases_and_marks_survive_a_restart() {
     let fresh: PickResponse = post(&sock, paths::PICK, TASK);
     let fresh = fresh.lease_id.unwrap();
     assert!(fresh != released && after.leases.iter().all(|l| l.lease_id != fresh));
+}
+
+/// [`journaled_config`] with `client-a` an admin.
+fn admin_journaled_config(dir: &Path) -> PathBuf {
+    let (from, to) = client_uid("client-a", own_uid());
+    config_copy(
+        dir,
+        &[
+            (from, format!("{to}\nadmin = true")),
+            client_uid("agent-1", foreign_uid(0)),
+            (
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                BEARER_SHA256.to_owned(),
+            ),
+            ("rate_per_s = 5.0", "rate_per_s = 1000.0".to_owned()),
+            ("burst = 20", "burst = 1000".to_owned()),
+        ],
+    )
+}
+
+/// Reports `outcome` on `login` with the credential fingerprint `fp`: the login's status after.
+fn report_credential(sock: &Path, login: &str, outcome: &str, fp: &str) -> LoginStatus {
+    let body = format!(r#"{{"login":"{login}","outcome":"{outcome}","credential":"{fp}"}}"#);
+    let r: ReportResponse = post(sock, paths::REPORT, &body);
+    r.login_status
+}
+
+fn status_in(s: &StateResponse, login: &str) -> LoginStatus {
+    s.logins.iter().find(|l| l.login == login).unwrap().status
+}
+
+#[test]
+fn a_new_credential_clears_auth_dead_and_the_change_survives_a_restart() {
+    let dir = temp_dir("credential");
+    let config = journaled_config(&dir, 1 << 20);
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    for _ in 0..2 {
+        report_credential(&sock, "login-3", "http_401", "aaaaaaaaaaaaaaaa");
+    }
+    assert_eq!(status_in(&state(&sock), "login-3"), LoginStatus::AuthDead);
+    drop(d);
+
+    let d = start(&config, &sock);
+    assert_eq!(status_in(&state(&sock), "login-3"), LoginStatus::AuthDead);
+    assert_eq!(
+        report_credential(&sock, "login-3", "error", "aaaaaaaaaaaaaaaa"),
+        LoginStatus::AuthDead,
+        "the credential the mark was reported with keeps it after a restart"
+    );
+    let bad = br#"{"login":"login-3","outcome":"error","credential":"not hex"}"#;
+    let (status, body) = call(&sock, "POST", paths::REPORT, Some(bad), None).unwrap();
+    assert_eq!((status, error_of(&body)), (400, ErrorCode::BadRequest));
+    assert_ne!(
+        report_credential(&sock, "login-3", "error", "bbbbbbbbbbbbbbbb"),
+        LoginStatus::AuthDead,
+        "a new credential clears the mark"
+    );
+    drop(d);
+
+    let _d = start(&config, &sock);
+    assert_ne!(status_in(&state(&sock), "login-3"), LoginStatus::AuthDead);
+    let pin =
+        r#"{"role":"worker","pin":{"vendor":"vendor-b","model":"model-small","login":"login-3"}}"#;
+    let picked: PickResponse = post(&sock, paths::PICK, pin);
+    assert_eq!(picked.login.as_deref(), Some("login-3"), "{picked:?}");
+    let journal = std::fs::read_to_string(dir.join("journal")).unwrap();
+    assert!(
+        journal.contains(r#""auth":"dead","credential":"aaaaaaaaaaaaaaaa""#),
+        "{journal}"
+    );
+}
+
+/// `qb login reset` with `args` against `sock` as this process's uid, or with `bearer`: its exit
+/// code and stdout.
+fn login_reset(sock: &Path, bearer: Option<&Path>, args: &[&str]) -> (i32, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qb"));
+    cmd.arg("--socket").arg(sock);
+    if let Some(file) = bearer {
+        cmd.arg("--bearer-file").arg(file);
+    }
+    let out = cmd
+        .args(["login", "reset"])
+        .args(args)
+        .env_remove("QB_BEARER_FILE")
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8(out.stdout).unwrap(),
+    )
+}
+
+#[test]
+fn login_reset_clears_auth_marks_for_an_admin_only_and_survives_a_restart() {
+    let dir = temp_dir("loginreset");
+    let config = admin_journaled_config(&dir);
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    let released = mark_and_lease(&sock);
+    report_credential(&sock, "login-2", "http_401", "aaaaaaaaaaaaaaaa");
+    let before = state(&sock);
+    assert_eq!(status_in(&before, "login-2"), LoginStatus::AuthStale);
+
+    let bearer = dir.join("bearer");
+    std::fs::write(&bearer, BEARER).unwrap();
+    let (code, _) = login_reset(&sock, Some(&bearer), &["login-3"]);
+    assert_eq!(code, 1, "client-b is no admin");
+    assert_eq!(status_in(&state(&sock), "login-3"), LoginStatus::AuthDead);
+    let (code, _) = login_reset(&sock, None, &["login-9"]);
+    assert_eq!(code, 1, "an unknown login");
+    assert_eq!(status_in(&state(&sock), "login-3"), LoginStatus::AuthDead);
+
+    let (code, out) = login_reset(&sock, None, &["login-3", "login-1"]);
+    assert_eq!(code, 0, "{out}");
+    let answer: AdminLoginsResetAnswer = serde_json::from_str(&out).unwrap();
+    let got: Vec<(&str, bool, LoginStatus)> = answer
+        .logins
+        .iter()
+        .map(|l| (l.login.as_str(), l.cleared, l.status))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("login-3", true, LoginStatus::Unknown),
+            ("login-1", false, LoginStatus::Exhausted),
+        ]
+    );
+    let (code, out) = login_reset(&sock, None, &["--all"]);
+    assert_eq!(code, 0, "{out}");
+    let answer: AdminLoginsResetAnswer = serde_json::from_str(&out).unwrap();
+    let cleared: Vec<&str> = answer
+        .logins
+        .iter()
+        .filter(|l| l.cleared)
+        .map(|l| l.login.as_str())
+        .collect();
+    assert_eq!(cleared, ["login-2"]);
+    assert_eq!(answer.logins.len(), before.logins.len());
+    drop(d);
+
+    let _d = start(&config, &sock);
+    let after = state(&sock);
+    for l in &after.logins {
+        assert!(
+            !matches!(l.status, LoginStatus::AuthDead | LoginStatus::AuthStale),
+            "{l:?}"
+        );
+    }
+    assert_eq!(status_in(&after, "login-1"), LoginStatus::Exhausted);
+    assert!(after.leases.iter().all(|l| l.lease_id != released));
+    assert_eq!(after.leases.len(), 1, "the live lease stays");
+}
+
+#[test]
+fn login_reset_needs_logins_or_all() {
+    // Usage errors exit before any connection.
+    let sock = Path::new("/nonexistent/qb.sock");
+    for args in [&[][..], &["--all", "login-1"][..]] {
+        let (code, _) = login_reset(sock, None, args);
+        assert_eq!(code, 2, "{args:?}");
+    }
 }
 
 #[test]
