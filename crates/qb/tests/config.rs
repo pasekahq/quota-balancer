@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use qb::config::{self, Journal, Kind};
-use qb::gateway::config::{Api, GatewayConfig};
+use qb::gateway::config::{Api, GatewayConfig, Route};
 use qb_core::ProbeSpec;
 
 const BASE: &str = r#"
@@ -671,6 +671,42 @@ fn front_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> {
     faults
 }
 
+/// The vendors of the candidates of every ladder step of `role`.
+fn candidate_vendors(role: &config::Role) -> impl Iterator<Item = &str> {
+    role.ladder
+        .iter()
+        .flat_map(|s| &s.candidates)
+        .map(|c| c.vendor.as_str())
+}
+
+/// Breaks of the rule that a route's `logins` hold a login of its pinned vendor, of each chain
+/// step's vendor, or, on a ladder route, of a candidate vendor of `role`: without one every pick
+/// of the route, or of that step, is limited to logins that cannot serve it.
+fn listed_faults(qbd: &config::Config, route: &Route, role: &config::Role) -> Vec<String> {
+    let Some(names) = &route.logins else {
+        return Vec::new();
+    };
+    let alias = &route.alias;
+    let listed = |vendor: &str| {
+        served_by(qbd, vendor)
+            .iter()
+            .any(|l| names.iter().any(|n| n == l))
+    };
+    let pinned = route.chain.iter().map(|s| s.vendor.as_str());
+    let mut faults: Vec<String> = pinned
+        .chain(route.vendor.as_deref())
+        .filter(|v| !listed(v))
+        .map(|v| format!("route `{alias}`: no listed login serves vendor `{v}`"))
+        .collect();
+    if route.difficulty.is_some() && !candidate_vendors(role).any(listed) {
+        faults.push(format!(
+            "route `{alias}`: no listed login serves a candidate vendor of `{}`",
+            role.name
+        ));
+    }
+    faults
+}
+
 /// Every break of the rules that make `gw` and `qbd` one installation (docs/config.md, Gateway
 /// config and Spend caps), one line each.
 fn installation_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> {
@@ -699,6 +735,7 @@ fn installation_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> 
         }
         let mut vendors: Vec<&str> = route.chain.iter().map(|s| s.vendor.as_str()).collect();
         vendors.extend(route.vendor.as_deref());
+        faults.extend(listed_faults(qbd, route, role));
         if let Some(difficulty) = route.difficulty {
             if !role.ladder.iter().any(|s| s.difficulty == difficulty) {
                 faults.push(format!(
@@ -706,12 +743,7 @@ fn installation_faults(qbd: &config::Config, gw: &GatewayConfig) -> Vec<String> 
                     role.name
                 ));
             }
-            vendors.extend(
-                role.ladder
-                    .iter()
-                    .flat_map(|s| &s.candidates)
-                    .map(|c| c.vendor.as_str()),
-            );
+            vendors.extend(candidate_vendors(role));
         }
         for vendor in vendors {
             let logins = served_by(qbd, vendor);
@@ -836,6 +868,27 @@ fn a_broken_installation_rule_is_found_in_either_example() {
         (
             gw("difficulty = 1", "difficulty = 2"),
             "route `work`: no step 2 in `gateway`",
+        ),
+        (
+            gw(
+                "vendor = \"vendor-a\"\nmodel = \"model-small\"",
+                "vendor = \"vendor-a\"\nmodel = \"model-small\"\nlogins = [\"key-1\"]",
+            ),
+            "route `compact`: no listed login serves vendor `vendor-a`",
+        ),
+        (
+            gw(
+                "expected_minutes = 2",
+                "expected_minutes = 2\nlogins = [\"login-1\", \"key-2\"]",
+            ),
+            "route `chat`: no listed login serves vendor `vendor-d`",
+        ),
+        (
+            gw(
+                "logins = [\"login-1\", \"login-3\", \"key-4\"]",
+                "logins = [\"key-1\"]",
+            ),
+            "route `hive-step-1`: no listed login serves a candidate vendor of `hive-heads`",
         ),
     ];
     for ((qbd_edit, gw_edit), fault) in cases {
