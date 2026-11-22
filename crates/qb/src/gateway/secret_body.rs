@@ -8,12 +8,13 @@
 //! unknown field under `deny_unknown_fields`, say) drops that `String` before the caller can wrap
 //! it. Here `serde_json` only borrows the field's raw JSON text from the body, which the caller
 //! holds in a zeroizing buffer. The text is then unescaped straight into a zeroizing string
-//! allocated at a size it never outgrows. Field names and every refusal go through `serde_json`
-//! as before, so the errors read the same.
+//! allocated at a size it never outgrows. Field names are compared where `serde_json` holds them
+//! and never copied into an error, in case a secret was sent as a name. Every refusal is a
+//! `serde_json` data or syntax error as before, so the gateway's messages read the same.
 
 use std::fmt;
 
-use serde::de::{self, Deserializer as _, MapAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Deserializer as _, MapAccess, Visitor};
 use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
@@ -47,9 +48,10 @@ impl<'de> Visitor<'de> for OneField {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut value = None;
-        while let Some(name) = map.next_key::<String>()? {
-            if name != self.0 {
-                return Err(de::Error::unknown_field(&name, &[]));
+        while let Some(known) = map.next_key_seed(IsField(self.0))? {
+            if !known {
+                // A secret sent by mistake as a field name must not reach the error text.
+                return Err(de::Error::custom("unknown field"));
             }
             if value.is_some() {
                 return Err(de::Error::duplicate_field(self.0));
@@ -57,6 +59,32 @@ impl<'de> Visitor<'de> for OneField {
             value = Some(map.next_value::<&RawValue>()?);
         }
         value.ok_or_else(|| de::Error::missing_field(self.0))
+    }
+}
+
+/// The seed and visitor of a field name: whether it is `.0`. It compares the name where
+/// `serde_json` holds it, so no copy of a name is made here: one sent without escapes is
+/// borrowed from the body, one with escapes sits in `serde_json`'s scratch buffer, as any
+/// field name of any body would.
+struct IsField(&'static str);
+
+impl<'de> DeserializeSeed<'de> for IsField {
+    type Value = bool;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl Visitor<'_> for IsField {
+    type Value = bool;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a field name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<bool, E> {
+        Ok(name == self.0)
     }
 }
 
@@ -179,7 +207,10 @@ mod tests {
             r#"{"key":"\ude00x"}"#,
             r#"{"key":"\ud83dx"}"#,
         ] {
-            assert!(decode(body.as_bytes(), "key").is_err(), "{body}");
+            let e = decode(body.as_bytes(), "key").map(|_| ()).unwrap_err();
+            // serde_json refused these as syntax when it built the `String`; the raw text it
+            // borrows passes, so the refusal is now a data error, as for a value of another type.
+            assert!(e.is_data(), "{body}: {e}");
         }
     }
 
@@ -190,6 +221,8 @@ mod tests {
             r#"{"key":"secret-value","key":"secret-value"}"#,
             r#"{"key":"secret-value"} trailing"#,
             r#"{"key":"secret-value\ud800"}"#,
+            r#"{"secret-value":"x"}"#,
+            r#"{"key":"x","secret-value":"x"}"#,
         ] {
             let e = decode(body.as_bytes(), "key").map(|_| ()).unwrap_err();
             assert!(!e.to_string().contains("secret-value"), "{body}: {e}");
