@@ -172,7 +172,7 @@ is the path below the vendor's base URL.
 |---|---|
 | `system` and every `system` message | the first message, `{role: system, content}`, joined by a blank line (compatible vendors differ on later system messages); absent when empty |
 | `user` message | one `tool` message per `tool_result{id,content}` (`tool_call_id: id`, `content`), then one `user` message of `text` and `image_url` parts (a base64 `data:` URL) |
-| `assistant` message | one `assistant` message: its text joined as `content` (`null` without text), `tool_calls[]{id, type: function, function{name, arguments: input as JSON}}` with the canonical id unchanged |
+| `assistant` message | one `assistant` message: its text joined as `content` (`null` without text), `tool_calls[]{id, type: function, function{name, arguments: input as JSON}}` |
 | `thinking` of any vendor; empty text; images of an assistant message | dropped |
 | `image` with `path` | `BuildError` |
 | `tools[]` | `tools[]{type: function, function{name, description, parameters}}`, `tool_choice: auto`; a tool with `native` follows its `elsewhere` as on the Messages upstream (`omit` left out, `refuse` a `BuildError`) |
@@ -180,6 +180,13 @@ is the path below the vendor's base URL.
 | (always) | `stream: true`, `stream_options.include_usage: true` |
 
 `effort` and `session_key` are not sent.
+
+A tool id goes out unchanged in `tool_calls[].id` and `tool_call_id` up to 40 bytes, the most
+the OpenAI API takes (`chat_upstream::MAX_TOOL_ID`; a longer one is a 400, "string too long").
+A longer id (a client's, or another vendor's that a chain turn brings back) goes out as `qbh_`
+and the 32 lowercase hex digits of its 128-bit FNV-1a hash, the same in the call and its tool
+message, so the pair still matches on every turn. The vendor answers with ids of its own, so the
+client never sees the shortened form. The id rules of other compatible vendors are not recorded.
 
 | Header | Value |
 |---|---|

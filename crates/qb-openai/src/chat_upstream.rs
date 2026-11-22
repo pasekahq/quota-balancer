@@ -3,6 +3,7 @@
 //! [`Reader`] turns the SSE answer into canonical content events, the stop reason and the
 //! vendor-reported cost. A non-200 answer is [`crate::limits::classify_chat_response`].
 
+use std::borrow::Cow;
 use std::fmt;
 
 use qb_proto::{Block, Elsewhere, Role, StopReason, StreamEvent, ToolCall, TurnRequest, Usage};
@@ -103,7 +104,7 @@ pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> 
                     return Err(BuildError::ImagePath(path.clone().unwrap_or_default()));
                 }
                 Block::ToolUse { id, name, input } => calls.push(ChatToolCall {
-                    id: id.clone(),
+                    id: tool_id(id).into_owned(),
                     kind: "function".into(),
                     function: FunctionCall {
                         name: name.clone(),
@@ -111,7 +112,7 @@ pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> 
                     },
                 }),
                 Block::ToolResult { id, content, .. } => results.push(ChatMessage {
-                    tool_call_id: Some(id.clone()),
+                    tool_call_id: Some(tool_id(id).into_owned()),
                     ..message("tool", Some(ChatContent::Text(content.clone())))
                 }),
                 Block::Thinking { .. } => {}
@@ -154,6 +155,31 @@ pub fn build(req: &TurnRequest, model: &str) -> Result<ChatRequest, BuildError> 
         }),
         ..ChatRequest::default()
     })
+}
+
+/// The longest tool call id the OpenAI Chat Completions API takes (a longer one is a 400,
+/// "string too long"). The id rules of other compatible vendors are not recorded.
+pub const MAX_TOOL_ID: usize = 40;
+
+/// Prefix of a tool id over [`MAX_TOOL_ID`] bytes, shortened by [`tool_id`].
+pub const SHORTENED_TOOL_ID_PREFIX: &str = "qbh_";
+
+/// `id` as the vendor accepts it: unchanged up to [`MAX_TOOL_ID`] bytes, else
+/// [`SHORTENED_TOOL_ID_PREFIX`] and the 32 lowercase hex digits of its 128-bit FNV-1a hash
+/// (36 bytes). The map is deterministic, so a tool call and its tool message still pair on every
+/// turn, and two ids of one history merge only by a deliberate collision of the client's own.
+/// Ids of another vendor or of a client then reach the vendor instead of a 400; the vendor
+/// answers with ids of its own, so a client never sees the shortened form.
+pub fn tool_id(id: &str) -> Cow<'_, str> {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    if id.len() <= MAX_TOOL_ID {
+        return Cow::Borrowed(id);
+    }
+    let hash = id
+        .bytes()
+        .fold(OFFSET, |h, b| (h ^ u128::from(b)).wrapping_mul(PRIME));
+    Cow::Owned(format!("{SHORTENED_TOOL_ID_PREFIX}{hash:032x}"))
 }
 
 /// The system prompt and the text of every system message, joined by a blank line: compatible

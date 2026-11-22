@@ -168,6 +168,76 @@ fn an_assistant_turn_of_tool_calls_only_has_null_content_and_no_system_without_o
     assert!(got.get("tools").is_none() && got.get("tool_choice").is_none());
 }
 
+/// A history of two tool rounds with these ids, each call answered by its result.
+fn rounds(ids: &[&str]) -> TurnRequest {
+    let mut messages = vec![Message {
+        role: Role::User,
+        content: vec![Block::Text { text: "Go".into() }],
+    }];
+    for id in ids {
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![Block::ToolUse {
+                id: (*id).into(),
+                name: "read".into(),
+                input: object(json!({"path": "a"})),
+            }],
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: vec![Block::ToolResult {
+                id: (*id).into(),
+                content: "ok".into(),
+                is_error: None,
+            }],
+        });
+    }
+    TurnRequest { messages, ..turn() }
+}
+
+/// The ids of the body's assistant tool calls and of its tool messages, in order.
+fn sent_ids(req: &TurnRequest) -> (Vec<String>, Vec<String>) {
+    let got = serde_json::to_value(build(req, "m").expect("builds")).expect("json");
+    let messages = got["messages"].as_array().expect("messages");
+    let calls = messages
+        .iter()
+        .filter_map(|m| m["tool_calls"].as_array())
+        .flatten()
+        .map(|c| c["id"].as_str().expect("id").to_owned())
+        .collect();
+    let results = messages
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["tool_call_id"].as_str().expect("id").to_owned())
+        .collect();
+    (calls, results)
+}
+
+#[test]
+fn tool_ids_over_40_bytes_go_out_shortened_and_still_paired() {
+    let short = "call_abc.def:0";
+    let at_limit = "x".repeat(40);
+    let long_a = format!("{}a", "functions.read:".repeat(3));
+    let long_b = format!("{}b", "functions.read:".repeat(3));
+    let ids = [short, at_limit.as_str(), long_a.as_str(), long_b.as_str()];
+    let (calls, results) = sent_ids(&rounds(&ids));
+    assert_eq!(calls, results, "each tool message answers its call");
+    assert_eq!(calls[0], short, "an id within the bound goes out unchanged");
+    assert_eq!(calls[1], at_limit);
+    for long in &calls[2..] {
+        assert!(long.len() <= 40, "{long}");
+        assert!(long.starts_with("qbh_"), "{long}");
+        assert!(long.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+    }
+    assert_ne!(calls[2], calls[3], "two long ids never merge");
+    assert_eq!(
+        calls[2], "qbh_3ec158b254665c91196a4a89031ce6d7",
+        "the hash of a history in flight never changes"
+    );
+    let (again, _) = sent_ids(&rounds(&ids));
+    assert_eq!(again, calls, "the map is deterministic across turns");
+}
+
 #[test]
 fn an_image_path_is_refused() {
     let mut req = turn();

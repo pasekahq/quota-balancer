@@ -563,11 +563,12 @@ Across vendors, on a chain step or a re-pick with `avoid_vendor`, a turn keeps t
   adapter call; the picked vendor's own thinking goes back to it.
 - Tool ids pass unchanged in both directions: a `tool_use` or `tool_result` id reaches every
   vendor as the client sent it, and a vendor's tool call id reaches the client as the vendor
-  sent it. The one exception: Anthropic accepts a tool id only when it matches
+  sent it. Two exceptions: Anthropic accepts a tool id only when it matches
   `^[a-zA-Z0-9_-]+$`, so its adapter sends any other id (some Chat Completions providers issue
   ids like `functions.read:0`) as `qbx_` and the lowercase hex of its bytes, the same in the
-  `tool_use` and its `tool_result`. Anthropic answers with ids of its own, so a client never
-  sees the rewritten form.
+  `tool_use` and its `tool_result`. Likewise the Chat Completions adapter sends an id over 40
+  bytes, the most the OpenAI Chat Completions API takes, as `qbh_` and 32 hex digits of its
+  hash. Each vendor answers with ids of its own, so a client never sees a rewritten form.
 - A fallback happens only before the first event reached the client; after it a failure ends
   the turn with `error`, `tried` lists every attempt of the turn, and no later step is called.
 - A login that failed in the turn is not picked again in it (above).
