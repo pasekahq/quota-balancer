@@ -19,8 +19,12 @@ request and writes refreshed OAuth tokens back. See `docs/design.md` and
 The agent and the gateway read a credential file into a zeroizing buffer and build each secret
 header value at its final size in a zeroizing string. The agent borrows the token straight from
 that buffer: it reads the JSON string raw and refuses one with escapes, so the JSON parser never
-unescapes it into a scratch buffer of its own. Sending the request still makes copies that are
-freed without being overwritten:
+unescapes it into a scratch buffer of its own. The gateway decodes the two request bodies that bring a secret, the key of
+`POST /v1/model/logins/{name}/key` and the paste of `.../oauth/code`, the same way: the JSON
+parser only borrows the field's raw text from the zeroizing body and checks the object's shape,
+and the gateway unescapes the text itself into a zeroizing string allocated at its final size, so
+a refused body (an unknown field, say) leaves no copy behind either. Sending the request still
+makes copies that are freed without being overwritten:
 
 - **ureq's header value.** ureq copies each header value, `Authorization` included, into an
   `http::HeaderValue` when the request is built; it is freed when the call returns.

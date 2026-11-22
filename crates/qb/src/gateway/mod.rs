@@ -18,6 +18,8 @@
 //! - [`chat_upstream`]: the adapter of the `chat_completions` API family;
 //! - [`oauth`]: the token endpoint client of `oauth_anthropic` and `chatgpt_oauth` logins, for
 //!   refreshes and sign-ins;
+//! - [`secret_body`]: the bodies that carry a key or a sign-in code, decoded without unzeroized
+//!   copies;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`spend`]: the monthly spend count of capped logins;
 //! - [`audit`]: the admin audit file, appended to and read back;
@@ -48,6 +50,7 @@ pub mod messages;
 pub mod oauth;
 pub mod openai;
 pub mod openai_upstream;
+mod secret_body;
 pub mod signin;
 pub mod spend;
 pub mod tokens;

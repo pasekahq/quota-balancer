@@ -794,17 +794,26 @@ impl LoginKey {
     /// # Errors
     /// The rule it breaks, never the key.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.key.is_empty() {
-            return Err("`key` is empty");
-        }
-        if self.key.len() > MAX_LOGIN_KEY {
-            return Err("`key` is longer than 4096 bytes");
-        }
-        if !self.key.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err("`key` holds whitespace, a control character or non-ASCII");
-        }
-        Ok(())
+        validate_login_key(&self.key)
     }
+}
+
+/// Checks `key` as [`LoginKey::validate`] checks the key of a [`LoginKey`], for a caller that
+/// decoded the key without the struct.
+///
+/// # Errors
+/// The rule it breaks, never the key.
+pub fn validate_login_key(key: &str) -> Result<(), &'static str> {
+    if key.is_empty() {
+        return Err("`key` is empty");
+    }
+    if key.len() > MAX_LOGIN_KEY {
+        return Err("`key` is longer than 4096 bytes");
+    }
+    if !key.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("`key` holds whitespace, a control character or non-ASCII");
+    }
+    Ok(())
 }
 
 /// `POST /v1/model/logins/{name}/key` response. It never holds the key.
