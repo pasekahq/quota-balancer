@@ -89,14 +89,14 @@ COMMANDS:
                                         without a daemon and print the /v1/state JSON at T
                                         (default: the last record's time), then the
                                         PickResponse to the PickRequest JSON; writes nothing
-    version                             print the version
+    version                             print the version and the git revision built from
 
 OPTIONS:
     -s, --socket PATH       unix socket (default: $QB_SOCKET, else /run/qb/qb.sock)
     --bearer-file PATH      send the token in PATH (trailing whitespace trimmed) as
                             `Authorization: Bearer` (default: $QB_BEARER_FILE)
     -h, --help              print this help
-    -V, --version           print the version
+    -V, --version           print the version and the git revision built from
 
 Client commands print the JSON response and exit 0 on HTTP 2xx, 1 otherwise, 2 on usage or
 connection errors. qb sends no telemetry.
@@ -438,7 +438,13 @@ fn run(args: Args) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Version => {
-            let _ = writeln!(out, "qb {}", env!("CARGO_PKG_VERSION"));
+            // The revision tells apart builds of one version (`build.rs`).
+            let _ = writeln!(
+                out,
+                "qb {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("QB_REVISION")
+            );
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Daemon(config) => daemon(&args.socket, &config),
