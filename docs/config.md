@@ -371,6 +371,8 @@ table, cannot be edited this way.
 `qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
 `qbd_bearer_file`) whose `role` is one the routes name, with `admin = true` when the gateway's
 own uid is to reach `qbd`'s admin API through it ([api.md](api.md#qbds-admin-api-getput-v1adminroles-and-post-v1adminreload)).
+One such entry serves every route: `qbd` picks for the role a request names, not for the
+caller's declared role, so the other roles the routes name need no client of their own.
 
 `[openai_models]`, optional: settings of models of the `openai` API family, keyed by model id as
 `qbd` picks it, at most 256. An entry applies to every route and login of `api = "openai"` that
