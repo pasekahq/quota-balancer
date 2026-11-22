@@ -3175,6 +3175,32 @@ fn only_the_gateway_s_own_uid_reads_the_usage_and_only_on_the_unix_socket() {
 }
 
 #[test]
+fn usage_skips_a_rotated_sibling_that_is_no_file_and_sums_lines_at_the_u64_limit() {
+    let dir = temp_dir("usage-edges");
+    let ledger = dir.join("usage.jsonl");
+    let top = u64::MAX - 10;
+    let lines = [ledger_line(USAGE_FROM, |_| ()), ledger_line(top, |_| ())];
+    std::fs::write(&ledger, format!("{}\n", lines.join("\n"))).unwrap();
+    std::fs::create_dir(dir.join(format!("usage.jsonl.{USAGE_FROM}"))).unwrap();
+    let r = rig_as(4, &key_files(), &usage_table(&ledger, 1 << 20), own_uid());
+
+    let (status, body) = usage_of(&r.gw, &format!("?from={USAGE_FROM}&to={USAGE_TO}"));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let answer: UsageAnswer = serde_json::from_slice(&body).unwrap();
+    assert_eq!(usage_rows(&answer), [(USAGE_FROM, None, 1)]);
+
+    let query = format!("?from={}&to={}&bucket=month", top - 10, u64::MAX);
+    let (status, body) = usage_of(&r.gw, &query);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let answer: UsageAnswer = serde_json::from_slice(&body).unwrap();
+    let rows = usage_rows(&answer);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (start, group, attempts) = rows[0];
+    assert!(start <= top && top - start < 31 * 86_400, "{start}");
+    assert_eq!((group, attempts), (None, 1));
+}
+
+#[test]
 fn a_bad_usage_query_or_too_many_rows_is_400_naming_the_cause() {
     let ledger = temp_dir("usage").join("usage.jsonl");
     let r = rig_as(4, &key_files(), &usage_table(&ledger, 1 << 20), own_uid());

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io;
 use std::ops::ControlFlow;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -90,8 +91,9 @@ impl Ledger {
     }
 }
 
-/// The rotated files of the ledger `file`: `(stamp, path)` of each `<file>.<unix s>` beside it,
-/// oldest first.
+/// The rotated files of the ledger `file`: `(stamp, path)` of each regular file (or link to one)
+/// `<file>.<unix s>` beside it, oldest first; a directory or other kind of that name is no
+/// rotated file and is left out.
 ///
 /// # Errors
 /// The directory cannot be read.
@@ -104,8 +106,12 @@ pub fn rotated(file: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if let Some(stamp) = stamp_of(&entry.file_name(), &prefix) {
-            files.push((stamp, entry.path()));
+        let Some(stamp) = stamp_of(&entry.file_name(), &prefix) else {
+            continue;
+        };
+        let path = entry.path();
+        if std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+            files.push((stamp, path));
         }
     }
     files.sort();
@@ -203,7 +209,9 @@ pub(crate) enum AggregateError {
 
 /// The sums of the lines of the ledger `file` with `at` from `query.from` up to `to`, read from
 /// `file` and the rotated files whose stamp is at or after `query.from`; a missing file counts
-/// as empty.
+/// as empty. The current file is opened before the rotated files are listed and a rotated file
+/// that is the one opened is not read twice, so a rotation during the read neither hides nor
+/// doubles a line, and appends never wait for a read.
 ///
 /// # Errors
 /// More than [`MAX_USAGE_ROWS`] rows, or a ledger file that cannot be listed or read.
@@ -212,8 +220,26 @@ pub(crate) fn aggregate(
     query: &UsageQuery,
     to: u64,
 ) -> Result<UsageAnswer, AggregateError> {
+    aggregate_paced(file, query, to, || ())
+}
+
+/// [`aggregate`], calling `pause` once the current file is open and again once the rotated
+/// files are listed, before any is read.
+fn aggregate_paced(
+    file: &Path,
+    query: &UsageQuery,
+    to: u64,
+    mut pause: impl FnMut(),
+) -> Result<UsageAnswer, AggregateError> {
     let from = query.from;
-    let mut files: Vec<PathBuf> = match rotated(file) {
+    let current = jsonl::open(file).map_err(AggregateError::Io)?;
+    let current_id = current
+        .as_ref()
+        .map(|f| f.metadata().map(|m| (m.dev(), m.ino())))
+        .transpose()
+        .map_err(AggregateError::Io)?;
+    pause();
+    let rotated: Vec<PathBuf> = match rotated(file) {
         Ok(files) => files
             .into_iter()
             .filter(|(stamp, _)| *stamp >= from)
@@ -222,12 +248,24 @@ pub(crate) fn aggregate(
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(AggregateError::Io(e)),
     };
-    files.push(file.to_owned());
+    pause();
+    let mut files = Vec::new();
+    for path in &rotated {
+        // Removed since the listing (pruned) or not a regular file now: nothing to read.
+        let Some(f) = jsonl::open(path).map_err(AggregateError::Io)? else {
+            continue;
+        };
+        let meta = f.metadata().map_err(AggregateError::Io)?;
+        if meta.is_file() && Some((meta.dev(), meta.ino())) != current_id {
+            files.push(f);
+        }
+    }
+    files.extend(current);
     let mut rows = BTreeMap::new();
     let mut skipped = 0;
-    for f in &files {
+    for f in files {
         let mut full = false;
-        skipped += jsonl::read(f, |line: UsageLine| {
+        skipped += jsonl::read_from(f, |line: UsageLine| {
             if !(from..to).contains(&line.at) {
                 return ControlFlow::Continue(());
             }
@@ -352,6 +390,49 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str::<UsageLine>(l).unwrap().request_id)
             .collect()
+    }
+
+    #[test]
+    fn a_rotation_during_a_read_neither_hides_nor_doubles_a_line() {
+        let dir = std::env::temp_dir().join(format!("qb-usage-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("usage.jsonl");
+        let size = json_line(&line("turn-0")).unwrap().len() as u64;
+        let ledger = Ledger::new(UsageLedger {
+            file: file.clone(),
+            rotate_bytes: 2 * size,
+            keep_days: 1,
+        });
+        for id in ["turn-0", "turn-1", "turn-2"] {
+            ledger.append(&line(id), NOW);
+        }
+        assert_eq!(rotated(&file).unwrap().len(), 1);
+        let query = UsageQuery {
+            from: NOW - 60,
+            to: None,
+            group_by: None,
+            bucket: None,
+        };
+        // The opened current file, holding turn-2, gets turn-3 and is rotated before the read
+        // lists the rotated files; its successor is rotated after the listing.
+        let mut next = 3;
+        let answer = aggregate_paced(&file, &query, NOW + 60, || {
+            for _ in 0..2 {
+                ledger.append(&line(&format!("turn-{next}")), NOW + next / 2);
+                next += 1;
+            }
+        })
+        .unwrap();
+        assert_eq!(next, 7);
+        assert_eq!(rotated(&file).unwrap().len(), 3);
+        assert_eq!(answer.rows.len(), 1);
+        assert_eq!(
+            answer.rows[0].attempts, 4,
+            "turn-0 to turn-3, once each: the lines of the files as the read opened them"
+        );
+        let after = aggregate(&file, &query, NOW + 60).unwrap();
+        assert_eq!(after.rows[0].attempts, 7);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
