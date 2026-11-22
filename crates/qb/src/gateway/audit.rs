@@ -190,8 +190,7 @@ mod tests {
 
     #[test]
     fn an_append_narrows_a_wide_file_and_narrow_leaves_other_kinds_alone() {
-        let dir = std::env::temp_dir().join(format!("qb-audit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::new("audit");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().mode() & 0o7777;
         let file = dir.join("audit.jsonl");
         std::fs::write(&file, "").unwrap();

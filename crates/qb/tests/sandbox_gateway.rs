@@ -3,6 +3,9 @@
 
 #![allow(clippy::unwrap_used)]
 
+#[path = "common/cleanup.rs"]
+mod cleanup;
+
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -102,6 +105,7 @@ fn finished(at: u64) -> UsageLine {
 #[allow(clippy::too_many_lines)] // the dumpable flag is process-wide, so one test covers it all
 fn gateway_may_write_its_own_files_and_its_config_and_reach_qbd_only() {
     let dir = Path::new("/tmp").join(format!("qb-gw-sandbox-{}", std::process::id()));
+    cleanup::remove_at_test_end(&dir);
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
     let credential = creds.join("login-1.json");

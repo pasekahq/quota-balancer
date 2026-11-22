@@ -394,8 +394,7 @@ mod tests {
 
     #[test]
     fn a_rotation_during_a_read_neither_hides_nor_doubles_a_line() {
-        let dir = std::env::temp_dir().join(format!("qb-usage-race-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::new("usage-race");
         let file = dir.join("usage.jsonl");
         let size = json_line(&line("turn-0")).unwrap().len() as u64;
         let ledger = Ledger::new(UsageLedger {
@@ -437,8 +436,7 @@ mod tests {
 
     #[test]
     fn rotations_within_one_second_keep_every_line_under_its_own_stamp() {
-        let dir = std::env::temp_dir().join(format!("qb-usage-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::new("usage");
         let file = dir.join("usage.jsonl");
         let size = json_line(&line("turn-0")).unwrap().len() as u64;
         let ledger = Ledger::new(UsageLedger {

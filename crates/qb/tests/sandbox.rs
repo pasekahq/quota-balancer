@@ -3,6 +3,9 @@
 
 #![allow(clippy::unwrap_used)]
 
+#[path = "common/cleanup.rs"]
+mod cleanup;
+
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -32,6 +35,7 @@ fn kernel_abi() -> Option<ABI> {
 #[test]
 fn hardening_allows_only_credentials_and_tcp_443() {
     let dir = std::env::temp_dir().join(format!("qb-sandbox-{}", std::process::id()));
+    cleanup::remove_at_test_end(&dir);
     let creds = dir.join("creds");
     std::fs::create_dir_all(&creds).unwrap();
     let allowed = creds.join(".credentials.json");

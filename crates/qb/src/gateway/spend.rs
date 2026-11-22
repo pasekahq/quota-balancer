@@ -223,8 +223,7 @@ mod tests {
 
     #[test]
     fn counts_persist_within_their_month_and_restart_from_zero_in_the_next() {
-        let dir = std::env::temp_dir().join(format!("qb-spend-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::new("spend");
         let file = dir.join("spend.json");
         let (start, end) = month(1_706_745_600);
         let mut ledger = Ledger::open(&file, start).unwrap();
