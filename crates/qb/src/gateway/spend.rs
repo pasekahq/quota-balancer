@@ -160,7 +160,8 @@ pub fn priced(usage: &Usage, price: &Price) -> f64 {
         + tokens(usage.cache_write, price.cache_write)
 }
 
-/// Start and end of the UTC calendar month holding `now`.
+/// Start and end of the UTC calendar month holding `now`; the end saturates at `u64::MAX` for
+/// the last month the type reaches.
 pub fn month(now: u64) -> (u64, u64) {
     // Hinnant's civil_from_days, on days since 0000-03-01; leap years repeat every 400 years,
     // so the era drops out.
@@ -175,7 +176,8 @@ pub fn month(now: u64) -> (u64, u64) {
     let year_of_era = yoe + u32::from(month <= 2);
     let start = days - u64::from(day);
     let length = days_in_month(year_of_era, month);
-    (start * 86_400, (start + u64::from(length)) * 86_400)
+    let end = (start + u64::from(length)).checked_mul(86_400);
+    (start * 86_400, end.unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -193,6 +195,12 @@ mod tests {
         let dec = y2026 - 31 * 86_400;
         assert_eq!(month(y2026 - 1), (dec, y2026));
         assert_eq!(month(y2025 + 86_400 * 40).0, y2025 + 86_400 * 31);
+        for now in [u64::MAX, u64::MAX - 86_400 * 40] {
+            let (start, end) = month(now);
+            assert!(start <= now && now < end || end == u64::MAX, "{now}");
+            assert!(now - start < 31 * 86_400, "{now}");
+        }
+        assert_eq!(month(u64::MAX).1, u64::MAX, "the end saturates");
     }
 
     #[test]

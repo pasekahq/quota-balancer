@@ -1053,7 +1053,10 @@ the largest value of their type.
 
 The gateway reads `usage.file` and the rotated files `<file>.<stamp>` whose stamp is at or after
 `from`; a rotated file holds only lines with `at` at or before its stamp, so one stamped before
-`from` has none in the window. A missing file counts as empty. An answer of more than 10 000 rows is 400 `bad_request`,
+`from` has none in the window. A missing file counts as empty, and a `<file>.<stamp>` that is not
+a regular file (a directory, say) is no rotated file and is not read. The read opens `usage.file`
+before it lists the rotated files and reads a file once, so a rotation during the read neither
+hides nor doubles a line; appends do not wait for the read. An answer of more than 10 000 rows is 400 `bad_request`,
 asking for a narrower window or a coarser bucket; no answer is cut short. An unknown parameter,
 one given twice, a missing `from` or an invalid value is 400 `bad_request` naming the parameter;
 without `[usage]` the answer is 404 `bad_request`.

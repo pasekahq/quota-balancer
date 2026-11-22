@@ -59,13 +59,34 @@ fn skip_line(input: &mut impl BufRead) -> io::Result<()> {
 /// The file cannot be opened or read.
 pub(crate) fn read<T: DeserializeOwned>(
     file: &Path,
+    each: impl FnMut(T) -> ControlFlow<()>,
+) -> io::Result<u64> {
+    match open(file)? {
+        Some(f) => read_from(f, each),
+        None => Ok(0),
+    }
+}
+
+/// `file` opened for reading; `None` when it is missing.
+///
+/// # Errors
+/// The file exists but cannot be opened.
+pub(crate) fn open(file: &Path) -> io::Result<Option<File>> {
+    match File::open(file) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`read`] of the open file `f`, from its current offset.
+///
+/// # Errors
+/// The file cannot be read.
+pub(crate) fn read_from<T: DeserializeOwned>(
+    f: File,
     mut each: impl FnMut(T) -> ControlFlow<()>,
 ) -> io::Result<u64> {
-    let f = match File::open(file) {
-        Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
-    };
     let mut reader = BufReader::new(f);
     let mut line = Vec::new();
     let mut skipped = 0;
