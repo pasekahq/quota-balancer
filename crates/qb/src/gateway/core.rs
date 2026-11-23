@@ -167,6 +167,16 @@ pub struct Gateway {
     announced: Mutex<HashMap<String, String>>,
 }
 
+/// Logs once per run that `model` has no price, so capped logins count nothing for it.
+fn warn_unpriced(ledger: &mut Ledger, model: &str) {
+    if ledger.first_unpriced(model) {
+        log::warn(&format!(
+            "gateway: model `{model}` has no price and its vendor reports no cost; \
+             turns and batches on capped logins count nothing for it"
+        ));
+    }
+}
+
 fn bad_request(message: impl Into<String>) -> GatewayError {
     GatewayError::new(ErrorClass::BadRequest, false, message)
 }
@@ -512,6 +522,11 @@ impl Gateway {
     /// The batch store; `None` without `[batches]`.
     pub(super) fn batches(&self) -> Option<&Store> {
         self.batches.as_ref()
+    }
+
+    /// The usage ledger; `None` without `[usage]`.
+    pub(super) fn usage(&self) -> Option<&usage::Ledger> {
+        self.usage.as_ref()
     }
 
     /// The credential of `login` from its file at `now`, refreshed when it is about to expire.
@@ -1524,6 +1539,8 @@ impl Gateway {
             at: now,
             duration_ms: u64::try_from(relay.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             request_id: turn.request_id.clone(),
+            custom_id: None,
+            batch: false,
             client: turn.client.clone(),
             route: turn.route.alias.clone(),
             step: u32::try_from(step).unwrap_or(u32::MAX),
@@ -1567,11 +1584,8 @@ impl Gateway {
         let cap = config.login(login)?.spend_cap?;
         let mut ledger = lock(self.ledger());
         let usd = spend::attempt_usd(cost, config.price(model), usage).map(|(usd, _)| usd);
-        if usd.is_none() && ledger.first_unpriced(model) {
-            log::warn(&format!(
-                "gateway: model `{model}` has no price and its vendor reports no cost; \
-                 turns on capped logins count nothing for it"
-            ));
+        if usd.is_none() {
+            warn_unpriced(&mut ledger, model);
         }
         let usd = usd.unwrap_or(0.0);
         let now = unix_now();
@@ -1581,6 +1595,37 @@ impl Gateway {
             }
         }
         Some(ledger.window(login, cap, now))
+    }
+
+    /// Adds `usd`, the cost of the message batch `batch_id` of `model` on `login` of `config`, to
+    /// the login's count once when it has a cap, and then reports its spend window to qbd; `None`
+    /// is a model without a price and adds nothing.
+    ///
+    /// # Errors
+    /// The spend file could not be written; the count stays as it was.
+    pub(super) fn count_batch(
+        &self,
+        config: &GatewayConfig,
+        (login, model): (&str, &str),
+        batch_id: &str,
+        usd: Option<f64>,
+    ) -> Result<(), String> {
+        let Some(cap) = config.login(login).and_then(|l| l.spend_cap) else {
+            return Ok(());
+        };
+        let mut ledger = lock(self.ledger());
+        let Some(usd) = usd.filter(|usd| usd.is_finite() && *usd > 0.0) else {
+            if usd.is_none() {
+                warn_unpriced(&mut ledger, model);
+            }
+            return Ok(());
+        };
+        let added = ledger.add_batch(login, batch_id, usd, unix_now())?;
+        drop(ledger);
+        if added {
+            self.publish_spend(login, Some(cap));
+        }
+        Ok(())
     }
 
     /// Reports the spend window of `login` under `cap` to qbd, or an empty one without a cap.

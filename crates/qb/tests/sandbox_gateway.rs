@@ -86,6 +86,8 @@ fn finished(at: u64) -> UsageLine {
         at,
         duration_ms: 1,
         request_id: "turn-1".into(),
+        custom_id: None,
+        batch: false,
         client: "client-a".into(),
         route: "chat".into(),
         step: 0,

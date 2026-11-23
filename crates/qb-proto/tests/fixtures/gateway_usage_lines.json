@@ -53,5 +53,26 @@
     "usd": 0.0009,
     "usd_source": "vendor",
     "tools": []
+  },
+  {
+    "at": 1800003600,
+    "duration_ms": 0,
+    "request_id": "msgbatch_01",
+    "custom_id": "item-3",
+    "batch": true,
+    "client": "client-a",
+    "route": "batch",
+    "step": 0,
+    "login": "key-1",
+    "model": "model-b",
+    "outcome": "ok",
+    "stop": "end",
+    "input": 1200,
+    "output": 340,
+    "cache_read": 0,
+    "cache_write": 0,
+    "usd": 0.00282,
+    "usd_source": "prices",
+    "tools": []
   }
 ]

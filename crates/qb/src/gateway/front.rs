@@ -881,11 +881,12 @@ fn batch(
 
 /// Answers `GET /v1/model/batches/{batch_id}/results` of `caller`, the gateway's `own` uid or
 /// not: a chunked NDJSON copy of the vendor's body, read and written [`RESULTS_CHUNK`] bytes at
-/// most at a time. A body that breaks after the head went out closes the connection without the
-/// last chunk, so the caller sees a cut transfer.
+/// most at a time, which settles the batch at the body's end ([`batches::Results::copy`]). A body
+/// that breaks after the head went out closes the connection without the last chunk, so the
+/// caller sees a cut transfer.
 fn batch_results(stream: &mut Conn, gateway: &Gateway, caller: &str, own: bool, id: &str) {
-    let mut body = match batches::results(gateway, caller, own, id) {
-        Ok(body) => body,
+    let results = match batches::results(gateway, caller, own, id) {
+        Ok(results) => results,
         Err((status, e)) => return reply(stream, status, &e),
     };
     if stream
@@ -895,24 +896,15 @@ fn batch_results(stream: &mut Conn, gateway: &Gateway, caller: &str, own: bool, 
     {
         return;
     }
-    let mut buf = vec![0u8; RESULTS_CHUNK];
-    loop {
-        let n = match io::Read::read(&mut body, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                log::warn(&format!(
-                    "gateway: results of batch {id} for {caller} broke: {e}"
-                ));
-                return;
-            }
-        };
-        if http::write_chunk(stream, &buf[..n]).is_err() {
-            return;
+    match results.copy(|chunk| http::write_chunk(stream, chunk)) {
+        Ok(()) => {
+            let _ = http::write_stream_end(stream);
         }
+        Err(batches::Cut::Vendor(e)) => log::warn(&format!(
+            "gateway: results of batch {id} for {caller} broke: {e}"
+        )),
+        Err(batches::Cut::Caller) => {}
     }
-    let _ = http::write_stream_end(stream);
 }
 
 /// Answers 405; true, the request is answered.

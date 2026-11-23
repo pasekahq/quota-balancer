@@ -434,10 +434,30 @@ fn usage_lines() {
                 Some(ErrorClass::Cancelled),
                 Some(UsdSource::Vendor)
             ),
+            (
+                0,
+                Outcome::Ok,
+                Some(StopReason::End),
+                None,
+                Some(UsdSource::Prices)
+            ),
         ]
     );
     assert_eq!(lines[1].usage.cache_read, 8000);
     assert_eq!(lines[1].tools, ["read_file", "search"]);
+    let batch: Vec<_> = lines
+        .iter()
+        .map(|l| (l.custom_id.as_deref(), l.batch))
+        .collect();
+    assert_eq!(
+        batch,
+        [
+            (None, false),
+            (None, false),
+            (None, false),
+            (Some("item-3"), true)
+        ]
+    );
     assert_eq!(lines[0].usd, None);
 }
 

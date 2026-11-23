@@ -1064,17 +1064,23 @@ pub enum UsdSource {
 /// Most tool names a usage line lists.
 pub const MAX_USAGE_TOOLS: usize = 64;
 
-/// One line of the gateway's usage ledger: one attempt of a turn that reached a vendor adapter.
-/// No field holds prompt or answer text, thinking, tool arguments or results, headers or
-/// credentials.
+/// One line of the gateway's usage ledger: one attempt of a turn that reached a vendor adapter,
+/// or one succeeded request of a settled message batch. No field holds prompt or answer text,
+/// thinking, tool arguments or results, headers or credentials.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageLine {
-    /// Unix time the attempt ended.
+    /// Unix time the attempt ended, or the batch settled.
     pub at: u64,
-    /// Milliseconds from the credential load to the attempt's end.
+    /// Milliseconds from the credential load to the attempt's end; 0 on a batch line.
     pub duration_ms: u64,
-    /// The turn's `request_id`.
+    /// The turn's `request_id`; the batch id on a batch line.
     pub request_id: String,
+    /// The request's `custom_id` on a batch line; absent on a turn line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_id: Option<String>,
+    /// True on a batch line; absent on a turn line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub batch: bool,
     /// The turn's caller name.
     pub client: String,
     /// The turn's route alias.
