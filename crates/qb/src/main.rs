@@ -2,12 +2,13 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use qb::auth::Gate;
+use qb::client::Streamed;
 use qb::config::Config;
 use qb::gateway::anthropic::Anthropic;
 use qb::gateway::chat_upstream::ChatCompletions;
@@ -26,7 +27,10 @@ use qb::{
     stream,
 };
 use qb_core::Core;
-use qb_proto::{AdminLoginsReset, Outcome, PickRequest, Pin, ReportRequest, SpendReset, paths};
+use qb_proto::{
+    AdminLoginsReset, BatchRequest, BatchSubmit, Outcome, PickRequest, Pin, ReportRequest,
+    SpendReset, paths,
+};
 use qb_vendors::claude::Event;
 use zeroize::Zeroizing;
 
@@ -53,6 +57,16 @@ COMMANDS:
     spend                               GET /v1/model/spend: the month's spend, cap and period
                                         end of each capped login of the gateway on --socket
     spend reset <LOGIN>                 POST /v1/model/spend/reset: set LOGIN's count to zero
+    batch submit --route ALIAS --key KEY <FILE>
+                                        POST /v1/model/batches: one Message Batch of the JSONL
+                                        in FILE (- = stdin), one object of `custom_id` and
+                                        `params` per non-empty line, checked before anything
+                                        is sent; exit 2 naming a bad line or custom_id
+    batch status <BATCH_ID>             GET /v1/model/batches/<BATCH_ID>
+    batch results <BATCH_ID>            GET /v1/model/batches/<BATCH_ID>/results: write the
+                                        result lines to stdout as they arrive; exit 1 when the
+                                        transfer is cut, keeping the lines written
+    batch cancel <BATCH_ID>             POST /v1/model/batches/<BATCH_ID>/cancel
     login import --config PATH --from FORMAT --source PATH [--provider P] [--entry E]
          [--var NAME] [--force] <LOGIN>
                                         copy the credential in the file --source into the
@@ -130,7 +144,19 @@ enum Call {
     Report(ReportRequest),
     /// A report whose outcome and windows come from a stream-json log; `-` is stdin.
     ReportStream(ReportRequest, PathBuf),
+    /// A batch of the JSONL requests in `file`, `-` for stdin.
+    BatchSubmit {
+        route: String,
+        key: String,
+        file: PathBuf,
+    },
+    BatchStatus(String),
+    BatchResults(String),
+    BatchCancel(String),
 }
+
+const BATCH_USAGE: &str = "expected `batch submit --route ALIAS --key KEY <FILE>` or \
+                           `batch status|results|cancel <BATCH_ID>`";
 
 struct Simulate {
     config: PathBuf,
@@ -198,6 +224,8 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
     let mut config = None;
     let mut operand: Option<OsString> = None;
     let mut spend_args: Vec<OsString> = Vec::new();
+    let mut batch_args: Vec<OsString> = Vec::new();
+    let (mut batch_route, mut batch_key) = (None, None);
     let (mut at, mut sim_pick) = (None, None);
     let mut from_stream = None;
     let mut login_args: Vec<OsString> = Vec::new();
@@ -251,6 +279,9 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
                 operand = Some(v);
             }
             Value(v) if sub == Some("spend") && spend_args.len() < 2 => spend_args.push(v),
+            Value(v) if sub == Some("batch") && batch_args.len() < 2 => batch_args.push(v),
+            Long("route") if sub == Some("batch") => batch_route = Some(string(p.value()?)?),
+            Long("key") if sub == Some("batch") => batch_key = Some(string(p.value()?)?),
             Value(v)
                 if sub == Some("login")
                     && (login_args.len() < 2
@@ -329,6 +360,36 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             [verb, login] if verb == "reset" => Cmd::Call(Call::SpendReset(string(login.clone())?)),
             _ => return Err("expected `spend` or `spend reset <LOGIN>`".into()),
         },
+        Some("batch") => {
+            let [verb, operand] = <[OsString; 2]>::try_from(batch_args).map_err(|_| BATCH_USAGE)?;
+            match (string(verb)?.as_str(), batch_route, batch_key) {
+                ("submit", Some(route), Some(key)) => Cmd::Call(Call::BatchSubmit {
+                    route,
+                    key,
+                    file: PathBuf::from(operand),
+                }),
+                ("submit", _, _) => return Err("`batch submit` needs --route and --key".into()),
+                (_, Some(_), _) | (_, _, Some(_)) => {
+                    return Err("--route and --key go with `batch submit`".into());
+                }
+                (verb, None, None) => {
+                    let id = string(operand)?;
+                    let plain = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+                    if id.is_empty() || !id.bytes().all(plain) {
+                        return Err(format!(
+                            "batch id `{id}`: expected letters, digits, `_` and `-`"
+                        )
+                        .into());
+                    }
+                    Cmd::Call(match verb {
+                        "status" => Call::BatchStatus(id),
+                        "results" => Call::BatchResults(id),
+                        "cancel" => Call::BatchCancel(id),
+                        _ => return Err(BATCH_USAGE.into()),
+                    })
+                }
+            }
+        }
         Some("login") if login_args.first().is_some_and(|a| a == "reset") && config.is_none() => {
             let logins = login_args[1..]
                 .iter()
@@ -493,9 +554,21 @@ fn run(args: Args) -> Result<ExitCode, String> {
         Cmd::Login(req) => login(&req),
         Cmd::Call(call) => {
             let bearer = bearer(args.bearer_file)?;
+            let socket = args.socket.as_path();
             let send = |method, path: &str, body: Option<&[u8]>| {
-                request(&args.socket, bearer.as_deref(), method, path, body)
+                printed(
+                    socket,
+                    client::call(socket, method, path, body, bearer.as_deref()),
+                )
             };
+            // The gateway's own vendor timeouts bound a batch request.
+            let parked = |method, path: &str, body: Option<&[u8]>| {
+                printed(
+                    socket,
+                    client::call_parked(socket, method, path, body, bearer.as_deref()),
+                )
+            };
+            let batch = |id: &str, tail: &str| format!("{}/{id}{tail}", paths::MODEL_BATCHES);
             match call {
                 Call::Health => send("GET", paths::HEALTH, None),
                 Call::State => send("GET", paths::STATE, None),
@@ -526,6 +599,15 @@ fn run(args: Args) -> Result<ExitCode, String> {
                     };
                     req.windows = event.windows;
                     send("POST", paths::REPORT, Some(&encode(&req)?))
+                }
+                Call::BatchSubmit { route, key, file } => {
+                    let submit = batch_submit(route, key, &file)?;
+                    parked("POST", paths::MODEL_BATCHES, Some(&encode(&submit)?))
+                }
+                Call::BatchStatus(id) => parked("GET", &batch(&id, ""), None),
+                Call::BatchCancel(id) => parked("POST", &batch(&id, "/cancel"), Some(b"")),
+                Call::BatchResults(id) => {
+                    batch_results(socket, bearer.as_deref(), &id, &batch(&id, "/results"))
                 }
             }
         }
@@ -562,16 +644,70 @@ fn last_event(file: &Path) -> Result<Option<Event>, String> {
     found.map_err(|e| format!("{name}: {e}"))
 }
 
-fn request(
+/// The submit on `route` with `key` of the JSONL requests in `file`, `-` for stdin, validated.
+///
+/// # Errors
+/// A line that cannot be read or is not a valid request, naming its number, or a submit that
+/// does not validate.
+fn batch_submit(route: String, key: String, file: &Path) -> Result<BatchSubmit, String> {
+    let (name, lines): (String, Box<dyn BufRead>) = if file == Path::new("-") {
+        ("stdin".to_owned(), Box::new(io::stdin().lock()))
+    } else {
+        let name = file.display().to_string();
+        let f = File::open(file).map_err(|e| format!("{name}: {e}"))?;
+        (name, Box::new(BufReader::new(f)))
+    };
+    let mut requests = Vec::new();
+    for (i, line) in lines.lines().enumerate() {
+        let at = |e: &dyn std::fmt::Display| format!("{name}: line {}: {e}", i + 1);
+        let line = line.map_err(|e| at(&e))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: BatchRequest = serde_json::from_str(&line).map_err(|e| at(&e))?;
+        request.validate().map_err(|e| at(&e))?;
+        requests.push(request);
+    }
+    let submit = BatchSubmit {
+        route,
+        idempotency_key: key,
+        requests,
+    };
+    submit.validate()?;
+    Ok(submit)
+}
+
+/// Copies the results of batch `id` at `path` to stdout as they arrive: exit 0 after the last
+/// chunk, 1 when the transfer is cut or the answer is not a 2xx, whose body is printed.
+///
+/// # Errors
+/// The connection's error before the answer's head, naming `socket`.
+fn batch_results(
     socket: &Path,
     bearer: Option<&str>,
-    method: &str,
+    id: &str,
     path: &str,
-    body: Option<&[u8]>,
 ) -> Result<ExitCode, String> {
-    let (status, resp) = client::call(socket, method, path, body, bearer)
+    let mut out = io::stdout().lock();
+    let streamed = client::call_streamed(socket, "GET", path, bearer, &mut out)
         .map_err(|e| format!("{}: {e}", socket.display()))?;
-    let mut out = std::io::stdout().lock();
+    match streamed {
+        Streamed::Complete => Ok(ExitCode::SUCCESS),
+        Streamed::Cut(e) => {
+            log::error(&format!("qb: results of batch {id} cut: {e}"));
+            Ok(ExitCode::from(1))
+        }
+        Streamed::Refused(status, body) => printed(socket, Ok((status, body))),
+    }
+}
+
+/// Prints the body of `answer` from `socket`: exit 0 on a 2xx, else 1.
+///
+/// # Errors
+/// The connection's error, naming `socket`.
+fn printed(socket: &Path, answer: io::Result<(u16, Vec<u8>)>) -> Result<ExitCode, String> {
+    let (status, resp) = answer.map_err(|e| format!("{}: {e}", socket.display()))?;
+    let mut out = io::stdout().lock();
     let _ = out.write_all(&resp);
     let _ = out.write_all(b"\n");
     Ok(if (200..300).contains(&status) {

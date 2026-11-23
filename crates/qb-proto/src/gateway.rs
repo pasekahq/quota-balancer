@@ -1283,6 +1283,35 @@ pub struct BatchRequest {
 }
 
 impl BatchRequest {
+    /// Checks the invariants of the request alone, those of [`BatchSubmit::validate`] but the
+    /// `custom_id`'s uniqueness.
+    ///
+    /// # Errors
+    /// The first violated invariant, as a message naming the request's `custom_id`, or the
+    /// field when the `custom_id` itself is invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_name(&self.custom_id) {
+            return Err("`custom_id` must match ^[A-Za-z0-9_-]{1,64}$".into());
+        }
+        if let Some(key) = ["model", "stream"]
+            .iter()
+            .find(|k| self.params.contains_key(**k))
+        {
+            return Err(format!(
+                "request `{}`: `params` must not hold `{key}`; the gateway sets the model and \
+                 a batch does not stream",
+                self.custom_id
+            ));
+        }
+        if self.max_tokens().is_none() {
+            return Err(format!(
+                "request `{}`: `params.max_tokens` must be a positive integer",
+                self.custom_id
+            ));
+        }
+        Ok(())
+    }
+
     /// The request's `params.max_tokens` when it is a positive integer.
     pub fn max_tokens(&self) -> Option<u64> {
         self.params
@@ -1319,22 +1348,7 @@ impl BatchSubmit {
             if !seen.insert(r.custom_id.as_str()) {
                 return Err(format!("`custom_id` `{}` is repeated", r.custom_id));
             }
-            if let Some(key) = ["model", "stream"]
-                .iter()
-                .find(|k| r.params.contains_key(**k))
-            {
-                return Err(format!(
-                    "request `{}`: `params` must not hold `{key}`; the gateway sets the model and \
-                     a batch does not stream",
-                    r.custom_id
-                ));
-            }
-            if r.max_tokens().is_none() {
-                return Err(format!(
-                    "request `{}`: `params.max_tokens` must be a positive integer",
-                    r.custom_id
-                ));
-            }
+            r.validate()?;
         }
         Ok(())
     }

@@ -566,6 +566,35 @@ fn a_batch_refusal_names_the_request_it_refuses() {
     }
 }
 
+#[test]
+fn a_batch_request_alone_names_itself_or_its_bad_custom_id() {
+    for (name, want) in [
+        ("bad_custom_id", "`custom_id` must match"),
+        (
+            "params_model",
+            "request `a`: `params` must not hold `model`",
+        ),
+        (
+            "max_tokens_zero",
+            "request `b`: `params.max_tokens` must be a positive integer",
+        ),
+    ] {
+        let raw = fixture(&format!("gateway/invalid/BatchSubmit.{name}.json"));
+        let submit: BatchSubmit = serde_json::from_str(&raw).unwrap();
+        let e = submit
+            .requests
+            .iter()
+            .find_map(|r| r.validate().err())
+            .unwrap();
+        assert!(e.starts_with(want), "{name}: {e}");
+    }
+    let raw = fixture("gateway/invalid/BatchSubmit.repeated_custom_id.json");
+    let submit: BatchSubmit = serde_json::from_str(&raw).unwrap();
+    for r in &submit.requests {
+        assert_eq!(r.validate(), Ok(()), "a repeat is the submit's to refuse");
+    }
+}
+
 /// A turn request around one block, for the block fixtures.
 fn around(block: Block) -> TurnRequest {
     TurnRequest {

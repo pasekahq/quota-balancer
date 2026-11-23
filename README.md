@@ -126,6 +126,8 @@ qb why l-257                      # the lease, the reason it was granted, its lo
 qb report --login login-1 --from-stream-json run.jsonl   # a Claude stream-json log, - = stdin
 qb simulate --config new.toml /var/lib/qb/journal --pick '{"role":"worker","difficulty":1}'
 qb --bearer-file token state                              # or QB_BEARER_FILE=token
+qb --socket gw.sock batch submit --route batch --key nightly-1 requests.jsonl   # - = stdin
+qb --socket gw.sock batch results msgbatch_01 > results.jsonl   # also: status, cancel
 ```
 
 - `report --from-stream-json` posts the windows of the log's last `rate_limit_event` with the

@@ -12041,13 +12041,13 @@ fn results_wait_for_the_batch_s_end_and_a_cut_body_stays_cut() {
     assert_eq!(chunks.concat(), prefix, "what arrived before the cut");
 }
 
+/// A route whose only login is `login-1`, the capped login of [`settle_rig`].
+const CAPPED_ROUTE: &str = "\n[[routes]]\nalias = \"capped\"\nrole = \"gateway\"\ndifficulty = 1\nlogins = [\"login-1\"]\n";
+
 /// A [`BatchRig`] for settlements, as the gateway's own uid: qbd's vendor-a declares the
 /// `spend` window, login-1 has a `spend_cap` of 10 USD and login-2 none, `model-large` costs 2,
 /// 10, 1 and 4 USD per million input, output, cache read and cache write tokens, the usage ledger
 /// is `usage.jsonl` and the store holds `records` when the gateway starts.
-/// A route whose only login is `login-1`, the capped login of [`settle_rig`].
-const CAPPED_ROUTE: &str = "\n[[routes]]\nalias = \"capped\"\nrole = \"gateway\"\ndifficulty = 1\nlogins = [\"login-1\"]\n";
-
 fn settle_rig(records: &[Value]) -> BatchRig {
     let vendor = Vendor::start();
     let dir = temp_dir("gws");
@@ -12690,4 +12690,213 @@ fn results_and_cancel_answer_only_the_caller_of_a_known_batch() {
     assert_eq!(call(&b.gw, "POST", &results, "").0, 405);
     assert_eq!(call(&b.gw, "GET", &cancel, "").0, 405);
     assert_eq!(batch_calls(&b.vendor), []);
+}
+
+/// The token of the bearer file the `qb batch` tests pass; the unix socket ignores it.
+const CLI_BEARER: &str = "cli-bearer-7f3a9c";
+
+/// What a run of the `qb` binary gave: exit code, stdout and stderr.
+struct Ran {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+/// Runs `qb --socket <b.gw> --bearer-file <file of CLI_BEARER> batch <args>` with `stdin`;
+/// asserts that the token is in neither output stream.
+fn qb_batch(b: &BatchRig, args: &[&str], stdin: &[u8]) -> Ran {
+    let bearer = b.dir.join("cli.bearer");
+    std::fs::write(&bearer, format!("{CLI_BEARER}\n")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qb"))
+        .arg("--socket")
+        .arg(&b.gw)
+        .arg("--bearer-file")
+        .arg(&bearer)
+        .arg("batch")
+        .args(args)
+        .env_remove("QB_BEARER_FILE")
+        .env_remove("QB_SOCKET")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let ran = Ran {
+        code: out.status.code().unwrap(),
+        stdout: out.stdout,
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    };
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    for (name, text) in [("stdout", stdout.as_ref()), ("stderr", ran.stderr.as_str())] {
+        assert!(!text.contains(CLI_BEARER), "{args:?}: the token on {name}");
+    }
+    ran
+}
+
+/// The JSONL file of a submit of one request per id of `ids`, as [`batch_body`] has them,
+/// with blank lines between them.
+fn batch_jsonl(ids: &[&str]) -> String {
+    let body = batch_body("unused", ids);
+    let mut text = String::new();
+    for r in body["requests"].as_array().unwrap() {
+        writeln!(text, "{r}\n").unwrap();
+    }
+    text
+}
+
+/// The `custom_id`s of the create body the vendor received as its request `n`.
+fn created_ids(vendor: &Vendor, n: usize) -> Vec<String> {
+    let sent = vendor.received();
+    assert_eq!(sent[n].path, "/v1/messages/batches");
+    let requests = sent[n].body["requests"].as_array().unwrap();
+    requests
+        .iter()
+        .map(|r| r["custom_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn qb_batch_submit_sends_a_jsonl_file_or_stdin_as_one_batch() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    let file = b.dir.join("requests.jsonl");
+    std::fs::write(&file, batch_jsonl(&["item-1", "item-2", "item-3"])).unwrap();
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let args = ["submit", "--route", "chat", "--key", "key-1"];
+    let ran = qb_batch(&b, &[&args[..], &[file.to_str().unwrap()]].concat(), b"");
+    assert_eq!(ran.code, 0, "{}", ran.stderr);
+    let created = batch_status((200, ran.stdout));
+    assert_eq!(
+        (created.batch_id.as_str(), created.route.as_str()),
+        ("msgbatch_01", "chat")
+    );
+    assert_eq!(created_ids(&b.vendor, 0), ["item-1", "item-2", "item-3"]);
+
+    b.vendor.answer(message_batch("msgbatch_02", false));
+    let args = ["submit", "--key", "key-2", "--route", "chat", "-"];
+    let ran = qb_batch(&b, &args, batch_jsonl(&["item-a", "item-b"]).as_bytes());
+    assert_eq!(ran.code, 0, "{}", ran.stderr);
+    assert_eq!(batch_status((200, ran.stdout)).batch_id, "msgbatch_02");
+    assert_eq!(created_ids(&b.vendor, 1), ["item-a", "item-b"]);
+    let keys: Vec<Value> = batch_records(&b.dir)
+        .iter()
+        .map(|r| r["idempotency_key"].clone())
+        .collect();
+    assert_eq!(keys, [json!("key-1"), json!("key-2")]);
+}
+
+#[test]
+fn qb_batch_submit_refuses_a_bad_line_before_any_request() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    let good = r#"{"custom_id": "item-1", "params": {"max_tokens": 64}}"#;
+    for (lines, names) in [
+        (format!("{good}\n\nnot json\n"), "stdin: line 3: "),
+        (
+            format!("{good}\n{{\"custom_id\": \"item-2\", \"params\": {{}}, \"x\": 1}}\n"),
+            "stdin: line 2: unknown field `x`",
+        ),
+        (
+            format!("{good}\n{{\"custom_id\": \"item 2\", \"params\": {{\"max_tokens\": 1}}}}\n"),
+            "stdin: line 2: `custom_id` must match",
+        ),
+        (
+            format!(
+                "{good}\n{{\"custom_id\": \"item-2\", \"params\": {{\"max_tokens\": 1, \"model\": \"m\"}}}}\n"
+            ),
+            "stdin: line 2: request `item-2`: `params` must not hold `model`",
+        ),
+        (
+            format!("{good}\n{good}\n"),
+            "`custom_id` `item-1` is repeated",
+        ),
+        ("\n\n".to_owned(), "`requests` must hold 1 to"),
+    ] {
+        let args = ["submit", "--route", "chat", "--key", "key-1", "-"];
+        let ran = qb_batch(&b, &args, lines.as_bytes());
+        assert_eq!(ran.code, 2, "{lines}: {}", ran.stderr);
+        assert!(ran.stderr.contains(names), "{lines}: {}", ran.stderr);
+        assert_eq!(ran.stdout, b"", "{lines}");
+    }
+    let ran = qb_batch(
+        &b,
+        &[
+            "submit",
+            "--route",
+            "chat",
+            "--key",
+            "key-1",
+            "/nonexistent.jsonl",
+        ],
+        b"",
+    );
+    assert_eq!(ran.code, 2, "{}", ran.stderr);
+    assert_eq!(batch_calls(&b.vendor), [], "nothing reached the vendor");
+    assert_eq!(leased_on_behalf_of(&b.dir), [], "nor qbd");
+}
+
+#[test]
+fn qb_batch_status_and_cancel_print_the_answer_and_its_exit_code() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    batch_status(submit_batch(&b.gw, &batch_body("key-1", &["item-1"])));
+
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    let ran = qb_batch(&b, &["status", "msgbatch_01"], b"");
+    assert_eq!(ran.code, 0, "{}", ran.stderr);
+    let status = batch_status((200, ran.stdout));
+    assert_eq!(status.processing_status, BatchProcessing::Ended);
+
+    b.vendor
+        .answer(message_batch_in("msgbatch_01", "canceling"));
+    let ran = qb_batch(&b, &["cancel", "msgbatch_01"], b"");
+    assert_eq!(ran.code, 0, "{}", ran.stderr);
+    let status = batch_status((200, ran.stdout));
+    assert_eq!(status.processing_status, BatchProcessing::Canceling);
+
+    for verb in ["status", "cancel", "results"] {
+        let ran = qb_batch(&b, &[verb, "msgbatch_none"], b"");
+        assert_eq!(ran.code, 1, "{verb}: {}", ran.stderr);
+        let refusal = batch_refusal((404, ran.stdout));
+        let none = "no batch `msgbatch_none`".to_owned();
+        assert_eq!(refusal, (404, ErrorClass::BadRequest, none), "{verb}");
+    }
+    let sent: Vec<String> = batch_calls(&b.vendor).into_iter().map(|c| c.1).collect();
+    assert_eq!(
+        sent[1..],
+        [
+            "/v1/messages/batches/msgbatch_01",
+            "/v1/messages/batches/msgbatch_01/cancel"
+        ]
+    );
+}
+
+#[test]
+fn qb_batch_results_copies_the_body_and_fails_on_a_cut_transfer() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    batch_status(submit_batch(&b.gw, &batch_body("key-1", &["item-1"])));
+    let text = "y".repeat(100);
+    let lines: Vec<Value> = (0..600)
+        .map(|i| json!({"custom_id": format!("item-{i}"), "result": {"type": "canceled"}, "pad": text}))
+        .collect();
+    let body = results_body(&lines);
+    assert!(body.len() > 4 * front::RESULTS_CHUNK, "several chunks");
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    b.vendor.answer(results_answer(body.clone()));
+    let ran = qb_batch(&b, &["results", "msgbatch_01"], b"");
+    assert_eq!(ran.code, 0, "{}", ran.stderr);
+    assert!(ran.stdout == body, "the vendor's body byte for byte");
+
+    let prefix = results_body(&lines[..3]);
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    b.vendor.answer(Answer::Cut(prefix.clone()));
+    let ran = qb_batch(&b, &["results", "msgbatch_01"], b"");
+    assert_eq!(ran.code, 1, "{}", ran.stderr);
+    assert_eq!(ran.stdout, prefix, "the lines before the cut");
+    assert!(
+        ran.stderr.contains("results of batch msgbatch_01 cut"),
+        "{}",
+        ran.stderr
+    );
 }

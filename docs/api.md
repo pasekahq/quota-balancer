@@ -1235,6 +1235,15 @@ as for a batch that already ended, answers its class with that class's status.
 The status, the results and the cancel take no pick and send no lease report to `qbd`; the
 status and the cancel leave the store as it is.
 
+The CLI sends these four requests to the gateway on `--socket`. `qb batch submit --route <alias>
+--key <idempotency_key> <file>` reads `file` (`-` for stdin) as JSONL, one `BatchRequest`
+(`{"custom_id": ..., "params": {...}}`) per non-empty line, and posts them as one submit; a line
+that does not parse or a submit that does not validate exits 2, naming the line number or the
+`custom_id`, and nothing is sent. `qb batch status <batch_id>` and `qb batch cancel <batch_id>`
+print the answer. `qb batch results <batch_id>` writes the body of a 200 to stdout as it arrives
+and exits 0 after the last chunk; a cut transfer exits 1 with a message on stderr, the lines
+already written kept. Each prints a refusal's JSON and exits 1 on a non-2xx answer.
+
 The first results read of a batch that reaches the end of the vendor's body settles the batch.
 As it copies the body the gateway reads each line's `custom_id`, `type`, and for a succeeded
 request its message's `stop_reason` and `usage`, never the message text; the bytes to the caller
