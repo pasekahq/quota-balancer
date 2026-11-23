@@ -69,7 +69,7 @@ impl Upstream for ChatCompletions {
         };
         let mut answer = vendor::send(&self.config, request, credential.secret(), cancel)?;
         if answer.status != 200 {
-            let body = answer.error_body(cancel)?;
+            let body = answer.short_body(cancel)?;
             let headers = answer.headers();
             let classified =
                 limits::classify_chat_response(answer.status, &headers, &body, unix_now());

@@ -165,6 +165,10 @@ file = "/var/lib/qb-gateway/usage/usage.jsonl"
 rotate_bytes = 16777216
 keep_days = 90
 
+# Anthropic Message Batches on the api_key logins, each bound to its login and caller here.
+[batches]
+file = "/var/lib/qb-gateway/batches.json"
+
 # The HTTP fronts for SDK clients: the model names clients send mapped to route aliases (a model
 # equal to an alias needs no entry), the same on every front.
 [fronts]

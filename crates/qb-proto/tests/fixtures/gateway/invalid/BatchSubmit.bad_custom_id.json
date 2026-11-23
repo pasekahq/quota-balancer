@@ -1,0 +1,1 @@
+{"route":"batch","idempotency_key":"k-1","requests":[{"custom_id":"a/b","params":{}}]}

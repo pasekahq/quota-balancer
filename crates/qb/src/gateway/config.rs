@@ -51,7 +51,7 @@ pub const ROTATE_GRACE_S: u32 = 3600;
 pub const MAX_ROTATE_GRACE_S: u32 = 604_800;
 
 /// A validated gateway config. Top-level keys come before the `[[clients]]`, `[[logins]]`,
-/// `[[routes]]`, `[openai_models]`, `[prices]`, `[usage]` and `[fronts]` tables.
+/// `[[routes]]`, `[openai_models]`, `[prices]`, `[usage]`, `[batches]` and `[fronts]` tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayConfig {
     /// The file the config was read from; a reload reads it again.
@@ -89,6 +89,8 @@ pub struct GatewayConfig {
     pub prices: Vec<Price>,
     /// The usage ledger; without it no attempt is recorded.
     pub usage: Option<UsageLedger>,
+    /// The batch store; without it the batch endpoints answer 404.
+    pub batches: Option<Batches>,
     /// The HTTP fronts; without it their endpoints answer 404.
     pub fronts: Option<Fronts>,
 }
@@ -126,6 +128,13 @@ pub struct UsageLedger {
     pub rotate_bytes: u64,
     /// Days a rotated file is kept after its stamp, 1 to [`MAX_USAGE_KEEP_DAYS`].
     pub keep_days: u32,
+}
+
+/// Where the gateway keeps the batches it created, each bound to its login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batches {
+    /// Absolute path of the batch store, mode 0600, replaced by rename on each change.
+    pub file: PathBuf,
 }
 
 /// The settings the HTTP fronts share and the fronts this gateway serves; at least one is set.
@@ -510,6 +519,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         audit_file: None,
         prices: Vec::new(),
         usage: None,
+        batches: None,
         fronts: None,
     };
     let known = [
@@ -528,6 +538,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
         "audit_file",
         "prices",
         "usage",
+        "batches",
         "fronts",
     ];
     let required = ["socket", "logins", "routes"];
@@ -560,6 +571,7 @@ fn walk_config(doc: &DeTable<'_>) -> Result<GatewayConfig, WalkError> {
             "audit_file" => c.audit_file = Some(string(at, v)?.into()),
             "prices" => c.prices = walk_prices(at, table(at, v)?)?,
             "usage" => c.usage = Some(walk_usage(at, table(at, v)?)?),
+            "batches" => c.batches = Some(walk_batches(at, table(at, v)?)?),
             _ => c.fronts = Some(walk_fronts(at, table(at, v)?)?),
         }
         Ok(())
@@ -643,6 +655,17 @@ fn walk_usage(at: &str, t: &DeTable<'_>) -> Result<UsageLedger, WalkError> {
         Ok(())
     })?;
     Ok(u)
+}
+
+fn walk_batches(at: &str, t: &DeTable<'_>) -> Result<Batches, WalkError> {
+    let mut b = Batches {
+        file: PathBuf::new(),
+    };
+    fields(at, t, &["file"], &["file"], |_, at, v| {
+        b.file = string(at, v)?.into();
+        Ok(())
+    })?;
+    Ok(b)
 }
 
 /// A finite amount of USD of at least 0, written as an integer or a float.
@@ -1207,6 +1230,9 @@ impl GatewayConfig {
         }
         if let Some(u) = &self.usage {
             absolute("usage.file", &u.file)?;
+        }
+        if let Some(b) = &self.batches {
+            absolute("batches.file", &b.file)?;
         }
         self.validate_routes()?;
         if self.openai_models.len() > MAX_MODELS {
@@ -2424,6 +2450,32 @@ difficulty = 1
             err.contains("usage.file: must be an absolute path"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_batches_table_takes_an_absolute_file() {
+        let table = "[batches]\nfile = \"/var/lib/qb-gateway/batches.json\"\n";
+        let c = check("", table).unwrap();
+        let file = c.batches.map(|b| b.file);
+        assert_eq!(
+            file.as_deref(),
+            Some(Path::new("/var/lib/qb-gateway/batches.json"))
+        );
+        assert_eq!(check("", "").unwrap().batches, None);
+        for (bad, says) in [
+            (
+                "[batches]\nfile = \"batches.json\"\n",
+                "batches.file: must be an absolute path",
+            ),
+            ("[batches]\n", "batches.file: is missing"),
+            (
+                "[batches]\nfile = \"/b.json\"\nkeep_days = 1\n",
+                "batches.keep_days: unknown field",
+            ),
+        ] {
+            let err = check("", bad).unwrap_err();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
     }
 
     #[test]

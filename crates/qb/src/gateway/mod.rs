@@ -22,6 +22,8 @@
 //!   copies;
 //! - [`core`]: pick, credential, adapter, report and rotation, shared by every front;
 //! - [`spend`]: the monthly spend count of capped logins;
+//! - [`batches`]: Anthropic Message Batches on `api_key` logins, submitted and read back, and the
+//!   store that binds each to its login;
 //! - [`audit`]: the admin audit file, appended to and read back;
 //! - [`admin`]: `qbd`'s `/v1/admin/*` forwarded for the gateway's own uid;
 //! - [`usage`]: the usage ledger, one line per adapter attempt, rotated and pruned;
@@ -39,6 +41,7 @@ pub mod answer;
 pub mod anthropic;
 pub mod audit;
 mod base64url;
+mod batches;
 pub mod chat_upstream;
 pub mod config;
 pub mod config_edit;

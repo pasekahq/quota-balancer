@@ -38,7 +38,7 @@ impl Default for Anthropic {
 }
 
 /// The seam's failure of a classified vendor failure.
-fn failure(f: limits::Failure) -> Failure {
+pub(super) fn failure(f: limits::Failure) -> Failure {
     use limits::FailureKind as K;
     let kind = match f.kind {
         K::UsageLimit { resets_at } => FailureKind::UsageLimit { resets_at },
@@ -109,7 +109,7 @@ impl Upstream for Anthropic {
         };
         let mut answer = vendor::send(&self.config, request, credential.secret(), cancel)?;
         if answer.status != 200 {
-            let body = answer.error_body(cancel)?;
+            let body = answer.short_body(cancel)?;
             let headers = answer.headers();
             return Err(failure(limits::classify_response(
                 answer.status,

@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 pub mod gateway;
 
 pub use gateway::{
-    ApiFamily, Attempt, AuditAction, AuditAnswer, AuditEntry, AuditResult, Block, CacheMode,
-    CancelAnswer, CancelRequest, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
+    ApiFamily, Attempt, AuditAction, AuditAnswer, AuditEntry, AuditResult, BatchCounts,
+    BatchProcessing, BatchRequest, BatchStatus, BatchSubmit, Block, CacheMode, CancelAnswer,
+    CancelRequest, ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut,
     ConfigRoutesWritten, ConfigStep, Effort, Elsewhere, ErrorClass, GatewayError, LadderAnswer,
     LadderCandidateState, LadderStepState, LoginKey, LoginKeyAnswer, LoginOauthCode,
     LoginOauthSigned, LoginOauthStarted, LoginSpend, MediaType, Message, NativeApi, NativeTool,
@@ -77,6 +78,9 @@ pub mod paths {
     pub const MODEL_AUDIT: &str = "/v1/model/audit";
     /// Gateway, `GET`: sums of the gateway's usage ledger; only the gateway's own uid.
     pub const MODEL_USAGE: &str = "/v1/model/usage";
+    /// Gateway, `POST`: create an Anthropic Message Batch on a route; `GET` of
+    /// `{MODEL_BATCHES}/{batch_id}`: its status.
+    pub const MODEL_BATCHES: &str = "/v1/model/batches";
     /// Gateway, `POST` to `{MODEL_CLIENTS}/{name}/rotate`: write a fresh token to a named
     /// loopback client's `token_file`; only the gateway's own uid.
     pub const MODEL_CLIENTS: &str = "/v1/model/clients";

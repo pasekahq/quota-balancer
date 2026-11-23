@@ -4,13 +4,14 @@
 #![allow(clippy::unwrap_used)]
 
 use qb_proto::{
-    ApiFamily, AuditAction, AuditAnswer, AuditResult, Block, CacheMode, CancelAnswer,
-    CancelRequest, ClientRotateAnswer, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten, Effort,
-    Elsewhere, ErrorClass, GatewayError, HealthStatus, LadderAnswer, LoginKey, LoginKeyAnswer,
-    LoginOauthCode, LoginOauthSigned, LoginOauthStarted, LoginStatus, MediaType, Message,
-    NativeApi, OauthPaste, Object, Outcome, ReloadAnswer, Role, RolesSource, RouteInfo, RouteState,
-    RoutesAnswer, SpendAnswer, SpendReset, StopReason, StreamEvent, Thinking, ToolCall,
-    TurnRequest, Usage, UsageAnswer, UsageBucket, UsageGroupBy, UsageLine, UsageQuery, UsdSource,
+    ApiFamily, AuditAction, AuditAnswer, AuditResult, BatchCounts, BatchProcessing, BatchStatus,
+    BatchSubmit, Block, CacheMode, CancelAnswer, CancelRequest, ClientRotateAnswer, ConfigRoutes,
+    ConfigRoutesPut, ConfigRoutesWritten, Effort, Elsewhere, ErrorClass, GatewayError,
+    HealthStatus, LadderAnswer, LoginKey, LoginKeyAnswer, LoginOauthCode, LoginOauthSigned,
+    LoginOauthStarted, LoginStatus, MediaType, Message, NativeApi, OauthPaste, Object, Outcome,
+    ReloadAnswer, Role, RolesSource, RouteInfo, RouteState, RoutesAnswer, SpendAnswer, SpendReset,
+    StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer, UsageBucket,
+    UsageGroupBy, UsageLine, UsageQuery, UsdSource,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -479,6 +480,57 @@ fn usage_query_and_answer() {
     assert_eq!(answer.skipped, 1);
 }
 
+#[test]
+fn batches() {
+    let submit: BatchSubmit = roundtrip("gateway_batch_submit.json");
+    assert_eq!(submit.validate(), Ok(()));
+    let ids: Vec<&str> = submit
+        .requests
+        .iter()
+        .map(|r| r.custom_id.as_str())
+        .collect();
+    assert_eq!(ids, ["item-1", "item-2"]);
+    let running: BatchStatus = roundtrip("gateway_batch_status.json");
+    assert_eq!(
+        (running.processing_status, running.ended_at),
+        (BatchProcessing::InProgress, None)
+    );
+    let ended: BatchStatus = roundtrip("gateway_batch_status_ended.json");
+    assert_eq!(ended.processing_status, BatchProcessing::Ended);
+    assert_eq!(ended.ended_at, Some(1_800_003_600));
+    assert_eq!(
+        ended.request_counts,
+        BatchCounts {
+            processing: 0,
+            succeeded: 1,
+            errored: 1,
+            canceled: 0,
+            expired: 0
+        }
+    );
+}
+
+#[test]
+fn a_batch_refusal_names_the_request_it_refuses() {
+    for (name, want) in [
+        (
+            "params_model",
+            "request `a`: `params` must not hold `model`",
+        ),
+        (
+            "params_stream",
+            "request `a`: `params` must not hold `stream`",
+        ),
+        ("repeated_custom_id", "`custom_id` `a` is repeated"),
+        ("bad_custom_id", "`requests[0].custom_id` must match"),
+    ] {
+        let raw = fixture(&format!("gateway/invalid/BatchSubmit.{name}.json"));
+        let submit: BatchSubmit = serde_json::from_str(&raw).unwrap();
+        let e = submit.validate().unwrap_err();
+        assert!(e.starts_with(want), "{name}: {e}");
+    }
+}
+
 /// A turn request around one block, for the block fixtures.
 fn around(block: Block) -> TurnRequest {
     TurnRequest {
@@ -523,6 +575,7 @@ fn invalid_fixtures_are_rejected() {
                 serde_json::to_value(e).unwrap() == serde_json::from_str::<Value>(&raw).unwrap()
             }),
             "CancelRequest" => rejected(&raw, |_: CancelRequest| true),
+            "BatchSubmit" => rejected(&raw, |b: BatchSubmit| b.validate().is_ok()),
             "ConfigRoutesPut" => rejected(&raw, |_: ConfigRoutesPut| true),
             "LoginKey" => rejected(&raw, |k: LoginKey| k.validate().is_ok()),
             "LoginOauthCode" => rejected(&raw, |_: LoginOauthCode| true),
@@ -697,6 +750,10 @@ fn typed_enums() -> Vec<(String, Vec<String>)> {
             names(&every!(StopReason: End, ToolUse, MaxTokens, Refusal)),
         ),
         (schema("ErrorClass"), names(&every_class())),
+        (
+            schema("BatchProcessing"),
+            names(&every!(BatchProcessing: InProgress, Canceling, Ended)),
+        ),
         (
             schema("RouteState"),
             names(&every!(RouteState: Ready, Degraded, Exhausted, Unavailable)),

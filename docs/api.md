@@ -395,6 +395,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/spend/reset` | `SpendReset` | 200 `LoginSpend`, 400 a login without `spend_cap`, 403 a caller other than the gateway's own uid, 500 the spend file could not be written |
 | `GET /v1/model/audit` | — | 200 `AuditAnswer`, 400 a bad query, 403 a caller other than the gateway's own uid, 404 no `audit_file` |
 | `GET /v1/model/usage` | — | 200 `UsageAnswer`, 400 a bad query or more than 10 000 rows, 403 a caller other than the gateway's own uid, 404 no `[usage]` |
+| `POST /v1/model/batches` | `BatchSubmit` | 200 `BatchStatus`, 400 a body that does not validate, an unknown or chain route or one without an `api_key` Anthropic login, 404 no `[batches]`, 409 a key used with another body, of unknown outcome or still running, 413 a body over `max_request_bytes`, 500 the store could not be written, 502 the create was not sent or its outcome is unknown; a pick that does not run and the vendor's refusal answer their class |
+| `GET /v1/model/batches/{batch_id}` | — | 200 `BatchStatus`, 403 another caller's batch, 404 no `[batches]` or an unknown batch, 409 the batch's login is no longer an `api_key` Anthropic login of the config, 502 no answer with a batch; the vendor's refusal answers its class |
 | `POST /v1/model/clients/{name}/rotate` | — | 200 `ClientRotateAnswer`, 403 a caller other than the gateway's own uid, 404 no such named client, 409 a client with `token_sha256`, 500 a file could not be written |
 | `GET /v1/model/config/routes` | — | 200 `ConfigRoutes` with an `ETag`, 403 a caller other than the gateway's own uid, 500 the config file cannot be read or does not validate |
 | `PUT /v1/model/config/routes` | `ConfigRoutesPut` with `If-Match` | 200 `ConfigRoutesWritten`, 400 a body or candidate file that does not validate, 403 a caller other than the gateway's own uid, 412 `If-Match` is not the file's hash, 428 no `If-Match`, 500 a file could not be read or written |
@@ -410,8 +412,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/responses` | OpenAI Responses request | Responses SSE or one `response` object; errors in the OpenAI error format ([openai.md](openai.md#serving-the-fronts)) |
 
 Framing is `qbd`'s: HTTP/1.1, one request per connection, head ≤ 8 KiB, `Content-Length`
-required, chunked request bodies refused. The body of `POST /v1/model/turn` and of a `POST` to
-an HTTP front (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) may be up to the config's
+required, chunked request bodies refused. The body of `POST /v1/model/turn`, of
+`POST /v1/model/batches` and of a `POST` to an HTTP front (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) may be up to the config's
 `max_request_bytes` (default 8 MiB), that of a `POST` to `/v1/model/logins/{name}/key` or
 `/v1/model/logins/{name}/oauth/code` up to 8 KiB, every other body up to 64 KiB; a request whose head and body have not arrived within 10 s is dropped
 without an answer. `/v1/model/*` requests reject unknown fields. Every non-200 answer of the
@@ -1121,3 +1123,68 @@ hides nor doubles a line; appends do not wait for the read. An answer of more th
 asking for a narrower window or a coarser bucket; no answer is cut short. An unknown parameter,
 one given twice, a missing `from` or an invalid value is 400 `bad_request` naming the parameter;
 without `[usage]` the answer is 404 `bad_request`.
+
+### `POST /v1/model/batches` and `GET /v1/model/batches/{batch_id}`
+
+With the `[batches]` table ([config.md](config.md#gateway-config)) the gateway creates Anthropic
+Message Batches on a route and reads their status back; without it both endpoints answer 404
+`bad_request`. Callers are those of `POST /v1/model/turn`, the gateway's own uid or a
+`[[clients]]` uid; the loopback listener serves neither endpoint.
+
+```json
+{"route": "batch", "idempotency_key": "nightly-0001",
+ "requests": [{"custom_id": "item-1",
+               "params": {"max_tokens": 256, "messages": [{"role": "user", "content": "Hi"}]}}]}
+```
+
+`route` names a pin or ladder route; a chain route is 400 `bad_request`. `idempotency_key` and
+each `custom_id` match `^[A-Za-z0-9_-]{1,64}$`, the `custom_id`s are unique, and there are 1 to
+100 000 requests. `params` is a JSON object of Messages parameters, sent to the vendor as given
+except that the gateway sets `model` to the picked model; a `model` or `stream` key is 400
+`bad_request` naming the request's `custom_id`. The body may be up to `max_request_bytes`. Every
+one of these checks runs before any pick.
+
+The gateway asks `qbd` one pick for the route's target, its `logins` the route's logins (every
+login of the config when the route lists none) that are `api_key` logins of the `anthropic` API
+family, `on_behalf_of` the caller and `run_id` the key. When that set is empty the answer is 400
+`bad_request` with the message ``route `<alias>` has no `api_key` Anthropic login; OAuth logins
+cannot run batches``, and neither `qbd` nor the vendor is asked. A pick that does not run answers
+as a turn would end (`quota_exhausted` with `resets_at`, `no_route`). On a `run` the gateway
+stores a pending record of the submit, sends `POST {base_url}/v1/messages/batches` with the
+login's key, reports the vendor's answer for the lease and releases it: `ok` for a 200, else the
+outcome of the vendor's error as for a turn ([Attempts and rotation](#attempts-and-rotation)).
+A batch the vendor created is bound to its id in the store before the 200 answer, a `BatchStatus`:
+
+```json
+{"batch_id": "msgbatch_0001", "route": "batch", "login": "key-1", "model": "model-large",
+ "processing_status": "in_progress",
+ "request_counts": {"processing": 1, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0},
+ "created_at": 1800000000, "expires_at": 1800086400}
+```
+
+`processing_status` is `in_progress`, `canceling` or `ended`; `ended_at` comes once it ended. The
+times are the vendor's, in Unix seconds. A vendor error answers the class it maps to as for a
+turn, `retry_after` and `resets_at` included, with the status of that class; the pending record
+goes and the key may be used again. A create that never went out, as when the login's
+credential cannot be read, is 502 `unavailable` and frees the key too. A create without an answer
+that tells its outcome (the connection failed, or a 200 without a batch) is 502 `unavailable` and
+keeps the pending record, so the key stays refused rather than create a second paid batch.
+
+The key is the caller's: the same caller and key with the same body (the same bytes, compared by
+SHA-256) answer the stored batch's current status, read from the vendor, without a create
+request; another body is 409 `bad_request`. A key whose pending record has no batch is 409
+`bad_request`, saying that the earlier submit's outcome is unknown, and so is a key whose submit
+is running; neither asks the vendor.
+
+`GET /v1/model/batches/{batch_id}` answers the vendor's status of a batch of the store as a
+`BatchStatus`, read with `GET {base_url}/v1/messages/batches/{batch_id}` through the login that
+created it, without a pick and without a report, also when its route changed or went since. An
+unknown id is 404 `bad_request`; another caller's batch is 403 `auth`, except for the gateway's
+own uid; a login no longer in the config, or no longer an `api_key` Anthropic login, is 409
+`unavailable` naming it. A vendor error answers its class with that class's status; no answer, or
+one without a batch, is 502 `unavailable`.
+
+A store record holds the vendor's `batch_id` (absent while pending), the caller's name, the
+route, the login, the model, the idempotency key, the SHA-256 of the submit body and the time of
+the submit; never a credential or prompt text. No answer, log line or store record holds the
+key.

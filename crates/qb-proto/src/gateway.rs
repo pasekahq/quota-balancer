@@ -1244,6 +1244,125 @@ pub struct UsageAnswer {
     pub skipped: u64,
 }
 
+/// Most requests of one batch.
+pub const MAX_BATCH_REQUESTS: usize = 100_000;
+
+/// `POST /v1/model/batches` request: one Anthropic Message Batch on a route alias.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSubmit {
+    /// Route alias of a pin or ladder route.
+    pub route: String,
+    /// The caller's key of this submit, `^[A-Za-z0-9_-]{1,64}$`; a repeat answers the batch it
+    /// created.
+    pub idempotency_key: String,
+    /// 1 to [`MAX_BATCH_REQUESTS`] requests, each `custom_id` unique.
+    pub requests: Vec<BatchRequest>,
+}
+
+/// One request of a [`BatchSubmit`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRequest {
+    /// The caller's id of the request, `^[A-Za-z0-9_-]{1,64}$`.
+    pub custom_id: String,
+    /// Anthropic Messages parameters without `model` and `stream`, sent as given.
+    pub params: Object,
+}
+
+impl BatchSubmit {
+    /// Checks the invariants that the type system does not express.
+    ///
+    /// # Errors
+    /// The first violated invariant, as a message naming the field or the request's `custom_id`.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_alias(&self.route) {
+            return Err("`route` must match ^[a-z][a-z0-9_-]{0,63}$".into());
+        }
+        if !is_name(&self.idempotency_key) {
+            return Err("`idempotency_key` must match ^[A-Za-z0-9_-]{1,64}$".into());
+        }
+        if self.requests.is_empty() || self.requests.len() > MAX_BATCH_REQUESTS {
+            return Err(format!(
+                "`requests` must hold 1 to {MAX_BATCH_REQUESTS} requests"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, r) in self.requests.iter().enumerate() {
+            if !is_name(&r.custom_id) {
+                return Err(format!(
+                    "`requests[{i}].custom_id` must match ^[A-Za-z0-9_-]{{1,64}}$"
+                ));
+            }
+            if !seen.insert(r.custom_id.as_str()) {
+                return Err(format!("`custom_id` `{}` is repeated", r.custom_id));
+            }
+            if let Some(key) = ["model", "stream"]
+                .iter()
+                .find(|k| r.params.contains_key(**k))
+            {
+                return Err(format!(
+                    "request `{}`: `params` must not hold `{key}`; the gateway sets the model and \
+                     a batch does not stream",
+                    r.custom_id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a batch is in its processing, as the vendor reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchProcessing {
+    /// Requests are still being processed.
+    InProgress,
+    /// A cancel was asked and is under way.
+    Canceling,
+    /// Every request ended; the results can be read.
+    Ended,
+}
+
+/// The requests of a batch by how far they got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchCounts {
+    /// Requests not processed yet.
+    pub processing: u64,
+    /// Requests that ended with a message.
+    pub succeeded: u64,
+    /// Requests that ended with an error.
+    pub errored: u64,
+    /// Requests cancelled before they ran.
+    pub canceled: u64,
+    /// Requests that did not run before the batch expired.
+    pub expired: u64,
+}
+
+/// `POST /v1/model/batches` and `GET /v1/model/batches/{batch_id}` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchStatus {
+    /// The vendor's id of the batch.
+    pub batch_id: String,
+    /// Route alias the batch was submitted on.
+    pub route: String,
+    /// Login that created the batch; every later request of the batch goes through it.
+    pub login: String,
+    /// Model every request of the batch runs on.
+    pub model: String,
+    /// Where the batch is in its processing.
+    pub processing_status: BatchProcessing,
+    /// The batch's requests by state.
+    pub request_counts: BatchCounts,
+    /// Unix time the vendor created the batch.
+    pub created_at: u64,
+    /// Unix time processing ended; absent before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<u64>,
+    /// Unix time the vendor expires the batch's unprocessed requests.
+    pub expires_at: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

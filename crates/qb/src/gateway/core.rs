@@ -26,6 +26,7 @@ use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
 use super::Refusal;
+use super::batches::Store;
 use super::config::{
     Api, ClientEffort, ClientToken, CredentialKind, GatewayConfig, GatewayLogin, Route,
 };
@@ -156,6 +157,8 @@ pub struct Gateway {
     tokens: Mutex<Arc<ClientTokens>>,
     /// The ledger of the startup `[usage]`.
     usage: Option<usage::Ledger>,
+    /// The batch store of the startup `[batches]`.
+    batches: Option<Store>,
     /// At most one per login; its verifier and state never leave this memory.
     sign_ins: Mutex<Vec<Pending>>,
     /// Seconds a started sign-in takes its code.
@@ -185,6 +188,22 @@ fn classify(kind: FailureKind) -> (Outcome, ErrorClass) {
         FailureKind::ContextTooLong => (Outcome::Error, ErrorClass::ContextTooLong),
         FailureKind::Cancelled => (Outcome::Error, ErrorClass::Cancelled),
     }
+}
+
+/// The qbd outcome of an adapter or vendor `failure` and the error the client gets: its class,
+/// retryability, `resets_at` of a usage limit, `retry_after` of a 429 or overload, and its
+/// message, which [`redact`] cleaned at the seam.
+pub(super) fn refusal(failure: &Failure) -> (Outcome, GatewayError) {
+    let (outcome, class) = classify(failure.kind);
+    let mut error = GatewayError::new(class, retryable(class), failure.message.clone());
+    match failure.kind {
+        FailureKind::UsageLimit { resets_at } => error.resets_at = resets_at,
+        FailureKind::RateLimited { retry_after } | FailureKind::Overloaded { retry_after } => {
+            error.retry_after = retry_after;
+        }
+        _ => {}
+    }
+    (outcome, error)
 }
 
 /// A failure that qbd marks on the login only, so another login may succeed.
@@ -417,9 +436,9 @@ impl Gateway {
     /// `refresher` and `qbd_bearer` for qbd, if qbd knows the gateway by token.
     ///
     /// # Errors
-    /// The config's `spend_file` exists but cannot be read as one, a `token_file` cannot be read
-    /// as a token, the `grace_file` exists but cannot be read as one, or the `audit_file` exists
-    /// with a mode wider than 0600 that cannot be narrowed.
+    /// The config's `spend_file` or `batches.file` exists but cannot be read as one, a
+    /// `token_file` cannot be read as a token, the `grace_file` exists but cannot be read as one,
+    /// or the `audit_file` exists with a mode wider than 0600 that cannot be narrowed.
     pub fn new(
         config: GatewayConfig,
         upstreams: Upstreams,
@@ -434,6 +453,10 @@ impl Gateway {
             audit::narrow(file)?;
         }
         let usage = config.usage.clone().map(usage::Ledger::new);
+        let batches = match &config.batches {
+            Some(b) => Some(Store::open(&b.file)?),
+            None => None,
+        };
         let tokens = ClientTokens::load(&config, unix_now())?;
         let startup = Arc::new(sorted(config));
         let mut opened: Vec<PathBuf> = Vec::new();
@@ -457,6 +480,7 @@ impl Gateway {
             spend,
             opened,
             usage,
+            batches,
             tokens: Mutex::new(Arc::new(tokens)),
             sign_ins: Mutex::new(Vec::new()),
             sign_in_expiry: SIGN_IN_EXPIRY_S,
@@ -483,6 +507,16 @@ impl Gateway {
     /// The current config snapshot.
     pub fn config(&self) -> Arc<GatewayConfig> {
         Arc::clone(&lock(&self.config))
+    }
+
+    /// The batch store; `None` without `[batches]`.
+    pub(super) fn batches(&self) -> Option<&Store> {
+        self.batches.as_ref()
+    }
+
+    /// The credential of `login` from its file at `now`, refreshed when it is about to expire.
+    pub(super) fn credential(&self, login: &GatewayLogin, now: u64) -> Result<Credential, String> {
+        self.store.load(login, now, false).map_err(|e| e.message)
     }
 
     /// The current hashes of the `token_file` clients.
@@ -1400,7 +1434,8 @@ impl Gateway {
             }
             Err(f) => f,
         };
-        let (outcome, class) = classify(failure.kind);
+        let (outcome, mut error) = refusal(&failure);
+        let class = error.class;
         // A stream that started shows the login works, however it ended.
         let outcome = if relay.emitted && outcome == Outcome::Error {
             Outcome::Ok
@@ -1432,14 +1467,6 @@ impl Gateway {
         attempt.class = class;
         let vendor = attempt.vendor.clone();
         progress.tried.push(attempt);
-        let mut error = GatewayError::new(class, retryable(class), failure.message);
-        match failure.kind {
-            FailureKind::UsageLimit { resets_at } => error.resets_at = resets_at,
-            FailureKind::RateLimited { retry_after } | FailureKind::Overloaded { retry_after } => {
-                error.retry_after = retry_after;
-            }
-            _ => {}
-        }
         if !relay.emitted {
             if let FailureKind::RateLimited {
                 retry_after: Some(wait),
@@ -1859,7 +1886,7 @@ impl Gateway {
         self.pick_once(&pick)
     }
 
-    fn pick_once(&self, req: &PickRequest) -> Result<PickResponse, GatewayError> {
+    pub(super) fn pick_once(&self, req: &PickRequest) -> Result<PickResponse, GatewayError> {
         let unavailable = |m: String| GatewayError::new(ErrorClass::Unavailable, true, m);
         let body = serde_json::to_vec(req).map_err(|e| unavailable(e.to_string()))?;
         let socket = &self.startup.qbd_socket;
@@ -1890,7 +1917,7 @@ impl Gateway {
     }
 
     /// Reports `outcome` and `windows` for `lease` and releases it; failures are logged only.
-    fn report(&self, lease: &str, outcome: Outcome, windows: Vec<WindowReport>) {
+    pub(super) fn report(&self, lease: &str, outcome: Outcome, windows: Vec<WindowReport>) {
         self.send_report(&ReportRequest {
             lease_id: Some(lease.to_owned()),
             login: None,
@@ -1904,7 +1931,7 @@ impl Gateway {
 
     /// [`Self::report`] of an attempt on `login` that read the credential of fingerprint `fp`,
     /// which an `http_401` carries.
-    fn report_attempt(
+    pub(super) fn report_attempt(
         &self,
         lease: &str,
         login: &str,
@@ -2179,7 +2206,7 @@ fn sorted(mut config: GatewayConfig) -> GatewayConfig {
 
 /// The first restart-only change of `new` against the startup config `old`, naming its file
 /// and field: the listeners, the qbd connection, the spend, audit and grace files, the usage
-/// ledger, and a credential or token file outside the directories `opened` the sandbox opened
+/// ledger, the batch store, and a credential or token file outside the directories `opened` the sandbox opened
 /// at startup.
 fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) -> Option<String> {
     let fail = |field: String, reason: &str| {
@@ -2203,6 +2230,7 @@ fn restart_only(old: &GatewayConfig, new: &GatewayConfig, opened: &[PathBuf]) ->
         ("spend_file", old.spend_file != new.spend_file),
         ("audit_file", old.audit_file != new.audit_file),
         ("usage", old.usage != new.usage),
+        ("batches", old.batches != new.batches),
         ("fronts.listen", listen(old) != listen(new)),
         ("fronts.grace_file", grace(old) != grace(new)),
     ];
@@ -2295,7 +2323,7 @@ fn nearest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 /// The error for a pick that is not `run`: `quota_exhausted` until the `retry_after` of a
 /// `wait`, `no_route` for `dead`.
-fn unpickable(p: &PickResponse, alias: &str) -> GatewayError {
+pub(super) fn unpickable(p: &PickResponse, alias: &str) -> GatewayError {
     if p.decision == Decision::Wait {
         let message = format!("every candidate of route `{alias}` waits ({})", p.reason);
         let mut e = GatewayError::new(ErrorClass::QuotaExhausted, true, message);
@@ -2308,7 +2336,7 @@ fn unpickable(p: &PickResponse, alias: &str) -> GatewayError {
 
 /// `f` with the credential's secret and account id replaced by `[redacted]`: the adapter must
 /// never quote them, and if it does, the copy stops here.
-fn redact(mut f: Failure, credential: &Credential) -> Failure {
+pub(super) fn redact(mut f: Failure, credential: &Credential) -> Failure {
     for value in [Some(credential.secret()), credential.account_id()]
         .into_iter()
         .flatten()
