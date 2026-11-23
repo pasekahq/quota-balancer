@@ -18,6 +18,8 @@ pub enum Answer {
     Full(u16, Vec<(String, String)>, Vec<u8>),
     /// A 200 stream that sends these bytes and then stays silent until the gateway closes it.
     Hold(Vec<u8>),
+    /// A 200 chunked stream that sends these bytes as one chunk and closes without the last one.
+    Cut(Vec<u8>),
     /// The answer, after a pause.
     After(Duration, Box<Answer>),
     /// The answer this function gives to the request body.
@@ -199,6 +201,14 @@ fn answer_with(conn: &mut TcpStream, answer: Answer, closed: &Sender<Instant>) {
             let mut rest = Vec::new();
             let _ = conn.read_to_end(&mut rest);
             let _ = closed.send(Instant::now());
+        }
+        Answer::Cut(bytes) => {
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/binary\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+            let chunk = format!("{:x}\r\n", bytes.len());
+            conn.write_all(head.as_bytes()).unwrap();
+            conn.write_all(chunk.as_bytes()).unwrap();
+            conn.write_all(&bytes).unwrap();
+            conn.write_all(b"\r\n").unwrap();
         }
         Answer::After(pause, answer) => {
             std::thread::sleep(pause);

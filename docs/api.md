@@ -397,6 +397,8 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `GET /v1/model/usage` | — | 200 `UsageAnswer`, 400 a bad query or more than 10 000 rows, 403 a caller other than the gateway's own uid, 404 no `[usage]` |
 | `POST /v1/model/batches` | `BatchSubmit` | 200 `BatchStatus`, 400 a body that does not validate, an unknown or chain route or one without an `api_key` Anthropic login, 404 no `[batches]`, 409 a key used with another body, of unknown outcome or still running, 413 a body over `max_request_bytes`, 500 the store could not be written, 502 the create was not sent or its outcome is unknown; a pick that does not run and the vendor's refusal answer their class |
 | `GET /v1/model/batches/{batch_id}` | — | 200 `BatchStatus`, 403 another caller's batch, 404 no `[batches]` or an unknown batch, 409 the batch's login is no longer an `api_key` Anthropic login of the config, 502 no answer with a batch; the vendor's refusal answers its class |
+| `GET /v1/model/batches/{batch_id}/results` | — | 200 chunked `application/x-ndjson`, the vendor's results lines as it sent them; 403, 404 and 502 as for the status, 409 a batch that has not ended or whose login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class |
+| `POST /v1/model/batches/{batch_id}/cancel` | empty | 200 `BatchStatus`, 400 a body; 403, 404, 409 and 502 as for the status; the vendor's refusal answers its class |
 | `POST /v1/model/clients/{name}/rotate` | — | 200 `ClientRotateAnswer`, 403 a caller other than the gateway's own uid, 404 no such named client, 409 a client with `token_sha256`, 500 a file could not be written |
 | `GET /v1/model/config/routes` | — | 200 `ConfigRoutes` with an `ETag`, 403 a caller other than the gateway's own uid, 500 the config file cannot be read or does not validate |
 | `PUT /v1/model/config/routes` | `ConfigRoutesPut` with `If-Match` | 200 `ConfigRoutesWritten`, 400 a body or candidate file that does not validate, 403 a caller other than the gateway's own uid, 412 `If-Match` is not the file's hash, 428 no `If-Match`, 500 a file could not be read or written |
@@ -1124,12 +1126,12 @@ asking for a narrower window or a coarser bucket; no answer is cut short. An unk
 one given twice, a missing `from` or an invalid value is 400 `bad_request` naming the parameter;
 without `[usage]` the answer is 404 `bad_request`.
 
-### `POST /v1/model/batches` and `GET /v1/model/batches/{batch_id}`
+### Message batches
 
 With the `[batches]` table ([config.md](config.md#gateway-config)) the gateway creates Anthropic
-Message Batches on a route and reads their status back; without it both endpoints answer 404
-`bad_request`. Callers are those of `POST /v1/model/turn`, the gateway's own uid or a
-`[[clients]]` uid; the loopback listener serves neither endpoint.
+Message Batches on a route, reads their status and results back and cancels them; without it
+every batch endpoint answers 404 `bad_request`. Callers are those of `POST /v1/model/turn`, the
+gateway's own uid or a `[[clients]]` uid; the loopback listener serves no batch endpoint.
 
 ```json
 {"route": "batch", "idempotency_key": "nightly-0001",
@@ -1183,6 +1185,28 @@ unknown id is 404 `bad_request`; another caller's batch is 403 `auth`, except fo
 own uid; a login no longer in the config, or no longer an `api_key` Anthropic login, is 409
 `unavailable` naming it. A vendor error answers its class with that class's status; no answer, or
 one without a batch, is 502 `unavailable`.
+
+`GET /v1/model/batches/{batch_id}/results` first reads the batch's status as above, with the same
+answers for an unknown id, another caller's batch or a gone login. A batch that has not ended is
+409 `bad_request` naming its `processing_status`, and no results request is sent. For an ended
+batch the gateway sends `GET {base_url}/v1/messages/batches/{batch_id}/results` through the login
+that created it; it never follows the batch's `results_url`. A vendor error before the answer
+starts answers its class as for the status, and no answer is 502 `unavailable`. The vendor's 200
+is answered 200 with `Transfer-Encoding: chunked` and `Content-Type: application/x-ndjson`: its
+body, one JSONL line per request in the vendor's order, passed through unchanged in chunks of at
+most 16 KiB, never held whole. Each line is `{"custom_id": ..., "result": {"type": ...}}` with the
+type `succeeded` (with the Messages `message` and its `usage`), `errored`, `canceled` or
+`expired`. When the vendor's body breaks after the answer started, the gateway closes the
+connection without the last chunk, so the transfer is cut and never looks complete.
+
+`POST /v1/model/batches/{batch_id}/cancel` takes an empty body; any body is 400 `bad_request`.
+It sends `POST {base_url}/v1/messages/batches/{batch_id}/cancel` through the login that created
+the batch and answers the vendor's `BatchStatus`, usually `canceling`, with the same answers for
+an unknown id, another caller's batch, a gone login or no answer as the status. A vendor refusal,
+as for a batch that already ended, answers its class with that class's status.
+
+The results and the cancel, like the status, take no pick, send no report to `qbd` and leave the
+store as it is.
 
 A store record holds the vendor's `batch_id` (absent while pending), the caller's name, the
 route, the login, the model, the idempotency key, the SHA-256 of the submit body and the time of

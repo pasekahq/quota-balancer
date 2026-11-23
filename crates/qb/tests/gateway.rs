@@ -50,7 +50,7 @@ use zeroize::Zeroizing;
 
 mod common;
 
-use common::http::{etag, finish, put, send, sha256_hex};
+use common::http::{chunks, etag, finish, put, send, sha256_hex};
 use common::pkce::{param, params, s256};
 use common::vendor::{Answer, Received, Vendor, fixture_of};
 use common::{Daemon, line_with, start_daemon, stderr_lines, temp_dir, wait_for};
@@ -11285,10 +11285,21 @@ fn batch_body(key: &str, ids: &[&str]) -> Value {
 /// The vendor's `message_batch` object `id`, ended at 09:30 with one success and one error,
 /// else in progress with two requests.
 fn message_batch(id: &str, ended: bool) -> Answer {
-    let (status, counts, ended_at) = if ended {
-        ("ended", [0, 1, 1, 0, 0], json!("2027-01-15T09:30:00.250Z"))
+    message_batch_in(id, if ended { "ended" } else { "in_progress" })
+}
+
+/// The vendor's `message_batch` object `id` in `status`: an ended one has one success and one
+/// error and a `results_url` on a host no login names, another two requests in processing.
+fn message_batch_in(id: &str, status: &str) -> Answer {
+    let (counts, ended_at, results_url) = if status == "ended" {
+        let url = format!("https://results.vendor-b.invalid/v1/messages/batches/{id}/results");
+        (
+            [0, 1, 1, 0, 0],
+            json!("2027-01-15T09:30:00.250Z"),
+            json!(url),
+        )
     } else {
-        ("in_progress", [2, 0, 0, 0, 0], Value::Null)
+        ([2, 0, 0, 0, 0], Value::Null, Value::Null)
     };
     let [processing, succeeded, errored, canceled, expired] = counts;
     let body = json!({
@@ -11297,7 +11308,7 @@ fn message_batch(id: &str, ended: bool) -> Answer {
                            "errored": errored, "canceled": canceled, "expired": expired},
         "ended_at": ended_at, "created_at": "2027-01-15T08:00:00Z",
         "expires_at": "2027-01-16T08:00:00Z", "cancel_initiated_at": null,
-        "archived_at": null, "results_url": null,
+        "archived_at": null, "results_url": results_url,
     });
     let json = vec![("content-type".to_owned(), "application/json".to_owned())];
     Answer::Full(200, json, body.to_string().into_bytes())
@@ -11321,6 +11332,46 @@ fn batch_of(gw: &Path, batch_id: &str) -> (u16, Vec<u8>) {
         &format!("{}/{batch_id}", paths::MODEL_BATCHES),
         "",
     )
+}
+
+/// `GET` of the results of `batch_id`: its connection, the answer still to read.
+fn results_of(gw: &Path, batch_id: &str) -> UnixStream {
+    let path = format!("{}/{batch_id}/results", paths::MODEL_BATCHES);
+    send(gw, "GET", &path, "")
+}
+
+/// `POST` of `body` to the cancel of `batch_id`.
+fn cancel_of(gw: &Path, batch_id: &str, body: &str) -> (u16, Vec<u8>) {
+    let path = format!("{}/{batch_id}/cancel", paths::MODEL_BATCHES);
+    call(gw, "POST", &path, body)
+}
+
+/// The head of the answer read from `s` to its end, the data of each chunk of its chunked body,
+/// and whether the body ended with the last chunk.
+fn chunks_of(mut s: UnixStream) -> (String, Vec<Vec<u8>>, bool) {
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8(raw[..at].to_vec()).unwrap();
+    assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+    let (chunks, ended) = chunks(&raw[at + 4..]);
+    (head, chunks, ended)
+}
+
+/// A vendor results body of `lines`, one JSON line each.
+fn results_body(lines: &[Value]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for line in lines {
+        body.extend_from_slice(line.to_string().as_bytes());
+        body.push(b'\n');
+    }
+    body
+}
+
+/// A vendor 200 answer with the results body `body`.
+fn results_answer(body: Vec<u8>) -> Answer {
+    let binary = vec![("content-type".to_owned(), "application/binary".to_owned())];
+    Answer::Full(200, binary, body)
 }
 
 /// The [`BatchStatus`] of a 200 answer.
@@ -11772,7 +11823,13 @@ fn bad_batch_input_is_refused_before_any_pick() {
 
     let (r, _vendor) = vendor_rig(&key_files(), two_keys);
     let none = "this gateway runs no batches: its config has no `[batches]` table".to_owned();
-    for answer in [submit_batch(&r.gw, &body), batch_of(&r.gw, "msgbatch_01")] {
+    let (results, _, results_body) = finish(results_of(&r.gw, "msgbatch_01"), Vec::new());
+    for answer in [
+        submit_batch(&r.gw, &body),
+        batch_of(&r.gw, "msgbatch_01"),
+        (results, results_body),
+        cancel_of(&r.gw, "msgbatch_01", ""),
+    ] {
         assert_eq!(
             batch_refusal(answer),
             (404, ErrorClass::BadRequest, none.clone())
@@ -11801,9 +11858,21 @@ fn no_batch_answer_log_or_record_holds_the_key() {
         answers.push(batch_of(&b.gw, "msgbatch_01"));
         b.vendor.answer(message_batch("msgbatch_01", true));
         answers.push(batch_of(&b.gw, "msgbatch_01"));
+        b.vendor.answer(message_batch("msgbatch_01", true));
+        b.vendor
+            .answer(vendor_error(401, "authentication_error", &quoted));
+        let (status, _, body) = finish(results_of(&b.gw, "msgbatch_01"), Vec::new());
+        answers.push((status, body));
+        b.vendor
+            .answer(vendor_error(400, "invalid_request_error", &quoted));
+        answers.push(cancel_of(&b.gw, "msgbatch_01", ""));
     });
     let statuses: Vec<u16> = answers.iter().map(|a| a.0).collect();
-    assert_eq!(statuses, [401, 200, 502, 200]);
+    assert_eq!(statuses, [401, 200, 502, 200, 401, 400]);
+    for answer in &answers[4..] {
+        let (_, _, message) = batch_refusal(answer.clone());
+        assert!(message.contains("[redacted]"), "{message}");
+    }
     let refused = batch_refusal(answers[0].clone());
     assert_eq!(refused.1, ErrorClass::Auth);
     assert!(
@@ -11821,5 +11890,203 @@ fn no_batch_answer_log_or_record_holds_the_key() {
         assert!(!text.contains(MARK), "{text}");
     }
     let keys: Vec<String> = batch_calls(&b.vendor).into_iter().map(|c| c.2).collect();
-    assert_eq!(keys, [MARK; 4], "the vendor got the key");
+    assert_eq!(keys, [MARK; 7], "the vendor got the key");
+}
+
+/// The status, class and message of a refused results request on `gw` for `batch_id`.
+fn results_refusal(gw: &Path, batch_id: &str) -> (u16, ErrorClass, String) {
+    let (status, _, body) = finish(results_of(gw, batch_id), Vec::new());
+    batch_refusal((status, body))
+}
+
+#[test]
+fn an_ended_batch_s_results_stream_from_the_base_url_of_its_login() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let ids = ["item-1", "item-2", "item-3", "item-4"];
+    let created = batch_status(submit_batch(&b.gw, &batch_body("key-1", &ids)));
+    let store = std::fs::read(batch_file(&b.dir)).unwrap();
+    let usage = json!({"input_tokens": 12, "output_tokens": 30});
+    let message = json!({"id": "msg_1", "type": "message", "role": "assistant",
+                         "model": "model-large", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "Résumé « item-3 »"}],
+                         "usage": usage});
+    let error = json!({"type": "error", "error": {"type": "invalid_request_error",
+                                                   "message": "max_tokens: too large"}});
+    let mut body = results_body(&[
+        json!({"custom_id": "item-3", "result": {"type": "succeeded", "message": message}}),
+        json!({"custom_id": "item-1", "result": {"type": "errored", "error": error}}),
+        json!({"custom_id": "item-4", "result": {"type": "canceled"}}),
+    ]);
+    body.extend_from_slice(
+        b"{ \"custom_id\" : \"item-2\",\t\"result\": {\"type\": \"expired\"} }\n",
+    );
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    b.vendor.answer(results_answer(body.clone()));
+    let (status, head, got) = finish(results_of(&b.gw, "msgbatch_01"), Vec::new());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&got));
+    assert!(
+        head.contains("Content-Type: application/x-ndjson"),
+        "{head}"
+    );
+    assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+    assert_eq!(got, body, "the vendor's lines byte for byte, in its order");
+    let key = key_of(&created.login);
+    let get = |path: &str| ("GET".to_owned(), path.to_owned(), key.to_owned());
+    assert_eq!(
+        batch_calls(&b.vendor)[1..],
+        [
+            get("/v1/messages/batches/msgbatch_01"),
+            get("/v1/messages/batches/msgbatch_01/results")
+        ],
+        "both to the login's base URL, not the batch's results_url"
+    );
+    assert_eq!(leased_on_behalf_of(&b.dir).len(), 1, "results take no pick");
+    assert_eq!(std::fs::read(batch_file(&b.dir)).unwrap(), store);
+}
+
+#[test]
+fn a_results_body_of_several_mib_passes_in_bounded_chunks() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    batch_status(submit_batch(&b.gw, &batch_body("key-1", &["item-1"])));
+    let text = "x".repeat(200);
+    let lines: Vec<Value> = (0..24_000)
+        .map(|i| {
+            json!({"custom_id": format!("item-{i}"), "result": {"type": "succeeded",
+                   "message": {"content": [{"type": "text", "text": text}],
+                               "usage": {"input_tokens": i, "output_tokens": 7}}}})
+        })
+        .collect();
+    let body = results_body(&lines);
+    assert!(body.len() > 5 << 20, "{} bytes", body.len());
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    b.vendor.answer(results_answer(body.clone()));
+    let (head, chunks, ended) = chunks_of(results_of(&b.gw, "msgbatch_01"));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(ended, "the body ends with the last chunk");
+    let largest = chunks.iter().map(Vec::len).max().unwrap();
+    assert!(
+        largest <= front::RESULTS_CHUNK,
+        "a chunk of {largest} bytes"
+    );
+    assert!(chunks.concat() == body, "the body passes intact");
+}
+
+#[test]
+fn results_wait_for_the_batch_s_end_and_a_cut_body_stays_cut() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    batch_status(submit_batch(
+        &b.gw,
+        &batch_body("key-1", &["item-1", "item-2"]),
+    ));
+    for status in ["in_progress", "canceling"] {
+        b.vendor.answer(message_batch_in("msgbatch_01", status));
+        let message =
+            format!("batch `msgbatch_01` is `{status}`; its results exist once it is `ended`");
+        assert_eq!(
+            results_refusal(&b.gw, "msgbatch_01"),
+            (409, ErrorClass::BadRequest, message)
+        );
+    }
+    let paths: Vec<String> = batch_calls(&b.vendor).into_iter().map(|c| c.1).collect();
+    assert_eq!(
+        paths[1..],
+        ["/v1/messages/batches/msgbatch_01"; 2],
+        "no results request"
+    );
+
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    b.vendor
+        .answer(vendor_error(500, "api_error", "Internal server error"));
+    let (status, class, _) = results_refusal(&b.gw, "msgbatch_01");
+    assert_eq!((status, class), (502, ErrorClass::Unavailable));
+
+    let prefix = results_body(&[json!({"custom_id": "item-1", "result": {"type": "canceled"}})]);
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    b.vendor.answer(Answer::Cut(prefix.clone()));
+    let (head, chunks, ended) = chunks_of(results_of(&b.gw, "msgbatch_01"));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(!ended, "a cut body never ends with the last chunk");
+    assert_eq!(chunks.concat(), prefix, "what arrived before the cut");
+}
+
+#[test]
+fn a_cancel_goes_through_the_login_that_created_the_batch() {
+    let records = [batch_record(
+        Some("msgbatch_b"),
+        "client-b",
+        "chat",
+        "login-2",
+        "key-b",
+        "00",
+    )];
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &records);
+    let store = std::fs::read(batch_file(&b.dir)).unwrap();
+    b.vendor.answer(message_batch_in("msgbatch_b", "canceling"));
+    let canceling = batch_status(cancel_of(&b.gw, "msgbatch_b", ""));
+    assert_eq!(canceling.processing_status, BatchProcessing::Canceling);
+    assert_eq!(
+        (canceling.batch_id.as_str(), canceling.login.as_str()),
+        ("msgbatch_b", "login-2"),
+        "the gateway's own uid cancels another caller's batch"
+    );
+    let ended = "Batch msgbatch_b has already ended";
+    b.vendor
+        .answer(vendor_error(400, "invalid_request_error", ended));
+    let (status, class, message) = batch_refusal(cancel_of(&b.gw, "msgbatch_b", ""));
+    assert_eq!((status, class), (400, ErrorClass::BadRequest));
+    assert!(message.contains(ended), "{message}");
+    let with_body = batch_refusal(cancel_of(&b.gw, "msgbatch_b", "{}"));
+    let message = "a batch cancel takes no body".to_owned();
+    assert_eq!(with_body, (400, ErrorClass::BadRequest, message));
+
+    let post = (
+        "POST".to_owned(),
+        "/v1/messages/batches/msgbatch_b/cancel".to_owned(),
+        "test-token-2".to_owned(),
+    );
+    assert_eq!(batch_calls(&b.vendor), [post.clone(), post]);
+    let bodies: Vec<Value> = b.vendor.received().iter().map(|r| r.body.clone()).collect();
+    assert_eq!(bodies, [Value::Null, Value::Null], "no body to the vendor");
+    assert_eq!(leased_on_behalf_of(&b.dir), [], "no pick");
+    assert_eq!(std::fs::read(batch_file(&b.dir)).unwrap(), store);
+}
+
+#[test]
+fn results_and_cancel_answer_only_the_caller_of_a_known_batch() {
+    let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
+    let records = [batch_record(
+        Some("msgbatch_b"),
+        "client-b",
+        "chat",
+        "login-1",
+        "key-b",
+        "00",
+    )];
+    let b = batch_rig(&key_files(), two_keys, &extra, own_uid() + 1, &records);
+    let other = "batch `msgbatch_b` belongs to another caller".to_owned();
+    assert_eq!(
+        results_refusal(&b.gw, "msgbatch_b"),
+        (403, ErrorClass::Auth, other.clone())
+    );
+    assert_eq!(
+        batch_refusal(cancel_of(&b.gw, "msgbatch_b", "")),
+        (403, ErrorClass::Auth, other)
+    );
+    let none = "no batch `msgbatch_none`".to_owned();
+    assert_eq!(
+        results_refusal(&b.gw, "msgbatch_none"),
+        (404, ErrorClass::BadRequest, none.clone())
+    );
+    assert_eq!(
+        batch_refusal(cancel_of(&b.gw, "msgbatch_none", "")),
+        (404, ErrorClass::BadRequest, none)
+    );
+    let results = format!("{}/msgbatch_b/results", paths::MODEL_BATCHES);
+    let cancel = format!("{}/msgbatch_b/cancel", paths::MODEL_BATCHES);
+    assert_eq!(call(&b.gw, "POST", &results, "").0, 405);
+    assert_eq!(call(&b.gw, "GET", &cancel, "").0, 405);
+    assert_eq!(batch_calls(&b.vendor), []);
 }

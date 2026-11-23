@@ -35,21 +35,30 @@ pub fn put(sock: &Path, path: &str, if_match: Option<&str>, body: &str) -> (u16,
 }
 
 /// The chunked body `raw` without its framing.
-pub fn dechunk(mut raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let line_end = raw.windows(2).position(|w| w == b"\r\n").unwrap();
+pub fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let (chunks, ended) = chunks(raw);
+    assert!(ended, "stream ends with the last chunk");
+    chunks.concat()
+}
+
+/// The data of each chunk of the chunked body `raw`, and whether it ends with the last chunk;
+/// a body without it must stop between chunks.
+pub fn chunks(mut raw: &[u8]) -> (Vec<Vec<u8>>, bool) {
+    let mut chunks = Vec::new();
+    while let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") {
         let size =
             usize::from_str_radix(std::str::from_utf8(&raw[..line_end]).unwrap(), 16).unwrap();
         raw = &raw[line_end + 2..];
         if size == 0 {
-            assert_eq!(raw, b"\r\n", "stream ends with the last chunk");
-            return out;
+            assert_eq!(raw, b"\r\n", "nothing after the last chunk");
+            return (chunks, true);
         }
-        out.extend_from_slice(&raw[..size]);
+        chunks.push(raw[..size].to_vec());
         assert_eq!(&raw[size..size + 2], b"\r\n");
         raw = &raw[size + 2..];
     }
+    assert_eq!(raw, b"", "the body stops between chunks");
+    (chunks, false)
 }
 
 /// Status, head and (dechunked) body of a complete answer.

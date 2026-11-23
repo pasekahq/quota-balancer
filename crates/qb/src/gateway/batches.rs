@@ -1,9 +1,10 @@
 //! Anthropic Message Batches on `api_key` logins: `POST /v1/model/batches` creates one on the
-//! login qbd picks for a route, `GET /v1/model/batches/{batch_id}` reads its status through the
-//! same login. The store binds each batch to its caller, login and idempotency key; it is one
-//! JSON file replaced by rename (mode 0600) on each change.
+//! login qbd picks for a route; `GET /v1/model/batches/{batch_id}`, `GET .../results` and
+//! `POST .../cancel` read its status, read its results and cancel it through the same login.
+//! The store binds each batch to its caller, login and idempotency key; it is one JSON file
+//! replaced by rename (mode 0600) on each change.
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -303,34 +304,40 @@ fn batch_logins(config: &GatewayConfig, route: &Route) -> Vec<String> {
         .collect()
 }
 
-/// How a vendor request on a login ended.
-enum Sent {
-    /// 200 with the batch object.
-    Batch(MessageBatch, Vec<WindowReport>),
+/// How a vendor request on a login ended without the answer it asked for.
+enum Fault {
     /// The vendor refused it.
     Failed(Failure),
     /// It never went out: the credential could not be read.
     Unsent(String),
-    /// No answer that tells the outcome: the request failed or the body is not a batch.
+    /// No answer that tells the outcome: the request failed or the body is not the one asked.
     Lost(String),
 }
 
+/// A batch object the vendor answered with 200, and the rate-limit windows of its answer.
+type Sent = Result<(MessageBatch, Vec<WindowReport>), Fault>;
+
 /// Sends a request of the Message Batches API at `path` below the base URL of `login`: a `POST`
-/// of `body`, else a `GET`.
-fn call(gateway: &Gateway, login: &GatewayLogin, path: &str, body: Option<Vec<u8>>) -> Sent {
-    let credential = match gateway.credential(login, unix_now()) {
-        Ok(c) => c,
-        Err(message) => return Sent::Unsent(message),
-    };
+/// of `body`, else a `GET`. The vendor's 200 answer with its body unread.
+fn request(
+    gateway: &Gateway,
+    login: &GatewayLogin,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> Result<vendor::Answer, Fault> {
+    let credential = gateway
+        .credential(login, unix_now())
+        .map_err(Fault::Unsent)?;
     let base = login.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
     let url = format!("{base}{path}");
     let headers = AuthMode::ApiKey.headers();
     let post = body.is_some();
+    let typed = body.as_ref().is_some_and(|b| !b.is_empty());
     let request = Request {
         url: &url,
         headers: headers
             .iter()
-            .filter(|(n, _)| *n != "accept" && (post || *n != "content-type"))
+            .filter(|(n, _)| *n != "accept" && (typed || *n != "content-type"))
             .map(|(n, v)| (*n, v.as_str()))
             .collect(),
         secret_header: AuthMode::ApiKey.secret_header(),
@@ -343,27 +350,26 @@ fn call(gateway: &Gateway, login: &GatewayLogin, path: &str, body: Option<Vec<u8
     } else {
         vendor::get(&config, &request, credential.secret(), &cancel)
     };
-    let read = sent.and_then(|mut answer| {
-        let body = answer.short_body(&cancel)?;
-        Ok((
-            answer.status,
-            limits::rate_limits(&answer.headers()),
-            answer,
-            body,
-        ))
-    });
-    let (status, rate, answer, body) = match read {
-        Ok(read) => read,
-        Err(f) => return Sent::Lost(redact(f, &credential).message),
-    };
-    if status != 200 {
-        let f = limits::classify_response(status, &answer.headers(), &body);
-        return Sent::Failed(redact(anthropic::failure(f), &credential));
+    let lost = |f: Failure| Fault::Lost(redact(f, &credential).message);
+    let mut answer = sent.map_err(lost)?;
+    if answer.status == 200 {
+        return Ok(answer);
     }
-    match serde_json::from_slice::<MessageBatch>(&body) {
-        Ok(batch) => Sent::Batch(batch, rate.windows),
-        Err(e) => Sent::Lost(format!("the vendor answered 200 without a batch: {e}")),
-    }
+    let body = answer.short_body(&cancel).map_err(lost)?;
+    let f = limits::classify_response(answer.status, &answer.headers(), &body);
+    Err(Fault::Failed(redact(anthropic::failure(f), &credential)))
+}
+
+/// [`request`] whose 200 answer is a batch object.
+fn call(gateway: &Gateway, login: &GatewayLogin, path: &str, body: Option<Vec<u8>>) -> Sent {
+    let mut answer = request(gateway, login, path, body)?;
+    let windows = limits::rate_limits(&answer.headers()).windows;
+    let body = answer
+        .short_body(&CancelToken::new())
+        .map_err(|f| Fault::Lost(f.message))?;
+    let batch = serde_json::from_slice::<MessageBatch>(&body)
+        .map_err(|e| Fault::Lost(format!("the vendor answered 200 without a batch: {e}")))?;
+    Ok((batch, windows))
 }
 
 /// Answers `POST /v1/model/batches` of `client` with `body`: creates the batch on a login qbd
@@ -461,7 +467,7 @@ pub(super) fn submit(gateway: &Gateway, client: &str, body: &[u8]) -> Result<Bat
     let fingerprint = creds::fingerprint(&entry.credentials);
     let sent = match serde_json::to_vec(&create) {
         Ok(body) => call(gateway, entry, BATCHES_PATH, Some(body)),
-        Err(e) => Sent::Unsent(e.to_string()),
+        Err(e) => Err(Fault::Unsent(e.to_string())),
     };
     created(gateway, (lease, &fingerprint), &claim, &record, sent)
 }
@@ -477,11 +483,11 @@ fn created(
 ) -> Result<BatchStatus, Refused> {
     let (key, login) = (&record.idempotency_key, &record.login);
     let batch = match sent {
-        Sent::Batch(batch, windows) => {
+        Ok((batch, windows)) => {
             gateway.report(lease, Outcome::Ok, windows);
             batch
         }
-        Sent::Failed(f) => {
+        Err(Fault::Failed(f)) => {
             let (outcome, e) = refusal(&f);
             gateway.report_attempt(lease, login, outcome, f.windows, fp);
             claim.forget();
@@ -493,7 +499,7 @@ fn created(
             ));
             return Err((e.class.http_status(), e));
         }
-        Sent::Unsent(message) => {
+        Err(Fault::Unsent(message)) => {
             gateway.report(lease, Outcome::Error, Vec::new());
             claim.forget();
             log::warn(&format!(
@@ -502,7 +508,7 @@ fn created(
             ));
             return Err(refused(502, ErrorClass::Unavailable, message));
         }
-        Sent::Lost(message) => {
+        Err(Fault::Lost(message)) => {
             gateway.report(lease, Outcome::Error, Vec::new());
             log::warn(&format!(
                 "gateway: batch `{key}` of {} on {login}: outcome unknown: {message}",
@@ -530,16 +536,11 @@ fn created(
     status(record, batch).map_err(|e| refused(502, ErrorClass::Unavailable, e))
 }
 
-/// Answers `GET /v1/model/batches/{batch_id}` of `client`, the gateway's own uid when `own`.
+/// The record of the batch `batch_id` that `client`, the gateway's own uid when `own`, may use.
 ///
 /// # Errors
-/// 404 without `[batches]` or for an unknown batch, 403 another caller's batch, as [`read`].
-pub(super) fn get(
-    gateway: &Gateway,
-    client: &str,
-    own: bool,
-    batch_id: &str,
-) -> Result<BatchStatus, Refused> {
+/// 404 without `[batches]` or for an unknown batch, 403 another caller's batch.
+fn owned(gateway: &Gateway, client: &str, own: bool, batch_id: &str) -> Result<Record, Refused> {
     let store = gateway.batches().ok_or_else(no_store)?;
     let record = store.find(batch_id).ok_or_else(|| {
         refused(
@@ -552,34 +553,126 @@ pub(super) fn get(
         let message = format!("batch `{batch_id}` belongs to another caller");
         return Err(refused(403, ErrorClass::Auth, message));
     }
+    Ok(record)
+}
+
+/// Answers `GET /v1/model/batches/{batch_id}` of `client`, the gateway's own uid when `own`.
+///
+/// # Errors
+/// As [`owned`] and [`read`].
+pub(super) fn get(
+    gateway: &Gateway,
+    client: &str,
+    own: bool,
+    batch_id: &str,
+) -> Result<BatchStatus, Refused> {
+    let record = owned(gateway, client, own, batch_id)?;
     read(gateway, &record, batch_id)
+}
+
+/// Answers `GET /v1/model/batches/{batch_id}/results` of `client`, the gateway's own uid when
+/// `own`: the body of the vendor's results of the ended batch, read as it arrives from the base
+/// URL of the login that created it.
+///
+/// # Errors
+/// As [`owned`] and [`read`]; 409 a batch that has not ended, the vendor's refusal, 502 no
+/// answer.
+pub(super) fn results(
+    gateway: &Gateway,
+    client: &str,
+    own: bool,
+    batch_id: &str,
+) -> Result<impl Read, Refused> {
+    let record = owned(gateway, client, own, batch_id)?;
+    let status = read(gateway, &record, batch_id)?;
+    if status.processing_status != BatchProcessing::Ended {
+        let message = format!(
+            "batch `{batch_id}` is `{}`; its results exist once it is `ended`",
+            status.processing_status.as_str()
+        );
+        return Err(refused(409, ErrorClass::BadRequest, message));
+    }
+    let config = gateway.config();
+    let entry = batch_login(&config, &record)?;
+    let path = format!("{BATCHES_PATH}/{batch_id}/results");
+    match request(gateway, entry, &path, None) {
+        Ok(answer) => Ok(answer.into_reader()),
+        Err(fault) => Err(fault_refused(fault)),
+    }
+}
+
+/// Answers `POST /v1/model/batches/{batch_id}/cancel` of `client`, the gateway's own uid when
+/// `own`: asks the vendor through the login that created the batch to cancel it.
+///
+/// # Errors
+/// As [`owned`] and [`read`].
+pub(super) fn cancel(
+    gateway: &Gateway,
+    client: &str,
+    own: bool,
+    batch_id: &str,
+) -> Result<BatchStatus, Refused> {
+    let record = owned(gateway, client, own, batch_id)?;
+    let config = gateway.config();
+    let entry = batch_login(&config, &record)?;
+    let path = format!("{BATCHES_PATH}/{batch_id}/cancel");
+    let status = answered(&record, call(gateway, entry, &path, Some(Vec::new())))?;
+    log::info(&format!(
+        "gateway: batch {batch_id} of {client} cancel asked on {}",
+        record.login
+    ));
+    Ok(status)
 }
 
 /// The vendor's status of the batch `batch_id` of `record`, read through its login without a
 /// pick.
 ///
 /// # Errors
-/// 409 a login no longer in the config or no longer an `api_key` Anthropic login, the vendor's
-/// refusal, 502 no answer or one without a batch.
+/// As [`batch_login`] and [`answered`].
 fn read(gateway: &Gateway, record: &Record, batch_id: &str) -> Result<BatchStatus, Refused> {
     let config = gateway.config();
+    let entry = batch_login(&config, record)?;
+    answered(
+        record,
+        call(gateway, entry, &format!("{BATCHES_PATH}/{batch_id}"), None),
+    )
+}
+
+/// The login of `config` that created the batch of `record`.
+///
+/// # Errors
+/// 409 a login no longer in the config or no longer an `api_key` Anthropic login.
+fn batch_login<'c>(
+    config: &'c GatewayConfig,
+    record: &Record,
+) -> Result<&'c GatewayLogin, Refused> {
     let login = &record.login;
-    let entry = config.login(login).filter(|l| runs_batches(l)).ok_or_else(|| {
+    config.login(login).filter(|l| runs_batches(l)).ok_or_else(|| {
         let message = format!(
             "login `{login}` of the batch is no longer an `api_key` Anthropic login of the config"
         );
         refused(409, ErrorClass::Unavailable, message)
-    })?;
-    match call(gateway, entry, &format!("{BATCHES_PATH}/{batch_id}"), None) {
-        Sent::Batch(batch, _) => {
-            status(record, batch).map_err(|e| refused(502, ErrorClass::Unavailable, e))
-        }
-        Sent::Failed(f) => {
+    })
+}
+
+/// The status of `record`'s batch from the vendor's answer `sent`.
+///
+/// # Errors
+/// The vendor's refusal, 502 no answer or one without a batch.
+fn answered(record: &Record, sent: Sent) -> Result<BatchStatus, Refused> {
+    let (batch, _) = sent.map_err(fault_refused)?;
+    status(record, batch).map_err(|e| refused(502, ErrorClass::Unavailable, e))
+}
+
+/// The answer of a vendor request that ended in `fault`.
+fn fault_refused(fault: Fault) -> Refused {
+    match fault {
+        Fault::Failed(f) => {
             let e = refusal(&f).1;
-            Err((e.class.http_status(), e))
+            (e.class.http_status(), e)
         }
-        Sent::Unsent(message) | Sent::Lost(message) => {
-            Err(refused(502, ErrorClass::Unavailable, message))
+        Fault::Unsent(message) | Fault::Lost(message) => {
+            refused(502, ErrorClass::Unavailable, message)
         }
     }
 }

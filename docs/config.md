@@ -428,8 +428,7 @@ other file of the directory.
 
 `[batches]`, optional: the batch store, which binds each Anthropic Message Batch the gateway
 creates to its caller, login and idempotency key
-([`POST /v1/model/batches`](api.md#post-v1modelbatches-and-get-v1modelbatchesbatch_id)); without
-it both batch endpoints answer 404.
+([Message batches](api.md#message-batches)); without it every batch endpoint answers 404.
 
 ```toml
 [batches]

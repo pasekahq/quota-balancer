@@ -495,6 +495,8 @@ fn batches() {
         (running.processing_status, running.ended_at),
         (BatchProcessing::InProgress, None)
     );
+    let canceling: BatchStatus = roundtrip("gateway_batch_status_canceling.json");
+    assert_eq!(canceling.processing_status, BatchProcessing::Canceling);
     let ended: BatchStatus = roundtrip("gateway_batch_status_ended.json");
     assert_eq!(ended.processing_status, BatchProcessing::Ended);
     assert_eq!(ended.ended_at, Some(1_800_003_600));
@@ -838,6 +840,9 @@ fn openapi_enums_match_the_types() {
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     for c in every_class() {
         assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+    }
+    for p in every!(BatchProcessing: InProgress, Canceling, Ended) {
+        assert_eq!(serde_json::to_value(p).unwrap(), p.as_str());
     }
     let typed = typed_enums();
     let mut found = Vec::new();
