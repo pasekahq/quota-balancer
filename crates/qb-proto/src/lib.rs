@@ -79,7 +79,9 @@ pub mod paths {
     /// Gateway, `GET`: sums of the gateway's usage ledger; only the gateway's own uid.
     pub const MODEL_USAGE: &str = "/v1/model/usage";
     /// Gateway, `POST`: create an Anthropic Message Batch on a route; `GET` of
-    /// `{MODEL_BATCHES}/{batch_id}`: its status.
+    /// `{MODEL_BATCHES}/{batch_id}`: its status; `GET` of `.../{batch_id}/results`: the vendor's
+    /// results of the ended batch as chunked NDJSON; `POST` of `.../{batch_id}/cancel` with no
+    /// body: cancel it.
     pub const MODEL_BATCHES: &str = "/v1/model/batches";
     /// Gateway, `POST` to `{MODEL_CLIENTS}/{name}/rotate`: write a fresh token to a named
     /// loopback client's `token_file`; only the gateway's own uid.

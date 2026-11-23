@@ -1324,6 +1324,17 @@ pub enum BatchProcessing {
     Ended,
 }
 
+impl BatchProcessing {
+    /// The wire name, e.g. `in_progress`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Canceling => "canceling",
+            Self::Ended => "ended",
+        }
+    }
+}
+
 /// The requests of a batch by how far they got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchCounts {
@@ -1339,7 +1350,8 @@ pub struct BatchCounts {
     pub expired: u64,
 }
 
-/// `POST /v1/model/batches` and `GET /v1/model/batches/{batch_id}` response.
+/// `POST /v1/model/batches`, `GET /v1/model/batches/{batch_id}` and `POST .../{batch_id}/cancel`
+/// response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchStatus {
     /// The vendor's id of the batch.

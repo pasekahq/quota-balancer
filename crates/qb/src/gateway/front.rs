@@ -1,7 +1,7 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/ladder`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
-//! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`, `/v1/model/batches` and
-//! `/v1/model/batches/{batch_id}` ([`super::batches`]),
+//! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`, `/v1/model/batches`,
+//! `/v1/model/batches/{batch_id}` and its `/results` and `/cancel` ([`super::batches`]),
 //! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`,
 //! `/v1/model/logins/{name}/oauth/start`, `/v1/model/logins/{name}/oauth/code`, `/v1/health`
 //! and `qbd`'s `/v1/admin/roles` and `/v1/admin/reload` ([`super::admin`]), and the HTTP fronts:
@@ -69,7 +69,10 @@ pub const LOOPBACK_UNCHECKED: usize = 4;
 /// How long a loopback peer may take to send the head that shows a client token.
 pub const LOOPBACK_HEAD_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Content type of the turn stream.
+/// Largest read of a batch's results from the vendor, and so the largest chunk to the caller.
+pub const RESULTS_CHUNK: usize = 16 << 10;
+
+/// Content type of the turn stream and of a batch's results.
 pub const NDJSON: &str = "application/x-ndjson";
 
 /// Who sends a request: the name its turns run under and the route aliases it may run on.
@@ -810,10 +813,36 @@ fn qbd_admin(stream: &mut Conn, gateway: &Gateway, req: &http::Request, uid: u32
     }
 }
 
-/// The batch id of a `/v1/model/batches/{batch_id}` path.
-fn batch_target(path: &str) -> Option<&str> {
-    let id = path.strip_prefix(paths::MODEL_BATCHES)?.strip_prefix('/')?;
-    (!id.is_empty() && !id.contains('/')).then_some(id)
+/// What a path below `/v1/model/batches` names.
+#[derive(Clone, Copy)]
+enum BatchTarget<'p> {
+    /// `/v1/model/batches`.
+    All,
+    /// `/v1/model/batches/{batch_id}`.
+    One(&'p str),
+    /// `/v1/model/batches/{batch_id}/results`.
+    Results(&'p str),
+    /// `/v1/model/batches/{batch_id}/cancel`.
+    Cancel(&'p str),
+}
+
+/// The batch endpoint of `path`, if it is one.
+fn batch_target(path: &str) -> Option<BatchTarget<'_>> {
+    let rest = path.strip_prefix(paths::MODEL_BATCHES)?;
+    if rest.is_empty() {
+        return Some(BatchTarget::All);
+    }
+    let rest = rest.strip_prefix('/')?;
+    let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    if id.is_empty() {
+        return None;
+    }
+    match tail {
+        "" if !rest.ends_with('/') => Some(BatchTarget::One(id)),
+        "results" => Some(BatchTarget::Results(id)),
+        "cancel" => Some(BatchTarget::Cancel(id)),
+        _ => None,
+    }
 }
 
 /// Answers `req` of `caller`, the gateway's `own` uid or not, when its path is
@@ -825,20 +854,65 @@ fn batch(
     caller: &str,
     own: bool,
 ) -> bool {
-    let answer = match (req.method, batch_target(&req.path)) {
-        (Method::Post, _) if req.path == paths::MODEL_BATCHES => {
-            batches::submit(gateway, caller, &req.body)
+    let Some(target) = batch_target(&req.path) else {
+        return false;
+    };
+    let answer = match (req.method, target) {
+        (Method::Post, BatchTarget::All) => batches::submit(gateway, caller, &req.body),
+        (Method::Get, BatchTarget::One(id)) => batches::get(gateway, caller, own, id),
+        (Method::Get, BatchTarget::Results(id)) => {
+            batch_results(stream, gateway, caller, own, id);
+            return true;
         }
-        (Method::Get, Some(id)) => batches::get(gateway, caller, own, id),
-        (_, Some(_)) => return reject_method(stream),
-        _ if req.path == paths::MODEL_BATCHES => return reject_method(stream),
-        _ => return false,
+        (Method::Post, BatchTarget::Cancel(_)) if !req.body.is_empty() => {
+            let message = "a batch cancel takes no body";
+            reject(stream, 400, ErrorClass::BadRequest, message);
+            return true;
+        }
+        (Method::Post, BatchTarget::Cancel(id)) => batches::cancel(gateway, caller, own, id),
+        _ => return reject_method(stream),
     };
     match answer {
         Ok(status) => reply(stream, 200, &status),
         Err((status, e)) => reply(stream, status, &e),
     }
     true
+}
+
+/// Answers `GET /v1/model/batches/{batch_id}/results` of `caller`, the gateway's `own` uid or
+/// not: a chunked NDJSON copy of the vendor's body, read and written [`RESULTS_CHUNK`] bytes at
+/// most at a time. A body that breaks after the head went out closes the connection without the
+/// last chunk, so the caller sees a cut transfer.
+fn batch_results(stream: &mut Conn, gateway: &Gateway, caller: &str, own: bool, id: &str) {
+    let mut body = match batches::results(gateway, caller, own, id) {
+        Ok(body) => body,
+        Err((status, e)) => return reply(stream, status, &e),
+    };
+    if stream
+        .set_write_timeout(Some(STREAM_WRITE_TIMEOUT))
+        .is_err()
+        || http::write_stream_head(stream, NDJSON).is_err()
+    {
+        return;
+    }
+    let mut buf = vec![0u8; RESULTS_CHUNK];
+    loop {
+        let n = match io::Read::read(&mut body, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                log::warn(&format!(
+                    "gateway: results of batch {id} for {caller} broke: {e}"
+                ));
+                return;
+            }
+        };
+        if http::write_chunk(stream, &buf[..n]).is_err() {
+            return;
+        }
+    }
+    let _ = http::write_stream_end(stream);
 }
 
 /// Answers 405; true, the request is answered.

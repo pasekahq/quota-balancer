@@ -191,6 +191,11 @@ impl Answer {
         Ok(body.unwrap_or_default())
     }
 
+    /// The body, read as it arrives.
+    pub(super) fn into_reader(self) -> impl Read {
+        self.response.into_body().into_reader()
+    }
+
     /// Reads the body into `feed` until it reports the stream's stop reason, handing the events
     /// it makes to `sink` after each read, also when `feed` fails. `feed` gets an empty chunk at
     /// the end of the body.
@@ -203,7 +208,7 @@ impl Answer {
         sink: &mut Sink<'_>,
         mut feed: impl FnMut(&[u8], &mut Vec<StreamEvent>) -> Result<Option<StopReason>, Failure>,
     ) -> Result<StopReason, Failure> {
-        let mut stream = self.response.into_body().into_reader();
+        let mut stream = self.into_reader();
         let mut buf = vec![0u8; READ_BYTES];
         let mut events = Vec::new();
         loop {
