@@ -84,6 +84,9 @@ pub struct Translator {
     started: bool,
     finished: Option<StopReason>,
     tool_names: HashMap<String, String>,
+    /// A `tool_use` block's input was not a JSON object: an error unless the message stops for
+    /// `max_tokens`, which cut it.
+    cut_tool: bool,
 }
 
 fn malformed(what: &str) -> Failure {
@@ -106,6 +109,7 @@ impl Translator {
             started: false,
             finished: None,
             tool_names: HashMap::new(),
+            cut_tool: false,
         }
     }
 
@@ -153,13 +157,16 @@ impl Translator {
                 if at != index {
                     return Err(malformed("stop for another block"));
                 }
-                self.close(open, out)?;
+                self.close(open, out);
             }
             Event::MessageDelta { delta, usage: u } => {
                 self.require_started()?;
                 self.merge_usage(&u);
                 if let Some(reason) = delta.stop_reason.as_deref() {
                     self.stop = Some(stop_reason(reason));
+                }
+                if self.cut_tool && self.stop != Some(StopReason::MaxTokens) {
+                    return Err(malformed("tool input is not a JSON object"));
                 }
                 out.push(StreamEvent::Usage {
                     usage: usage(&self.usage),
@@ -171,6 +178,9 @@ impl Translator {
                     return Err(malformed("message_stop inside a block"));
                 }
                 let stop = self.stop.unwrap_or(StopReason::End);
+                if self.cut_tool && stop != StopReason::MaxTokens {
+                    return Err(malformed("tool input is not a JSON object"));
+                }
                 self.finished = Some(stop);
                 return Ok(Progress::Finished(stop));
             }
@@ -203,6 +213,9 @@ impl Translator {
         self.require_started()?;
         if self.open.is_some() {
             return Err(malformed("block started before the previous one stopped"));
+        }
+        if self.cut_tool {
+            return Err(malformed("tool input is not a JSON object"));
         }
         let open = match content_block {
             ContentBlock::Text { text, .. } => {
@@ -306,7 +319,7 @@ impl Translator {
         };
     }
 
-    fn close(&self, open: Open, out: &mut Vec<StreamEvent>) -> Result<(), Failure> {
+    fn close(&mut self, open: Open, out: &mut Vec<StreamEvent>) {
         match open {
             Open::Text | Open::Skipped => {}
             Open::ToolUse { id, name, json } => {
@@ -314,10 +327,13 @@ impl Translator {
                 let input = if json.trim().is_empty() {
                     Object::new()
                 } else {
-                    match serde_json::from_str::<Value>(&json) {
-                        Ok(Value::Object(m)) => m,
-                        _ => return Err(malformed("tool input is not a JSON object")),
-                    }
+                    let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&json) else {
+                        // `max_tokens` cuts the input mid-JSON; the `message_delta` after this
+                        // block brings the stop reason that decides.
+                        self.cut_tool = true;
+                        return;
+                    };
+                    m
                 };
                 out.push(StreamEvent::ToolCall {
                     tool_call: ToolCall { id, name, input },
@@ -334,7 +350,6 @@ impl Translator {
                 out.push(self.thinking(&ContentBlock::RedactedThinking { data }));
             }
         }
-        Ok(())
     }
 
     fn thinking(&self, block: &ContentBlock) -> StreamEvent {

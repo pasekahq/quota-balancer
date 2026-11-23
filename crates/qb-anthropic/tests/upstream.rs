@@ -124,6 +124,50 @@ fn max_tokens_stop() {
     assert_eq!(got.events[1], text("A very long ans"));
 }
 
+/// The tool-use fixture without its second call, the first call's input cut mid-JSON and the
+/// message stopping for `stop`.
+fn cut_tool_use(stop: &str) -> Vec<u8> {
+    let s = String::from_utf8(fixture("upstream_tool_use.sse")).expect("utf-8");
+    let second =
+        s.find("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2");
+    let delta = s.find("event: message_delta").expect("message_delta");
+    let s = format!("{}{}", &s[..second.expect("second call")], &s[delta..]);
+    let s = s.replacen(r#""partial_json":"]}"}"#, r#""partial_json":", 3"}"#, 1);
+    let s = s.replacen(
+        r#""stop_reason":"tool_use""#,
+        &format!(r#""stop_reason":"{stop}""#),
+        1,
+    );
+    s.into_bytes()
+}
+
+#[test]
+fn a_tool_call_cut_by_max_tokens_is_dropped_and_the_turn_stops_for_max_tokens() {
+    let got = run(&cut_tool_use("max_tokens"));
+    assert_eq!(got.end, Ok(StopReason::MaxTokens));
+    let calls: Vec<_> = got
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::ToolCall { tool_call } => Some(tool_call.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(calls.is_empty(), "the cut call is dropped: {calls:?}");
+    assert_eq!(got.events[1], text("Reading the file first."));
+}
+
+#[test]
+fn unparsable_tool_input_without_max_tokens_is_unavailable() {
+    let failure = run(&cut_tool_use("tool_use")).end.expect_err("malformed");
+    assert_eq!(failure.kind, FailureKind::Unavailable);
+    assert!(
+        failure.message.contains("tool input"),
+        "{}",
+        failure.message
+    );
+}
+
 #[test]
 fn error_mid_stream_keeps_delivered_events() {
     let got = run(&fixture("upstream_error_overloaded.sse"));

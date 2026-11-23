@@ -114,7 +114,10 @@ Events out of order (a content event before `response.created`, a delta outside 
 item added twice, any known event after the end), arguments that are not a JSON object, a
 function call without `call_id` or name, open items holding more than 768 KiB of arguments or
 more than 64 open items, undecodable event data, and a stream that ends before
-`response.completed` are `unavailable` failures. Events already returned stay delivered.
+`response.completed` are `unavailable` failures. Events already returned stay delivered. A
+function call whose arguments do not parse is the exception when the response ends
+`response.incomplete` for its output token limit, which cut them: the call is dropped and the
+turn ends normally with `max_tokens`, so the cut answer is not retried on another login.
 
 ## Rate limits and failures
 
@@ -218,7 +221,8 @@ A stream the vendor closes after a finish reason but without `[DONE]` ends with 
 that does not decode, content after the finish reason, data after `[DONE]`, a tool call without
 id or name, arguments that are not a JSON object, more than 64 tool calls or more than 768 KiB of
 them, and an oversized event are `unavailable` failures. Events already returned stay delivered;
-a failed stream emits no `usage`.
+a failed stream emits no `usage`. Arguments that do not parse with `finish_reason` `length`, which
+cut them, drop that call instead, and the turn ends normally with `max_tokens`.
 
 ### Chat Completions failures
 

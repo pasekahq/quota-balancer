@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::fmt::Write as _;
+
 use common::{Answer, NOW, OTHER, VENDOR, fixture, object, run};
 use qb_openai::limits::{
     FailureKind, RateLimits, classify_response, classify_stream_error, rate_limits,
@@ -98,6 +100,47 @@ fn incomplete_is_a_length_stop() {
         vec![text("The list goes on and"), usage(50, 16, 0)]
     );
     assert_eq!(got.end, Ok(StopReason::MaxTokens));
+}
+
+/// A Responses stream with one function call whose arguments are cut mid-JSON, ending with
+/// `end` (`response.completed` or `response.incomplete` for the output token limit).
+fn cut_call_stream(end: &str) -> Vec<u8> {
+    let item = json!({"id": "fc_1", "type": "function_call", "status": "incomplete",
+        "call_id": "call_1", "name": "write", "arguments": "{\"text\": \"abc"});
+    let (status, details) = if end == "response.incomplete" {
+        ("incomplete", json!({"reason": "max_output_tokens"}))
+    } else {
+        ("completed", Value::Null)
+    };
+    let events = [
+        json!({"type": "response.created", "sequence_number": 0,
+            "response": {"id": "r", "object": "response", "status": "in_progress", "output": []}}),
+        json!({"type": "response.output_item.added", "sequence_number": 1, "output_index": 0,
+            "item": item}),
+        json!({"type": "response.output_item.done", "sequence_number": 2, "output_index": 0,
+            "item": item}),
+        json!({"type": end, "sequence_number": 3,
+            "response": {"id": "r", "object": "response", "status": status, "output": [],
+                "incomplete_details": details}}),
+    ];
+    let mut sse = String::new();
+    for e in &events {
+        let kind = e["type"].as_str().expect("type");
+        write!(sse, "event: {kind}\ndata: {e}\n\n").expect("write to a String");
+    }
+    sse.into_bytes()
+}
+
+#[test]
+fn a_function_call_cut_by_the_output_limit_is_dropped_and_the_turn_stops_for_max_tokens() {
+    let got = run(&cut_call_stream("response.incomplete"));
+    assert_eq!(got.events, Vec::new());
+    assert_eq!(got.end, Ok(StopReason::MaxTokens));
+
+    let f = run(&cut_call_stream("response.completed"))
+        .end
+        .expect_err("unparsable arguments of a complete response");
+    assert_eq!(f.kind, FailureKind::Unavailable);
 }
 
 #[test]
