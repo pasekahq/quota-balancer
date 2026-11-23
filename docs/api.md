@@ -566,6 +566,7 @@ vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
 | 401 | `http_401` | an OAuth login first refreshes its token and retries once on the same lease; then as above, and the login is dead (below) |
 | model unavailable to the login | `model_unavailable` | as above |
 | unreadable or invalid credential file, or a refresh token the vendor refused | `http_401` | as above, and the login is dead (below) |
+| a token refresh that failed in transport, with a 5xx or 429 | `error` | next pick without the login, which stays unmarked; with no other login the turn ends `unavailable`, retryable |
 | overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn. On a chain route: the next step |
 | invalid request, context too long | `error` | the turn ends |
 | no call: the login's spend and open batch reserves reached its `spend_cap` | `error`, with the `spend` window at 1.0 | as after a usage limit |
@@ -576,7 +577,10 @@ login is tried. A 401 that the
 one refresh did not cure, or an unusable credential file, does not pass by itself: after the
 lease report the gateway also sends `POST /v1/report {"login", "outcome": "http_401"}`, which
 makes the login `auth_dead` in `qbd`, so the next pick of the same turn skips it. A login that
-failed in a turn is never called again in that turn: when a pick still returns it, the lease is
+failed in a turn is never called again in that turn: after a token refresh that failed in
+transport, which marks nothing in `qbd`, the picks send `logins` without that login (the route's
+`logins`, else every login of the config) while any is left, and when a pick still returns a
+failed login, the lease is
 released with `error`, and on a ladder or pin route the turn ends with the last failure's class,
 as it does when the pick after a failure answers `dead`. So a key login that answers 401 gets
 one call per turn, an OAuth login two (before and after its one refresh).

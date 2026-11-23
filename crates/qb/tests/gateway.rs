@@ -1358,7 +1358,7 @@ fn expiring_oauth(refresh: &str) -> String {
 }
 
 #[test]
-fn a_refresh_that_cannot_reach_the_vendor_ends_the_turn_retryable() {
+fn a_refresh_that_cannot_reach_the_vendor_moves_the_turn_to_the_next_login() {
     let r = rig_with(
         4,
         &[
@@ -1367,15 +1367,40 @@ fn a_refresh_that_cannot_reach_the_vendor_ends_the_turn_retryable() {
         ],
     );
     let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
-    assert_eq!(kinds(&events), ["error Unavailable"]);
-    assert!(last_error(&events).retryable);
-    assert_eq!(r.fake.calls(), Vec::new(), "the expired token is not sent");
+    assert_eq!(kinds(&events), ["route login-2", "text_delta", "stop End"]);
+    let calls: Vec<String> = r.fake.calls().into_iter().map(|c| c.0).collect();
+    assert_eq!(
+        calls,
+        ["login-2"],
+        "the expired token of login-1 is not sent"
+    );
     let s = state(&r.qbd);
     assert_eq!(
         status_of(&s, "login-1"),
         LoginStatus::Unknown,
-        "reported as error"
+        "reported as error, which marks nothing"
     );
+    assert_eq!(s.leases, Vec::new());
+}
+
+#[test]
+fn refreshes_that_cannot_reach_the_vendor_on_every_login_end_the_turn_retryable() {
+    let r = rig_with(
+        4,
+        &[
+            ("login-1", expiring_oauth("refresh-down"), 0o600),
+            ("login-2", expiring_oauth("refresh-down"), 0o600),
+        ],
+    );
+    let (_, _, events) = turn(&r.gw, &turn_body("turn-1"));
+    assert_eq!(kinds(&events), ["error Unavailable"]);
+    let error = last_error(&events);
+    assert!(error.retryable);
+    assert_eq!(error.tried.len(), 2, "{error:?}");
+    assert_eq!(r.fake.calls(), Vec::new(), "no expired token is sent");
+    let s = state(&r.qbd);
+    assert_eq!(status_of(&s, "login-1"), LoginStatus::Unknown);
+    assert_eq!(status_of(&s, "login-2"), LoginStatus::Unknown);
     assert_eq!(s.leases, Vec::new());
 }
 
