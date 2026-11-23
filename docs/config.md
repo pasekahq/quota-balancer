@@ -266,7 +266,7 @@ Example: [`deploy/examples/gateway.toml`](../deploy/examples/gateway.toml), with
 and route shapes out of them one at a time.
 
 Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`,
-`[openai_models]`, `[prices]`, `[usage]`, `[fronts]`):
+`[openai_models]`, `[prices]`, `[usage]`, `[batches]`, `[fronts]`):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -275,7 +275,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `qbd_socket` | string | Absolute path of `qbd`'s socket, default `/run/qb/qb.sock`. |
 | `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`; without it `qbd` identifies the gateway by uid. |
 | `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
-| `max_request_bytes` | integer | Largest body of `POST /v1/model/turn` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
+| `max_request_bytes` | integer | Largest body of `POST /v1/model/turn`, of `POST /v1/model/batches` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
 | `spend_file` | string | Absolute path of the file that counts the spend of the logins with a `spend_cap`; required when one has it ([Spend caps](#spend-caps)). |
 | `audit_file` | string | Absolute path of the file each admin action (reload, spend reset, client token rotation, config edit) is appended to as one JSON line, created with mode 0600 in an existing directory; an existing file whose mode lets its group or others in is narrowed to 0600 at startup (the gateway does not start when it cannot), on each reload and before each append; without it nothing is recorded and `GET /v1/model/audit` answers 404 ([api.md](api.md#get-v1modelaudit)). |
@@ -339,8 +339,8 @@ turn moves to the next login. A field of another type (`key` in an OAuth file, `
 an `oauth_anthropic` or `api_key` file, an OAuth field in an `api_key` file) or any other field
 is refused, and the error names the field, never a value. The gateway may create, write and
 remove files in its config file's directory, the credential files' directories, the
-directories of `spend_file`, `audit_file` and `usage.file`, the directories of the named
-clients' `token_file`s and the directory of `fronts.grace_file`, and nowhere else.
+directories of `spend_file`, `audit_file`, `usage.file` and `batches.file`, the directories of
+the named clients' `token_file`s and the directory of `fronts.grace_file`, and nowhere else.
 
 `[[routes]]`, 1 to 64: aliases clients name in `route`, each mapped to a `qbd` pick target: a
 ladder step, a pin, or a chain of pins.
@@ -425,6 +425,24 @@ keep_days = 90
 
 The ledger is `file` and the files `<file>.<digits>` beside it; rotation and pruning touch no
 other file of the directory.
+
+`[batches]`, optional: the batch store, which binds each Anthropic Message Batch the gateway
+creates to its caller, login and idempotency key
+([`POST /v1/model/batches`](api.md#post-v1modelbatches-and-get-v1modelbatchesbatch_id)); without
+it both batch endpoints answer 404.
+
+```toml
+[batches]
+file = "/var/lib/qb-gateway/batches.json"
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `file` | string | Required. Absolute path of the store, created with mode 0600 in an existing directory and replaced by rename on each change. A file that does not parse as a store stops the start with an error naming it. |
+
+A batch runs only on an `api_key` login of the `anthropic` API family: the vendor refuses
+subscription OAuth tokens for batches. The store holds no credential and no prompt text, and it
+keeps every record; the gateway does not prune it.
 
 ### Spend caps
 
@@ -897,10 +915,10 @@ included; its stream is not cut. Refresh locks of the credential files carry ove
 
 These keys need a restart: `socket`, `socket_mode`, `fronts.listen` (the listeners exist before
 the sandbox), `qbd_socket` and `qbd_bearer_file` (the token is read once at startup),
-`spend_file`, `audit_file`, `[usage]` and `fronts.grace_file` (the sandbox opens their
-directories once), and a login whose `credentials` or a named client whose `token_file` lies in
+`spend_file`, `audit_file`, `[usage]`, `[batches]` and `fronts.grace_file` (the sandbox opens
+their directories once), and a login whose `credentials` or a named client whose `token_file` lies in
 a directory the sandbox did not open at startup (it opens the directories of the config file, the startup
-config's credential files, `spend_file`, `audit_file`, `usage.file`, token files and
+config's credential files, `spend_file`, `audit_file`, `usage.file`, `batches.file`, token files and
 `grace_file` once; one missing then stays closed until a restart). A file that cannot be read,
 does not validate, changes one of them or names a token file that cannot be read is refused: the running config stays, the gateway logs one line
 `gateway: reload refused: <file>: <field>: <reason>` with the line where the file has one, and

@@ -1,0 +1,10 @@
+{
+  "batch_id": "msgbatch_0001",
+  "route": "batch",
+  "login": "key-1",
+  "model": "model-large",
+  "processing_status": "in_progress",
+  "request_counts": {"processing": 2, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0},
+  "created_at": 1800000000,
+  "expires_at": 1800086400
+}

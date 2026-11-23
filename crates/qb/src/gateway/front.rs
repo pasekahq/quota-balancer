@@ -1,6 +1,7 @@
 //! The gateway's listeners. The unix socket serves the C4 front, `/v1/model/turn`,
 //! `/v1/model/routes`, `/v1/model/ladder`, `/v1/model/cancel`, `/v1/model/reload`, `/v1/model/spend`,
-//! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`,
+//! `/v1/model/spend/reset`, `/v1/model/audit`, `/v1/model/usage`, `/v1/model/batches` and
+//! `/v1/model/batches/{batch_id}` ([`super::batches`]),
 //! `/v1/model/clients/{name}/rotate`, `/v1/model/config/routes`, `/v1/model/logins/{name}/key`,
 //! `/v1/model/logins/{name}/oauth/start`, `/v1/model/logins/{name}/oauth/code`, `/v1/health`
 //! and `qbd`'s `/v1/admin/roles` and `/v1/admin/reload` ([`super::admin`]), and the HTTP fronts:
@@ -41,7 +42,7 @@ use super::core::{Cancel, Gateway, LadderQuery, edit_action};
 use super::tokens::ClientTokens;
 use super::upstream::{CancelToken, Flow};
 use super::usage::{self, AggregateError};
-use super::{admin, audit, messages, openai};
+use super::{admin, audit, batches, messages, openai};
 use crate::auth::token_matches;
 use crate::hangup::Hangup;
 use crate::http::{self, Head, Method, ReadError};
@@ -528,9 +529,8 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
     let login_target = Cell::new(None);
     let max_body = |head: &Head<'_>| {
         dialect.set(Dialect::of(head.path));
-        if head.method == Method::Post
-            && (head.path == paths::MODEL_TURN || HTTP_FRONTS.contains(&head.path))
-        {
+        let bulk = head.path == paths::MODEL_TURN || head.path == paths::MODEL_BATCHES;
+        if head.method == Method::Post && (bulk || HTTP_FRONTS.contains(&head.path)) {
             limit.set(max_turn);
         }
         if let Some((name, action)) = login_target_of(head.path) {
@@ -550,7 +550,7 @@ fn handle(mut stream: Conn, gateway: &Gateway, watch: &Watch, own_uid: u32, star
             return unreadable(&mut stream, &e, limit.get(), dialect.get());
         }
     };
-    if named(&mut stream, gateway, &req, uid, own_uid) {
+    if named(&mut stream, gateway, &req, &caller.name, uid, own_uid) {
         return;
     }
     match (req.method, req.path.as_str()) {
@@ -616,17 +616,22 @@ fn health(started: Instant) -> HealthResponse {
     }
 }
 
-/// Answers `req` from the peer of `uid` when its path names a client or a login, an admin
-/// endpoint of the gateway's own uid `own_uid`; false for another path.
+/// Answers `req` from `caller`, the peer of `uid`, when its path names a client or a login, an
+/// admin endpoint of the gateway's own uid `own_uid`, or is `/v1/model/batches` or a batch's;
+/// false for another path.
 fn named(
     stream: &mut Conn,
     gateway: &Gateway,
     req: &http::Request,
+    caller: &str,
     uid: u32,
     own_uid: u32,
 ) -> bool {
     let actor = audit::uid_actor(uid);
     let own = uid == own_uid;
+    if batch(stream, gateway, req, caller, own) {
+        return true;
+    }
     if let Some((name, action)) = login_target_of(&req.path) {
         login(stream, gateway, name, action, req, &actor, own);
     } else if let Some(name) = rotate_target(&req.path) {
@@ -803,6 +808,43 @@ fn qbd_admin(stream: &mut Conn, gateway: &Gateway, req: &http::Request, uid: u32
         }
         Err(r) => reject(stream, r.status, r.class, &r.message),
     }
+}
+
+/// The batch id of a `/v1/model/batches/{batch_id}` path.
+fn batch_target(path: &str) -> Option<&str> {
+    let id = path.strip_prefix(paths::MODEL_BATCHES)?.strip_prefix('/')?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// Answers `req` of `caller`, the gateway's `own` uid or not, when its path is
+/// `/v1/model/batches` or one batch's; false for another path.
+fn batch(
+    stream: &mut Conn,
+    gateway: &Gateway,
+    req: &http::Request,
+    caller: &str,
+    own: bool,
+) -> bool {
+    let answer = match (req.method, batch_target(&req.path)) {
+        (Method::Post, _) if req.path == paths::MODEL_BATCHES => {
+            batches::submit(gateway, caller, &req.body)
+        }
+        (Method::Get, Some(id)) => batches::get(gateway, caller, own, id),
+        (_, Some(_)) => return reject_method(stream),
+        _ if req.path == paths::MODEL_BATCHES => return reject_method(stream),
+        _ => return false,
+    };
+    match answer {
+        Ok(status) => reply(stream, 200, &status),
+        Err((status, e)) => reply(stream, status, &e),
+    }
+    true
+}
+
+/// Answers 405; true, the request is answered.
+fn reject_method(stream: &mut Conn) -> bool {
+    reject(stream, 405, ErrorClass::BadRequest, "method not allowed");
+    true
 }
 
 /// Answers `POST /v1/model/cancel` of `caller` with `body`.

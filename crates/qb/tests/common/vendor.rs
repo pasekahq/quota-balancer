@@ -26,10 +26,11 @@ pub enum Answer {
 
 /// One request the scripted vendor received.
 pub struct Received {
+    pub method: String,
     pub path: String,
     /// Header names in lowercase.
     pub headers: Vec<(String, String)>,
-    /// A JSON body, or a form body as a string.
+    /// A JSON body, a form body as a string, or null without a body.
     pub body: Value,
     /// When the vendor had read the whole request.
     pub at: Instant,
@@ -137,7 +138,9 @@ fn read_http(conn: &mut TcpStream) -> Received {
     }
     let head = String::from_utf8(raw).unwrap();
     let mut lines = head.lines();
-    let path = lines.next().unwrap().split(' ').nth(1).unwrap().to_owned();
+    let mut start = lines.next().unwrap().split(' ');
+    let method = start.next().unwrap().to_owned();
+    let path = start.next().unwrap().to_owned();
     let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(n, v)| (n.to_ascii_lowercase(), v.trim().to_owned()))
@@ -145,20 +148,22 @@ fn read_http(conn: &mut TcpStream) -> Received {
     let length: usize = headers
         .iter()
         .find(|(n, _)| n == "content-length")
-        .map(|(_, v)| v.parse().unwrap())
-        .unwrap();
+        .map_or(0, |(_, v)| v.parse().unwrap());
     let mut body = vec![0u8; length];
     conn.read_exact(&mut body).unwrap();
     let at = Instant::now();
     let form = headers
         .iter()
         .any(|(n, v)| n == "content-type" && v == "application/x-www-form-urlencoded");
-    let body = if form {
+    let body = if body.is_empty() {
+        Value::Null
+    } else if form {
         Value::String(String::from_utf8(body).unwrap())
     } else {
         serde_json::from_slice(&body).unwrap()
     };
     Received {
+        method,
         path,
         headers,
         body,

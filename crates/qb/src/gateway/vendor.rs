@@ -1,7 +1,7 @@
 //! What the vendor adapters share: one ureq agent with rustls per attempt, which the turn's
 //! cancel hook shuts down so a blocked connect, write or read returns at once, and which resolves
 //! host names on the calling thread; the secret header built in a zeroizing string; the bounded
-//! error body; the read loop that feeds a stream parser and hands its events to the sink.
+//! short body; the read loop that feeds a stream parser and hands its events to the sink.
 
 use std::io::{self, Read};
 use std::time::Duration;
@@ -19,8 +19,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound of one attempt, from connect to the end of the stream.
 pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Largest error body read for its message.
-const MAX_ERROR_BODY: u64 = 64 << 10;
+/// Largest short body read: an error's, or a small JSON answer's.
+const MAX_SHORT_BODY: u64 = 64 << 10;
 
 /// Size of one read of the stream.
 const READ_BYTES: usize = 16 << 10;
@@ -92,21 +92,32 @@ pub(super) struct Answer {
     response: ureq::http::Response<ureq::Body>,
 }
 
-/// Sends `req` with `secret` on a fresh agent of `config` that `cancel` shuts down. The secret
-/// header value and the body are dropped once the request is sent.
+/// An agent of `config` that `cancel` shuts down, and the value of the secret header
+/// `prefix` + `secret`.
+fn armed(
+    config: &ureq::config::Config,
+    (prefix, secret): (&str, &str),
+    cancel: &CancelToken,
+) -> (ureq::Agent, Zeroizing<String>) {
+    let agent = agent(config);
+    let stop = agent.clone();
+    cancel.on_cancel(Box::new(move || stop.shutdown()));
+    let mut value = Zeroizing::new(String::with_capacity(prefix.len() + secret.len()));
+    value.push_str(prefix);
+    value.push_str(secret);
+    (agent, value)
+}
+
+/// Sends `req` as a `POST` with `secret` on a fresh agent of `config` that `cancel` shuts down.
+/// The secret header value and the body are dropped once the request is sent.
 pub(super) fn send(
     config: &ureq::config::Config,
     req: Request<'_>,
     secret: &str,
     cancel: &CancelToken,
 ) -> Result<Answer, Failure> {
-    let agent = agent(config);
-    let stop = agent.clone();
-    cancel.on_cancel(Box::new(move || stop.shutdown()));
     let (name, prefix) = req.secret_header;
-    let mut value = Zeroizing::new(String::with_capacity(prefix.len() + secret.len()));
-    value.push_str(prefix);
-    value.push_str(secret);
+    let (agent, value) = armed(config, (prefix, secret), cancel);
     let mut call = agent.post(req.url);
     for (header, v) in &req.headers {
         call = call.header(*header, *v);
@@ -114,6 +125,32 @@ pub(super) fn send(
     let sent = call.header(name, value.as_str()).send(&req.body[..]);
     drop(value);
     drop(req.body);
+    answer(sent, cancel)
+}
+
+/// [`send`] of a `GET` of `req`, whose body is not sent.
+pub(super) fn get(
+    config: &ureq::config::Config,
+    req: &Request<'_>,
+    secret: &str,
+    cancel: &CancelToken,
+) -> Result<Answer, Failure> {
+    let (name, prefix) = req.secret_header;
+    let (agent, value) = armed(config, (prefix, secret), cancel);
+    let mut call = agent.get(req.url);
+    for (header, v) in &req.headers {
+        call = call.header(*header, *v);
+    }
+    let sent = call.header(name, value.as_str()).call();
+    drop(value);
+    answer(sent, cancel)
+}
+
+/// The answer of a sent request, or the failure that kept it.
+fn answer(
+    sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    cancel: &CancelToken,
+) -> Result<Answer, Failure> {
     let response = sent.map_err(|e| broken(cancel, "vendor request failed", &e))?;
     let headers = response
         .headers()
@@ -136,16 +173,17 @@ impl Answer {
             .collect()
     }
 
-    /// The first 64 KiB of an error answer's body; empty when it cannot be read.
+    /// The first 64 KiB of the body of an error or another short answer; empty when it cannot
+    /// be read.
     ///
     /// # Errors
     /// The turn was cancelled while reading.
-    pub(super) fn error_body(&mut self, cancel: &CancelToken) -> Result<Vec<u8>, Failure> {
+    pub(super) fn short_body(&mut self, cancel: &CancelToken) -> Result<Vec<u8>, Failure> {
         let body = self
             .response
             .body_mut()
             .with_config()
-            .limit(MAX_ERROR_BODY)
+            .limit(MAX_SHORT_BODY)
             .read_to_vec();
         if cancel.is_cancelled() {
             return Err(cancelled());

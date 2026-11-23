@@ -47,8 +47,8 @@ At start the gateway reads its config, creates its listeners, clears its dumpabl
 handles every file and network right of that ABI):
 
 - read and write beneath the directory of the config file and of each file the gateway
-  writes: credential files, `spend_file`, `audit_file`, `usage.file`, named clients'
-  `token_file`s and `fronts.grace_file`. Read files and directories, write and truncate files,
+  writes: credential files, `spend_file`, `audit_file`, `usage.file`, `batches.file`, named
+  clients' `token_file`s and `fronts.grace_file`. Read files and directories, write and truncate files,
   create regular files, remove files. The directory, not the file, because a write replaces
   the file by a rename inside that directory and a backup is a new file beside it. No `REFER`
   right: renames never cross directories.

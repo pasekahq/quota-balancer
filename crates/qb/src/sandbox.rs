@@ -2,9 +2,9 @@
 //! touch a secret: the process becomes non-dumpable, and landlock limits it to the credential
 //! directories (read-only for the agent; for the others also writing, creating and removing
 //! regular files, as a credential file is written by rename, and the same in the directories of
-//! the gateway's config, spend, audit, usage, client token and grace files). The agent, the
-//! gateway and `qb login` may also read the resolver files and connect over TCP to port 443; the
-//! import has no network. `qb login` may read the files of its config's directory, and the import
+//! the gateway's config, spend, audit, usage, batch store, client token and grace files). The
+//! agent, the gateway and `qb login` may also read the resolver files and connect over TCP to port
+//! 443; the import has no network. `qb login` may read the files of its config's directory, and the import
 //! those of its config's and its source's directories. The only TCP bind allowed is the gateway's
 //! on the port of its loopback Messages listener.
 
@@ -76,8 +76,8 @@ pub fn harden_gateway(config: &GatewayConfig) -> Result<Confined, String> {
 }
 
 /// The files `qb gateway` owns and writes: its config file and the config's backups, each
-/// login's credential file, `spend_file`, `audit_file`, `usage.file`, each named client's
-/// `token_file` and `fronts.grace_file`.
+/// login's credential file, `spend_file`, `audit_file`, `usage.file`, `batches.file`, each named
+/// client's `token_file` and `fronts.grace_file`.
 pub fn gateway_files(config: &GatewayConfig) -> impl Iterator<Item = &Path> {
     let fronts = config.fronts.as_ref();
     let token_files = fronts
@@ -92,6 +92,7 @@ pub fn gateway_files(config: &GatewayConfig) -> impl Iterator<Item = &Path> {
         .chain(config.spend_file.as_deref())
         .chain(config.audit_file.as_deref())
         .chain(config.usage.as_ref().map(|u| u.file.as_path()))
+        .chain(config.batches.as_ref().map(|b| b.file.as_path()))
         .chain(token_files)
         .chain(fronts.and_then(|f| f.grace_file.as_deref()))
 }

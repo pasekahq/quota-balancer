@@ -384,6 +384,83 @@
         }
       }
     },
+    "/v1/model/batches": {
+      "post": {
+        "operationId": "batchSubmit",
+        "summary": "Create an Anthropic Message Batch on a pin or ladder route: the gateway asks qbd one pick limited to the route's `api_key` logins of the `anthropic` API family (every such login of the config when the route lists none), stores a pending record for the caller's `idempotency_key`, sends the requests to the vendor with `model` set to the picked model, reports the vendor's answer to qbd and binds the batch to the login in `batches.file` before it answers. Callers as for `POST /v1/model/turn`; not served on the loopback listener; body up to `max_request_bytes`. 404 `bad_request` without `[batches]`; 400 `bad_request`, before any pick, for a body that does not validate, an unknown or chain route, or a route without an `api_key` Anthropic login; 409 `bad_request` for a key this caller used with another body, a key whose earlier submit has no known outcome, or a key whose submit is running; a repeat of the same body and key answers the stored batch's status without a create request. A pick that does not run answers as a turn would; the vendor's refusal answers its class; 502 `unavailable` when the request was not sent, or when its outcome is unknown, which keeps the key refused; 500 `unavailable` when `batches.file` cannot be written.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchSubmit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The batch the vendor created, or the one an earlier submit of the same body and key created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/batches/{batch_id}": {
+      "get": {
+        "operationId": "batchStatus",
+        "summary": "The vendor's status of a batch this gateway created, read through the login that created it, without a pick and also when the route changed since. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class; 502 `unavailable` without an answer that holds a batch.",
+        "parameters": [
+          {
+            "name": "batch_id",
+            "in": "path",
+            "required": true,
+            "description": "The vendor's id of the batch, as `BatchStatus.batch_id`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The batch's status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/model/clients/{name}/rotate": {
       "post": {
         "operationId": "clientRotate",
@@ -2202,6 +2279,165 @@
           "to",
           "rows",
           "skipped"
+        ]
+      },
+      "BatchSubmit": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/batches`.",
+        "properties": {
+          "route": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+            "description": "Alias of a pin or ladder route."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "description": "The caller's key of this submit; a repeat with the same body answers the batch it created, one with another body is 409."
+          },
+          "requests": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100000,
+            "items": {
+              "$ref": "#/components/schemas/BatchRequest"
+            },
+            "description": "The batch's requests; each `custom_id` unique."
+          }
+        },
+        "required": [
+          "route",
+          "idempotency_key",
+          "requests"
+        ],
+        "additionalProperties": false
+      },
+      "BatchRequest": {
+        "type": "object",
+        "description": "One request of a `BatchSubmit`.",
+        "properties": {
+          "custom_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "description": "The caller's id of the request, unique in the batch."
+          },
+          "params": {
+            "type": "object",
+            "description": "Anthropic Messages parameters sent to the vendor as given, except that the gateway sets `model` to the picked model; a `model` or `stream` key is 400 `bad_request` naming the request's `custom_id`."
+          }
+        },
+        "required": [
+          "custom_id",
+          "params"
+        ],
+        "additionalProperties": false
+      },
+      "BatchProcessing": {
+        "type": "string",
+        "enum": [
+          "in_progress",
+          "canceling",
+          "ended"
+        ],
+        "description": "Where a batch is in its processing, as the vendor reports it."
+      },
+      "BatchCounts": {
+        "type": "object",
+        "description": "The requests of a batch by how far they got.",
+        "properties": {
+          "processing": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests not processed yet."
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests that ended with a message."
+          },
+          "errored": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests that ended with an error."
+          },
+          "canceled": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests cancelled before they ran."
+          },
+          "expired": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests that did not run before the batch expired."
+          }
+        },
+        "required": [
+          "processing",
+          "succeeded",
+          "errored",
+          "canceled",
+          "expired"
+        ]
+      },
+      "BatchStatus": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/batches` and `GET /v1/model/batches/{batch_id}`.",
+        "properties": {
+          "batch_id": {
+            "type": "string",
+            "description": "The vendor's id of the batch."
+          },
+          "route": {
+            "type": "string",
+            "description": "Route alias the batch was submitted on."
+          },
+          "login": {
+            "type": "string",
+            "description": "Login that created the batch; every later request of the batch goes through it."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model every request of the batch runs on."
+          },
+          "processing_status": {
+            "$ref": "#/components/schemas/BatchProcessing"
+          },
+          "request_counts": {
+            "$ref": "#/components/schemas/BatchCounts"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time the vendor created the batch."
+          },
+          "ended_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time processing ended; absent before."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time the vendor expires the batch's unprocessed requests."
+          }
+        },
+        "required": [
+          "batch_id",
+          "route",
+          "login",
+          "model",
+          "processing_status",
+          "request_counts",
+          "created_at",
+          "expires_at"
         ]
       },
       "Health": {

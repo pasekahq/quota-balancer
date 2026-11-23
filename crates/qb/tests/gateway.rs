@@ -38,12 +38,12 @@ use qb_core::Core;
 use qb_openai::request::identity as openai_identity;
 use qb_proto::{
     AdminLoginsResetAnswer, AdminReloadAnswer, AdminRolesWritten, AuditAction, AuditAnswer,
-    AuditEntry, AuditResult, Block, CancelAnswer, ClientRotateAnswer, ConfigRoute, ConfigRoutes,
-    ConfigRoutesPut, ConfigRoutesWritten, ConfigStep, ErrorClass, GatewayError, LoginKeyAnswer,
-    LoginOauthSigned, LoginOauthStarted, LoginSpend, LoginStatus, OauthPaste, Outcome,
-    ReloadAnswer, RouteState, RouteStatus, RoutesAnswer, SpendAnswer, StateResponse, StopReason,
-    StreamEvent, Thinking, ToolCall, TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow,
-    UsdSource, WindowReport, paths,
+    AuditEntry, AuditResult, BatchCounts, BatchProcessing, BatchStatus, Block, CancelAnswer,
+    ClientRotateAnswer, ConfigRoute, ConfigRoutes, ConfigRoutesPut, ConfigRoutesWritten,
+    ConfigStep, ErrorClass, GatewayError, LoginKeyAnswer, LoginOauthSigned, LoginOauthStarted,
+    LoginSpend, LoginStatus, OauthPaste, Outcome, ReloadAnswer, RouteState, RouteStatus,
+    RoutesAnswer, SpendAnswer, StateResponse, StopReason, StreamEvent, Thinking, ToolCall,
+    TurnRequest, Usage, UsageAnswer, UsageLine, UsageRow, UsdSource, WindowReport, paths,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -11209,4 +11209,580 @@ fn routes_and_the_ladder_show_the_state_of_a_route_s_listed_logins_only() {
         json!({"role": "gateway", "steps": [step_1, step_2]}),
         "step 1 adds chat's every login, step 2 has deep's"
     );
+}
+
+/// The batch store of the gateway whose files are in `dir`.
+fn batch_file(dir: &Path) -> PathBuf {
+    dir.join("batches.json")
+}
+
+/// A gateway as `gateway_uid` with the Anthropic adapter, on the qbd `qbd`, its files in `dir`:
+/// the credential files `files`, the login keys `logins`, and `extra` appended; its socket.
+fn batch_gateway(
+    dir: &Path,
+    qbd: &Path,
+    files: &[(&str, String, u32)],
+    logins: &[String; 2],
+    extra: &str,
+    gateway_uid: u32,
+) -> PathBuf {
+    credentials(dir, files);
+    let text = gateway_toml(dir, qbd, 4, [&logins[0], &logins[1]], extra);
+    let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
+    let refresher = Box::new(Counting(Arc::default()));
+    serve_gateway(&text, upstreams, refresher, gateway_uid, None)
+}
+
+/// A gateway with `[batches]` in its own directory, on a qbd of [`QBD`] and a scripted vendor.
+struct BatchRig {
+    dir: PathBuf,
+    qbd: PathBuf,
+    gw: PathBuf,
+    vendor: Vendor,
+}
+
+/// A [`BatchRig`] whose gateway runs as `gateway_uid` with `extra` and a store that holds
+/// `records` when it starts.
+fn batch_rig(
+    files: &[(&str, String, u32)],
+    logins: impl Fn(&Vendor) -> [String; 2],
+    extra: &str,
+    gateway_uid: u32,
+    records: &[Value],
+) -> BatchRig {
+    let vendor = Vendor::start();
+    let dir = temp_dir("gwb");
+    let qbd = start_qbd(&dir, QBD);
+    if !records.is_empty() {
+        let store = json!({ "batches": records }).to_string();
+        std::fs::write(batch_file(&dir), store).unwrap();
+    }
+    let extra = format!(
+        "{extra}\n[batches]\nfile = \"{}\"\n",
+        batch_file(&dir).display()
+    );
+    let gw = batch_gateway(&dir, &qbd, files, &logins(&vendor), &extra, gateway_uid);
+    BatchRig {
+        dir,
+        qbd,
+        gw,
+        vendor,
+    }
+}
+
+/// A submit on route `chat` with key `key`, one request per id of `ids`.
+fn batch_body(key: &str, ids: &[&str]) -> Value {
+    let requests: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({"custom_id": id, "params": {"max_tokens": 64,
+                   "messages": [{"role": "user", "content": format!("Summarise {id}")}]}})
+        })
+        .collect();
+    json!({"route": "chat", "idempotency_key": key, "requests": requests})
+}
+
+/// The vendor's `message_batch` object `id`, ended at 09:30 with one success and one error,
+/// else in progress with two requests.
+fn message_batch(id: &str, ended: bool) -> Answer {
+    let (status, counts, ended_at) = if ended {
+        ("ended", [0, 1, 1, 0, 0], json!("2027-01-15T09:30:00.250Z"))
+    } else {
+        ("in_progress", [2, 0, 0, 0, 0], Value::Null)
+    };
+    let [processing, succeeded, errored, canceled, expired] = counts;
+    let body = json!({
+        "id": id, "type": "message_batch", "processing_status": status,
+        "request_counts": {"processing": processing, "succeeded": succeeded,
+                           "errored": errored, "canceled": canceled, "expired": expired},
+        "ended_at": ended_at, "created_at": "2027-01-15T08:00:00Z",
+        "expires_at": "2027-01-16T08:00:00Z", "cancel_initiated_at": null,
+        "archived_at": null, "results_url": null,
+    });
+    let json = vec![("content-type".to_owned(), "application/json".to_owned())];
+    Answer::Full(200, json, body.to_string().into_bytes())
+}
+
+/// A vendor error answer of `status` with an Anthropic error body of `kind` and `message`.
+fn vendor_error(status: u16, kind: &str, message: &str) -> Answer {
+    let body = json!({"type": "error", "error": {"type": kind, "message": message}});
+    let json = vec![("content-type".to_owned(), "application/json".to_owned())];
+    Answer::Full(status, json, body.to_string().into_bytes())
+}
+
+fn submit_batch(gw: &Path, body: &Value) -> (u16, Vec<u8>) {
+    call(gw, "POST", paths::MODEL_BATCHES, &body.to_string())
+}
+
+fn batch_of(gw: &Path, batch_id: &str) -> (u16, Vec<u8>) {
+    call(
+        gw,
+        "GET",
+        &format!("{}/{batch_id}", paths::MODEL_BATCHES),
+        "",
+    )
+}
+
+/// The [`BatchStatus`] of a 200 answer.
+fn batch_status((status, body): (u16, Vec<u8>)) -> BatchStatus {
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The status and class of a refused batch request, and its message.
+fn batch_refusal((status, body): (u16, Vec<u8>)) -> (u16, ErrorClass, String) {
+    let e: GatewayError = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&body)));
+    (status, e.class, e.message.unwrap_or_default())
+}
+
+/// The records of the batch store in `dir`.
+fn batch_records(dir: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(batch_file(dir)).unwrap();
+    let stored: Value = serde_json::from_str(&text).unwrap();
+    stored["batches"].as_array().unwrap().clone()
+}
+
+/// `(method, path, x-api-key)` of each request the vendor received.
+fn batch_calls(vendor: &Vendor) -> Vec<(String, String, String)> {
+    let sent = vendor.received();
+    sent.iter()
+        .map(|r| {
+            let key = r.header("x-api-key").unwrap_or("none").to_owned();
+            (r.method.clone(), r.path.clone(), key)
+        })
+        .collect()
+}
+
+/// The key of `login` in [`key_files`].
+fn key_of(login: &str) -> &'static str {
+    if login == "login-1" {
+        "test-token-1"
+    } else {
+        "test-token-2"
+    }
+}
+
+#[test]
+fn a_batch_runs_on_an_api_key_login_and_is_stored_before_its_answer() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let body = batch_body("key-1", &["item-1", "item-2"]);
+    let created = batch_status(submit_batch(&b.gw, &body));
+    assert_eq!(
+        created,
+        BatchStatus {
+            batch_id: "msgbatch_01".into(),
+            route: "chat".into(),
+            login: created.login.clone(),
+            model: "model-large".into(),
+            processing_status: BatchProcessing::InProgress,
+            request_counts: BatchCounts {
+                processing: 2,
+                succeeded: 0,
+                errored: 0,
+                canceled: 0,
+                expired: 0
+            },
+            created_at: 1_800_000_000,
+            ended_at: None,
+            expires_at: 1_800_086_400,
+        }
+    );
+    let key = key_of(&created.login);
+    let sent = b.vendor.received();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (sent[0].method.as_str(), sent[0].path.as_str()),
+        ("POST", "/v1/messages/batches")
+    );
+    assert_eq!(sent[0].header("x-api-key"), Some(key));
+    assert_eq!(sent[0].header("authorization"), None);
+    assert!(sent[0].header("anthropic-version").is_some());
+    let mut want = body["requests"].clone();
+    for r in want.as_array_mut().unwrap() {
+        r["params"]["model"] = json!("model-large");
+    }
+    assert_eq!(sent[0].body, json!({ "requests": want }));
+    drop(sent);
+
+    let records = batch_records(&b.dir);
+    assert_eq!(records.len(), 1);
+    let r = &records[0];
+    let caller = format!("uid:{}", own_uid());
+    for (field, value) in [
+        ("batch_id", "msgbatch_01"),
+        ("client", caller.as_str()),
+        ("route", "chat"),
+        ("login", created.login.as_str()),
+        ("model", "model-large"),
+        ("idempotency_key", "key-1"),
+    ] {
+        assert_eq!(r[field], json!(value), "{field}");
+    }
+    assert_eq!(r["body_sha256"], json!(sha256_hex(&body.to_string())));
+    assert!(r["created_at"].as_u64().unwrap() >= unix_now() - 60);
+    let mode = std::fs::metadata(batch_file(&b.dir)).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(state(&b.qbd).leases, [], "the lease is released");
+    assert_eq!(leased_on_behalf_of(&b.dir), [Some(caller)]);
+}
+
+/// An `oauth_anthropic` credential file with the access token `access`.
+fn anthropic_oauth(access: &str) -> String {
+    format!(
+        r#"{{"type":"oauth_anthropic","access_token":"{access}","refresh_token":"refresh-0","expires_at":{}}}"#,
+        unix_now() + 3600
+    )
+}
+
+#[test]
+fn an_oauth_login_never_runs_a_batch() {
+    let oauth = "kind = \"oauth_anthropic\"";
+    let files = [
+        ("login-1", anthropic_oauth("access-1"), 0o600),
+        ("login-2", anthropic_oauth("access-2"), 0o600),
+    ];
+    let b = batch_rig(
+        &files,
+        |v| [v.login(oauth), v.login(oauth)],
+        "",
+        own_uid(),
+        &[],
+    );
+    let refused = batch_refusal(submit_batch(&b.gw, &batch_body("key-1", &["item-1"])));
+    let message = "route `chat` has no `api_key` Anthropic login; OAuth logins cannot run batches";
+    assert_eq!(refused, (400, ErrorClass::BadRequest, message.to_owned()));
+    assert_eq!(batch_calls(&b.vendor), []);
+    assert_eq!(leased_on_behalf_of(&b.dir), [], "no pick");
+
+    let files = [
+        ("login-1", anthropic_oauth("access-1"), 0o600),
+        ("login-2", api_key("test-token-2"), 0o600),
+    ];
+    let mixed = |v: &Vendor| [v.login(oauth), v.login(ANTHROPIC_KEY)];
+    let b = batch_rig(&files, mixed, "", own_uid(), &[]);
+    let pick = br#"{"role":"gateway","difficulty":1}"#;
+    let (status, picked) = qb::client::call(&b.qbd, "POST", paths::PICK, Some(pick), None).unwrap();
+    assert_eq!(status, 200);
+    let picked: Value = serde_json::from_slice(&picked).unwrap();
+    assert_eq!(picked["login"], "login-1", "qbd prefers the OAuth login");
+    let release = json!({"lease_id": picked["lease_id"], "outcome": "ok", "release": true});
+    let (status, _) = qb::client::call(
+        &b.qbd,
+        "POST",
+        paths::REPORT,
+        Some(release.to_string().as_bytes()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let created = batch_status(submit_batch(&b.gw, &batch_body("key-1", &["item-1"])));
+    assert_eq!(created.login, "login-2");
+    let post = ("POST".to_owned(), "/v1/messages/batches".to_owned());
+    assert_eq!(
+        batch_calls(&b.vendor),
+        [(post.0, post.1, "test-token-2".to_owned())]
+    );
+}
+
+/// A stored record of batch `batch_id` (`None` for a pending one) of `client` on `route` and
+/// `login`, submitted with `key` and a body of hash `sha`.
+fn batch_record(
+    batch_id: Option<&str>,
+    client: &str,
+    route: &str,
+    login: &str,
+    key: &str,
+    sha: &str,
+) -> Value {
+    json!({"batch_id": batch_id, "client": client, "route": route, "login": login,
+           "model": "model-large", "idempotency_key": key, "body_sha256": sha,
+           "created_at": 1_799_990_000})
+}
+
+#[test]
+fn a_batch_status_reads_the_vendor_through_the_login_that_created_it() {
+    let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
+    let records = [
+        batch_record(
+            Some("msgbatch_b"),
+            "client-b",
+            "chat",
+            "login-1",
+            "key-b",
+            "00",
+        ),
+        batch_record(
+            Some("msgbatch_old"),
+            "client-a",
+            "retired",
+            "login-2",
+            "key-0",
+            "00",
+        ),
+    ];
+    let b = batch_rig(&key_files(), two_keys, &extra, own_uid() + 1, &records);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let created = batch_status(submit_batch(&b.gw, &batch_body("key-1", &["item-1"])));
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let running = batch_status(batch_of(&b.gw, "msgbatch_01"));
+    assert_eq!(running, created);
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    let ended = batch_status(batch_of(&b.gw, "msgbatch_01"));
+    assert_eq!(ended.processing_status, BatchProcessing::Ended);
+    assert_eq!(ended.ended_at, Some(1_800_005_400));
+    assert_eq!(
+        (ended.request_counts.succeeded, ended.request_counts.errored),
+        (1, 1)
+    );
+    assert_eq!(
+        (ended.login, ended.route),
+        (created.login.clone(), "chat".into())
+    );
+    b.vendor.answer(message_batch("msgbatch_old", true));
+    let old = batch_status(batch_of(&b.gw, "msgbatch_old"));
+    assert_eq!(
+        (old.route.as_str(), old.login.as_str()),
+        ("retired", "login-2"),
+        "read through its login although its route is gone"
+    );
+
+    let unknown = batch_refusal(batch_of(&b.gw, "msgbatch_none"));
+    assert_eq!((unknown.0, unknown.1), (404, ErrorClass::BadRequest));
+    let other = batch_refusal(batch_of(&b.gw, "msgbatch_b"));
+    let message = "batch `msgbatch_b` belongs to another caller".to_owned();
+    assert_eq!(other, (403, ErrorClass::Auth, message));
+    let get = |id: &str, key: &str| {
+        let path = format!("/v1/messages/batches/{id}");
+        ("GET".to_owned(), path, key.to_owned())
+    };
+    let key = key_of(&created.login);
+    let post = (
+        "POST".to_owned(),
+        "/v1/messages/batches".to_owned(),
+        key.to_owned(),
+    );
+    assert_eq!(
+        batch_calls(&b.vendor),
+        [
+            post,
+            get("msgbatch_01", key),
+            get("msgbatch_01", key),
+            get("msgbatch_old", "test-token-2")
+        ]
+    );
+    assert_eq!(
+        leased_on_behalf_of(&b.dir).len(),
+        1,
+        "a status takes no pick"
+    );
+}
+
+#[test]
+fn a_repeated_submit_answers_its_batch_and_a_pending_one_is_refused() {
+    let pending = batch_body("key-p", &["item-1"]);
+    let sha = sha256_hex(&pending.to_string());
+    let caller = format!("uid:{}", own_uid());
+    let records = [batch_record(
+        None, &caller, "chat", "login-1", "key-p", &sha,
+    )];
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &records);
+    let body = batch_body("key-1", &["item-1", "item-2"]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let first = batch_status(submit_batch(&b.gw, &body));
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    let again = batch_status(submit_batch(&b.gw, &body));
+    assert_eq!(again.batch_id, "msgbatch_01");
+    assert_eq!(
+        again.processing_status,
+        BatchProcessing::Ended,
+        "its current status"
+    );
+    let calls: Vec<String> = batch_calls(&b.vendor).into_iter().map(|c| c.0).collect();
+    assert_eq!(calls, ["POST", "GET"], "no second create");
+
+    let other = batch_body("key-1", &["item-3"]);
+    let refused = batch_refusal(submit_batch(&b.gw, &other));
+    let message = "idempotency_key `key-1` was used with another body".to_owned();
+    assert_eq!(refused, (409, ErrorClass::BadRequest, message));
+    let (status, class, message) = batch_refusal(submit_batch(&b.gw, &pending));
+    assert_eq!((status, class), (409, ErrorClass::BadRequest));
+    assert!(message.contains("is unknown"), "{message}");
+    assert_eq!(batch_calls(&b.vendor).len(), 2, "no request for either");
+
+    b.vendor
+        .answer(vendor_error(500, "api_error", "Internal server error"));
+    let body = batch_body("key-2", &["item-1"]);
+    let (status, class, _) = batch_refusal(submit_batch(&b.gw, &body));
+    assert_eq!((status, class), (502, ErrorClass::Unavailable));
+    b.vendor.answer(message_batch("msgbatch_02", false));
+    let retried = batch_status(submit_batch(&b.gw, &body));
+    assert_eq!(
+        retried.batch_id, "msgbatch_02",
+        "a refused create frees its key"
+    );
+    let ids: Vec<Value> = batch_records(&b.dir)
+        .iter()
+        .map(|r| r["batch_id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        [Value::Null, json!("msgbatch_01"), json!("msgbatch_02")]
+    );
+    assert_eq!(first.batch_id, "msgbatch_01");
+    assert_eq!(state(&b.qbd).leases, []);
+}
+
+#[test]
+fn a_restarted_gateway_reads_the_batches_of_its_store() {
+    let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
+    let b = batch_rig(&key_files(), two_keys, &extra, own_uid() + 1, &[]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let created = batch_status(submit_batch(&b.gw, &batch_body("key-1", &["item-1"])));
+    let dir = temp_dir("gwb2");
+    let store = format!("[batches]\nfile = \"{}\"\n", batch_file(&b.dir).display());
+    let restarted = batch_gateway(
+        &dir,
+        &b.qbd,
+        &key_files(),
+        &two_keys(&b.vendor),
+        &store,
+        own_uid(),
+    );
+    b.vendor.answer(message_batch("msgbatch_01", true));
+    let read = batch_status(batch_of(&restarted, "msgbatch_01"));
+    assert_eq!(
+        (read.batch_id, read.login),
+        (created.batch_id, created.login)
+    );
+
+    let broken = temp_dir("gwb3");
+    let file = batch_file(&broken);
+    std::fs::write(&file, "{\"batches\": [{\"batch_id\": 1}]}").unwrap();
+    let text = gateway_toml(
+        &broken,
+        &b.qbd,
+        4,
+        [ANTHROPIC_KEY, ANTHROPIC_KEY],
+        &format!("[batches]\nfile = \"{}\"\n", file.display()),
+    );
+    let config = qb::gateway::config::parse(Path::new("gateway.toml"), &text).unwrap();
+    let refresher = Box::new(Counting(Arc::default()));
+    let e = Gateway::new(config, Vec::new(), refresher, None)
+        .err()
+        .unwrap();
+    let named = format!("{}: not a batch store", file.display());
+    assert!(e.starts_with(&named), "{e}");
+}
+
+#[test]
+fn bad_batch_input_is_refused_before_any_pick() {
+    let chain = "[[routes]]\nalias = \"chain-1\"\nrole = \"gateway\"\n\
+                 chain = [{ vendor = \"vendor-a\", model = \"model-large\" }]\n";
+    let b = batch_rig(&key_files(), two_keys, chain, own_uid(), &[]);
+    let body = batch_body("key-1", &["item-1", "item-2"]);
+    let with = |path: &str, value: Value| {
+        let mut b = body.clone();
+        let (parent, key) = path.rsplit_once('/').unwrap();
+        match b.pointer_mut(parent).unwrap() {
+            Value::Object(o) => drop(o.insert(key.to_owned(), value)),
+            other => panic!("not an object: {other}"),
+        }
+        b
+    };
+    for (bad, says) in [
+        (
+            with("/route", json!("chain-1")),
+            "route `chain-1` is a chain route",
+        ),
+        (with("/route", json!("none")), "unknown route alias `none`"),
+        (
+            with("/requests/1/params/model", json!("model-x")),
+            "request `item-2`: `params` must not hold `model`",
+        ),
+        (
+            with("/requests/0/params/stream", json!(true)),
+            "request `item-1`: `params` must not hold `stream`",
+        ),
+        (
+            with("/requests/1/custom_id", json!("item 2")),
+            "`requests[1].custom_id` must match",
+        ),
+        (
+            with("/requests/1/custom_id", json!("item-1")),
+            "`custom_id` `item-1` is repeated",
+        ),
+        (
+            with("/requests", json!([])),
+            "`requests` must hold 1 to 100000",
+        ),
+        (
+            with("/idempotency_key", json!("key/1")),
+            "`idempotency_key` must match",
+        ),
+        (with("/model", json!("model-x")), "unknown field `model`"),
+    ] {
+        let (status, class, message) = batch_refusal(submit_batch(&b.gw, &bad));
+        assert_eq!((status, class), (400, ErrorClass::BadRequest), "{bad}");
+        assert!(message.starts_with(says), "{says}: {message}");
+    }
+    assert_eq!(batch_calls(&b.vendor), []);
+    assert_eq!(leased_on_behalf_of(&b.dir), [], "no pick");
+    let (status, _) = call(&b.gw, "PUT", paths::MODEL_BATCHES, "");
+    assert_eq!(status, 405);
+
+    let (r, _vendor) = vendor_rig(&key_files(), two_keys);
+    let none = "this gateway runs no batches: its config has no `[batches]` table".to_owned();
+    for answer in [submit_batch(&r.gw, &body), batch_of(&r.gw, "msgbatch_01")] {
+        assert_eq!(
+            batch_refusal(answer),
+            (404, ErrorClass::BadRequest, none.clone())
+        );
+    }
+}
+
+#[test]
+fn no_batch_answer_log_or_record_holds_the_key() {
+    const MARK: &str = "test-token-b4e1";
+    let files = [
+        ("login-1", api_key(MARK), 0o600),
+        ("login-2", api_key(MARK), 0o600),
+    ];
+    let b = batch_rig(&files, two_keys, "", own_uid(), &[]);
+    let quoted = format!("invalid x-api-key {MARK}");
+    let body = batch_body("key-1", &["item-1"]);
+    let mut answers = Vec::new();
+    let logged = stderr_of(|| {
+        b.vendor
+            .answer(vendor_error(401, "authentication_error", &quoted));
+        answers.push(submit_batch(&b.gw, &body));
+        b.vendor.answer(message_batch("msgbatch_01", false));
+        answers.push(submit_batch(&b.gw, &body));
+        b.vendor.answer(vendor_error(500, "api_error", &quoted));
+        answers.push(batch_of(&b.gw, "msgbatch_01"));
+        b.vendor.answer(message_batch("msgbatch_01", true));
+        answers.push(batch_of(&b.gw, "msgbatch_01"));
+    });
+    let statuses: Vec<u16> = answers.iter().map(|a| a.0).collect();
+    assert_eq!(statuses, [401, 200, 502, 200]);
+    let refused = batch_refusal(answers[0].clone());
+    assert_eq!(refused.1, ErrorClass::Auth);
+    assert!(
+        refused.2.contains("invalid x-api-key [redacted]"),
+        "{}",
+        refused.2
+    );
+    assert!(logged.contains("gateway: batch `key-1`"), "{logged}");
+    let store = std::fs::read_to_string(batch_file(&b.dir)).unwrap();
+    let texts = answers
+        .iter()
+        .map(|a| String::from_utf8_lossy(&a.1).into_owned())
+        .chain([logged, store]);
+    for text in texts {
+        assert!(!text.contains(MARK), "{text}");
+    }
+    let keys: Vec<String> = batch_calls(&b.vendor).into_iter().map(|c| c.2).collect();
+    assert_eq!(keys, [MARK; 4], "the vendor got the key");
 }
