@@ -369,6 +369,8 @@ mod tests {
             at: NOW,
             duration_ms: 5,
             request_id: request_id.into(),
+            custom_id: None,
+            batch: false,
             client: "client-a".into(),
             route: "chat".into(),
             step: 0,

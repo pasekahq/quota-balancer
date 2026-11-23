@@ -2832,6 +2832,8 @@ fn ledger_line(at: u64, edit: impl FnOnce(&mut UsageLine)) -> String {
         at,
         duration_ms: 100,
         request_id: format!("turn-{at}"),
+        custom_id: None,
+        batch: false,
         client: "client-a".into(),
         route: "chat".into(),
         step: 0,
@@ -11217,7 +11219,8 @@ fn batch_file(dir: &Path) -> PathBuf {
 }
 
 /// A gateway as `gateway_uid` with the Anthropic adapter, on the qbd `qbd`, its files in `dir`:
-/// the credential files `files`, the login keys `logins`, and `extra` appended; its socket.
+/// the credential files `files`, the login keys `logins`, and `extra`: its top-level keys first,
+/// its tables appended; its socket.
 fn batch_gateway(
     dir: &Path,
     qbd: &Path,
@@ -11227,7 +11230,9 @@ fn batch_gateway(
     gateway_uid: u32,
 ) -> PathBuf {
     credentials(dir, files);
-    let text = gateway_toml(dir, qbd, 4, [&logins[0], &logins[1]], extra);
+    let (top, tables) = split_top(extra);
+    let toml = gateway_toml(dir, qbd, 4, [&logins[0], &logins[1]], tables);
+    let text = format!("{top}\n{toml}");
     let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
     let refresher = Box::new(Counting(Arc::default()));
     serve_gateway(&text, upstreams, refresher, gateway_uid, None)
@@ -11942,7 +11947,22 @@ fn an_ended_batch_s_results_stream_from_the_base_url_of_its_login() {
         "both to the login's base URL, not the batch's results_url"
     );
     assert_eq!(leased_on_behalf_of(&b.dir).len(), 1, "results take no pick");
-    assert_eq!(std::fs::read(batch_file(&b.dir)).unwrap(), store);
+    let stored: Value = serde_json::from_slice(&store).unwrap();
+    let mut records = batch_records(&b.dir);
+    let settled = records[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("settled")
+        .unwrap();
+    assert!(
+        settled["at"].is_u64() && settled.get("usd").is_none(),
+        "{settled}"
+    );
+    assert_eq!(
+        json!({ "batches": records }),
+        stored,
+        "the complete read only settled the batch, without a price"
+    );
 }
 
 #[test]
@@ -12010,6 +12030,305 @@ fn results_wait_for_the_batch_s_end_and_a_cut_body_stays_cut() {
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
     assert!(!ended, "a cut body never ends with the last chunk");
     assert_eq!(chunks.concat(), prefix, "what arrived before the cut");
+}
+
+/// A [`BatchRig`] for settlements, as the gateway's own uid: qbd's vendor-a declares the
+/// `spend` window, login-1 has a `spend_cap` of 10 USD and login-2 none, `model-large` costs 2,
+/// 10, 1 and 4 USD per million input, output, cache read and cache write tokens, the usage ledger
+/// is `usage.jsonl` and the store holds `records` when the gateway starts.
+fn settle_rig(records: &[Value]) -> BatchRig {
+    let vendor = Vendor::start();
+    let dir = temp_dir("gws");
+    let five_hour = "windows = [{ name = \"five_hour\", length_s = 18000, t_burn_s = 1800 }]";
+    let with_spend = "windows = [\n  { name = \"five_hour\", length_s = 18000, t_burn_s = 1800 },\n  \
+                      { name = \"spend\", length_s = 2678400, t_burn_s = 0 },\n]";
+    let qbd = start_qbd(&dir, &QBD.replacen(five_hour, with_spend, 1));
+    std::fs::write(batch_file(&dir), json!({ "batches": records }).to_string()).unwrap();
+    let extra = format!(
+        "spend_file = \"{d}/spend.json\"\n{usage}\n[batches]\nfile = \"{batches}\"\n\n\
+         [prices.\"model-large\"]\ninput = 2\noutput = 10\ncache_read = 1\ncache_write = 4\n",
+        d = dir.display(),
+        usage = usage_table(&dir.join("usage.jsonl"), 1 << 20),
+        batches = batch_file(&dir).display(),
+    );
+    let [key_1, key_2] = two_keys(&vendor);
+    let logins = [format!("{key_1}\nspend_cap = 10.0"), key_2];
+    let gw = batch_gateway(&dir, &qbd, &key_files(), &logins, &extra, own_uid());
+    BatchRig {
+        dir,
+        qbd,
+        gw,
+        vendor,
+    }
+}
+
+/// The gateway of `b`'s config restarted on its store, spend file and usage ledger, on the
+/// socket `socket` beside the first.
+fn restart_settle_rig(b: &BatchRig, socket: &str) -> PathBuf {
+    let text = std::fs::read_to_string(config_file(&b.gw)).unwrap();
+    let config: String = text
+        .lines()
+        .map(|l| {
+            if l.starts_with("socket = ") {
+                format!("socket = \"{}\"\n", b.dir.join(socket).display())
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    let upstreams: Upstreams = vec![(Api::Anthropic, Box::new(Anthropic::new()))];
+    serve_gateway(
+        &config,
+        upstreams,
+        Box::new(Counting(Arc::default())),
+        own_uid(),
+        None,
+    )
+}
+
+/// A succeeded result line of `custom_id` that stopped for `stop_reason` with `usage`.
+fn succeeded(custom_id: &str, stop_reason: &str, usage: &Value) -> Value {
+    let message = json!({"id": "msg_1", "type": "message", "role": "assistant",
+                         "model": "model-large", "stop_reason": stop_reason,
+                         "content": [{"type": "text", "text": "Résumé"}], "usage": usage});
+    json!({"custom_id": custom_id, "result": {"type": "succeeded", "message": message}})
+}
+
+/// Reads the complete results of `batch_id` on `gw` after the vendor answers the ended status
+/// and `body`; asserts the caller gets `body` unchanged.
+fn read_results(b: &BatchRig, gw: &Path, batch_id: &str, body: &[u8]) {
+    b.vendor.answer(message_batch(batch_id, true));
+    b.vendor.answer(results_answer(body.to_vec()));
+    let (head, chunks, ended) = chunks_of(results_of(gw, batch_id));
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(
+        ended && chunks.concat() == body,
+        "the vendor's body, unchanged"
+    );
+}
+
+/// The usage lines of the rig's ledger; none before the first append.
+fn batch_usage(b: &BatchRig) -> Vec<UsageLine> {
+    let file = b.dir.join("usage.jsonl");
+    if file.exists() {
+        usage_lines(&file)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The `settled` value of the stored record of `batch_id`.
+fn settled_of(b: &BatchRig, batch_id: &str) -> Value {
+    let records = batch_records(&b.dir);
+    let record = records.iter().find(|r| r["batch_id"] == batch_id).unwrap();
+    record.get("settled").cloned().unwrap_or(Value::Null)
+}
+
+#[test]
+fn a_complete_results_read_settles_the_succeeded_requests_once() {
+    let record = batch_record(
+        Some("msgbatch_a"),
+        "client-a",
+        "chat",
+        "login-1",
+        "key-a",
+        "00",
+    );
+    let b = settle_rig(&[record]);
+    let error = json!({"type": "error", "error": {"type": "api_error", "message": "Overloaded"}});
+    let body = results_body(&[
+        succeeded(
+            "item-1",
+            "end_turn",
+            &json!({"input_tokens": 1000, "output_tokens": 2000,
+                   "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 500}),
+        ),
+        json!({"custom_id": "item-2", "result": {"type": "errored", "error": error}}),
+        json!({"custom_id": "item-3", "result": {"type": "canceled"}}),
+        json!({"custom_id": "item-4", "result": {"type": "expired"}}),
+        succeeded(
+            "item-5",
+            "max_tokens",
+            &json!({"input_tokens": 3000, "output_tokens": 500}),
+        ),
+    ]);
+    let before = unix_now();
+    read_results(&b, &b.gw, "msgbatch_a", &body);
+    let after = unix_now();
+    let lines = batch_usage(&b);
+    assert_eq!(lines.len(), 2, "one line per succeeded result");
+    let at = lines[0].at;
+    assert!((before..=after).contains(&at), "{at}");
+    let line = |custom_id: &str, stop, usage, usd| UsageLine {
+        at,
+        duration_ms: 0,
+        request_id: "msgbatch_a".into(),
+        custom_id: Some(custom_id.into()),
+        batch: true,
+        client: "client-a".into(),
+        route: "chat".into(),
+        step: 0,
+        login: "login-1".into(),
+        model: "model-large".into(),
+        outcome: Outcome::Ok,
+        stop: Some(stop),
+        error: None,
+        usage,
+        usd: Some(usd),
+        usd_source: Some(UsdSource::Prices),
+        tools: Vec::new(),
+    };
+    let first = Usage {
+        input: 1000,
+        output: 2000,
+        cache_read: 4000,
+        cache_write: 500,
+    };
+    let second = Usage {
+        input: 3000,
+        output: 500,
+        cache_read: 0,
+        cache_write: 0,
+    };
+    let (usd_1, usd_2) = (lines[0].usd.unwrap(), lines[1].usd.unwrap());
+    assert_usd(usd_1, 0.014);
+    assert_usd(usd_2, 0.0055);
+    assert_eq!(
+        lines,
+        [
+            line("item-1", StopReason::End, first, usd_1),
+            line("item-5", StopReason::MaxTokens, second, usd_2)
+        ]
+    );
+    let total = usd_1 + usd_2;
+    assert_usd(spent(&b.gw, "login-1"), total);
+    let (used, resets_at) = spend_window(&b.qbd, "login-1");
+    assert_usd(used, total / 10.0);
+    assert_eq!(resets_at, Some(month_end()));
+    assert_eq!(settled_of(&b, "msgbatch_a")["at"], at);
+    assert_usd(settled_of(&b, "msgbatch_a")["usd"].as_f64().unwrap(), total);
+
+    read_results(&b, &b.gw, "msgbatch_a", &body);
+    let restarted = restart_settle_rig(&b, "gw2.sock");
+    read_results(&b, &restarted, "msgbatch_a", &body);
+    assert_eq!(batch_usage(&b).len(), 2, "a settled batch writes no line");
+    assert_usd(spent(&restarted, "login-1"), total);
+
+    // A crash after the spend count was written, before the record was settled.
+    let mut records = batch_records(&b.dir);
+    records[0].as_object_mut().unwrap().remove("settled");
+    let unsettled = json!({ "batches": records }).to_string();
+    std::fs::write(batch_file(&b.dir), unsettled).unwrap();
+    std::fs::remove_file(b.dir.join("usage.jsonl")).unwrap();
+    let again = restart_settle_rig(&b, "gw3.sock");
+    read_results(&b, &again, "msgbatch_a", &body);
+    assert_eq!(batch_usage(&b).len(), 2);
+    assert_usd(spent(&again, "login-1"), total);
+    assert_usd(spend_window(&b.qbd, "login-1").0, total / 10.0);
+}
+
+#[test]
+fn a_cut_or_unparseable_results_body_settles_nothing_until_a_complete_read() {
+    let record = batch_record(
+        Some("msgbatch_a"),
+        "client-a",
+        "chat",
+        "login-1",
+        "key-a",
+        "00",
+    );
+    let b = settle_rig(&[record]);
+    let usage = json!({"input_tokens": 1000, "output_tokens": 1000});
+    let body = results_body(&[
+        succeeded("item-1", "end_turn", &usage),
+        succeeded("item-2", "tool_use", &usage),
+    ]);
+    b.vendor.answer(message_batch("msgbatch_a", true));
+    b.vendor.answer(Answer::Cut(body.clone()));
+    let (_, chunks, ended) = chunks_of(results_of(&b.gw, "msgbatch_a"));
+    assert!(
+        !ended && chunks.concat() == body,
+        "every line, then the cut"
+    );
+
+    for bad in [
+        json!({"custom_id": "item-3", "result": {"type": "unknown"}}),
+        json!({"custom_id": "item-3", "result": {"type": "succeeded"}}),
+        json!({"result": {"type": "canceled"}}),
+    ] {
+        let mut broken = body.clone();
+        broken.extend_from_slice(&results_body(&[bad]));
+        broken.extend_from_slice(&results_body(&[succeeded(
+            "item-4",
+            "end_turn",
+            &json!({"input_tokens": 1}),
+        )]));
+        read_results(&b, &b.gw, "msgbatch_a", &broken);
+    }
+    let mut torn = body.clone();
+    torn.extend_from_slice(b"{\"custom_id\": \"item-3\", \"res");
+    read_results(&b, &b.gw, "msgbatch_a", &torn);
+    assert_eq!(batch_usage(&b), []);
+    assert_eq!(spent(&b.gw, "login-1"), 0.0);
+    assert_eq!(settled_of(&b, "msgbatch_a"), Value::Null);
+
+    read_results(&b, &b.gw, "msgbatch_a", &body);
+    let lines = batch_usage(&b);
+    let ids: Vec<_> = lines.iter().map(|l| l.custom_id.as_deref()).collect();
+    assert_eq!(ids, [Some("item-1"), Some("item-2")]);
+    assert_eq!(lines[1].stop, Some(StopReason::ToolUse));
+    assert_usd(spent(&b.gw, "login-1"), 0.012);
+}
+
+#[test]
+fn an_unpriced_model_or_an_uncapped_login_adds_no_spend() {
+    let mut unpriced = batch_record(
+        Some("msgbatch_u"),
+        "client-a",
+        "chat",
+        "login-1",
+        "key-u",
+        "00",
+    );
+    unpriced["model"] = json!("model-free");
+    let uncapped = batch_record(
+        Some("msgbatch_n"),
+        "client-a",
+        "chat",
+        "login-2",
+        "key-n",
+        "00",
+    );
+    let b = settle_rig(&[unpriced, uncapped]);
+    let body = results_body(&[succeeded(
+        "item-1",
+        "end_turn",
+        &json!({"input_tokens": 1000, "output_tokens": 1000}),
+    )]);
+    read_results(&b, &b.gw, "msgbatch_u", &body);
+    read_results(&b, &b.gw, "msgbatch_n", &body);
+    let lines = batch_usage(&b);
+    let sources: Vec<_> = lines
+        .iter()
+        .map(|l| (l.request_id.as_str(), l.model.as_str(), l.usd_source))
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            ("msgbatch_u", "model-free", None),
+            ("msgbatch_n", "model-large", Some(UsdSource::Prices))
+        ]
+    );
+    assert_eq!(lines[0].usd, None);
+    assert_usd(lines[1].usd.unwrap(), 0.006);
+    assert_eq!(spent(&b.gw, "login-1"), 0.0);
+    assert!(
+        !b.dir.join("spend.json").exists(),
+        "neither batch added to a count"
+    );
+    assert_eq!(settled_of(&b, "msgbatch_u"), json!({"at": lines[0].at}));
+    let settled = settled_of(&b, "msgbatch_n");
+    assert_usd(settled["usd"].as_f64().unwrap(), 0.006);
 }
 
 #[test]

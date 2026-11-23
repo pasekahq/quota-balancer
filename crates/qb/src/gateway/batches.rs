@@ -1,18 +1,21 @@
 //! Anthropic Message Batches on `api_key` logins: `POST /v1/model/batches` creates one on the
 //! login qbd picks for a route; `GET /v1/model/batches/{batch_id}`, `GET .../results` and
 //! `POST .../cancel` read its status, read its results and cancel it through the same login.
-//! The store binds each batch to its caller, login and idempotency key; it is one JSON file
+//! The store binds each batch to its caller, login and idempotency key and keeps its
+//! settlement: the first complete results read prices the succeeded requests, adds their cost to
+//! a capped login's spend once and appends one usage line per request. The store is one JSON file
 //! replaced by rename (mode 0600) on each change.
 
-use std::io::{ErrorKind, Read};
+use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use qb_anthropic::limits;
 use qb_anthropic::request::AuthMode;
+use qb_anthropic::wire::WireUsage;
+use qb_anthropic::{limits, stream};
 use qb_proto::{
     BatchCounts, BatchProcessing, BatchStatus, BatchSubmit, Decision, ErrorClass, GatewayError,
-    Object, Outcome, PickRequest, WindowReport,
+    Object, Outcome, PickRequest, StopReason, Usage, UsageLine, UsdSource, WindowReport,
 };
 use qb_vendors::rfc3339;
 use serde::{Deserialize, Serialize};
@@ -20,9 +23,10 @@ use serde::{Deserialize, Serialize};
 use super::anthropic::{self, DEFAULT_BASE_URL};
 use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
 use super::core::{Gateway, redact, refusal, unpickable};
-use super::creds;
+use super::front::RESULTS_CHUNK;
 use super::upstream::{CancelToken, Failure};
 use super::vendor::{self, Request};
+use super::{creds, spend};
 use crate::rewrite::write_atomic;
 use crate::server::unix_now;
 use crate::{log, sha256};
@@ -44,7 +48,7 @@ fn no_store() -> Refused {
 
 /// One batch the gateway created, or a submit whose create request is under way or ended
 /// without a known outcome: then `batch_id` is absent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +62,20 @@ struct Record {
     body_sha256: String,
     /// Unix time of the submit.
     created_at: u64,
+    /// Present once a complete results read settled the batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled: Option<Settlement>,
+}
+
+/// How a batch was settled.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Settlement {
+    /// Unix time of the settlement.
+    at: u64,
+    /// USD of the succeeded requests at half the model's `[prices]` entry; absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usd: Option<f64>,
 }
 
 /// The file's contents.
@@ -139,6 +157,30 @@ impl Store {
             .iter()
             .find(|r| r.batch_id.as_deref() == Some(batch_id));
         found.cloned()
+    }
+
+    /// Marks the batch `batch_id` settled as `settlement`; false when it already was.
+    ///
+    /// # Errors
+    /// The file could not be written; the record stays unsettled.
+    fn settle(&self, batch_id: &str, settlement: Settlement) -> Result<bool, String> {
+        let mut state = self.state();
+        let Some(i) = state
+            .records
+            .iter()
+            .position(|r| r.batch_id.as_deref() == Some(batch_id))
+        else {
+            return Err(format!("no batch `{batch_id}` in the store"));
+        };
+        if state.records[i].settled.is_some() {
+            return Ok(false);
+        }
+        state.records[i].settled = Some(settlement);
+        let saved = self.save(&state.records);
+        if saved.is_err() {
+            state.records[i].settled = None;
+        }
+        saved.map(|()| true)
     }
 
     /// Looks up `client`'s `key` for a body of hash `sha`: its batch, or a claim on the key.
@@ -444,6 +486,7 @@ pub(super) fn submit(gateway: &Gateway, client: &str, body: &[u8]) -> Result<Bat
         idempotency_key: submit.idempotency_key.clone(),
         body_sha256: sha,
         created_at: unix_now(),
+        settled: None,
     };
     if let Err(e) = claim.pending(record.clone()) {
         gateway.report(lease, Outcome::Error, Vec::new());
@@ -577,12 +620,12 @@ pub(super) fn get(
 /// # Errors
 /// As [`owned`] and [`read`]; 409 a batch that has not ended, the vendor's refusal, 502 no
 /// answer.
-pub(super) fn results(
-    gateway: &Gateway,
+pub(super) fn results<'g>(
+    gateway: &'g Gateway,
     client: &str,
     own: bool,
     batch_id: &str,
-) -> Result<impl Read, Refused> {
+) -> Result<Results<'g, impl Read>, Refused> {
     let record = owned(gateway, client, own, batch_id)?;
     let status = read(gateway, &record, batch_id)?;
     if status.processing_status != BatchProcessing::Ended {
@@ -595,9 +638,255 @@ pub(super) fn results(
     let config = gateway.config();
     let entry = batch_login(&config, &record)?;
     let path = format!("{BATCHES_PATH}/{batch_id}/results");
-    match request(gateway, entry, &path, None) {
-        Ok(answer) => Ok(answer.into_reader()),
-        Err(fault) => Err(fault_refused(fault)),
+    let store = gateway.batches().ok_or_else(no_store)?;
+    let answer = request(gateway, entry, &path, None).map_err(fault_refused)?;
+    Ok(Results {
+        gateway,
+        store,
+        batch_id: batch_id.to_owned(),
+        body: answer.into_reader(),
+        unsettled: record.settled.is_none().then_some(record),
+    })
+}
+
+/// The vendor's results body of an ended batch, and the batch's record while it is unsettled.
+pub(super) struct Results<'g, R> {
+    gateway: &'g Gateway,
+    store: &'g Store,
+    batch_id: String,
+    body: R,
+    unsettled: Option<Record>,
+}
+
+/// Where a copy of a batch's results broke before the vendor's end of body.
+pub(super) enum Cut {
+    /// The vendor's body broke.
+    Vendor(io::Error),
+    /// The caller's side could not be written.
+    Caller,
+}
+
+impl<R: Read> Results<'_, R> {
+    /// Copies the body unchanged to `send` in pieces of at most [`RESULTS_CHUNK`] bytes; once
+    /// the body of an unsettled batch ends and every line parses as a result, settles the batch
+    /// before it returns.
+    ///
+    /// # Errors
+    /// The body broke or `send` failed; nothing is settled.
+    pub(super) fn copy(self, send: impl FnMut(&[u8]) -> io::Result<()>) -> Result<(), Cut> {
+        let tee = Tee {
+            body: self.body,
+            send,
+            cut: None,
+        };
+        let mut reader = BufReader::with_capacity(RESULTS_CHUNK, tee);
+        let Some(record) = self.unsettled else {
+            return drain(&mut reader);
+        };
+        let Ok(read) = read_results(&mut reader) else {
+            return Err(cut_of(&mut reader));
+        };
+        drain(&mut reader)?;
+        let id = &self.batch_id;
+        match read {
+            Ok(billed) => settle((self.gateway, self.store), &record, id, billed),
+            Err(line) => log::warn(&format!(
+                "gateway: results of batch {id}: line {line} is not a batch result; the batch \
+                 stays unsettled"
+            )),
+        }
+        Ok(())
+    }
+}
+
+/// A reader of `body` that hands each read to `send` before it returns it.
+struct Tee<R, F> {
+    body: R,
+    send: F,
+    /// Set by the first failure; every later read fails.
+    cut: Option<Cut>,
+}
+
+impl<R: Read, F: FnMut(&[u8]) -> io::Result<()>> Read for Tee<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cut.is_some() {
+            return Err(io::Error::other("the results copy broke"));
+        }
+        let n = loop {
+            match self.body.read(buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let kept = io::Error::new(e.kind(), e.to_string());
+                    self.cut = Some(Cut::Vendor(e));
+                    return Err(kept);
+                }
+            }
+        };
+        if n > 0 {
+            if let Err(e) = (self.send)(&buf[..n]) {
+                self.cut = Some(Cut::Caller);
+                return Err(e);
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// Copies the rest of `reader`'s body.
+fn drain<R: Read, F: FnMut(&[u8]) -> io::Result<()>>(
+    reader: &mut BufReader<Tee<R, F>>,
+) -> Result<(), Cut> {
+    match io::copy(reader, &mut io::sink()) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(cut_of(reader)),
+    }
+}
+
+/// The failure a read of `reader` met.
+fn cut_of<R, F>(reader: &mut BufReader<Tee<R, F>>) -> Cut {
+    reader
+        .get_mut()
+        .cut
+        .take()
+        .expect("a read error of a tee is the cut it records")
+}
+
+/// One line of the vendor's results body, the fields the settlement reads.
+#[derive(Deserialize)]
+struct ResultLine {
+    custom_id: String,
+    result: VendorResult,
+}
+
+/// Derived field by field, not as a tagged enum, so serde skips the message text it reads past
+/// instead of buffering it.
+#[derive(Deserialize)]
+struct VendorResult {
+    #[serde(rename = "type")]
+    kind: ResultKind,
+    #[serde(default)]
+    message: Option<BilledMessage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResultKind {
+    Succeeded,
+    Errored,
+    Canceled,
+    Expired,
+}
+
+#[derive(Deserialize)]
+struct BilledMessage {
+    #[serde(default)]
+    stop_reason: Option<String>,
+    usage: WireUsage,
+}
+
+/// A succeeded request of a batch: what its usage line holds besides the record's fields.
+struct Billed {
+    custom_id: String,
+    stop: Option<StopReason>,
+    usage: Usage,
+}
+
+/// The succeeded requests of the results body `reader`, in its order, read to its end, or the
+/// number, from 1, of its first line that is not a result.
+///
+/// # Errors
+/// The read failed.
+fn read_results(reader: &mut impl Read) -> io::Result<Result<Vec<Billed>, usize>> {
+    let mut billed = Vec::new();
+    let lines = serde_json::Deserializer::from_reader(reader).into_iter::<ResultLine>();
+    for (i, line) in lines.enumerate() {
+        let line = match line {
+            Ok(line) => line,
+            Err(e) if e.is_io() => return Err(e.into()),
+            Err(e) => return Ok(Err(e.line())),
+        };
+        match (line.result.kind, line.result.message) {
+            (ResultKind::Succeeded, Some(m)) => billed.push(Billed {
+                custom_id: line.custom_id,
+                stop: m.stop_reason.as_deref().map(stream::stop_reason),
+                usage: stream::usage(&m.usage),
+            }),
+            (ResultKind::Succeeded, None) => return Ok(Err(i + 1)),
+            (ResultKind::Errored | ResultKind::Canceled | ResultKind::Expired, _) => {}
+        }
+    }
+    Ok(Ok(billed))
+}
+
+/// Settles the batch `batch_id` of `record` from its succeeded requests `billed`, priced at half
+/// the model's `[prices]` entry: adds their cost to the login's spend once, marks the record
+/// settled, then appends their usage lines. A crash or failed write before the mark leaves the
+/// batch unsettled for the next read; one after it loses the lines not yet appended.
+fn settle(
+    (gateway, store): (&Gateway, &Store),
+    record: &Record,
+    batch_id: &str,
+    billed: Vec<Billed>,
+) {
+    let config = gateway.config();
+    let price = config.price(&record.model);
+    let usd = |usage: &Usage| price.map(|p| 0.5 * spend::priced(usage, p));
+    let total = price.map(|_| billed.iter().filter_map(|b| usd(&b.usage)).sum::<f64>());
+    let (login, model) = (record.login.as_str(), record.model.as_str());
+    if let Err(e) = gateway.count_batch(&config, (login, model), batch_id, total) {
+        log::error(&format!(
+            "gateway: spend of {login}: {e}; batch {batch_id} stays unsettled"
+        ));
+        return;
+    }
+    let now = unix_now();
+    match store.settle(
+        batch_id,
+        Settlement {
+            at: now,
+            usd: total,
+        },
+    ) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            log::error(&format!(
+                "gateway: batch store: {e}; batch {batch_id} stays unsettled"
+            ));
+            return;
+        }
+    }
+    log::info(&format!(
+        "gateway: batch {batch_id} of {} settled on {login}: {} succeeded",
+        record.client,
+        billed.len()
+    ));
+    let Some(ledger) = gateway.usage() else {
+        return;
+    };
+    for b in billed {
+        let usd = usd(&b.usage);
+        let line = UsageLine {
+            at: now,
+            duration_ms: 0,
+            request_id: batch_id.to_owned(),
+            custom_id: Some(b.custom_id),
+            batch: true,
+            client: record.client.clone(),
+            route: record.route.clone(),
+            step: 0,
+            login: login.to_owned(),
+            model: model.to_owned(),
+            outcome: Outcome::Ok,
+            stop: b.stop,
+            error: None,
+            usage: b.usage,
+            usd,
+            usd_source: usd.map(|_| UsdSource::Prices),
+            tools: Vec::new(),
+        };
+        ledger.append(&line, now);
     }
 }
 
@@ -698,6 +987,7 @@ mod tests {
             idempotency_key: "key-1".into(),
             body_sha256: "aa".into(),
             created_at: 1_800_000_000,
+            settled: None,
         };
         claim.pending(record.clone()).unwrap();
         claim.bind("msgbatch_1").unwrap();

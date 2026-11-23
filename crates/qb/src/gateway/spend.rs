@@ -24,6 +24,9 @@ struct Stored {
     period_start: u64,
     /// USD per login.
     spent_usd: BTreeMap<String, f64>,
+    /// The message batches whose cost the month's counts hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    batches: Vec<String>,
 }
 
 /// The counts of the current month and the models already warned about as unpriced.
@@ -33,6 +36,8 @@ pub struct Ledger {
     /// Start and end of the month the counts belong to.
     period: (u64, u64),
     spent: BTreeMap<String, f64>,
+    /// The batches counted in the month.
+    batches: Vec<String>,
     unpriced: Vec<String>,
 }
 
@@ -44,23 +49,24 @@ impl Ledger {
     /// The file cannot be read or is not a spend file.
     pub fn open(file: &Path, now: u64) -> Result<Self, String> {
         let period = month(now);
-        let spent = match std::fs::read(file) {
+        let (spent, batches) = match std::fs::read(file) {
             Ok(bytes) => {
                 let stored: Stored = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("{}: not a spend file: {e}", file.display()))?;
                 if stored.period_start == period.0 {
-                    stored.spent_usd
+                    (stored.spent_usd, stored.batches)
                 } else {
-                    BTreeMap::new()
+                    (BTreeMap::new(), Vec::new())
                 }
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) if e.kind() == ErrorKind::NotFound => (BTreeMap::new(), Vec::new()),
             Err(e) => return Err(format!("{}: {e}", file.display())),
         };
         Ok(Self {
             file: file.to_owned(),
             period,
             spent,
+            batches,
             unpriced: Vec::new(),
         })
     }
@@ -70,6 +76,7 @@ impl Ledger {
         if now >= self.period.1 {
             self.period = month(now);
             self.spent.clear();
+            self.batches.clear();
         }
     }
 
@@ -94,6 +101,36 @@ impl Ledger {
         self.roll(now);
         *self.spent.entry(login.to_owned()).or_insert(0.0) += usd;
         self.save()
+    }
+
+    /// Adds `usd`, the cost of the message batch `batch_id`, to the count of `login` and writes
+    /// the file, unless the month already counts that batch: then false.
+    ///
+    /// # Errors
+    /// The file could not be written; the counts stay as they were, so a retry adds the batch.
+    pub fn add_batch(
+        &mut self,
+        login: &str,
+        batch_id: &str,
+        usd: f64,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.roll(now);
+        if self.batches.iter().any(|b| b == batch_id) {
+            return Ok(false);
+        }
+        let before = self.spent.get(login).copied();
+        self.batches.push(batch_id.to_owned());
+        *self.spent.entry(login.to_owned()).or_insert(0.0) += usd;
+        if let Err(e) = self.save() {
+            self.batches.pop();
+            match before {
+                Some(usd) => self.spent.insert(login.to_owned(), usd),
+                None => self.spent.remove(login),
+            };
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// Sets the count of `login` to zero and writes the file.
@@ -130,6 +167,7 @@ impl Ledger {
         let stored = Stored {
             period_start: self.period.0,
             spent_usd: self.spent.clone(),
+            batches: self.batches.clone(),
         };
         let bytes = serde_json::to_vec(&stored).map_err(|e| e.to_string())?;
         write_atomic(&self.file, &bytes).map_err(|e| format!("{}: {e}", self.file.display()))
@@ -253,6 +291,37 @@ mod tests {
         std::fs::write(&file, "{}").unwrap();
         let e = Ledger::open(&file, end).unwrap_err();
         assert!(e.contains("not a spend file"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_batch_counts_once_a_month_and_a_file_without_batches_keeps_its_counts() {
+        let dir = crate::testdir::new("spend-batch");
+        let file = dir.join("spend.json");
+        let (start, end) = month(1_706_745_600);
+        let old = format!("{{\"period_start\": {start}, \"spent_usd\": {{\"key-1\": 1.5}}}}");
+        std::fs::write(&file, old).unwrap();
+        let mut ledger = Ledger::open(&file, start + 10).unwrap();
+        assert!((ledger.spent("key-1", start + 10) - 1.5).abs() < 1e-9);
+        assert_eq!(
+            ledger.add_batch("key-1", "msgbatch_1", 0.25, start + 20),
+            Ok(true)
+        );
+        assert_eq!(
+            ledger.add_batch("key-1", "msgbatch_1", 0.25, start + 30),
+            Ok(false)
+        );
+        let mut again = Ledger::open(&file, start + 40).unwrap();
+        assert_eq!(
+            again.add_batch("key-1", "msgbatch_1", 0.25, start + 40),
+            Ok(false)
+        );
+        assert!((again.spent("key-1", start + 40) - 1.75).abs() < 1e-9);
+        assert_eq!(
+            again.add_batch("key-1", "msgbatch_1", 0.25, end),
+            Ok(true),
+            "a new month has counted no batch"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

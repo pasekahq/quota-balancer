@@ -756,7 +756,9 @@ spend` sends the `GET`, which answers each capped login of the current config in
 {"logins": [{"login": "key-1", "spent_usd": 12.5, "cap_usd": 50.0, "period_end": 1800000000}]}
 ```
 
-`period_end` is the next UTC month's start, when the count starts again from zero. `qb --socket
+`spent_usd` counts the month's turns and settled message batches
+([Message batches](#message-batches)). `period_end` is the next UTC month's start, when the count
+starts again from zero. `qb --socket
 <gateway socket> spend reset <login>` sends `{"login": "key-1"}`: the login's count becomes zero,
 the gateway reports its `spend` window to `qbd` so the login runs again, and the answer is the
 login's entry as above. A login without a `spend_cap` in the current config is 400
@@ -1040,34 +1042,41 @@ With `audit_file`, each `PUT` and `POST` is recorded as `admin_roles`, `admin_re
 
 With the `[usage]` table ([config.md](config.md#gateway-config)) the gateway appends one JSON
 line per adapter attempt to `usage.file`, creating it with mode 0600, in one `write` per line, as
-the attempt ends. An attempt is a pick whose login's adapter was called: each chain step and each
+the attempt ends, and one batch line per succeeded request of a message batch as the batch
+settles ([Message batches](#message-batches)). An attempt is a pick whose login's adapter was called: each chain step and each
 move to another login within a turn has its own line, whether the attempt finished, failed or
 was cancelled; a 401 retried after a token refresh stays one attempt. A pick that never reaches
 an adapter (a login at its spend cap, a credential that does not load, a step `qbd` cannot run)
-leaves no line. A line is a `UsageLine`:
+leaves no line. A line is a `UsageLine`, an attempt's or a batch line:
 
 ```json
 {"at": 1800000004, "duration_ms": 3870, "request_id": "turn-1", "client": "client-a",
  "route": "chat", "step": 1, "login": "login-2", "model": "model-b", "outcome": "ok",
  "stop": "tool_use", "input": 1200, "output": 340, "cache_read": 8000, "cache_write": 0,
  "usd": 0.00564, "usd_source": "prices", "tools": ["read_file", "search"]}
+{"at": 1800003600, "duration_ms": 0, "request_id": "msgbatch_01", "custom_id": "item-3",
+ "batch": true, "client": "client-a", "route": "batch", "step": 0, "login": "key-1",
+ "model": "model-b", "outcome": "ok", "stop": "end", "input": 1200, "output": 340,
+ "cache_read": 0, "cache_write": 0, "usd": 0.00282, "usd_source": "prices", "tools": []}
 ```
 
 | Field | Meaning |
 |---|---|
-| `at` | Unix time the attempt ended |
-| `duration_ms` | milliseconds from the attempt's credential load to its end, a refresh's retry included |
-| `request_id` | the turn's `request_id` |
-| `client` | the turn's caller: `uid:<n>` for the gateway's own uid, a `[[clients]]` name, `client-token` or a `[[fronts.clients]]` name |
-| `route` | the turn's route alias |
-| `step` | index of the chain step the attempt ran on; 0 on a route without a chain |
-| `login`, `model` | the login and model `qbd` picked |
-| `outcome` | the outcome reported to `qbd` for the attempt (`ok`, `usage_limit`, `http_401`, `http_429`, `model_unavailable`, `error`); a failure after the stream started reports `ok` |
-| `stop` | the vendor's stop reason, when the attempt finished and was not cancelled |
+| `at` | Unix time the attempt ended; on a batch line, the time the batch settled |
+| `duration_ms` | milliseconds from the attempt's credential load to its end, a refresh's retry included; 0 on a batch line |
+| `request_id` | the turn's `request_id`; on a batch line, the batch id |
+| `custom_id` | only on a batch line: the request's `custom_id` |
+| `batch` | only on a batch line: `true` |
+| `client` | the turn's or batch submit's caller: `uid:<n>` for the gateway's own uid, a `[[clients]]` name, `client-token` or a `[[fronts.clients]]` name |
+| `route` | the turn's or batch submit's route alias |
+| `step` | index of the chain step the attempt ran on; 0 on a route without a chain and on a batch line |
+| `login`, `model` | the login and model `qbd` picked for the attempt or the batch submit |
+| `outcome` | the outcome reported to `qbd` for the attempt (`ok`, `usage_limit`, `http_401`, `http_429`, `model_unavailable`, `error`); a failure after the stream started reports `ok`; `ok` on a batch line |
+| `stop` | the vendor's stop reason, when the attempt finished and was not cancelled, or of the batch request's message; absent when the message has none |
 | `error` | otherwise the failure class, `cancelled` for a cancelled attempt |
-| `input`, `output`, `cache_read`, `cache_write` | the attempt's last `usage`; 0 when the vendor reported none |
-| `usd`, `usd_source` | USD of the attempt: the cost the vendor reported (`vendor`), else its usage at the model's `[prices]` entry (`prices`); both absent when there is neither |
-| `tools` | the sorted unique names of the attempt's tool calls, each cut to 64 bytes, at most 64 |
+| `input`, `output`, `cache_read`, `cache_write` | the attempt's last `usage`, or the batch request's message `usage`; 0 when the vendor reported none |
+| `usd`, `usd_source` | USD of the attempt: the cost the vendor reported (`vendor`), else its usage at the model's `[prices]` entry (`prices`); on a batch line, its usage at half the model's `[prices]` entry (`prices`); both absent when there is neither |
+| `tools` | the sorted unique names of the attempt's tool calls, each cut to 64 bytes, at most 64; empty on a batch line |
 
 No field holds prompt or answer text, thinking, tool arguments or results, headers or
 credentials. A line that cannot be appended is logged at error priority with the path; the turn
@@ -1112,8 +1121,8 @@ not parse as a `UsageLine` or are longer than 64 KiB, which are left out:
 | `unpriced` | lines without `usd` |
 | `duration_ms` | sum of the lines' `duration_ms` |
 
-With `group_by=tool` a line counts once under each of its `tools` and lines without tools are
-left out, so the rows' sums overlap and do not add up to the window's totals. Sums saturate at
+A batch line counts as one attempt like a turn's line. With `group_by=tool` a line counts once
+under each of its `tools` and lines without tools are left out, so the rows' sums overlap and do not add up to the window's totals. Sums saturate at
 the largest value of their type.
 
 The gateway reads `usage.file` and the rotated files `<file>.<stamp>` whose stamp is at or after
@@ -1205,10 +1214,28 @@ the batch and answers the vendor's `BatchStatus`, usually `canceling`, with the 
 an unknown id, another caller's batch, a gone login or no answer as the status. A vendor refusal,
 as for a batch that already ended, answers its class with that class's status.
 
-The results and the cancel, like the status, take no pick, send no report to `qbd` and leave the
-store as it is.
+The status, the results and the cancel take no pick and send no lease report to `qbd`; the
+status and the cancel leave the store as it is.
+
+The first results read of a batch that reaches the end of the vendor's body settles the batch.
+As it copies the body the gateway reads each line's `custom_id`, `type`, and for a succeeded
+request its message's `stop_reason` and `usage`, never the message text; the bytes to the caller
+stay unchanged. A succeeded request costs its `usage` at half the `[prices]` entry of the
+record's model, as the vendor bills batches; errored, canceled and expired requests cost nothing.
+At the end of the body the gateway, in this order, adds the batch's cost to the spend count of a
+login with a `spend_cap` once per batch id and reports the login's `spend` window to `qbd`
+([config.md](config.md#spend-caps)), marks the record settled, and with `[usage]` appends one
+batch line per succeeded request ([Usage ledger](#usage-ledger)). A model without a `[prices]`
+entry gives batch lines without `usd` and adds nothing to the count. A body that breaks, a caller
+that stops reading, or a line that does not parse as a result (logged once with the batch id and
+the line number; the copy goes on) settles nothing, and a later complete read settles the batch.
+A settled batch's later results reads copy the body and change nothing, also after a restart. A
+crash, or a store that cannot be written, before the record is marked leaves the batch unsettled
+for the next read without counting its cost twice; a crash while the lines are appended loses
+the lines not yet written.
 
 A store record holds the vendor's `batch_id` (absent while pending), the caller's name, the
-route, the login, the model, the idempotency key, the SHA-256 of the submit body and the time of
-the submit; never a credential or prompt text. No answer, log line or store record holds the
+route, the login, the model, the idempotency key, the SHA-256 of the submit body, the time of
+the submit and, once settled, `settled`: the time of the settlement and the batch's `usd`
+(absent without a price); never a credential or prompt text. No answer, log line or store record holds the
 key.

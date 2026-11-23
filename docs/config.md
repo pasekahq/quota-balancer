@@ -427,7 +427,7 @@ The ledger is `file` and the files `<file>.<digits>` beside it; rotation and pru
 other file of the directory.
 
 `[batches]`, optional: the batch store, which binds each Anthropic Message Batch the gateway
-creates to its caller, login and idempotency key
+creates to its caller, login and idempotency key and keeps its settlement
 ([Message batches](api.md#message-batches)); without it every batch endpoint answers 404.
 
 ```toml
@@ -453,13 +453,19 @@ warning per such model and run. The counts live in `spend_file`, which the gatew
 (temporary 0600 file in the same directory, fsync, rename); they survive a restart and a reload
 and start from zero at each month's start. A file that is not a spend file stops the start.
 
+A message batch on a capped login counts when its first complete results read settles it
+([api.md](api.md#message-batches)): the succeeded requests' `usage` at half the model's
+`[prices]` entry, added in the month of the settlement. A model without a price counts nothing,
+with the same warning. The spend file lists the batches its month counts, so a batch adds its
+cost once, also across a restart.
+
 A login whose count reached its cap is not called: the gateway checks before each adapter call,
 whatever `qbd` picked, and the turn moves on as after a usage limit before the first event, to
 another login or the next chain step, else ends `quota_exhausted` with `resets_at` at the next
 month's start. The gateway reports the count to `qbd` as the login's window `spend`
 (`utilization` = spent / cap, `resets_at` = the next month's start) after every call on the
-login, so `qbd` stops picking it and `GET /v1/model/routes` shows the route `exhausted` with that
-reset. `qbd` keeps only windows its vendor declares, so give the capped API-key logins a `qbd`
+login and every batch that adds to its count, so `qbd` stops picking it and
+`GET /v1/model/routes` shows the route `exhausted` with that reset. `qbd` keeps only windows its vendor declares, so give the capped API-key logins a `qbd`
 vendor of their own that declares `spend`, and no uncapped login:
 
 ```toml

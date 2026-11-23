@@ -464,7 +464,7 @@
     "/v1/model/batches/{batch_id}/results": {
       "get": {
         "operationId": "batchResults",
-        "summary": "The vendor's results of an ended batch this gateway created: the gateway reads the batch's status as `GET /v1/model/batches/{batch_id}` does, then sends `GET {base_url}/v1/messages/batches/{batch_id}/results` through the login that created it, never to the batch's `results_url`, without a pick. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `bad_request` naming the `processing_status` of a batch that has not ended, with no results request sent; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class; 502 `unavailable` without an answer.",
+        "summary": "The vendor's results of an ended batch this gateway created: the gateway reads the batch's status as `GET /v1/model/batches/{batch_id}` does, then sends `GET {base_url}/v1/messages/batches/{batch_id}/results` through the login that created it, never to the batch's `results_url`, without a pick. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `bad_request` naming the `processing_status` of a batch that has not ended, with no results request sent; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class; 502 `unavailable` without an answer. The first read that reaches the end of the vendor's body settles the batch before the last chunk: each succeeded request costs its `usage` at half the `[prices]` entry of the batch's model (errored, canceled and expired requests nothing), the batch's cost is added once to the spend count of a login with a `spend_cap`, which is reported to qbd as its `spend` window, the store record is marked settled, and with `[usage]` one usage line with `batch: true`, `request_id` the batch id and the request's `custom_id` is appended per succeeded request. A model without a price gives lines without `usd` and adds no spend. A cut body, a caller that stops reading or a line that is not a result settles nothing; a settled batch's later reads change nothing.",
         "parameters": [
           {
             "name": "batch_id",
@@ -1931,7 +1931,7 @@
           "spent_usd": {
             "type": "number",
             "minimum": 0,
-            "description": "USD counted this month."
+            "description": "USD counted this month: turns and settled message batches."
           },
           "cap_usd": {
             "type": "number",
@@ -2269,7 +2269,7 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0,
-            "description": "Lines counted."
+            "description": "Lines counted, turn attempts and batch lines alike."
           },
           "failed": {
             "type": "integer",
