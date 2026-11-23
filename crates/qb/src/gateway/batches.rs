@@ -3,8 +3,9 @@
 //! `POST .../cancel` read its status, read its results and cancel it through the same login.
 //! The store binds each batch to its caller, login and idempotency key and keeps its
 //! settlement: the first complete results read prices the succeeded requests, adds their cost to
-//! a capped login's spend once and appends one usage line per request. The store is one JSON file
-//! replaced by rename (mode 0600) on each change.
+//! a capped login's spend once and appends one usage line per request. On a capped login a submit
+//! reserves an upper bound of the batch's cost, which counts toward the cap until the batch
+//! settles. The store is one JSON file replaced by rename (mode 0600) on each change.
 
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -14,14 +15,15 @@ use qb_anthropic::request::AuthMode;
 use qb_anthropic::wire::WireUsage;
 use qb_anthropic::{limits, stream};
 use qb_proto::{
-    BatchCounts, BatchProcessing, BatchStatus, BatchSubmit, Decision, ErrorClass, GatewayError,
-    Object, Outcome, PickRequest, StopReason, Usage, UsageLine, UsdSource, WindowReport,
+    BatchCounts, BatchProcessing, BatchRequest, BatchStatus, BatchSubmit, Decision, ErrorClass,
+    GatewayError, Object, Outcome, PickRequest, StopReason, Usage, UsageLine, UsdSource,
+    WindowReport,
 };
 use qb_vendors::rfc3339;
 use serde::{Deserialize, Serialize};
 
 use super::anthropic::{self, DEFAULT_BASE_URL};
-use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
+use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Price, Route};
 use super::core::{Gateway, redact, refusal, unpickable};
 use super::front::RESULTS_CHUNK;
 use super::upstream::{CancelToken, Failure};
@@ -62,6 +64,9 @@ struct Record {
     body_sha256: String,
     /// Unix time of the submit.
     created_at: u64,
+    /// USD the submit reserved under its login's `spend_cap`; absent on an uncapped login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reserve_usd: Option<f64>,
     /// Present once a complete results read settled the batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settled: Option<Settlement>,
@@ -89,6 +94,27 @@ struct State {
     records: Vec<Record>,
     /// `(client, idempotency_key)` of the submits running now.
     running: Vec<(String, String)>,
+    /// The batches a results read holds the settlement of.
+    settling: Vec<String>,
+}
+
+impl State {
+    fn position(&self, batch_id: &str) -> Option<usize> {
+        self.records
+            .iter()
+            .position(|r| r.batch_id.as_deref() == Some(batch_id))
+    }
+}
+
+/// USD the unsettled records of `login` in `records` created in the month of `now` reserve.
+fn reserved_in(records: &[Record], login: &str, now: u64) -> f64 {
+    let (start, end) = spend::month(now);
+    records
+        .iter()
+        .filter(|r| r.login == login && r.settled.is_none())
+        .filter(|r| (start..end).contains(&r.created_at))
+        .filter_map(|r| r.reserve_usd)
+        .sum()
 }
 
 /// The batch store of `[batches]`.
@@ -112,6 +138,12 @@ struct Claim<'s> {
     key: String,
 }
 
+/// A results read's hold on the settlement of its batch; dropping it lets a later read settle.
+struct Settling<'s> {
+    store: &'s Store,
+    batch_id: String,
+}
+
 impl Store {
     /// The store in `file`; a missing file holds no batch.
     ///
@@ -132,6 +164,7 @@ impl Store {
             state: Mutex::new(State {
                 records,
                 running: Vec::new(),
+                settling: Vec::new(),
             }),
         })
     }
@@ -152,35 +185,29 @@ impl Store {
     /// The record of the batch `batch_id`.
     fn find(&self, batch_id: &str) -> Option<Record> {
         let state = self.state();
-        let found = state
-            .records
-            .iter()
-            .find(|r| r.batch_id.as_deref() == Some(batch_id));
-        found.cloned()
+        state.position(batch_id).map(|i| state.records[i].clone())
     }
 
-    /// Marks the batch `batch_id` settled as `settlement`; false when it already was.
-    ///
-    /// # Errors
-    /// The file could not be written; the record stays unsettled.
-    fn settle(&self, batch_id: &str, settlement: Settlement) -> Result<bool, String> {
+    /// USD the unsettled batches of `login` created in the month of `now` reserve, pending
+    /// creates included.
+    pub(super) fn reserved(&self, login: &str, now: u64) -> f64 {
+        reserved_in(&self.state().records, login, now)
+    }
+
+    /// The record of the unsettled batch `batch_id` and the hold on its settlement; `None` when
+    /// the batch is settled, unknown or held by another read.
+    fn settling(&self, batch_id: &str) -> Option<(Record, Settling<'_>)> {
         let mut state = self.state();
-        let Some(i) = state
-            .records
-            .iter()
-            .position(|r| r.batch_id.as_deref() == Some(batch_id))
-        else {
-            return Err(format!("no batch `{batch_id}` in the store"));
+        let i = state.position(batch_id)?;
+        if state.records[i].settled.is_some() || state.settling.iter().any(|b| b == batch_id) {
+            return None;
+        }
+        state.settling.push(batch_id.to_owned());
+        let hold = Settling {
+            store: self,
+            batch_id: batch_id.to_owned(),
         };
-        if state.records[i].settled.is_some() {
-            return Ok(false);
-        }
-        state.records[i].settled = Some(settlement);
-        let saved = self.save(&state.records);
-        if saved.is_err() {
-            state.records[i].settled = None;
-        }
-        saved.map(|()| true)
+        Some((state.records[i].clone(), hold))
     }
 
     /// Looks up `client`'s `key` for a body of hash `sha`: its batch, or a claim on the key.
@@ -231,18 +258,27 @@ impl Claim<'_> {
         r.client == self.client && r.idempotency_key == self.key
     }
 
-    /// Stores `record`, which has no `batch_id`, before its create request goes out.
+    /// Stores `record`, which has no `batch_id`, before its create request goes out, when
+    /// `afford` accepts the USD its login's records reserve; false when it does not. Under the
+    /// store's lock, so concurrent submits see each other's reserve.
     ///
     /// # Errors
     /// The file could not be written; the store stays as it was.
-    fn pending(&self, record: Record) -> Result<(), String> {
+    fn pending(&self, record: Record, afford: impl FnOnce(f64) -> bool) -> Result<bool, String> {
         let mut state = self.store.state();
+        if !afford(reserved_in(
+            &state.records,
+            &record.login,
+            record.created_at,
+        )) {
+            return Ok(false);
+        }
         state.records.push(record);
         let saved = self.store.save(&state.records);
         if saved.is_err() {
             state.records.pop();
         }
-        saved
+        saved.map(|()| true)
     }
 
     /// Binds the pending record to the vendor's `batch_id`.
@@ -274,6 +310,32 @@ impl Drop for Claim<'_> {
         state
             .running
             .retain(|(c, k)| c != &self.client || k != &self.key);
+    }
+}
+
+impl Settling<'_> {
+    /// Marks the batch settled as `settlement`.
+    ///
+    /// # Errors
+    /// The file could not be written; the record stays unsettled.
+    fn settle(&self, settlement: Settlement) -> Result<(), String> {
+        let mut state = self.store.state();
+        let Some(i) = state.position(&self.batch_id) else {
+            return Err(format!("no batch `{}` in the store", self.batch_id));
+        };
+        state.records[i].settled = Some(settlement);
+        let saved = self.store.save(&state.records);
+        if saved.is_err() {
+            state.records[i].settled = None;
+        }
+        saved
+    }
+}
+
+impl Drop for Settling<'_> {
+    fn drop(&mut self) {
+        let mut state = self.store.state();
+        state.settling.retain(|b| b != &self.batch_id);
     }
 }
 
@@ -414,15 +476,39 @@ fn call(gateway: &Gateway, login: &GatewayLogin, path: &str, body: Option<Vec<u8
     Ok((batch, windows))
 }
 
+/// USD a batch of `requests` costs at most at half of `price`: each request's `params` JSON
+/// bytes as input tokens and its `max_tokens` as output tokens.
+#[allow(clippy::cast_precision_loss)] // byte and token counts stay far below 2^53
+fn reserve(requests: &[BatchRequest], price: &Price) -> f64 {
+    let micro: f64 = requests
+        .iter()
+        .map(|r| {
+            let bytes = serde_json::to_vec(&r.params).expect("a JSON object serializes");
+            let max_tokens = r.max_tokens().expect("a validated request has max_tokens");
+            bytes.len() as f64 * price.input + max_tokens as f64 * price.output
+        })
+        .sum();
+    0.5 * micro / 1_000_000.0
+}
+
+/// Reports the spend window of `login` to qbd when `config` gives it a `spend_cap`.
+fn publish_spend(gateway: &Gateway, config: &GatewayConfig, login: &str) {
+    if let Some(cap) = config.login(login).and_then(|l| l.spend_cap) {
+        gateway.publish_spend(login, Some(cap));
+    }
+}
+
 /// Answers `POST /v1/model/batches` of `client` with `body`: creates the batch on a login qbd
 /// picks among the route's `api_key` Anthropic logins and stores it before the answer, or
-/// answers the batch an earlier submit of the same body and key created.
+/// answers the batch an earlier submit of the same body and key created. On a login with a
+/// `spend_cap` the stored record reserves the batch's [`reserve`] first.
 ///
 /// # Errors
 /// 404 without `[batches]`; 400 a body that does not validate, an unknown or chain route, a
-/// route without an `api_key` Anthropic login; 409 a key used with another body, an earlier
-/// submit of unknown outcome or a running one; qbd's and the vendor's refusals; 502 a create
-/// whose outcome is unknown; 500 the store could not be written.
+/// route without an `api_key` Anthropic login, a capped login's model without `[prices]`; 409 a
+/// key used with another body, an earlier submit of unknown outcome or a running one; 429 a
+/// reserve the login's cap cannot take; qbd's and the vendor's refusals; 502 a create whose
+/// outcome is unknown; 500 the store could not be written.
 pub(super) fn submit(gateway: &Gateway, client: &str, body: &[u8]) -> Result<BatchStatus, Refused> {
     let store = gateway.batches().ok_or_else(no_store)?;
     let bad = |message: String| refused(400, ErrorClass::BadRequest, message);
@@ -486,14 +572,17 @@ pub(super) fn submit(gateway: &Gateway, client: &str, body: &[u8]) -> Result<Bat
         idempotency_key: submit.idempotency_key.clone(),
         body_sha256: sha,
         created_at: unix_now(),
+        reserve_usd: None,
         settled: None,
     };
-    if let Err(e) = claim.pending(record.clone()) {
-        gateway.report(lease, Outcome::Error, Vec::new());
-        log::error(&format!("gateway: batch store: {e}"));
-        let message = format!("cannot write the batch store: {e}");
-        return Err(refused(500, ErrorClass::Unavailable, message));
-    }
+    let record = pending(
+        gateway,
+        (&config, entry),
+        lease,
+        &claim,
+        &submit.requests,
+        record,
+    )?;
     let create = Create {
         requests: submit
             .requests
@@ -515,6 +604,74 @@ pub(super) fn submit(gateway: &Gateway, client: &str, body: &[u8]) -> Result<Bat
     created(gateway, (lease, &fingerprint), &claim, &record, sent)
 }
 
+/// Stores `record`, the pending submit of `requests` on `entry` of `config`, through `claim`; on
+/// a login with a `spend_cap` it reserves their [`reserve`], and the login's spend window goes to
+/// qbd after the write. A refusal reports the lease `lease` `error`.
+///
+/// # Errors
+/// 400 a capped login's model without a `[prices]` entry; 429 a reserve that would pass the cap;
+/// 500 the store could not be written.
+fn pending(
+    gateway: &Gateway,
+    (config, entry): (&GatewayConfig, &GatewayLogin),
+    lease: &str,
+    claim: &Claim<'_>,
+    requests: &[BatchRequest],
+    mut record: Record,
+) -> Result<Record, Refused> {
+    let (login, model, now) = (
+        entry.name.as_str(),
+        record.model.as_str(),
+        record.created_at,
+    );
+    let capped = match (entry.spend_cap, config.price(model)) {
+        (None, _) => None,
+        (Some(cap), Some(price)) => Some((cap, reserve(requests, price))),
+        (Some(_), None) => {
+            gateway.report(lease, Outcome::Error, Vec::new());
+            let message = format!(
+                "model `{model}` has no `[prices.\"{model}\"]` entry; a batch on login `{login}`, \
+                 which has a spend_cap, needs one"
+            );
+            return Err(refused(400, ErrorClass::BadRequest, message));
+        }
+    };
+    record.reserve_usd = capped.map(|(_, usd)| usd);
+    let afford = |reserved: f64| {
+        capped.is_none_or(|(cap, usd)| gateway.spent(login, now) + reserved + usd <= cap)
+    };
+    match claim.pending(record.clone(), afford) {
+        Ok(true) => {}
+        Ok(false) => {
+            let (cap, usd) = capped.expect("an uncapped login affords every batch");
+            let window = gateway.spend_window(login, cap, now);
+            let resets_at = window.resets_at;
+            gateway.report(lease, Outcome::Error, vec![window]);
+            log::warn(&format!(
+                "gateway: batch `{}` of {} on {login}: a reserve of {usd} USD passes the spend cap",
+                record.idempotency_key, record.client
+            ));
+            let message = format!(
+                "login `{login}` cannot reserve {usd} USD for the batch: its spend and open batch \
+                 reserves of the month would pass its spend_cap of {cap} USD"
+            );
+            let mut e = GatewayError::new(ErrorClass::QuotaExhausted, true, message);
+            e.resets_at = resets_at;
+            return Err((e.class.http_status(), e));
+        }
+        Err(e) => {
+            gateway.report(lease, Outcome::Error, Vec::new());
+            log::error(&format!("gateway: batch store: {e}"));
+            let message = format!("cannot write the batch store: {e}");
+            return Err(refused(500, ErrorClass::Unavailable, message));
+        }
+    }
+    if let Some((cap, _)) = capped {
+        gateway.publish_spend(login, Some(cap));
+    }
+    Ok(record)
+}
+
 /// Reports the create request `sent` of the submit `record` on lease `lease` and stores or forgets
 /// the batch; `fp` is the fingerprint of the credential file it read.
 fn created(
@@ -534,6 +691,7 @@ fn created(
             let (outcome, e) = refusal(&f);
             gateway.report_attempt(lease, login, outcome, f.windows, fp);
             claim.forget();
+            publish_spend(gateway, &gateway.config(), login);
             log::warn(&format!(
                 "gateway: batch `{key}` of {} on {login}: {}: {}",
                 record.client,
@@ -545,6 +703,7 @@ fn created(
         Err(Fault::Unsent(message)) => {
             gateway.report(lease, Outcome::Error, Vec::new());
             claim.forget();
+            publish_spend(gateway, &gateway.config(), login);
             log::warn(&format!(
                 "gateway: batch `{key}` of {} on {login}: not sent: {message}",
                 record.client
@@ -639,23 +798,25 @@ pub(super) fn results<'g>(
     let entry = batch_login(&config, &record)?;
     let path = format!("{BATCHES_PATH}/{batch_id}/results");
     let store = gateway.batches().ok_or_else(no_store)?;
+    // Held from before the vendor request to the settlement, so a concurrent read settles
+    // nothing.
+    let unsettled = store.settling(batch_id);
     let answer = request(gateway, entry, &path, None).map_err(fault_refused)?;
     Ok(Results {
         gateway,
-        store,
         batch_id: batch_id.to_owned(),
         body: answer.into_reader(),
-        unsettled: record.settled.is_none().then_some(record),
+        unsettled,
     })
 }
 
-/// The vendor's results body of an ended batch, and the batch's record while it is unsettled.
+/// The vendor's results body of an ended batch, and the batch's record and the hold on its
+/// settlement while it is unsettled and no other read holds it.
 pub(super) struct Results<'g, R> {
     gateway: &'g Gateway,
-    store: &'g Store,
     batch_id: String,
     body: R,
-    unsettled: Option<Record>,
+    unsettled: Option<(Record, Settling<'g>)>,
 }
 
 /// Where a copy of a batch's results broke before the vendor's end of body.
@@ -680,7 +841,7 @@ impl<R: Read> Results<'_, R> {
             cut: None,
         };
         let mut reader = BufReader::with_capacity(RESULTS_CHUNK, tee);
-        let Some(record) = self.unsettled else {
+        let Some((record, hold)) = self.unsettled else {
             return drain(&mut reader);
         };
         let Ok(read) = read_results(&mut reader) else {
@@ -689,7 +850,7 @@ impl<R: Read> Results<'_, R> {
         drain(&mut reader)?;
         let id = &self.batch_id;
         match read {
-            Ok(billed) => settle((self.gateway, self.store), &record, id, billed),
+            Ok(billed) => settle(self.gateway, (&record, &hold), id, billed),
             Err(line) => log::warn(&format!(
                 "gateway: results of batch {id}: line {line} is not a batch result; the batch \
                  stays unsettled"
@@ -819,13 +980,14 @@ fn read_results(reader: &mut impl Read) -> io::Result<Result<Vec<Billed>, usize>
     Ok(Ok(billed))
 }
 
-/// Settles the batch `batch_id` of `record` from its succeeded requests `billed`, priced at half
-/// the model's `[prices]` entry: adds their cost to the login's spend once, marks the record
-/// settled, then appends their usage lines. A crash or failed write before the mark leaves the
-/// batch unsettled for the next read; one after it loses the lines not yet appended.
+/// Settles the batch `batch_id` of `record`, whose settlement `hold` holds, from its succeeded
+/// requests `billed`, priced at half the model's `[prices]` entry: adds their cost to the
+/// login's spend once, marks the record settled, which releases its reserve, reports the login's
+/// spend window, then appends their usage lines. A crash or failed write before the mark leaves
+/// the batch unsettled for the next read; one after it loses the lines not yet appended.
 fn settle(
-    (gateway, store): (&Gateway, &Store),
-    record: &Record,
+    gateway: &Gateway,
+    (record, hold): (&Record, &Settling<'_>),
     batch_id: &str,
     billed: Vec<Billed>,
 ) {
@@ -841,22 +1003,17 @@ fn settle(
         return;
     }
     let now = unix_now();
-    match store.settle(
-        batch_id,
-        Settlement {
-            at: now,
-            usd: total,
-        },
-    ) {
-        Ok(true) => {}
-        Ok(false) => return,
-        Err(e) => {
-            log::error(&format!(
-                "gateway: batch store: {e}; batch {batch_id} stays unsettled"
-            ));
-            return;
-        }
+    let settlement = Settlement {
+        at: now,
+        usd: total,
+    };
+    if let Err(e) = hold.settle(settlement) {
+        log::error(&format!(
+            "gateway: batch store: {e}; batch {batch_id} stays unsettled"
+        ));
+        return;
     }
+    publish_spend(gateway, &config, login);
     log::info(&format!(
         "gateway: batch {batch_id} of {} settled on {login}: {} succeeded",
         record.client,
@@ -987,9 +1144,10 @@ mod tests {
             idempotency_key: "key-1".into(),
             body_sha256: "aa".into(),
             created_at: 1_800_000_000,
+            reserve_usd: None,
             settled: None,
         };
-        claim.pending(record.clone()).unwrap();
+        assert_eq!(claim.pending(record.clone(), |_| true), Ok(true));
         claim.bind("msgbatch_1").unwrap();
         drop(claim);
         let mode = std::os::unix::fs::PermissionsExt::mode(

@@ -453,18 +453,25 @@ warning per such model and run. The counts live in `spend_file`, which the gatew
 (temporary 0600 file in the same directory, fsync, rename); they survive a restart and a reload
 and start from zero at each month's start. A file that is not a spend file stops the start.
 
-A message batch on a capped login counts when its first complete results read settles it
-([api.md](api.md#message-batches)): the succeeded requests' `usage` at half the model's
-`[prices]` entry, added in the month of the settlement. A model without a price counts nothing,
-with the same warning. The spend file lists the batches its month counts, so a batch adds its
-cost once, also across a restart.
+A message batch on a capped login needs a `[prices]` entry for its model. Its submit reserves an
+upper bound of its cost, half of each request's `params` JSON bytes at the input price plus its
+`max_tokens` at the output price, and is refused 429 `quota_exhausted` without a vendor call when
+the month's spend plus the login's open reserves plus this reserve would pass the cap
+([api.md](api.md#message-batches)). The reserve is kept in the batch store, so it survives a
+restart, and counts toward the cap for turns and later batches while the batch is unsettled and
+was submitted in the current month. The batch's first complete results read settles it: the
+reserve goes and the succeeded requests' `usage` at half the model's `[prices]` entry is added in
+the month of the settlement. A batch stored before its login had a cap reserves nothing, and its
+model without a price counts nothing, with the same warning. The spend file lists the batches its
+month counts, so a batch adds its cost once, also across a restart.
 
-A login whose count reached its cap is not called: the gateway checks before each adapter call,
-whatever `qbd` picked, and the turn moves on as after a usage limit before the first event, to
-another login or the next chain step, else ends `quota_exhausted` with `resets_at` at the next
-month's start. The gateway reports the count to `qbd` as the login's window `spend`
-(`utilization` = spent / cap, `resets_at` = the next month's start) after every call on the
-login and every batch that adds to its count, so `qbd` stops picking it and
+A login whose count plus open reserves reached its cap is not called: the gateway checks before
+each adapter call, whatever `qbd` picked, and the turn moves on as after a usage limit before the
+first event, to another login or the next chain step, else ends `quota_exhausted` with
+`resets_at` at the next month's start. The gateway reports the count to `qbd` as the login's
+window `spend` (`utilization` = (spent + reserved) / cap, at most 1, `resets_at` = the next
+month's start) after every call on the login, every batch submit's stored or removed reserve and
+every batch settlement, so `qbd` stops picking it and
 `GET /v1/model/routes` shows the route `exhausted` with that reset. `qbd` keeps only windows its vendor declares, so give the capped API-key logins a `qbd`
 vendor of their own that declares `spend`, and no uncapped login:
 
@@ -478,8 +485,8 @@ On a vendor that also serves uncapped logins, `spend` would be their longest win
 observed: a usage limit on one of them would mark it exhausted until that window's reset, up to
 31 days, and its snapshot would stay stale.
 
-`qb --socket <gateway socket> spend` prints each capped login's `spent_usd`, `cap_usd` and
-`period_end`; `qb --socket <gateway socket> spend reset <login>` sets its count to zero
+`qb --socket <gateway socket> spend` prints each capped login's `spent_usd`, `reserved_usd`,
+`cap_usd` and `period_end`; `qb --socket <gateway socket> spend reset <login>` sets its count to zero
 ([api.md](api.md#get-v1modelspend-and-post-v1modelspendreset)). A reset, or a cap raised by a
 reload, makes the login run again: the gateway reports the new `spend` window to `qbd` at once.
 `GET` and `PUT /v1/model/config/routes` read and set or remove the `spend_cap`s of the `api_key`

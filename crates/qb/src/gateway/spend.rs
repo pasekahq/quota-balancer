@@ -143,12 +143,12 @@ impl Ledger {
         self.save()
     }
 
-    /// The [`WINDOW`] of `login` under `cap`: its count's fraction of the cap, at most 1, until
-    /// the month ends.
-    pub fn window(&mut self, login: &str, cap: f64, now: u64) -> WindowReport {
+    /// The [`WINDOW`] of `login` under `cap`: its count plus `reserved` USD as a fraction of the
+    /// cap, at most 1, until the month ends.
+    pub fn window(&mut self, login: &str, cap: f64, reserved: f64, now: u64) -> WindowReport {
         WindowReport {
             name: WINDOW.to_owned(),
-            utilization: (self.spent(login, now) / cap).min(1.0),
+            utilization: ((self.spent(login, now) + reserved) / cap).min(1.0),
             resets_at: Some(self.period_end(now)),
             length_s: None,
         }
