@@ -176,7 +176,7 @@ fn retryable(class: ErrorClass) -> bool {
 }
 
 /// The qbd outcome and the client's error class of a failure of `kind`.
-pub(super) fn classify(kind: FailureKind) -> (Outcome, ErrorClass) {
+fn classify(kind: FailureKind) -> (Outcome, ErrorClass) {
     match kind {
         FailureKind::UsageLimit { .. } => (Outcome::UsageLimit, ErrorClass::QuotaExhausted),
         FailureKind::Auth => (Outcome::Http401, ErrorClass::Auth),
@@ -188,6 +188,22 @@ pub(super) fn classify(kind: FailureKind) -> (Outcome, ErrorClass) {
         FailureKind::ContextTooLong => (Outcome::Error, ErrorClass::ContextTooLong),
         FailureKind::Cancelled => (Outcome::Error, ErrorClass::Cancelled),
     }
+}
+
+/// The qbd outcome of an adapter or vendor `failure` and the error the client gets: its class,
+/// retryability, `resets_at` of a usage limit, `retry_after` of a 429 or overload, and its
+/// message, which [`redact`] cleaned at the seam.
+pub(super) fn refusal(failure: &Failure) -> (Outcome, GatewayError) {
+    let (outcome, class) = classify(failure.kind);
+    let mut error = GatewayError::new(class, retryable(class), failure.message.clone());
+    match failure.kind {
+        FailureKind::UsageLimit { resets_at } => error.resets_at = resets_at,
+        FailureKind::RateLimited { retry_after } | FailureKind::Overloaded { retry_after } => {
+            error.retry_after = retry_after;
+        }
+        _ => {}
+    }
+    (outcome, error)
 }
 
 /// A failure that qbd marks on the login only, so another login may succeed.
@@ -1418,7 +1434,8 @@ impl Gateway {
             }
             Err(f) => f,
         };
-        let (outcome, class) = classify(failure.kind);
+        let (outcome, mut error) = refusal(&failure);
+        let class = error.class;
         // A stream that started shows the login works, however it ended.
         let outcome = if relay.emitted && outcome == Outcome::Error {
             Outcome::Ok
@@ -1450,14 +1467,6 @@ impl Gateway {
         attempt.class = class;
         let vendor = attempt.vendor.clone();
         progress.tried.push(attempt);
-        let mut error = GatewayError::new(class, retryable(class), failure.message);
-        match failure.kind {
-            FailureKind::UsageLimit { resets_at } => error.resets_at = resets_at,
-            FailureKind::RateLimited { retry_after } | FailureKind::Overloaded { retry_after } => {
-                error.retry_after = retry_after;
-            }
-            _ => {}
-        }
         if !relay.emitted {
             if let FailureKind::RateLimited {
                 retry_after: Some(wait),

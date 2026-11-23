@@ -11636,6 +11636,43 @@ fn a_repeated_submit_answers_its_batch_and_a_pending_one_is_refused() {
 }
 
 #[test]
+fn a_repeat_while_the_create_is_in_flight_is_told_it_runs() {
+    let b = batch_rig(&key_files(), two_keys, "", own_uid(), &[]);
+    let slow = Answer::After(
+        Duration::from_millis(500),
+        Box::new(message_batch("msgbatch_01", false)),
+    );
+    b.vendor.answer(slow);
+    let body = batch_body("key-1", &["item-1"]);
+    let gw = b.gw.clone();
+    let first_body = body.clone();
+    let first = std::thread::spawn(move || submit_batch(&gw, &first_body));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.vendor.received().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the create never reached the vendor"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ids: Vec<Value> = batch_records(&b.dir)
+        .iter()
+        .map(|r| r["batch_id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        [Value::Null],
+        "the create is in flight on a pending record"
+    );
+    let refused = batch_refusal(submit_batch(&b.gw, &body));
+    let message = "a submit with idempotency_key `key-1` is running".to_owned();
+    assert_eq!(refused, (409, ErrorClass::BadRequest, message));
+    let created = batch_status(first.join().unwrap());
+    assert_eq!(created.batch_id, "msgbatch_01");
+    assert_eq!(b.vendor.received().len(), 1, "the repeat asked no vendor");
+}
+
+#[test]
 fn a_restarted_gateway_reads_the_batches_of_its_store() {
     let extra = format!("\n[[clients]]\nname = \"client-a\"\nuid = {}\n", own_uid());
     let b = batch_rig(&key_files(), two_keys, &extra, own_uid() + 1, &[]);

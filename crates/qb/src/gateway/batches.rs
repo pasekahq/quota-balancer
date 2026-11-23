@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use super::anthropic::{self, DEFAULT_BASE_URL};
 use super::config::{Api, CredentialKind, GatewayConfig, GatewayLogin, Route};
-use super::core::{Gateway, classify, redact, unpickable};
+use super::core::{Gateway, redact, refusal, unpickable};
 use super::creds;
 use super::upstream::{CancelToken, Failure};
 use super::vendor::{self, Request};
@@ -143,12 +143,18 @@ impl Store {
     /// Looks up `client`'s `key` for a body of hash `sha`: its batch, or a claim on the key.
     ///
     /// # Errors
-    /// 409 when the key was used with another body, its earlier submit has no known outcome, or
-    /// a submit with it is running.
+    /// 409 when a submit with the key is running, the key was used with another body, or its
+    /// earlier submit has no known outcome.
     fn claim(&self, client: &str, key: &str, sha: &str) -> Result<Found<'_>, Refused> {
         let mut state = self.state();
         let taken = |c: &str, k: &str| c == client && k == key;
         let conflict = |message: String| refused(409, ErrorClass::BadRequest, message);
+        // Before the records: a running submit's pending record is no unknown outcome yet.
+        if state.running.iter().any(|(c, k)| taken(c, k)) {
+            return Err(conflict(format!(
+                "a submit with idempotency_key `{key}` is running"
+            )));
+        }
         if let Some(r) = state
             .records
             .iter()
@@ -167,11 +173,6 @@ impl Store {
                     r.login
                 ))),
             };
-        }
-        if state.running.iter().any(|(c, k)| taken(c, k)) {
-            return Err(conflict(format!(
-                "a submit with idempotency_key `{key}` is running"
-            )));
         }
         state.running.push((client.to_owned(), key.to_owned()));
         Ok(Found::Claimed(Claim {
@@ -365,22 +366,6 @@ fn call(gateway: &Gateway, login: &GatewayLogin, path: &str, body: Option<Vec<u8
     }
 }
 
-/// The answer to a vendor's refusal `f`, and the outcome qbd hears of it.
-fn vendor_refusal(f: &Failure) -> (Outcome, Refused) {
-    use super::upstream::FailureKind as K;
-    let (outcome, class) = classify(f.kind);
-    let retryable = matches!(class, ErrorClass::Overloaded | ErrorClass::Unavailable);
-    let mut e = GatewayError::new(class, retryable, f.message.clone());
-    match f.kind {
-        K::UsageLimit { resets_at } => e.resets_at = resets_at,
-        K::RateLimited { retry_after } | K::Overloaded { retry_after } => {
-            e.retry_after = retry_after;
-        }
-        _ => {}
-    }
-    (outcome, (class.http_status(), e))
-}
-
 /// Answers `POST /v1/model/batches` of `client` with `body`: creates the batch on a login qbd
 /// picks among the route's `api_key` Anthropic logins and stores it before the answer, or
 /// answers the batch an earlier submit of the same body and key created.
@@ -497,7 +482,7 @@ fn created(
             batch
         }
         Sent::Failed(f) => {
-            let (outcome, refusal) = vendor_refusal(&f);
+            let (outcome, e) = refusal(&f);
             gateway.report_attempt(lease, login, outcome, f.windows, fp);
             claim.forget();
             log::warn(&format!(
@@ -506,7 +491,7 @@ fn created(
                 f.kind.as_str(),
                 f.message
             ));
-            return Err(refusal);
+            return Err((e.class.http_status(), e));
         }
         Sent::Unsent(message) => {
             gateway.report(lease, Outcome::Error, Vec::new());
@@ -589,7 +574,10 @@ fn read(gateway: &Gateway, record: &Record, batch_id: &str) -> Result<BatchStatu
         Sent::Batch(batch, _) => {
             status(record, batch).map_err(|e| refused(502, ErrorClass::Unavailable, e))
         }
-        Sent::Failed(f) => Err(vendor_refusal(&f).1),
+        Sent::Failed(f) => {
+            let e = refusal(&f).1;
+            Err((e.class.http_status(), e))
+        }
         Sent::Unsent(message) | Sent::Lost(message) => {
             Err(refused(502, ErrorClass::Unavailable, message))
         }
