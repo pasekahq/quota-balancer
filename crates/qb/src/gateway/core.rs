@@ -1557,11 +1557,30 @@ impl Gateway {
         ledger.append(&line, now);
     }
 
-    /// The spend window of `entry` when it has a `spend_cap` and spent it by `now`.
+    /// The spend window of `entry` when it has a `spend_cap` that its spend and reserves fill by
+    /// `now`.
     fn over_cap(&self, entry: &GatewayLogin, now: u64) -> Option<WindowReport> {
         let cap = entry.spend_cap?;
-        let window = lock(self.ledger()).window(&entry.name, cap, now);
+        let window = self.spend_window(&entry.name, cap, now);
         (window.utilization >= 1.0).then_some(window)
+    }
+
+    /// USD the unsettled message batches of `login` created in the month of `now` reserve.
+    fn reserved(&self, login: &str, now: u64) -> f64 {
+        self.batches
+            .as_ref()
+            .map_or(0.0, |s| s.reserved(login, now))
+    }
+
+    /// USD `login` spent in the month of `now`; only called for a login with a `spend_cap`.
+    pub(super) fn spent(&self, login: &str, now: u64) -> f64 {
+        lock(self.ledger()).spent(login, now)
+    }
+
+    /// The spend window of `login` under `cap` at `now`: its spend plus its reserves.
+    pub(super) fn spend_window(&self, login: &str, cap: f64, now: u64) -> WindowReport {
+        let reserved = self.reserved(login, now);
+        lock(self.ledger()).window(login, cap, reserved, now)
     }
 
     /// The ledger; only called for a login with a `spend_cap`, which needs the startup file.
@@ -1594,12 +1613,13 @@ impl Gateway {
                 log::error(&format!("gateway: spend of {login}: {e}"));
             }
         }
-        Some(ledger.window(login, cap, now))
+        drop(ledger);
+        Some(self.spend_window(login, cap, now))
     }
 
     /// Adds `usd`, the cost of the message batch `batch_id` of `model` on `login` of `config`, to
-    /// the login's count once when it has a cap, and then reports its spend window to qbd; `None`
-    /// is a model without a price and adds nothing.
+    /// the login's count once when it has a cap; `None` is a model without a price and adds
+    /// nothing.
     ///
     /// # Errors
     /// The spend file could not be written; the count stays as it was.
@@ -1610,9 +1630,9 @@ impl Gateway {
         batch_id: &str,
         usd: Option<f64>,
     ) -> Result<(), String> {
-        let Some(cap) = config.login(login).and_then(|l| l.spend_cap) else {
+        if config.login(login).and_then(|l| l.spend_cap).is_none() {
             return Ok(());
-        };
+        }
         let mut ledger = lock(self.ledger());
         let Some(usd) = usd.filter(|usd| usd.is_finite() && *usd > 0.0) else {
             if usd.is_none() {
@@ -1620,19 +1640,15 @@ impl Gateway {
             }
             return Ok(());
         };
-        let added = ledger.add_batch(login, batch_id, usd, unix_now())?;
-        drop(ledger);
-        if added {
-            self.publish_spend(login, Some(cap));
-        }
+        ledger.add_batch(login, batch_id, usd, unix_now())?;
         Ok(())
     }
 
     /// Reports the spend window of `login` under `cap` to qbd, or an empty one without a cap.
-    fn publish_spend(&self, login: &str, cap: Option<f64>) {
+    pub(super) fn publish_spend(&self, login: &str, cap: Option<f64>) {
         let now = unix_now();
         let window = match cap {
-            Some(cap) => lock(self.ledger()).window(login, cap, now),
+            Some(cap) => self.spend_window(login, cap, now),
             None => WindowReport {
                 name: spend::WINDOW.to_owned(),
                 utilization: 0.0,
@@ -1652,7 +1668,8 @@ impl Gateway {
         });
     }
 
-    /// The month's spend of each login of the current config with a `spend_cap`.
+    /// The month's spend and batch reserves of each login of the current config with a
+    /// `spend_cap`.
     pub fn spend(&self) -> SpendAnswer {
         let config = self.config();
         let now = unix_now();
@@ -1661,10 +1678,12 @@ impl Gateway {
             .iter()
             .filter_map(|l| {
                 let cap = l.spend_cap?;
+                let reserved = self.reserved(&l.name, now);
                 let mut ledger = lock(self.ledger());
                 Some(LoginSpend {
                     login: l.name.clone(),
                     spent_usd: ledger.spent(&l.name, now),
+                    reserved_usd: Some(reserved),
                     cap_usd: cap,
                     period_end: ledger.period_end(now),
                 })
@@ -1714,6 +1733,7 @@ impl Gateway {
         Ok(LoginSpend {
             login: login.to_owned(),
             spent_usd: 0.0,
+            reserved_usd: Some(self.reserved(login, now)),
             cap_usd: cap,
             period_end,
         })

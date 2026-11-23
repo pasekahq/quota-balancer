@@ -744,7 +744,12 @@ pub struct LoginSpend {
     pub login: String,
     /// USD counted this month.
     pub spent_usd: f64,
-    /// The login's `spend_cap` in USD; at or above it the login is not called.
+    /// USD the month's unsettled message batches of the login reserve; the cap counts
+    /// `spent_usd` plus this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_usd: Option<f64>,
+    /// The login's `spend_cap` in USD; at or above it, spent plus reserved, the login is not
+    /// called.
     pub cap_usd: f64,
     /// Unix time the month ends and the count starts again from zero.
     pub period_end: u64,
@@ -1272,8 +1277,19 @@ pub struct BatchSubmit {
 pub struct BatchRequest {
     /// The caller's id of the request, `^[A-Za-z0-9_-]{1,64}$`.
     pub custom_id: String,
-    /// Anthropic Messages parameters without `model` and `stream`, sent as given.
+    /// Anthropic Messages parameters without `model` and `stream`, with a positive integer
+    /// `max_tokens`, sent as given.
     pub params: Object,
+}
+
+impl BatchRequest {
+    /// The request's `params.max_tokens` when it is a positive integer.
+    pub fn max_tokens(&self) -> Option<u64> {
+        self.params
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+    }
 }
 
 impl BatchSubmit {
@@ -1310,6 +1326,12 @@ impl BatchSubmit {
                 return Err(format!(
                     "request `{}`: `params` must not hold `{key}`; the gateway sets the model and \
                      a batch does not stream",
+                    r.custom_id
+                ));
+            }
+            if r.max_tokens().is_none() {
+                return Err(format!(
+                    "request `{}`: `params.max_tokens` must be a positive integer",
                     r.custom_id
                 ));
             }

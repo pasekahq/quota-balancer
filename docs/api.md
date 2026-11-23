@@ -395,7 +395,7 @@ Types are in `crates/qb-proto/src/gateway.rs`, examples in
 | `POST /v1/model/spend/reset` | `SpendReset` | 200 `LoginSpend`, 400 a login without `spend_cap`, 403 a caller other than the gateway's own uid, 500 the spend file could not be written |
 | `GET /v1/model/audit` | — | 200 `AuditAnswer`, 400 a bad query, 403 a caller other than the gateway's own uid, 404 no `audit_file` |
 | `GET /v1/model/usage` | — | 200 `UsageAnswer`, 400 a bad query or more than 10 000 rows, 403 a caller other than the gateway's own uid, 404 no `[usage]` |
-| `POST /v1/model/batches` | `BatchSubmit` | 200 `BatchStatus`, 400 a body that does not validate, an unknown or chain route or one without an `api_key` Anthropic login, 404 no `[batches]`, 409 a key used with another body, of unknown outcome or still running, 413 a body over `max_request_bytes`, 500 the store could not be written, 502 the create was not sent or its outcome is unknown; a pick that does not run and the vendor's refusal answer their class |
+| `POST /v1/model/batches` | `BatchSubmit` | 200 `BatchStatus`, 400 a body that does not validate, an unknown or chain route or one without an `api_key` Anthropic login, a capped login's model without a `[prices]` entry, 404 no `[batches]`, 409 a key used with another body, of unknown outcome or still running, 413 a body over `max_request_bytes`, 429 a reserve past the login's `spend_cap`, 500 the store could not be written, 502 the create was not sent or its outcome is unknown; a pick that does not run and the vendor's refusal answer their class |
 | `GET /v1/model/batches/{batch_id}` | — | 200 `BatchStatus`, 403 another caller's batch, 404 no `[batches]` or an unknown batch, 409 the batch's login is no longer an `api_key` Anthropic login of the config, 502 no answer with a batch; the vendor's refusal answers its class |
 | `GET /v1/model/batches/{batch_id}/results` | — | 200 chunked `application/x-ndjson`, the vendor's results lines as it sent them; 403, 404 and 502 as for the status, 409 a batch that has not ended or whose login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class |
 | `POST /v1/model/batches/{batch_id}/cancel` | empty | 200 `BatchStatus`, 400 a body; 403, 404, 409 and 502 as for the status; the vendor's refusal answers its class |
@@ -568,7 +568,7 @@ vendor adapter. After the attempt the gateway reports to `qbd` with the lease,
 | unreadable or invalid credential file, or a refresh token the vendor refused | `http_401` | as above, and the login is dead (below) |
 | overload, 5xx, transport failure | `error` | one more pick with `avoid_vendor`; if it finds nothing, this failure ends the turn. On a chain route: the next step |
 | invalid request, context too long | `error` | the turn ends |
-| no call: the login reached its `spend_cap` | `error`, with the `spend` window at 1.0 | as after a usage limit |
+| no call: the login's spend and open batch reserves reached its `spend_cap` | `error`, with the `spend` window at 1.0 | as after a usage limit |
 
 Once an event has reached the client the gateway never retries: a failure ends the stream
 with an `error` event. A turn is bounded by `max_attempts` attempts (default 4), picks whose
@@ -753,11 +753,14 @@ gateway's own uid may call them: any other caller gets 403 `auth`. `qb --socket 
 spend` sends the `GET`, which answers each capped login of the current config in config order:
 
 ```json
-{"logins": [{"login": "key-1", "spent_usd": 12.5, "cap_usd": 50.0, "period_end": 1800000000}]}
+{"logins": [{"login": "key-1", "spent_usd": 12.5, "reserved_usd": 7.5, "cap_usd": 50.0,
+             "period_end": 1800000000}]}
 ```
 
 `spent_usd` counts the month's turns and settled message batches
-([Message batches](#message-batches)). `period_end` is the next UTC month's start, when the count
+([Message batches](#message-batches)). `reserved_usd` is the sum of the reserves of the login's
+unsettled batches submitted in the month, pending creates included; the cap counts
+`spent_usd + reserved_usd`. `period_end` is the next UTC month's start, when the count
 starts again from zero. `qb --socket
 <gateway socket> spend reset <login>` sends `{"login": "key-1"}`: the login's count becomes zero,
 the gateway reports its `spend` window to `qbd` so the login runs again, and the answer is the
@@ -1152,8 +1155,9 @@ gateway's own uid or a `[[clients]]` uid; the loopback listener serves no batch 
 each `custom_id` match `^[A-Za-z0-9_-]{1,64}$`, the `custom_id`s are unique, and there are 1 to
 100 000 requests. `params` is a JSON object of Messages parameters, sent to the vendor as given
 except that the gateway sets `model` to the picked model; a `model` or `stream` key is 400
-`bad_request` naming the request's `custom_id`. The body may be up to `max_request_bytes`. Every
-one of these checks runs before any pick.
+`bad_request` naming the request's `custom_id`, and so is a `max_tokens` that is missing or not a
+positive integer. The body may be up to `max_request_bytes`. Every one of these checks runs before
+any pick.
 
 The gateway asks `qbd` one pick for the route's target, its `logins` the route's logins (every
 login of the config when the route lists none) that are `api_key` logins of the `anthropic` API
@@ -1164,6 +1168,20 @@ as a turn would end (`quota_exhausted` with `resets_at`, `no_route`). On a `run`
 stores a pending record of the submit, sends `POST {base_url}/v1/messages/batches` with the
 login's key, reports the vendor's answer for the lease and releases it: `ok` for a 200, else the
 outcome of the vendor's error as for a turn ([Attempts and rotation](#attempts-and-rotation)).
+
+On a login with a `spend_cap` ([config.md](config.md#spend-caps)) the pending record reserves an
+upper bound of the batch's cost: half of the sum over its requests of the bytes of the request's
+`params` JSON at the model's `[prices]` input price plus its `max_tokens` at the output price, per
+million. A model without a `[prices]` entry is 400 `bad_request` naming the missing
+`[prices."<model>"]` entry. When the login's spend of the current UTC month plus its open reserves
+([`GET /v1/model/spend`](#get-v1modelspend-and-post-v1modelspendreset)) plus this reserve would
+pass the cap, the submit is 429 `quota_exhausted` with `resets_at` the month's end, nothing is
+stored or sent, and the lease is released with `error` and the login's `spend` window, as for a
+turn at its cap. The check and the write of the pending record are one step of the store, so
+concurrent submits see each other's reserves. After the write the gateway reports the login's
+`spend` window to `qbd`; a refused or unsent create removes the record, its reserve with it, and
+reports the window again. One pick only: a login that cannot take the reserve is not replaced by
+another. On a login without a cap the record reserves nothing.
 A batch the vendor created is bound to its id in the store before the 200 answer, a `BatchStatus`:
 
 ```json
@@ -1223,10 +1241,14 @@ request its message's `stop_reason` and `usage`, never the message text; the byt
 stay unchanged. A succeeded request costs its `usage` at half the `[prices]` entry of the
 record's model, as the vendor bills batches; errored, canceled and expired requests cost nothing.
 At the end of the body the gateway, in this order, adds the batch's cost to the spend count of a
-login with a `spend_cap` once per batch id and reports the login's `spend` window to `qbd`
-([config.md](config.md#spend-caps)), marks the record settled, and with `[usage]` appends one
-batch line per succeeded request ([Usage ledger](#usage-ledger)). A model without a `[prices]`
-entry gives batch lines without `usd` and adds nothing to the count. A body that breaks, a caller
+login with a `spend_cap` once per batch id ([config.md](config.md#spend-caps)), marks the record
+settled, which releases its reserve, reports the login's `spend` window to `qbd`, and with
+`[usage]` appends one batch line per succeeded request ([Usage ledger](#usage-ledger)). A model
+without a `[prices]` entry gives batch lines without `usd` and adds nothing to the count; its
+settlement, like one at zero, still releases the reserve. A results read of an unsettled batch
+holds the batch's settlement from before its results request until it settles or ends; a
+concurrent read of the same batch copies the body and settles nothing, and a read whose spend
+count or store write fails lets the hold go, so a later read settles the batch. A body that breaks, a caller
 that stops reading, or a line that does not parse as a result (logged once with the batch id and
 the line number; the copy goes on) settles nothing, and a later complete read settles the batch.
 A settled batch's later results reads copy the body and change nothing, also after a restart. A
@@ -1236,6 +1258,6 @@ the lines not yet written.
 
 A store record holds the vendor's `batch_id` (absent while pending), the caller's name, the
 route, the login, the model, the idempotency key, the SHA-256 of the submit body, the time of
-the submit and, once settled, `settled`: the time of the settlement and the batch's `usd`
-(absent without a price); never a credential or prompt text. No answer, log line or store record holds the
+the submit, on a capped login `reserve_usd`, the submit's reserve, and, once settled, `settled`:
+the time of the settlement and the batch's `usd` (absent without a price); never a credential or prompt text. No answer, log line or store record holds the
 key.

@@ -163,6 +163,7 @@ fn errors_routes_cancel() {
     assert_eq!((reloaded.routes, reloaded.logins), (3, 2));
     let spend: SpendAnswer = roundtrip("gateway_spend_answer.json");
     assert_eq!(spend.logins[0].period_end, 1_800_000_000);
+    assert_eq!(spend.logins[0].reserved_usd, Some(7.5));
     let reset: SpendReset = roundtrip("gateway_spend_reset_request.json");
     assert_eq!(reset.login, "key-1");
     let rotated: ClientRotateAnswer = roundtrip("gateway_client_rotate_answer.json");
@@ -545,6 +546,18 @@ fn a_batch_refusal_names_the_request_it_refuses() {
         ),
         ("repeated_custom_id", "`custom_id` `a` is repeated"),
         ("bad_custom_id", "`requests[0].custom_id` must match"),
+        (
+            "max_tokens_zero",
+            "request `b`: `params.max_tokens` must be a positive integer",
+        ),
+        (
+            "max_tokens_not_integer",
+            "request `a`: `params.max_tokens` must be a positive integer",
+        ),
+        (
+            "max_tokens_missing",
+            "request `a`: `params.max_tokens` must be a positive integer",
+        ),
     ] {
         let raw = fixture(&format!("gateway/invalid/BatchSubmit.{name}.json"));
         let submit: BatchSubmit = serde_json::from_str(&raw).unwrap();

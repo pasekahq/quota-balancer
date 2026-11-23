@@ -197,7 +197,7 @@
     "/v1/model/spend": {
       "get": {
         "operationId": "spend",
-        "summary": "The spend of each login with a `spend_cap` in the current UTC calendar month, in config order; only the gateway's own uid, 403 for any other caller.",
+        "summary": "The spend and open message batch reserves of each login with a `spend_cap` in the current UTC calendar month, in config order; only the gateway's own uid, 403 for any other caller.",
         "responses": {
           "200": {
             "description": "The capped logins.",
@@ -387,7 +387,7 @@
     "/v1/model/batches": {
       "post": {
         "operationId": "batchSubmit",
-        "summary": "Create an Anthropic Message Batch on a pin or ladder route: the gateway asks qbd one pick limited to the route's `api_key` logins of the `anthropic` API family (every such login of the config when the route lists none), stores a pending record for the caller's `idempotency_key`, sends the requests to the vendor with `model` set to the picked model, reports the vendor's answer to qbd and binds the batch to the login in `batches.file` before it answers. Callers as for `POST /v1/model/turn`; not served on the loopback listener; body up to `max_request_bytes`. 404 `bad_request` without `[batches]`; 400 `bad_request`, before any pick, for a body that does not validate, an unknown or chain route, or a route without an `api_key` Anthropic login; 409 `bad_request` for a key this caller used with another body, a key whose earlier submit has no known outcome, or a key whose submit is running; a repeat of the same body and key answers the stored batch's status without a create request. A pick that does not run answers as a turn would; the vendor's refusal answers its class; 502 `unavailable` when the request was not sent, or when its outcome is unknown, which keeps the key refused; 500 `unavailable` when `batches.file` cannot be written.",
+        "summary": "Create an Anthropic Message Batch on a pin or ladder route: the gateway asks qbd one pick limited to the route's `api_key` logins of the `anthropic` API family (every such login of the config when the route lists none), stores a pending record for the caller's `idempotency_key`, sends the requests to the vendor with `model` set to the picked model, reports the vendor's answer to qbd and binds the batch to the login in `batches.file` before it answers. Callers as for `POST /v1/model/turn`; not served on the loopback listener; body up to `max_request_bytes`. 404 `bad_request` without `[batches]`; 400 `bad_request`, before any pick, for a body that does not validate, an unknown or chain route, or a route without an `api_key` Anthropic login, and for a request whose `params.max_tokens` is not a positive integer; on a login with a `spend_cap` the pending record reserves half of the sum over the requests of the `params` JSON bytes at the model's `[prices]` input price plus `max_tokens` at its output price per million, after the pick: 400 `bad_request` naming the missing `[prices.\"<model>\"]` entry of the picked model, and 429 `quota_exhausted` with `resets_at` the month's end, nothing stored or sent and the lease released `error` with the login's `spend` window, when the month's spend plus the login's open reserves plus this reserve would pass the cap; the window goes to qbd after the record is written and after a refused or unsent create removes it; 409 `bad_request` for a key this caller used with another body, a key whose earlier submit has no known outcome, or a key whose submit is running; a repeat of the same body and key answers the stored batch's status without a create request. A pick that does not run answers as a turn would; the vendor's refusal answers its class; 502 `unavailable` when the request was not sent, or when its outcome is unknown, which keeps the key refused; 500 `unavailable` when `batches.file` cannot be written.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -464,7 +464,7 @@
     "/v1/model/batches/{batch_id}/results": {
       "get": {
         "operationId": "batchResults",
-        "summary": "The vendor's results of an ended batch this gateway created: the gateway reads the batch's status as `GET /v1/model/batches/{batch_id}` does, then sends `GET {base_url}/v1/messages/batches/{batch_id}/results` through the login that created it, never to the batch's `results_url`, without a pick. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `bad_request` naming the `processing_status` of a batch that has not ended, with no results request sent; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class; 502 `unavailable` without an answer. The first read that reaches the end of the vendor's body settles the batch before the last chunk: each succeeded request costs its `usage` at half the `[prices]` entry of the batch's model (errored, canceled and expired requests nothing), the batch's cost is added once to the spend count of a login with a `spend_cap`, which is reported to qbd as its `spend` window, the store record is marked settled, and with `[usage]` one usage line with `batch: true`, `request_id` the batch id and the request's `custom_id` is appended per succeeded request. A model without a price gives lines without `usd` and adds no spend. A cut body, a caller that stops reading or a line that is not a result settles nothing; a settled batch's later reads change nothing.",
+        "summary": "The vendor's results of an ended batch this gateway created: the gateway reads the batch's status as `GET /v1/model/batches/{batch_id}` does, then sends `GET {base_url}/v1/messages/batches/{batch_id}/results` through the login that created it, never to the batch's `results_url`, without a pick. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `bad_request` naming the `processing_status` of a batch that has not ended, with no results request sent; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class; 502 `unavailable` without an answer. The first read that reaches the end of the vendor's body settles the batch before the last chunk: each succeeded request costs its `usage` at half the `[prices]` entry of the batch's model (errored, canceled and expired requests nothing), the batch's cost is added once to the spend count of a login with a `spend_cap`, the store record is marked settled, which releases the submit's reserve also for a settlement at zero or without a price, the login's `spend` window is reported to qbd, and with `[usage]` one usage line with `batch: true`, `request_id` the batch id and the request's `custom_id` is appended per succeeded request. A model without a price gives lines without `usd` and adds no spend. A cut body, a caller that stops reading or a line that is not a result settles nothing; a settled batch's later reads change nothing. A read of an unsettled batch holds its settlement from before the results request; a concurrent read of the same batch settles nothing, and a failed spend count or store write lets the hold go for a later read.",
         "parameters": [
           {
             "name": "batch_id",
@@ -1933,10 +1933,15 @@
             "minimum": 0,
             "description": "USD counted this month: turns and settled message batches."
           },
+          "reserved_usd": {
+            "type": "number",
+            "minimum": 0,
+            "description": "USD the login's unsettled message batches submitted this month reserve, pending creates included. Absent in an answer of an older gateway."
+          },
           "cap_usd": {
             "type": "number",
             "exclusiveMinimum": 0,
-            "description": "The login's `spend_cap`; at or above it the login is not called."
+            "description": "The login's `spend_cap`; at or above it, `spent_usd` plus `reserved_usd`, the login is not called."
           },
           "period_end": {
             "type": "integer",
@@ -2417,7 +2422,16 @@
           },
           "params": {
             "type": "object",
-            "description": "Anthropic Messages parameters sent to the vendor as given, except that the gateway sets `model` to the picked model; a `model` or `stream` key is 400 `bad_request` naming the request's `custom_id`."
+            "description": "Anthropic Messages parameters sent to the vendor as given, except that the gateway sets `model` to the picked model; a `model` or `stream` key, or a `max_tokens` that is missing or not a positive integer, is 400 `bad_request` naming the request's `custom_id`.",
+            "required": [
+              "max_tokens"
+            ],
+            "properties": {
+              "max_tokens": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
           }
         },
         "required": [

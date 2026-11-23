@@ -11478,6 +11478,11 @@ fn a_batch_runs_on_an_api_key_login_and_is_stored_before_its_answer() {
     }
     assert_eq!(r["body_sha256"], json!(sha256_hex(&body.to_string())));
     assert!(r["created_at"].as_u64().unwrap() >= unix_now() - 60);
+    assert_eq!(
+        r.get("reserve_usd"),
+        None,
+        "an uncapped login reserves nothing"
+    );
     let mode = std::fs::metadata(batch_file(&b.dir)).unwrap().mode() & 0o777;
     assert_eq!(mode, 0o600);
     assert_eq!(state(&b.qbd).leases, [], "the lease is released");
@@ -11816,6 +11821,10 @@ fn bad_batch_input_is_refused_before_any_pick() {
             "`idempotency_key` must match",
         ),
         (with("/model", json!("model-x")), "unknown field `model`"),
+        (
+            with("/requests/1/params/max_tokens", json!(0)),
+            "request `item-2`: `params.max_tokens` must be a positive integer",
+        ),
     ] {
         let (status, class, message) = batch_refusal(submit_batch(&b.gw, &bad));
         assert_eq!((status, class), (400, ErrorClass::BadRequest), "{bad}");
@@ -12036,6 +12045,9 @@ fn results_wait_for_the_batch_s_end_and_a_cut_body_stays_cut() {
 /// `spend` window, login-1 has a `spend_cap` of 10 USD and login-2 none, `model-large` costs 2,
 /// 10, 1 and 4 USD per million input, output, cache read and cache write tokens, the usage ledger
 /// is `usage.jsonl` and the store holds `records` when the gateway starts.
+/// A route whose only login is `login-1`, the capped login of [`settle_rig`].
+const CAPPED_ROUTE: &str = "\n[[routes]]\nalias = \"capped\"\nrole = \"gateway\"\ndifficulty = 1\nlogins = [\"login-1\"]\n";
+
 fn settle_rig(records: &[Value]) -> BatchRig {
     let vendor = Vendor::start();
     let dir = temp_dir("gws");
@@ -12046,7 +12058,8 @@ fn settle_rig(records: &[Value]) -> BatchRig {
     std::fs::write(batch_file(&dir), json!({ "batches": records }).to_string()).unwrap();
     let extra = format!(
         "spend_file = \"{d}/spend.json\"\n{usage}\n[batches]\nfile = \"{batches}\"\n\n\
-         [prices.\"model-large\"]\ninput = 2\noutput = 10\ncache_read = 1\ncache_write = 4\n",
+         [prices.\"model-large\"]\ninput = 2\noutput = 10\ncache_read = 1\ncache_write = 4\n\
+         {CAPPED_ROUTE}",
         d = dir.display(),
         usage = usage_table(&dir.join("usage.jsonl"), 1 << 20),
         batches = batch_file(&dir).display(),
@@ -12329,6 +12342,275 @@ fn an_unpriced_model_or_an_uncapped_login_adds_no_spend() {
     assert_eq!(settled_of(&b, "msgbatch_u"), json!({"at": lines[0].at}));
     let settled = settled_of(&b, "msgbatch_n");
     assert_usd(settled["usd"].as_f64().unwrap(), 0.006);
+}
+
+/// A submit on route `capped` with key `key`, one request per entry of `max_tokens`.
+fn capped_body(key: &str, max_tokens: &[u64]) -> Value {
+    let requests: Vec<Value> = max_tokens
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            json!({"custom_id": format!("item-{i}"), "params": {"max_tokens": n,
+                   "messages": [{"role": "user", "content": "Summarise the notes"}]}})
+        })
+        .collect();
+    json!({"route": "capped", "idempotency_key": key, "requests": requests})
+}
+
+/// The reserve of `body` at the model-large price of [`settle_rig`]: half of each request's
+/// `params` bytes at 2 USD and its `max_tokens` at 10 USD per million tokens.
+#[allow(clippy::cast_precision_loss)]
+fn reserve_of(body: &Value) -> f64 {
+    let requests = body["requests"].as_array().unwrap();
+    let micro: f64 = requests
+        .iter()
+        .map(|r| {
+            let bytes = serde_json::to_vec(&r["params"]).unwrap().len() as f64;
+            bytes * 2.0 + r["params"]["max_tokens"].as_f64().unwrap() * 10.0
+        })
+        .sum();
+    0.5 * micro / 1_000_000.0
+}
+
+/// `(spent_usd, reserved_usd)` of `login` on the gateway `gw`.
+fn spend_and_reserve(gw: &Path, login: &str) -> (f64, f64) {
+    let answer = spend_of(gw);
+    let l = answer.logins.iter().find(|l| l.login == login).unwrap();
+    (l.spent_usd, l.reserved_usd.unwrap())
+}
+
+/// The [`GatewayError`] of a refused submit, after its status is `status`.
+fn refused_with(status: u16, (got, body): (u16, Vec<u8>)) -> GatewayError {
+    assert_eq!(got, status, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[test]
+fn a_capped_submit_reserves_its_upper_bound_and_one_past_the_cap_is_refused_unsent() {
+    let b = settle_rig(&[]);
+    let past = capped_body("key-past", &[1_000_000, 1_000_000]);
+    assert!(reserve_of(&past) > 10.0);
+    let e = refused_with(429, submit_batch(&b.gw, &past));
+    assert_eq!(e.class, ErrorClass::QuotaExhausted);
+    assert_eq!(e.resets_at, Some(month_end()));
+    let message = e.message.unwrap();
+    assert!(message.contains("spend_cap of 10 USD"), "{message}");
+    assert_eq!(batch_calls(&b.vendor), [], "no vendor call");
+    assert_eq!(batch_records(&b.dir), Vec::<Value>::new(), "no record");
+    assert_eq!(state(&b.qbd).leases, []);
+    assert_eq!(spend_window(&b.qbd, "login-1"), (0.0, Some(month_end())));
+
+    b.vendor
+        .answer(vendor_error(500, "api_error", "Internal server error"));
+    let refused = capped_body("key-0", &[300_000]);
+    let (status, class, _) = batch_refusal(submit_batch(&b.gw, &refused));
+    assert_eq!((status, class), (502, ErrorClass::Unavailable));
+    assert_eq!(spend_and_reserve(&b.gw, "login-1"), (0.0, 0.0));
+    assert_eq!(
+        spend_window(&b.qbd, "login-1").0,
+        0.0,
+        "a forgotten create releases its reserve"
+    );
+
+    let body = capped_body("key-1", &[600_000, 600_000]);
+    let reserve = reserve_of(&body);
+    assert!(reserve > 6.0 && reserve < 6.01, "{reserve}");
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    let created = batch_status(submit_batch(&b.gw, &body));
+    assert_eq!(created.login, "login-1");
+    let records = batch_records(&b.dir);
+    assert_usd(records[0]["reserve_usd"].as_f64().unwrap(), reserve);
+    let (spent, reserved) = spend_and_reserve(&b.gw, "login-1");
+    assert_eq!(spent, 0.0);
+    assert_usd(reserved, reserve);
+    let (used, resets_at) = spend_window(&b.qbd, "login-1");
+    assert_usd(used, reserve / 10.0);
+    assert_eq!(resets_at, Some(month_end()));
+
+    assert_eq!(state(&b.qbd).leases, []);
+}
+
+#[test]
+fn an_open_reserve_refuses_the_next_submit_until_its_batch_settles_also_after_a_restart() {
+    let b = settle_rig(&[]);
+    let first = capped_body("key-1", &[600_000, 600_000]);
+    b.vendor.answer(message_batch("msgbatch_01", false));
+    batch_status(submit_batch(&b.gw, &first));
+    let second = capped_body("key-2", &[600_000, 600_000]);
+    let e = refused_with(429, submit_batch(&b.gw, &second));
+    assert_eq!(e.class, ErrorClass::QuotaExhausted);
+    assert_eq!(
+        batch_calls(&b.vendor).len(),
+        1,
+        "the second create is not sent"
+    );
+
+    let restarted = restart_settle_rig(&b, "gw2.sock");
+    let (spent, reserved) = spend_and_reserve(&restarted, "login-1");
+    assert_eq!(spent, 0.0);
+    assert_usd(reserved, reserve_of(&first));
+    let e = refused_with(429, submit_batch(&restarted, &second));
+    assert_eq!(e.resets_at, Some(month_end()));
+    assert_eq!(batch_calls(&b.vendor).len(), 1);
+
+    let body = results_body(&[succeeded(
+        "item-0",
+        "end_turn",
+        &json!({"input_tokens": 1000, "output_tokens": 2000}),
+    )]);
+    read_results(&b, &restarted, "msgbatch_01", &body);
+    let actual = 0.011;
+    let (spent, reserved) = spend_and_reserve(&restarted, "login-1");
+    assert_usd(spent, actual);
+    assert_eq!(reserved, 0.0, "the settlement releases the reserve");
+    assert_usd(spend_window(&b.qbd, "login-1").0, actual / 10.0);
+
+    b.vendor.answer(message_batch("msgbatch_02", false));
+    let created = batch_status(submit_batch(&restarted, &second));
+    assert_eq!(created.batch_id, "msgbatch_02");
+    let (spent, reserved) = spend_and_reserve(&restarted, "login-1");
+    assert_usd(spent, actual);
+    assert_usd(reserved, reserve_of(&second));
+    assert_usd(
+        spend_window(&b.qbd, "login-1").0,
+        (actual + reserve_of(&second)) / 10.0,
+    );
+}
+
+#[test]
+fn reserves_that_fill_the_cap_refuse_turns_on_the_login_and_a_zero_settlement_frees_it() {
+    let now = unix_now();
+    let mut pending = batch_record(None, "client-a", "capped", "login-1", "key-p", "00");
+    pending["created_at"] = json!(now);
+    pending["reserve_usd"] = json!(4.0);
+    let mut open = batch_record(
+        Some("msgbatch_a"),
+        "client-a",
+        "capped",
+        "login-1",
+        "key-a",
+        "00",
+    );
+    open["created_at"] = json!(now);
+    open["reserve_usd"] = json!(6.0);
+    let mut last_month = batch_record(
+        Some("msgbatch_old"),
+        "client-a",
+        "capped",
+        "login-1",
+        "key-o",
+        "00",
+    );
+    last_month["created_at"] = json!(qb::gateway::spend::month(now).0 - 1);
+    last_month["reserve_usd"] = json!(5.0);
+    let b = settle_rig(&[pending, open, last_month]);
+    assert_eq!(spend_and_reserve(&b.gw, "login-1"), (0.0, 10.0));
+
+    let events = turn(&b.gw, &turn_on("capped", "turn-1")).2;
+    assert_eq!(kinds(&events), ["error QuotaExhausted"]);
+    assert_eq!(last_error(&events).resets_at, Some(month_end()));
+    assert_eq!(
+        b.vendor.received().len(),
+        0,
+        "the capped login is not called"
+    );
+    assert_eq!(spend_window(&b.qbd, "login-1"), (1.0, Some(month_end())));
+
+    let errored = json!({"custom_id": "item-1", "result": {"type": "expired"}});
+    read_results(&b, &b.gw, "msgbatch_a", &results_body(&[errored]));
+    assert_eq!(spend_and_reserve(&b.gw, "login-1"), (0.0, 4.0));
+    assert_usd(spend_window(&b.qbd, "login-1").0, 0.4);
+    assert!(
+        !b.dir.join("spend.json").exists(),
+        "a settlement at zero adds no spend"
+    );
+    b.vendor
+        .answer(recorded("200_allowed", Some("upstream_text.sse")));
+    let events = turn(&b.gw, &turn_on("capped", "turn-2")).2;
+    assert_eq!(kinds(&events)[0], "route login-1");
+}
+
+#[test]
+fn a_capped_login_s_unpriced_model_and_a_bad_max_tokens_are_refused_unsent() {
+    let spend = temp_dir("gwp").join("spend.json");
+    let extra = format!("spend_file = \"{}\"\n{CAPPED_ROUTE}", spend.display());
+    let capped = |v: &Vendor| {
+        let [key_1, key_2] = two_keys(v);
+        [format!("{key_1}\nspend_cap = 10.0"), key_2]
+    };
+    let b = batch_rig(&key_files(), capped, &extra, own_uid(), &[]);
+    let e = refused_with(400, submit_batch(&b.gw, &capped_body("key-1", &[64])));
+    assert_eq!(e.class, ErrorClass::BadRequest);
+    let message = e.message.unwrap();
+    assert!(
+        message.starts_with("model `model-large` has no `[prices.\"model-large\"]` entry"),
+        "{message}"
+    );
+    assert_eq!(state(&b.qbd).leases, []);
+    assert_eq!(leased_on_behalf_of(&b.dir).len(), 1);
+
+    let mut bad = capped_body("key-2", &[64]);
+    bad["requests"][0]["params"]["max_tokens"] = json!(1.5);
+    let e = refused_with(400, submit_batch(&b.gw, &bad));
+    let message = e.message.unwrap();
+    assert!(
+        message.starts_with("request `item-0`: `params.max_tokens` must be a positive integer"),
+        "{message}"
+    );
+    assert_eq!(leased_on_behalf_of(&b.dir).len(), 1, "no pick");
+    assert_eq!(batch_calls(&b.vendor), []);
+    assert!(!batch_file(&b.dir).exists(), "no record");
+}
+
+#[test]
+fn a_read_that_holds_the_settlement_makes_a_concurrent_read_settle_nothing() {
+    let record = batch_record(
+        Some("msgbatch_a"),
+        "client-a",
+        "chat",
+        "login-1",
+        "key-a",
+        "00",
+    );
+    let b = settle_rig(&[record]);
+    let body = results_body(&[succeeded(
+        "item-1",
+        "end_turn",
+        &json!({"input_tokens": 1000, "output_tokens": 2000}),
+    )]);
+    let total = 0.011;
+
+    // A spend file that cannot be replaced fails the spend add; the next read retries.
+    std::fs::create_dir(b.dir.join("spend.json")).unwrap();
+    read_results(&b, &b.gw, "msgbatch_a", &body);
+    assert_eq!(settled_of(&b, "msgbatch_a"), Value::Null);
+    std::fs::remove_dir(b.dir.join("spend.json")).unwrap();
+
+    b.vendor.answer(message_batch("msgbatch_a", true));
+    b.vendor.answer(Answer::After(
+        Duration::from_millis(500),
+        Box::new(results_answer(body.clone())),
+    ));
+    let gw = b.gw.clone();
+    let held = std::thread::spawn(move || chunks_of(results_of(&gw, "msgbatch_a")));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.vendor.received().len() < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "the first read never asked its results"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    read_results(&b, &b.gw, "msgbatch_a", &body);
+    assert_eq!(batch_usage(&b), [], "the concurrent read settles nothing");
+    assert_eq!(spent(&b.gw, "login-1"), 0.0);
+    assert_eq!(settled_of(&b, "msgbatch_a"), Value::Null);
+
+    let (_, chunks, ended) = held.join().unwrap();
+    assert!(ended && chunks.concat() == body);
+    assert_eq!(batch_usage(&b).len(), 1, "the holding read settles once");
+    assert_usd(spent(&b.gw, "login-1"), total);
+    assert_usd(settled_of(&b, "msgbatch_a")["usd"].as_f64().unwrap(), total);
 }
 
 #[test]
