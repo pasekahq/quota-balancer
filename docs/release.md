@@ -23,12 +23,12 @@ The URL of an asset is
 `https://github.com/pasekahq/quota-balancer/releases/download/v<version>/<asset>`.
 Each asset has a build provenance attestation signed through Sigstore and stored with GitHub.
 `qb --version` prints the version and the git revision the binary was built from, e.g.
-`qb 0.1.0 (0123456789ab)`.
+`qb 0.2.0 (0123456789ab)`.
 
 ## Verify a release
 
 ```sh
-gh release download v0.1.0 -R pasekahq/quota-balancer
+gh release download v0.2.0 -R pasekahq/quota-balancer
 sha256sum -c SHA256SUMS
 gh attestation verify qb-x86_64-unknown-linux-musl -R pasekahq/quota-balancer
 chmod +x qb-x86_64-unknown-linux-musl && ./qb-x86_64-unknown-linux-musl --version

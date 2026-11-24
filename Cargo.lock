@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "qb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "httparse",
  "landlock",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "qb-anthropic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "qb-proto",
  "serde",
@@ -222,11 +222,11 @@ dependencies = [
 
 [[package]]
 name = "qb-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "qb-openai"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "qb-proto",
  "qb-vendors",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "qb-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "qb-vendors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "qb-proto",
  "serde_json",
