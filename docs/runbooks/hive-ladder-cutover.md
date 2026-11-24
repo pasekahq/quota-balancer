@@ -15,7 +15,7 @@ Placeholders:
 |---|---|
 | `<host>` | The host `qbd` and the gateway run on. |
 | `<user>`, `<uid>` | The user the gateway runs as, a user unit of this user, and its uid. `<user>` is in the group `qb-clients`, so it reaches `qbd`'s socket. |
-| `<gateway-client>` | The name of `<uid>`'s `[[clients]]` entry in `<qbd-config>`, the client `qbd` identifies the gateway and `<user>` as. |
+| `<gateway-client>` | The name of the gateway's `[[clients]]` entry in `<qbd-config>`, by the `bearer_sha256` of the gateway's `qbd_bearer_file`: the client `qbd` identifies the gateway as. |
 | `<qbd-socket>` | `qbd`'s socket, `/run/qb/qb.sock` with the shipped `qbd.socket`. |
 | `<gateway-socket>` | The gateway's `socket`, for example `/run/user/<uid>/qb-gateway/gateway.sock`. |
 | `<port>` | The port of the gateway's `fronts.listen`. |
@@ -81,8 +81,10 @@ reading and the model ids.
    answers 200 to the second but refuses the `PUT` of step 5 with 400 naming the unknown field,
    and writes nothing.
 2. A root shell on `<host>`, a shell as `<user>`, and `jq` on `<host>`.
-3. `<qbd-config>` has `<gateway-client>` with `uid = <uid>`, and the gateway logs its turns as in
-   the Hermes cutover runbook.
+3. `<qbd-config>` has `<gateway-client>` with `bearer_sha256`, the gateway config has
+   `qbd_bearer_file`, and the gateway logs its turns as in the Hermes cutover runbook. A client
+   by `uid` matches nobody under the shipped `qbd.service`, whose `PrivateUsers=yes` shows every
+   caller as the overflow uid ([config.md](../config.md#clients)).
 4. The subscription logins `<sub-login>` and `<openai-login>` are logins of the gateway with
    credential files in `<credentials-dir>` (the Hermes cutover runbook's
    [Gateway credentials](hermes-secretary-cutover.md#gateway-credentials) step, or a sign-in as
@@ -214,8 +216,8 @@ there already.
    shape, with the windows of their subscriptions as in the Hermes cutover runbook.
 
    For the admin API through the gateway, used by step 4, add `admin = true` to the entry of
-   `<gateway-client>`. `<user>` then is an admin on `<qbd-socket>` as well: `qbd` identifies it by
-   uid.
+   `<gateway-client>`. Whoever holds the gateway's `qbd_bearer_file` then is an admin on
+   `<qbd-socket>` as well: `qbd` identifies the caller by that token.
 
    `[[vendors]]` and `[[logins]]` are restart-only in `qbd`: a reload refuses them, so the new
    vendor and login need a restart. `admin` alone is taken by a reload. Check the file with a
