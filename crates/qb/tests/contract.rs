@@ -587,13 +587,18 @@ fn foreign_uid(slot: usize) -> u32 {
     uid
 }
 
+/// The lines that declare `client-a` and `agent-1` in the example `qbd.toml`, by bearer as the
+/// shipped `qbd.service` needs; the edits below swap the bearer for a uid.
+const CLIENT_A: &str = "name = \"client-a\"\nbearer_sha256 = \"0000000000000000000000000000000000000000000000000000000000000003\"";
+const AGENT_1: &str = "name = \"agent-1\"\nbearer_sha256 = \"0000000000000000000000000000000000000000000000000000000000000002\"";
+
 /// [`config_copy`] edit giving the example client `client` the uid `uid`. Anchored on the client's
 /// name, so edits of different clients never rewrite each other's result.
 fn client_uid(client: &str, uid: u32) -> (&'static str, String) {
     let line = match client {
-        "client-a" => "name = \"client-a\"\nuid = 1001",
-        "agent-1" => "name = \"agent-1\"\nuid = 1002",
-        other => panic!("{other} has no uid in qbd.toml"),
+        "client-a" => CLIENT_A,
+        "agent-1" => AGENT_1,
+        other => panic!("{other} is not a client of qbd.toml"),
     };
     (line, format!("name = \"{client}\"\nuid = {uid}"))
 }
@@ -2615,7 +2620,7 @@ fn an_admin_reads_the_roles_held_inline_in_the_config() {
     let config = config_copy(
         &dir,
         &[(
-            "name = \"client-a\"\nuid = 1001",
+            CLIENT_A,
             format!("name = \"client-a\"\nuid = {}\n{ADMIN}", own_uid()),
         )],
     );
@@ -3027,7 +3032,7 @@ fn a_put_without_a_roles_file_is_404_and_writes_nothing() {
     let config = config_copy(
         &dir,
         &[(
-            "name = \"client-a\"\nuid = 1001",
+            CLIENT_A,
             format!("name = \"client-a\"\nuid = {}\n{ADMIN}", own_uid()),
         )],
     );
