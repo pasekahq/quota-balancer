@@ -20,8 +20,8 @@ only for its own credential owner. The decision is [ADR 0001](docs/adr/0001-mode
 the gateway serves logins of the Anthropic Messages API, by OAuth token or API key, and of the
 OpenAI Responses API, by ChatGPT subscription login or API key.
 
-> **Status: alpha (0.1.x).** The daemon, CLI, agent probes and the model gateway (Anthropic
-> Messages, OpenAI Responses, API keys, OpenRouter, fallback chains) work and run in the author's
+> **Status: alpha (0.2.x).** The daemon, CLI, agent probes and the model gateway (Anthropic
+> Messages, OpenAI Responses, API keys, OpenRouter, fallback chains, Anthropic Message Batches) work and run in the author's
 > own setup; multi-host use is next. Expect breaking changes between minor versions. See
 > [CHANGELOG.md](CHANGELOG.md) and [docs/roadmap.md](docs/roadmap.md).
 
@@ -85,7 +85,7 @@ x86_64 and arm64 Linux, bare (`qb-x86_64-unknown-linux-musl`, `qb-aarch64-unknow
 and as tarballs with the license, a `SHA256SUMS` file and build provenance attestations:
 
 ```sh
-gh release download v0.1.0 -R pasekahq/quota-balancer
+gh release download v0.2.0 -R pasekahq/quota-balancer
 sha256sum -c SHA256SUMS
 gh attestation verify qb-x86_64-unknown-linux-musl -R pasekahq/quota-balancer
 ```

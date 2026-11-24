@@ -97,6 +97,13 @@ workflow (static musl builds for x86_64 and aarch64, `SHA256SUMS`, build provena
 [release.md](release.md)), then the repository is public at `pasekahq/quota-balancer` under
 `AGPL-3.0-only`.
 
+## 0.2 — batches and pilot fixes (done)
+
+Anthropic Message Batches through the gateway with spend-cap reserves and `qb batch`, credential
+fingerprints that clear the auth marks of a replaced credential (`qb login reset`), a turn that
+moves on after a failed token refresh, a tool call cut by the output limit dropped instead of
+retried, and `qbd` clients identified by bearer under the shipped unit.
+
 ## Later (S3+)
 
 TCP + mTLS transport, varlink on the same socket, read-only shared-memory state for status

@@ -11,6 +11,47 @@ made and verified is in [docs/release.md](docs/release.md).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-24
+
+Anthropic Message Batches through the gateway, credential marks that follow a replaced
+credential, and fixes before the first pilot.
+
+### Added
+
+- **Message Batches** for `api_key` Anthropic logins: `POST /v1/model/batches` submits a batch on
+  a route, `GET /v1/model/batches/{batch_id}` reads its status, `.../results` streams its results
+  and `.../cancel` cancels it, each for the caller that created it, with a `[batches]` store in
+  the gateway config. A batch reserves its cost under the login's `spend_cap` before its create
+  and settles it from its complete results. `qb batch submit|status|results|cancel` drives them
+  from the CLI.
+- **`qb login reset`** and credential fingerprints: `POST /v1/report` takes an optional
+  `credential` fingerprint, and an `auth_stale` or `auth_dead` mark clears once the gateway
+  announces another credential for the login, so a replaced key or sign-in no longer stays dead.
+
+### Changed
+
+- The examples, `docs/config.md` and the runbooks identify `qbd`'s clients by `bearer_sha256`:
+  the shipped `qbd.service` runs with `PrivateUsers=yes`, which shows every caller's uid as the
+  overflow uid, so a client by `uid` matched nobody. The gateway example sets
+  `qbd_bearer_file`, `qb-agent.service` sets `QB_BEARER_FILE`.
+- The installation check of the shipped examples follows the documented client rule, and finds a
+  route whose `logins` cannot serve its pin, chain steps or ladder.
+
+### Fixed
+
+- A token refresh that failed in transport, with a 5xx or with a 429 no longer ends the turn: the login
+  is left for the rest of the turn without a mark in `qbd`, and the turn moves to the next login;
+  it ends `unavailable`, retryable, only when none is left.
+- A tool call cut by the output token limit (`max_tokens` on Anthropic, `length` on Chat
+  Completions, an incomplete Responses answer) is dropped and the turn ends with `max_tokens`,
+  instead of failing as `unavailable`, being retried on another login and paid twice.
+- A 401 is reported with the fingerprint of the credential the attempt sent, so a key replaced
+  while a request was in flight is not marked dead.
+- `GET /v1/model/usage` totals saturate at the `u64` limits and survive a rotation between
+  listing and reading the ledger.
+- The key and sign-in paste bodies of `/v1/model/logins/{name}/*` are decoded without
+  unzeroized copies of the secret.
+
 ## [0.1.0] - 2026-11-22
 
 The first tagged release: static musl binaries for x86_64 and aarch64, `SHA256SUMS` and build
@@ -64,5 +105,6 @@ provenance attestations.
   attests their build provenance. `qb --version` prints the git revision it was built from,
   e.g. `qb 0.1.0 (0123456789ab)`.
 
-[Unreleased]: https://github.com/pasekahq/quota-balancer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/pasekahq/quota-balancer/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pasekahq/quota-balancer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pasekahq/quota-balancer/releases/tag/v0.1.0
