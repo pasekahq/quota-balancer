@@ -185,6 +185,38 @@ fn retryable(class: ErrorClass) -> bool {
     matches!(class, ErrorClass::Overloaded | ErrorClass::Unavailable)
 }
 
+/// The logins a pick may land on: `route`'s, or every login of `config`, without those that
+/// `failed` in this turn while qbd holds no mark that keeps its picks off them (a token
+/// endpoint that timed out); `route`'s as they stand when none failed or none would be left.
+fn untried_logins(
+    route: Option<&[String]>,
+    config: &GatewayConfig,
+    failed: &[String],
+) -> Option<Vec<String>> {
+    if failed.is_empty() {
+        return route.map(<[String]>::to_vec);
+    }
+    let left: Vec<String> = match route {
+        Some(logins) => logins
+            .iter()
+            .filter(|l| !failed.contains(l))
+            .cloned()
+            .collect(),
+        None => config
+            .logins
+            .iter()
+            .map(|l| &l.name)
+            .filter(|l| !failed.contains(l))
+            .cloned()
+            .collect(),
+    };
+    if left.is_empty() {
+        route.map(<[String]>::to_vec)
+    } else {
+        Some(left)
+    }
+}
+
 /// The qbd outcome and the client's error class of a failure of `kind`.
 fn classify(kind: FailureKind) -> (Outcome, ErrorClass) {
     match kind {
@@ -363,6 +395,9 @@ struct Progress {
     tried: Vec<Attempt>,
     /// Logins that failed in this turn; they are not tried again.
     failed: Vec<String>,
+    /// The logins of `failed` that qbd holds no mark of, whose token endpoint failed: the
+    /// picks after leave them out.
+    unmarked: Vec<String>,
     /// Vendor to avoid after a vendor-scoped failure; set at most once per turn.
     avoid: Option<String>,
     /// Send `resume_of`; cleared by the first `wait` it causes.
@@ -1176,6 +1211,7 @@ impl Gateway {
         let mut progress = Progress {
             tried: Vec::new(),
             failed: Vec::new(),
+            unmarked: Vec::new(),
             avoid: None,
             resume: req.session_key.is_some(),
             step: 0,
@@ -1345,17 +1381,23 @@ impl Gateway {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn(&format!("gateway: {e}"));
-                    progress.tried.push(attempt);
                     if e.unusable {
+                        progress.tried.push(attempt);
                         self.report_401(&lease, &login, &fingerprint, Vec::new());
                         self.report_dead(&login, &fingerprint);
                         progress.failed.push(login);
                         return Next::Retry;
                     }
+                    // A token endpoint that timed out or failed passes by itself: `error` marks
+                    // nothing, and the turn moves on to another login, ending `unavailable` and
+                    // retryable when there is none.
                     self.report(&lease, Outcome::Error, Vec::new());
-                    let message = "a login's token could not be refreshed";
-                    let error = GatewayError::new(ErrorClass::Unavailable, true, message);
-                    return fail(emit, error, progress, "refresh failed");
+                    let mut attempt = attempt;
+                    attempt.class = ErrorClass::Unavailable;
+                    progress.tried.push(attempt);
+                    progress.unmarked.push(login.clone());
+                    progress.failed.push(login);
+                    return Next::Retry;
                 }
             };
             let at = Picked {
@@ -1940,7 +1982,7 @@ impl Gateway {
             expected_minutes: route.expected_minutes,
             run_id: Some(session.unwrap_or(&req.request_id).clone()),
             on_behalf_of: Some(turn.client.clone()),
-            logins: route.logins.clone(),
+            logins: untried_logins(route.logins.as_deref(), &turn.config, &progress.unmarked),
         };
         let p = self.pick_once(&pick)?;
         if p.decision != Decision::Wait || pick.resume_of.is_none() {

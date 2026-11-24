@@ -275,7 +275,7 @@ a 401. The refresh is the OAuth refresh grant:
 |---|---|
 | 2xx with `access_token` and an expiry | the new tokens, written back to the credential file with the unchanged `account_id` |
 | 400, 401, or another non-5xx answer other than 429 whose error code (`"error": "<code>"` or `"error": {"code": "<code>"}`) is `invalid_grant`, `refresh_token_expired`, `refresh_token_reused` or `refresh_token_invalidated` | refused: the login is `auth_dead` until a new sign-in, the turn moves to the next login |
-| 429, 5xx, transport failure, another status, a 2xx without `access_token` or expiry | failed: the turn ends `unavailable`, retryable |
+| 429, 5xx, transport failure, another status, a 2xx without `access_token` or expiry | failed: reported as `error`, which marks nothing; the turn moves to the next login and ends `unavailable`, retryable, when none is left |
 
 A refresh error names the endpoint, the status and the error code, never a body value, header,
 token or account id. These field names, the refusal shape and the use of the `id_token`'s `exp`

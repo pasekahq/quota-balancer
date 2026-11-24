@@ -202,7 +202,7 @@ when it expires within 60 s or the vendor answered 401, through the vendor's OAu
 |---|---|
 | 2xx with the required fields | the new tokens, written back to the credential file |
 | 400, 401, or another non-5xx answer other than 429 with an `invalid_grant`-class error code ([openai.md](openai.md#serving-the-upstream)) | refused: the login is `auth_dead` until a new sign-in, the turn moves to the next login |
-| transport failure or 5xx at every endpoint, 429, another status, a malformed 2xx | failed: the turn ends `unavailable`, retryable |
+| transport failure or 5xx at every endpoint, 429, another status, a malformed 2xx | failed: reported as `error`, which marks nothing; the turn moves to the next login and ends `unavailable`, retryable, when none is left |
 
 A refresh error names the endpoint, the status and the OAuth `error` code, never a body, header
 or token.
