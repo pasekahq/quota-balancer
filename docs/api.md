@@ -32,7 +32,9 @@ Before routing, every request is identified and then charged to its caller's tok
    every `bearer_sha256` of `[[clients]]` (see [config.md](config.md)); the matching client is
    the caller. A token that matches none is 401 `unauthorized`, whatever the peer's uid.
 2. Without a bearer, the peer's uid from `SO_PEERCRED` names the client with that `uid`; a uid no
-   client declares is 401.
+   client declares is 401. Under the shipped `qbd.service` (`PrivateUsers=yes`) every peer's uid
+   is the overflow uid 65534, so there clients are identified by bearer
+   ([config.md](config.md#clients)).
 3. With no `[[clients]]` declared, every peer without a bearer is the caller `uid:<uid>`; the
    socket's file mode is the boundary.
 4. The caller takes one token from its own bucket: `[limits] burst` tokens, refilled at

@@ -184,9 +184,13 @@ candidates = [
   { vendor = "vendor-b", model = "model-large", effort = "xhigh", tier = 1 },
 ]
 
+# Clients by bearer: qbd.service runs in a private user namespace (PrivateUsers=yes), where every
+# caller's uid is the overflow uid, so a client by `uid` matches nobody under the shipped unit.
+# Hash a token with `printf %s "$TOKEN" | sha256sum`; the caller sends it with --bearer-file,
+# $QB_BEARER_FILE or the gateway's qbd_bearer_file.
 [[clients]]
 name = "client-a"
-uid = 1001
+bearer_sha256 = "0000000000000000000000000000000000000000000000000000000000000003"
 role = "worker"
 
 [[clients]]
@@ -196,11 +200,12 @@ role = "reviewer"
 
 [[clients]]
 name = "agent-1"
-uid = 1002
+bearer_sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
 
 # The gateway forwards qbd's admin API (/v1/admin/*) for its own uid, so its client is an admin.
+# Its token is the file of qbd_bearer_file in deploy/examples/gateway.toml.
 [[clients]]
 name = "gateway"
-uid = 1003
+bearer_sha256 = "0000000000000000000000000000000000000000000000000000000000000004"
 role = "gateway"
 admin = true

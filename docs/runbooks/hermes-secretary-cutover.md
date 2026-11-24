@@ -104,19 +104,31 @@ candidates = [
 
 [[clients]]
 name = "gateway"
-uid = <uid>
+bearer_sha256 = "<the hash of the qbd token>"
 role = "<gateway-role>"
 ```
 
-A `uid` is unique among clients: if `<uid>` is a `qbd` client already, identify the gateway by
-bearer instead (`bearer_sha256` here, `qbd_bearer_file` in the gateway config). Then:
+`qbd` knows the gateway by a bearer token, not by `<uid>`: the shipped `qbd.service` runs with
+`PrivateUsers=yes`, where every caller's uid is the overflow uid 65534, so a client by `uid`
+matches nobody and each pick of the gateway would get 401. As `<user>`, make the token and print
+the hash for `bearer_sha256`:
+
+```sh
+umask 077
+head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > <credentials-dir>/qbd-bearer
+sha256sum < <credentials-dir>/qbd-bearer | cut -d' ' -f1
+```
+
+Then:
 
 ```sh
 sudo usermod -aG qb-clients <user>
 sudo systemctl enable --now qbd.socket      # first install
 sudo systemctl restart qbd.service          # config change of a running qbd
-qb state                                    # as <user>, in a new login: lists <login-1>
+qb --bearer-file <credentials-dir>/qbd-bearer state   # as <user>, in a new login: lists <login-1>
 ```
+
+`qb state` without the token answers 401 `unknown client`.
 
 The gateway reaches `/run/qb/qb.sock` through the group `qb-clients`, which `<user>`'s service
 manager has only when it started after the `usermod`. `systemd-run --user --wait --pipe id -G`
@@ -162,6 +174,7 @@ token for an Anthropic OAuth token, which it would send with another identity.
 ```toml
 socket = "/run/user/<uid>/qb-gateway/gateway.sock"
 qbd_socket = "/run/qb/qb.sock"
+qbd_bearer_file = "<credentials-dir>/qbd-bearer"
 max_attempts = 4
 
 [[logins]]

@@ -870,8 +870,8 @@ fn a_broken_installation_rule_is_found_in_either_example() {
         ),
         (
             qbd(
-                "name = \"gateway\"\nuid = 1003\nrole = \"gateway\"",
-                "name = \"gateway\"\nuid = 1003\nrole = \"worker\"",
+                "name = \"gateway\"\nbearer_sha256 = \"0000000000000000000000000000000000000000000000000000000000000004\"\nrole = \"gateway\"",
+                "name = \"gateway\"\nbearer_sha256 = \"0000000000000000000000000000000000000000000000000000000000000004\"\nrole = \"worker\"",
             ),
             "no qbd client has a role the routes name",
         ),

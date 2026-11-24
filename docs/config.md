@@ -102,6 +102,13 @@ A `(difficulty, window)` pair appears at most once per role.
 
 Optional. Each client needs `uid`, `bearer_sha256` or both.
 
+Under the shipped [`qbd.service`](../deploy/systemd/qbd.service) identify clients by
+`bearer_sha256`. Its `PrivateUsers=yes` runs `qbd` in a user namespace where every caller's uid
+is the overflow uid 65534, so a client by `uid` matches nobody there and gets 401. The callers
+send the token with `--bearer-file` or `$QB_BEARER_FILE` (the CLI and `qb agent`) or
+`qbd_bearer_file` (the gateway). A `uid` works where `qbd` sees real peer uids: a `qbd` run
+without `PrivateUsers=`, for example from a shell.
+
 | Key | Type | Meaning |
 |---|---|---|
 | `name` | string | Client name in leases and the journal. |
@@ -273,7 +280,7 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 | `socket` | string | Required. Absolute path of the gateway's unix socket; a stale socket file is replaced. |
 | `socket_mode` | integer | `0o600` (default): only the gateway's user may connect; `0o660`: its group too. |
 | `qbd_socket` | string | Absolute path of `qbd`'s socket, default `/run/qb/qb.sock`. |
-| `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`; without it `qbd` identifies the gateway by uid. |
+| `qbd_bearer_file` | string | Absolute path of a file with the gateway's bearer token for `qbd`, read at start; without it `qbd` identifies the gateway by uid, which the shipped `qbd.service` hides ([`[[clients]]`](#clients)). |
 | `max_turns` | integer 1..=16 | Turns running at once, default 4; a further turn gets 429. |
 | `max_request_bytes` | integer | Largest body of `POST /v1/model/turn`, of `POST /v1/model/batches` and of a `POST` to an HTTP front, default 8388608, at most 33554432; other requests take at most 64 KiB. |
 | `max_attempts` | integer 1..=16 | Attempts per turn, default 4: picks whose login the gateway tries. |
@@ -368,8 +375,8 @@ path that is a symlink becomes a regular 0600 file, and the symlink's target kee
 bytes. `routes` given as an inline array, or an item whose `[[routes.chain]]` follows another
 table, cannot be edited this way.
 
-`qbd` needs a `[[clients]]` entry for the gateway (by uid, or by bearer with
-`qbd_bearer_file`) whose `role` is one the routes name, with `admin = true` when the gateway's
+`qbd` needs a `[[clients]]` entry for the gateway (by bearer with `qbd_bearer_file`, or by uid
+when `qbd` runs without `PrivateUsers=`) whose `role` is one the routes name, with `admin = true` when the gateway's
 own uid is to reach `qbd`'s admin API through it ([api.md](api.md#qbds-admin-api-getput-v1adminroles-and-post-v1adminreload)).
 One such entry serves every route: `qbd` picks for the role a request names, not for the
 caller's declared role, so the other roles the routes name need no client of their own.
@@ -591,13 +598,16 @@ Each shape below is a part of [`deploy/examples/gateway.toml`](../deploy/example
 and the lines of [`deploy/examples/qbd.toml`](../deploy/examples/qbd.toml) it needs; the two files
 together are one working installation. Every route of that gateway but `hive-step-1` to
 `hive-step-5` runs on the `qbd` role `gateway`, which `qbd.toml` declares with a ladder and
-grants to the gateway's uid:
+grants to the gateway by its `qbd_bearer_file`:
 
 ```toml
+# gateway.toml
+qbd_bearer_file = "/var/lib/qb-gateway/credentials/qbd-bearer"
+
 # qbd.toml
 [[clients]]
 name = "gateway"
-uid = 1003
+bearer_sha256 = "0000000000000000000000000000000000000000000000000000000000000004"
 role = "gateway"
 ```
 

@@ -31,6 +31,8 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+# In this user namespace every peer outside it has the overflow uid 65534, so a [[clients]]
+# entry by `uid` matches no caller: identify clients by `bearer_sha256` (docs/config.md#clients).
 PrivateUsers=yes
 StateDirectory=qb
 StateDirectoryMode=0700

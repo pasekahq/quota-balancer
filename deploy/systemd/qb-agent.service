@@ -9,6 +9,8 @@ Documentation=https://github.com/pasekahq/quota-balancer
 [Service]
 Type=simple
 Environment=QB_SOCKET=/run/qb/qb.sock
+# qbd.service's PrivateUsers=yes hides this user's uid from qbd: the agent's client is its bearer.
+Environment=QB_BEARER_FILE=%h/.config/qb/qbd-bearer
 WorkingDirectory=~
 ExecStart=%h/.local/bin/qb agent --config %h/.config/qb/agent.toml
 Restart=on-failure

@@ -1,9 +1,12 @@
 # qb gateway config: model traffic for the credential owner, picked and reported through qbd.
 # Format: docs/config.md#gateway-config. deploy/examples/qbd.toml is the matching qbd config: the
-# gateway's client by uid with role "gateway", that role's ladder, and the logins and vendors below.
+# gateway's client by bearer with role "gateway", that role's ladder, and the logins and vendors
+# below.
 
 socket = "/run/user/1003/qb-gateway/gateway.sock"
 qbd_socket = "/run/qb/qb.sock"
+# qbd knows the gateway by this token (mode 0600), not by uid: qbd.service hides peer uids.
+qbd_bearer_file = "/var/lib/qb-gateway/credentials/qbd-bearer"
 max_turns = 4
 max_attempts = 4
 # Counts the monthly spend of the logins with a spend_cap; only the gateway writes it.
