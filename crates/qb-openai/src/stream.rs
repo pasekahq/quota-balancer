@@ -95,6 +95,9 @@ pub struct Translator {
     started: bool,
     tool_calls: bool,
     refused: bool,
+    /// The `call_id` of a function call whose arguments were not a JSON object: an error unless
+    /// the response ends incomplete for its output token limit, which cut them.
+    cut_call: Option<String>,
     finished: Option<StopReason>,
 }
 
@@ -133,6 +136,7 @@ impl Translator {
             started: false,
             tool_calls: false,
             refused: false,
+            cut_call: None,
             finished: None,
         }
     }
@@ -193,6 +197,9 @@ impl Translator {
     ) -> Result<Progress, Failure> {
         match ev.kind.as_str() {
             event::OUTPUT_ITEM_ADDED => {
+                if self.cut_call.is_some() {
+                    return Err(malformed("function arguments are not a JSON object"));
+                }
                 let index = index(&ev)?;
                 let item = ev
                     .item
@@ -242,7 +249,13 @@ impl Translator {
                     .ok_or_else(|| malformed("item event without item"))?;
                 self.done(at, item, out)?;
             }
-            event::COMPLETED | event::INCOMPLETE => return Ok(self.end(&ev, out)),
+            event::COMPLETED | event::INCOMPLETE => {
+                let progress = self.end(&ev, out);
+                if self.cut_call.is_some() && self.finished != Some(StopReason::MaxTokens) {
+                    return Err(malformed("function arguments are not a JSON object"));
+                }
+                return Ok(progress);
+            }
             _ => {}
         }
         Ok(Progress::Continue)
@@ -312,8 +325,11 @@ impl Translator {
                 if id.is_empty() || name.is_empty() {
                     return Err(malformed("function call without call_id or name"));
                 }
-                let input = call_input(&args)
-                    .ok_or_else(|| malformed("function arguments are not a JSON object"))?;
+                let Some(input) = call_input(&args) else {
+                    // Arguments cut by the output token limit; `end` decides.
+                    self.cut_call = Some(id);
+                    return Ok(());
+                };
                 let name = join_namespace(item.namespace, name);
                 self.tool_calls = true;
                 out.push(StreamEvent::ToolCall {

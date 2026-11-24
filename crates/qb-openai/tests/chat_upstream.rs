@@ -465,6 +465,29 @@ fn malformed_tool_calls_and_order_fail_as_unavailable() {
 }
 
 #[test]
+fn a_tool_call_cut_by_length_is_dropped_and_the_turn_stops_for_max_tokens() {
+    let bytes = stream(
+        &[
+            chunk(
+                &json!({"tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                    "function": {"name": "now", "arguments": "{}"}}]}),
+                None,
+            ),
+            chunk(
+                &json!({"tool_calls": [{"index": 1, "id": "c2", "type": "function",
+                    "function": {"name": "write", "arguments": "{\"text\": \"abc"}}]}),
+                None,
+            ),
+            chunk(&json!({}), Some("length")),
+        ],
+        true,
+    );
+    let got = run_chat(&bytes);
+    assert_eq!(got.events, vec![call("c1", "now", json!({}))]);
+    assert_eq!(got.end, Ok(StopReason::MaxTokens));
+}
+
+#[test]
 fn empty_arguments_are_an_empty_object_and_calls_on_stop_are_tool_use() {
     let bytes = stream(
         &[

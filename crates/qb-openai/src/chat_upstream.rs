@@ -375,13 +375,19 @@ impl Turn {
             ));
         };
         self.calls.sort_by_key(|p| p.index.unwrap_or(u32::MAX));
-        let made = !self.calls.is_empty();
+        let mut made = false;
         for p in self.calls.drain(..) {
             if p.id.is_empty() || p.name.is_empty() {
                 return Err(malformed("tool call without id or name"));
             }
-            let input = call_input(&p.args)
-                .ok_or_else(|| malformed("tool call arguments are not a JSON object"))?;
+            let Some(input) = call_input(&p.args) else {
+                // `length` cuts the arguments mid-JSON: the call is dropped and the turn ends
+                // with `max_tokens`, so the cut answer is not retried on another login.
+                if stop == StopReason::MaxTokens {
+                    continue;
+                }
+                return Err(malformed("tool call arguments are not a JSON object"));
+            };
             out.push(StreamEvent::ToolCall {
                 tool_call: ToolCall {
                     id: p.id,
@@ -389,6 +395,7 @@ impl Turn {
                     input,
                 },
             });
+            made = true;
         }
         self.held = 0;
         // Some OpenAI-compatible vendors end a turn with tool calls on `stop`.

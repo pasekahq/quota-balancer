@@ -138,6 +138,9 @@ is `tool_use`; `max_tokens` and `model_context_window_exceeded` are `max_tokens`
 Events out of order (a delta outside its block, a second `message_start`, events after
 `message_stop`), tool input that is not a JSON object, undecodable event data, and a stream that
 ends before `message_stop` are `unavailable` failures. Events already returned stay delivered.
+A `tool_use` block whose input does not parse is the exception when the message stops for
+`max_tokens`, which cut it: the call is dropped and the turn ends normally with `max_tokens`, so
+the cut answer is not retried on another login and paid twice.
 
 ## Rate limits and failures
 
