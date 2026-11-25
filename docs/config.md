@@ -914,6 +914,8 @@ the changed ones after each reload, so a mark of another file clears.
   `qb login reset <LOGIN>` or `qb login reset --all`
   ([api.md](api.md#post-v1adminloginsreset)); `qb --socket <gateway socket> login reset ...`
   goes through the gateway when its `[[clients]]` entry in `qbd` has `admin = true`.
+- A login marked `exhausted` that works again before its windows reset (a subscription paid up,
+  a key topped up): `qb login reset --quota <LOGIN>`, same admin rule, clears the quota marks too.
 
 The fingerprints need a `qbd` at least as new as the gateway: an older one refuses a report
 that carries one. Upgrade `qbd` first.

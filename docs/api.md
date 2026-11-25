@@ -128,7 +128,8 @@ Each entry of `windows` overwrites that window of the login's snapshot (`source 
 | `model_unavailable` | The model is dead on the login for `outcomes.model_unavailable_s`; other models and logins are unaffected. |
 | `error` | Nothing. |
 
-Marks end by time only: an `ok` report does not lift `exhausted` or `rate_limited`. Nothing is
+Marks end by time only: an `ok` report does not lift `exhausted` or `rate_limited`; an admin's
+[`POST /v1/admin/logins/reset`](#post-v1adminloginsreset) with `quota` lifts them early. Nothing is
 applied when the report answers an error: 400 for a `utilization` outside `0.0..=1.0`, a
 `model_unavailable` login report without `model` or a `credential` that is not 8 to 64
 lowercase hex digits, 404 for an unknown lease or login or a `model_unavailable` model no ladder
@@ -351,12 +352,17 @@ unchanged, and no other backup.
 ```json
 {"logins": ["login-1", "login-2"]}
 {"all": true}
+{"logins": ["login-1"], "quota": true}
 ```
 
 Clears the `auth_stale` or `auth_dead` mark of each login named in `logins`, or of every declared
 login with `all`; exactly one of the two is given, else 400 `bad_request`. A login the config
-does not declare is 404 `not_found` and nothing is cleared. Other marks stay: an `exhausted` login
-stays `exhausted`. Each login whose mark is cleared is journaled as after a report, so a restart
+does not declare is 404 `not_found` and nothing is cleared. Without `quota` other marks stay: an
+`exhausted` login stays `exhausted`. With `quota: true` the `exhausted`, `rate_limited` and
+dead-model marks (`dead_until`) and the window readings go too, for a login that works again
+before its windows reset (a subscription paid up, a key topped up); its live leases stay, and the
+next report or probe reads its windows again. A `qbd` older than `quota` answers it 400.
+Each login whose mark is cleared is journaled as after a report, so a restart
 keeps it cleared, and leaving `auth_dead` runs the `on_recover` hook. It works with or without a
 `roles_file`. The answer lists every login asked for, in request order or, with `all`, in
 declaration order:
@@ -366,9 +372,11 @@ declaration order:
             {"login": "login-2", "cleared": false, "status": "ok"}]}
 ```
 
-`status` is the login's status afterwards, as in `GET /v1/state`. The log line names the logins
-whose mark was cleared, `auth marks cleared: login-1`, or says `no auth mark cleared`. The CLI is
-`qb login reset <LOGIN>...` or `qb login reset --all`.
+`status` is the login's status afterwards, as in `GET /v1/state`; `cleared` is true when the login
+had a mark this reset clears (with `quota` also a window reading). The log line names the logins
+whose mark was cleared, `auth marks cleared: login-1` (`auth and quota marks cleared: ...` with
+`quota`), or says `no auth mark cleared`. The CLI is `qb login reset [--quota] <LOGIN>...` or
+`qb login reset [--quota] --all`.
 
 ### `POST /v1/admin/reload`
 

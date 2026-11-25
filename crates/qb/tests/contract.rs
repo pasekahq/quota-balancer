@@ -892,10 +892,48 @@ fn login_reset_clears_auth_marks_for_an_admin_only_and_survives_a_restart() {
 }
 
 #[test]
+fn login_reset_quota_clears_a_stuck_exhausted_mark_and_survives_a_restart() {
+    let dir = temp_dir("quotareset");
+    let config = admin_journaled_config(&dir);
+    let sock = dir.join("qb.sock");
+    let d = start(&config, &sock);
+    let _ = mark_and_lease(&sock);
+    assert_eq!(status_in(&state(&sock), "login-1"), LoginStatus::Exhausted);
+
+    let bearer = dir.join("bearer");
+    std::fs::write(&bearer, BEARER).unwrap();
+    let (code, out) = login_reset(&sock, Some(&bearer), &["--quota", "login-1"]);
+    assert_eq!(code, 1, "client-b is no admin");
+    assert_eq!(error_of(out.as_bytes()), ErrorCode::Forbidden, "{out}");
+    let (code, out) = login_reset(&sock, None, &["login-1"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(status_in(&state(&sock), "login-1"), LoginStatus::Exhausted);
+
+    let (code, out) = login_reset(&sock, None, &["--quota", "login-1"]);
+    assert_eq!(code, 0, "{out}");
+    let answer: AdminLoginsResetAnswer = serde_json::from_str(&out).unwrap();
+    assert!(answer.logins[0].cleared, "{out}");
+    assert_ne!(answer.logins[0].status, LoginStatus::Exhausted, "{out}");
+    let s = state(&sock);
+    let login = s.logins.iter().find(|l| l.login == "login-1").unwrap();
+    assert_eq!(login.dead_until, None, "{login:?}");
+    drop(d);
+
+    let _d = start(&config, &sock);
+    let after = state(&sock);
+    assert_ne!(status_in(&after, "login-1"), LoginStatus::Exhausted);
+    assert_eq!(
+        status_in(&after, "login-3"),
+        LoginStatus::AuthDead,
+        "an untouched login keeps its marks"
+    );
+}
+
+#[test]
 fn login_reset_needs_logins_or_all() {
     // Usage errors exit before any connection.
     let sock = Path::new("/nonexistent/qb.sock");
-    for args in [&[][..], &["--all", "login-1"][..]] {
+    for args in [&[][..], &["--all", "login-1"][..], &["--quota"][..]] {
         let (code, _) = login_reset(sock, None, args);
         assert_eq!(code, 2, "{args:?}");
     }

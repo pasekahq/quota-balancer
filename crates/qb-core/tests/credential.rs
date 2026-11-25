@@ -4,7 +4,7 @@
 mod common;
 
 use common::{NOW, cand, core, login_view, on, pick, ran, role, spec, step};
-use qb_core::{Auth, Core, LoginStatus, OutcomeClass, Record, ReportInput};
+use qb_core::{Auth, Core, LoginStatus, OutcomeClass, Record, ReportInput, Verdict};
 
 /// Role `worker`: `vendor-a/a` (tier 1, logins 1 and 2), then `vendor-b/b` (tier 2, login 3).
 fn worker() -> Core {
@@ -150,6 +150,33 @@ fn a_reset_clears_auth_marks_only() {
         c.login_names().collect::<Vec<_>>(),
         ["login-1", "login-2", "login-3"]
     );
+}
+
+#[test]
+fn a_quota_reset_clears_a_stuck_exhausted_mark_and_keeps_the_auth_mark() {
+    let mut c = worker();
+    report(&mut c, "login-1", OutcomeClass::Http401, Some(A));
+    report(&mut c, "login-1", OutcomeClass::UsageLimit, None);
+    report(&mut c, "login-2", OutcomeClass::UsageLimit, None);
+    report(&mut c, "login-3", OutcomeClass::Http429, None);
+    assert!(!matches!(pick(&mut c, "worker", 1, None), Verdict::Run(..)));
+    assert_eq!(
+        c.reset_quota("login-2", NOW),
+        Some((true, LoginStatus::Unknown))
+    );
+    let marks = c.marks("login-2").expect("declared");
+    assert_eq!(marks, qb_core::Marks::default(), "nothing left to journal");
+    assert_eq!(ran(&pick(&mut c, "worker", 1, None)).0, "login-2");
+    assert_eq!(
+        c.reset_quota("login-1", NOW),
+        Some((true, LoginStatus::AuthStale)),
+        "the auth mark stays"
+    );
+    assert_eq!(
+        c.reset_quota("login-1", NOW),
+        Some((false, LoginStatus::AuthStale))
+    );
+    assert_eq!(c.reset_quota("login-9", NOW), None);
 }
 
 #[test]

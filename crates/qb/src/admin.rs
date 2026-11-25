@@ -1,6 +1,6 @@
 //! `qbd`'s `/v1/admin/*`: only a client declared with `admin = true` reaches it. The roles of the
 //! config files on disk, their `roles_file` replaced, the reload SIGHUP also runs, and the auth
-//! marks of logins cleared. Every call logs one line naming its caller.
+//! marks of logins cleared, with their quota marks on request. Every call logs one line naming its caller.
 
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -113,8 +113,9 @@ fn route(
     }
 }
 
-/// Clears the auth marks of the logins of the [`AdminLoginsReset`] body of `req` at `now`, each
-/// changed login journaled as after a report; `trail` names the logins cleared.
+/// Clears the auth marks, and with `quota` the quota marks and window readings, of the logins of
+/// the [`AdminLoginsReset`] body of `req` at `now`, each changed login journaled as after a
+/// report; `trail` names the logins cleared.
 fn reset_logins(state: State<'_>, req: &Request, now: u64, trail: &mut Option<String>) -> Reply {
     let body: AdminLoginsReset = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
@@ -145,9 +146,15 @@ fn reset_logins(state: State<'_>, req: &Request, now: u64, trail: &mut Option<St
     let mut answer = AdminLoginsResetAnswer { logins: Vec::new() };
     for login in logins {
         let before = core.marks(&login);
-        let Some((cleared, status)) = core.reset_auth(&login, now) else {
+        let Some((mut cleared, mut status)) = core.reset_auth(&login, now) else {
             continue;
         };
+        if body.quota {
+            if let Some((quota, after)) = core.reset_quota(&login, now) {
+                cleared |= quota;
+                status = after;
+            }
+        }
         api::record_marks(journal, hooks, core, login.clone(), before.as_ref(), now);
         answer.logins.push(LoginReset {
             login,
@@ -161,10 +168,11 @@ fn reset_logins(state: State<'_>, req: &Request, now: u64, trail: &mut Option<St
         .filter(|l| l.cleared)
         .map(|l| l.login.as_str())
         .collect();
+    let what = if body.quota { "auth and quota" } else { "auth" };
     *trail = Some(if cleared.is_empty() {
-        "no auth mark cleared".to_owned()
+        format!("no {what} mark cleared")
     } else {
-        format!("auth marks cleared: {}", cleared.join(" "))
+        format!("{what} marks cleared: {}", cleared.join(" "))
     });
     json(200, &answer)
 }

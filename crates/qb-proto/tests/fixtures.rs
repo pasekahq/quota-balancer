@@ -160,7 +160,9 @@ fn admin_logins_reset() {
     assert_eq!(named.logins, ["login-1", "login-2"]);
     assert!(named.validate().is_ok());
     let all: AdminLoginsReset = roundtrip("admin_logins_reset_all.json");
-    assert!(all.all && all.validate().is_ok());
+    assert!(all.all && all.validate().is_ok() && !all.quota);
+    let quota: AdminLoginsReset = roundtrip("admin_logins_reset_quota.json");
+    assert!(quota.quota && quota.validate().is_ok());
     assert!(AdminLoginsReset::default().validate().is_err());
     let both = AdminLoginsReset { all: true, ..named };
     assert!(both.validate().is_err());

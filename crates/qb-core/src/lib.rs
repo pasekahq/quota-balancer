@@ -1722,6 +1722,25 @@ impl Core {
         Some((cleared, self.status(li)))
     }
 
+    /// Clears the `exhausted`, `rate_limited` and dead-model marks and the window readings of the
+    /// configured login `login` as of `now`, after the deadlines due then: whether it had any, and
+    /// the login's status afterwards. Its auth mark and leases stay; the next report or probe
+    /// reads its windows again. `None` for a login the config does not declare.
+    pub fn reset_quota(&mut self, login: &str, now: UnixSecs) -> Option<(bool, LoginStatus)> {
+        self.tick(now);
+        let li = self.logins.iter().position(|l| l.name == login)?;
+        let l = &mut self.logins[li];
+        let cleared = l.exhausted_until.is_some()
+            || l.rate_limited_until.is_some()
+            || l.model_dead.iter().any(Option::is_some)
+            || l.windows.iter().any(Option::is_some);
+        l.exhausted_until = None;
+        l.rate_limited_until = None;
+        l.model_dead.fill(None);
+        l.windows = [None; MAX_WINDOWS];
+        Some((cleared, self.status(li)))
+    }
+
     /// The declared logins, in declaration order.
     pub fn login_names(&self) -> impl Iterator<Item = &str> {
         self.logins.iter().map(|l| l.name.as_str())

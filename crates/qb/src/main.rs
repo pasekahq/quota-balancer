@@ -76,9 +76,12 @@ COMMANDS:
                                         entries, --entry id or label), `claude-code`, `codex`,
                                         `env` (with --var NAME); the file must not exist
                                         unless --force; exit 1 if refused
-    login reset (<LOGIN>... | --all)   POST /v1/admin/logins/reset (an admin client of qbd):
+    login reset [--quota] (<LOGIN>... | --all)
+                                        POST /v1/admin/logins/reset (an admin client of qbd):
                                         clear the auth_stale or auth_dead mark of each LOGIN,
-                                        or of every login, journaled; other marks stay
+                                        or of every login, journaled; with --quota also the
+                                        exhausted, rate_limited and dead-model marks and the
+                                        window readings (a login paid up or topped up early)
     login --config PATH [--force] <LOGIN>
                                         sign the `oauth_anthropic` or `chatgpt_oauth` LOGIN of
                                         the gateway config PATH in with OAuth PKCE: print an
@@ -233,6 +236,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
         (None, None, None, None, None);
     let mut force = false;
     let mut all = false;
+    let mut quota = false;
     let mut name: Option<String> = if as_qbd {
         Some("daemon".to_owned())
     } else {
@@ -311,6 +315,7 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
             Long("var") if sub == Some("login") => var = Some(string(p.value()?)?),
             Long("force") if sub == Some("login") => force = true,
             Long("all") if sub == Some("login") => all = true,
+            Long("quota") if sub == Some("login") => quota = true,
             Long("from-stream-json") if sub == Some("report") => {
                 from_stream = Some(PathBuf::from(p.value()?));
             }
@@ -396,13 +401,13 @@ fn parse(as_qbd: bool) -> Result<Args, lexopt::Error> {
                 .cloned()
                 .map(string)
                 .collect::<Result<Vec<_>, _>>()?;
-            let reset = AdminLoginsReset { logins, all };
+            let reset = AdminLoginsReset { logins, all, quota };
             reset
                 .validate()
                 .map_err(|_| "expected `login reset <LOGIN>...` or `login reset --all`")?;
             Cmd::Call(Call::LoginsReset(reset))
         }
-        _ if all => return Err("--all goes with `login reset`".into()),
+        _ if all || quota => return Err("--all and --quota go with `login reset`".into()),
         Some("login") if login_args.len() == 1 && login_args[0] != "import" => {
             if format.is_some()
                 || source_file.is_some()
