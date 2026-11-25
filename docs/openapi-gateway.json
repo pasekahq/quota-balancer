@@ -2968,6 +2968,10 @@
           "all": {
             "type": "boolean",
             "description": "Every declared login instead."
+          },
+          "quota": {
+            "type": "boolean",
+            "description": "Also clear the `exhausted`, `rate_limited` and dead-model marks and the window readings."
           }
         }
       },
@@ -2987,7 +2991,7 @@
                 },
                 "cleared": {
                   "type": "boolean",
-                  "description": "The login had an `auth_stale` or `auth_dead` mark, now cleared."
+                  "description": "The login had an `auth_stale` or `auth_dead` mark, or with `quota` a quota mark or a window reading, now cleared."
                 },
                 "status": {
                   "type": "string",

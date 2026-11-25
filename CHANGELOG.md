@@ -11,6 +11,13 @@ made and verified is in [docs/release.md](docs/release.md).
 
 ## [Unreleased]
 
+### Added
+
+- **`qb login reset --quota`**: `POST /v1/admin/logins/reset` takes an optional `quota`, which
+  also clears the `exhausted`, `rate_limited` and dead-model marks and the window readings of the
+  logins, so a login paid up or topped up before its windows reset works again without a
+  restart or a renamed login. Admin clients of `qbd` only, journaled and logged.
+
 ## [0.2.0] - 2026-11-24
 
 Anthropic Message Batches through the gateway, credential marks that follow a replaced

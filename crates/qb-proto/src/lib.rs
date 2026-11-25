@@ -682,7 +682,7 @@ pub struct AdminReloadAnswer {
 }
 
 /// `POST /v1/admin/logins/reset` request: the logins whose `auth_stale` or `auth_dead` mark
-/// to clear, or `all` of them.
+/// to clear, or `all` of them; with `quota` also their quota marks.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminLoginsReset {
@@ -692,6 +692,9 @@ pub struct AdminLoginsReset {
     /// Every declared login instead.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub all: bool,
+    /// Also clear the `exhausted`, `rate_limited` and dead-model marks and the window readings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quota: bool,
 }
 
 impl AdminLoginsReset {
@@ -720,7 +723,8 @@ pub struct AdminLoginsResetAnswer {
 pub struct LoginReset {
     /// Login name.
     pub login: String,
-    /// The login had an `auth_stale` or `auth_dead` mark, now cleared.
+    /// The login had an `auth_stale` or `auth_dead` mark, or with `quota` a quota mark or a
+    /// window reading, now cleared.
     pub cleared: bool,
     /// Login status after the reset.
     pub status: LoginStatus,
