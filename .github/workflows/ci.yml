@@ -129,3 +129,5 @@ jobs:
             systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit" || status=1
           done
           exit "$status"
+      - name: The gateway unit keeps its runtime directory across restarts
+        run: ci/runtime_dir_preserve.sh deploy/systemd/qb-gateway.service

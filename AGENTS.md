@@ -23,6 +23,7 @@ and a JSON `/v1` API over HTTP/1.1 on a unix socket. Design: `docs/design.md`. C
 | `deploy/systemd/` | Unit templates with hardening. |
 | `ci/release.sh`, `.github/workflows/release.yml` | Release builds, checks, assets, `SHA256SUMS` and notes; a tag `v<version>` publishes (`docs/release.md`). `crates/qb/build.rs` embeds the git revision `qb --version` prints. |
 | `ci/budgets.sh` | Binary size and static-link checks; the other budgets are the acceptance lane (`docs/design.md`, "Budgets"). |
+| `ci/runtime_dir_preserve.sh` | Fails unless a unit's effective `[Service]` `RuntimeDirectoryPreserve` is `yes`; the `systemd-units` job runs it on the gateway unit. |
 | `clients/python/` | `qb_client.py`: single-file stdlib client (Python ≥ 3.9) to copy in; `contract.rs` drives it through `contract_driver.py`, so `cargo test` needs `python3`. |
 | `ci/broad_check.py` | Stdlib-only driver for fmt + clippy + test (`python3 -m ci.broad_check`); external harnesses call this. |
 
@@ -40,8 +41,9 @@ CC_x86_64_unknown_linux_musl=gcc cargo build --release --locked --target x86_64-
 ring's build script compiles C for the musl target; `CC_x86_64_unknown_linux_musl` names the
 compiler when `x86_64-linux-musl-gcc` is not installed.
 
-Optional locally, always in CI: `cargo deny check`, `gitleaks git .`, and the exposure of every
-service unit within its own threshold (the `systemd-units` job; a new unit needs a case there):
+Optional locally, always in CI: `cargo deny check`, `gitleaks git .`, and the `systemd-units`
+job: the exposure of every service unit within its own threshold (a new unit needs a case there)
+and the gateway unit's `RuntimeDirectoryPreserve=yes`:
 
 ```sh
 for unit in deploy/systemd/*.service; do
@@ -53,6 +55,7 @@ for unit in deploy/systemd/*.service; do
   esac
   systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit"
 done
+ci/runtime_dir_preserve.sh deploy/systemd/qb-gateway.service
 ```
 
 Release builds are CPU-heavy (fat LTO). Run one cargo build at a time on shared hosts, under

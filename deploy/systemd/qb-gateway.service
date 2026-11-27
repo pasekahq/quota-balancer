@@ -18,6 +18,9 @@ Type=simple
 WorkingDirectory=~
 RuntimeDirectory=qb-gateway
 RuntimeDirectoryMode=0700
+# Kept across stops and restarts: a client that sees the directory in its own mount namespace
+# keeps the old one, so a re-created directory cuts it off from the socket until it restarts.
+RuntimeDirectoryPreserve=yes
 ExecStart=%h/.local/bin/qb gateway --config %h/.config/qb/gateway.toml
 # SIGHUP reloads the config (docs/config.md, "Reload"); a refused one keeps the running config.
 ExecReload=/bin/kill -HUP $MAINPID
