@@ -291,7 +291,11 @@ Top-level keys come before the tables (`[[clients]]`, `[[logins]]`, `[[routes]]`
 the socket file: `socket_mode = 0o660` with the caller in the gateway user's group, and a
 directory it may traverse. The shipped unit's `RuntimeDirectoryMode=0700` keeps everyone else
 out of the runtime directory; with clients, set `RuntimeDirectoryMode=0750` and a shared group,
-or put the socket in a directory outside it.
+or put the socket in a directory outside it. The shipped unit also sets
+`RuntimeDirectoryPreserve=yes`, so the runtime directory and the socket's path survive stops and
+restarts: a client that sees the directory through its own mount namespace keeps the directory it
+saw, and a re-created one would cut it off from the socket until the client restarts. An
+installed drop-in that sets the same key is redundant and can be removed.
 
 | Key | Type | Meaning |
 |---|---|---|
